@@ -1,0 +1,17 @@
+[workspace]
+members = ["flame-core", "flame-test"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Alex"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/CodeAlexx/Flame"
+description = "Fast Learning Accelerated Matrix Engine - GPU tensor framework for deep learning"
+
+[workspace.dependencies]
+cudarc = "0.9"
+half = "2.3"
+num-traits = "0.2"
+thiserror = "1.0"

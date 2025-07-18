@@ -1,0 +1,114 @@
+[package]
+name = "flame-core"
+version = "0.1.0"
+authors = ["Alex"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/CodeAlexx/Flame"
+description = "Core tensor operations and autograd for FLAME"
+
+[dependencies]
+cudarc = { version = "0.11.9", features = ["driver", "cublas", "nvrtc", "cuda-12050"] }
+half = { version = "2.3", features = ["num-traits"] }
+num-traits = "0.2"
+thiserror = "1.0"
+rand = "0.8"
+rand_distr = "0.4"
+lazy_static = "1.4"
+serde_json = "1.0"
+# candle-core = { path = "../../candle-fork/candle-core", features = ["cuda"] }  # Removed - no longer needed
+
+
+[features]
+default = []
+cuda = []  # CUDA support is always enabled when cudarc is available
+
+[[example]]
+name = "weight_update"
+
+[[example]]
+name = "autograd_demo"
+
+[[example]]
+name = "conv2d_demo"
+
+[[example]]
+name = "norm_demo"
+
+[[example]]
+name = "cuda_kernel_test"
+
+[[example]]
+name = "transpose_test"
+
+[[example]]
+name = "autograd_training"
+
+[[example]]
+name = "conv2d_cuda_test"
+
+[[example]]
+name = "activation_test"
+
+[[example]]
+name = "optimizer_test"
+
+[[example]]
+name = "attention_test"
+
+[[example]]
+name = "serialization_test"
+
+[[example]]
+name = "bmm_test"
+
+[[example]]
+name = "regularization_test"
+
+[[example]]
+name = "mixed_precision_test"
+
+[[example]]
+name = "gradient_clip_test"
+
+[[example]]
+name = "autograd_test"
+
+[[example]]
+name = "autograd_v2_test"
+
+[[example]]
+name = "test_pooling_correct"
+
+[[example]]
+name = "test_pooling_values"
+
+[[example]]
+name = "test_upsampling"
+
+[[example]]
+name = "test_norm"
+
+[[example]]
+name = "test_activations"
+
+[[example]]
+name = "test_candle_interop"
+
+[[example]]
+name = "test_attention"
+
+[[example]]
+name = "test_modulated_blocks"
+
+[[example]]
+name = "test_flux_blocks"
+
+[[example]]
+name = "test_mmdit_blocks"
+
+[[example]]
+name = "test_eridiffusion_adapter"
+
+[[example]]
+name = "kernel_launcher_example"

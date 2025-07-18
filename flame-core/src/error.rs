@@ -1,0 +1,47 @@
+use crate::shape::Shape;
+use thiserror::Error;
+
+pub type Result<T> = std::result::Result<T, FlameError>;
+
+#[derive(Error, Debug)]
+pub enum FlameError {
+    #[error("CUDA error: {0}")]
+    Cuda(String),
+    
+    #[error("Shape mismatch: expected {expected}, got {got}")]
+    ShapeMismatch { expected: Shape, got: Shape },
+    
+    #[error("Broadcasting incompatible shapes: {lhs} and {rhs}")]
+    BroadcastIncompatible { lhs: Shape, rhs: Shape },
+    
+    #[error("Unsupported dtype: {0}")]
+    UnsupportedDType(String),
+    
+    #[error("Invalid operation: {0}")]
+    InvalidOperation(String),
+    
+    #[error("CUDA driver error")]
+    CudaDriver,
+    
+    #[error("CUBLAS error")]
+    CuBlas,
+    
+    #[error("IO error: {0}")]
+    Io(String),
+    
+    #[error("Kernel error: {0}")]
+    KernelError(String),
+}
+
+// Now actually converts cudarc errors
+impl From<cudarc::driver::DriverError> for FlameError {
+    fn from(e: cudarc::driver::DriverError) -> Self {
+        FlameError::Cuda(format!("{:?}", e))
+    }
+}
+
+impl From<cudarc::cublas::result::CublasError> for FlameError {
+    fn from(_: cudarc::cublas::result::CublasError) -> Self {
+        FlameError::CuBlas
+    }
+}

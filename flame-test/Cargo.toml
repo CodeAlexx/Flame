@@ -1,0 +1,21 @@
+[package]
+name = "flame-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flame-core = { path = "../flame-core" }
+cudarc = { workspace = true }
+candle-core = { path = "../../candle-fork/candle-core" }
+
+[[bin]]
+name = "basic_ops"
+path = "../examples/test_basic_ops.rs"
+
+[[bin]]
+name = "nvrtc"
+path = "../examples/test_nvrtc.rs"
+
+[[bin]]
+name = "training_sim"
+path = "../examples/test_flame_training_sim.rs"
