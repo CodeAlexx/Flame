@@ -1,5 +1,6 @@
 use crate::{Shape, Result, FlameError};
-use crate::autograd_v3::{record_op, Op};
+use crate::autograd::{AutogradContext, Op};
+use crate::autograd_v3::{record_op, Op as OpV3};
 use crate::gradient::{GradientMap, TensorGradExt};
 use cudarc::driver::{CudaDevice, CudaSlice};
 use cudarc::cublas::CudaBlas;
@@ -159,6 +160,11 @@ impl Tensor {
         Self::from_vec(data.to_vec(), shape, device)
     }
     
+    /// Compute gradients via automatic differentiation
+    pub fn backward(&self) -> Result<GradientMap> {
+        AutogradContext::backward(self)
+    }
+    
     /// Set data from slice (useful for initialization)
     /// This creates a new tensor with the provided data
     pub fn set_data(&self, data: &[f32]) -> Result<Tensor> {
@@ -247,7 +253,7 @@ impl Tensor {
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::MatMul { 
                     lhs: self.id,
@@ -382,7 +388,7 @@ extern "C" __global__ void copy_at_offset(
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::BatchMatMul { 
                     lhs: self.id,
@@ -478,7 +484,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::Add { 
                     lhs: self.id,
@@ -511,7 +517,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad || other.requires_grad {
             
             // Record as subtraction
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::Sub { 
                     lhs: self.id,
@@ -536,7 +542,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::Mul { 
                     lhs: self.id,
@@ -561,7 +567,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::MulScalar { 
                     input: self.id,
@@ -588,7 +594,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::AddScalar { 
                     input: self.id,
@@ -610,7 +616,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::ReLU { 
                     input: self.id
@@ -631,7 +637,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::GELU { 
                     input: self.id
@@ -652,7 +658,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::SiLU { 
                     input: self.id
@@ -673,7 +679,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::Tanh { 
                     input: self.id
@@ -694,7 +700,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::Sigmoid { 
                     input: self.id
@@ -713,7 +719,7 @@ extern "C" __global__ void slice_kernel(
         // Record square operation if needed
         if self.requires_grad {
             // Record as square
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::Square { 
                     input: self.id
@@ -735,7 +741,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::Mean { 
                     input: self.id,
@@ -757,7 +763,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::Sum { 
                     input: self.id,
@@ -809,7 +815,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::SumDim { 
                     input: self.id,
@@ -855,7 +861,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::Transpose { 
                     input: self.id
@@ -967,24 +973,17 @@ extern "C" __global__ void slice_kernel(
         })
     }
     
-    
-    /// Perform backward pass to compute gradients
-    pub fn backward(&self, engine: &crate::autograd_v3::AutogradEngine) -> Result<GradientMap> {
-        if !self.requires_grad {
-            return Err(FlameError::InvalidOperation(
-                "backward() called on tensor that doesn't require grad".into()
-            ));
-        }
-        
-        if self.shape.elem_count() != 1 {
-            return Err(FlameError::InvalidOperation(
-                "backward() can only be called on scalar tensors".into()
-            ));
-        }
-        
-        // Call autograd engine to compute gradients
-        engine.backward(self)
+    /// 2D Convolution
+    pub fn conv2d(
+        &self,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        stride: usize,
+        padding: usize,
+    ) -> Result<Tensor> {
+        crate::cuda_conv2d::conv2d(self, weight, bias, stride, padding)
     }
+    
     
     
     /// Reshape tensor to new dimensions
@@ -1113,7 +1112,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::Permute { 
                     input: self.id,
@@ -1223,7 +1222,7 @@ extern "C" __global__ void slice_kernel(
         if self.requires_grad || bias.requires_grad {
             output.requires_grad = true;
             
-            record_op(
+            AutogradContext::record_op(
                 output.id,
                 Op::AddBias { 
                     input: self.id,

@@ -6,17 +6,19 @@ pub mod gradient;
 pub mod device;
 pub mod linear;
 pub mod conv;
+pub mod cuda_conv2d;
+pub mod layer_norm;
 pub mod norm;
 pub mod cuda_kernels;
 pub mod cuda_kernel_sources;
 pub mod cuda_ops;
 pub mod cuda_kernels_v2;
 pub mod autograd;
-pub mod autograd_ops;
-pub mod autograd_engine;
-pub mod autograd_v2;
-pub mod autograd_v3;
-// pub mod autograd_simple;  // Replaced by autograd_v3
+// pub mod autograd_ops;  // Using new autograd
+// pub mod autograd_engine;  // Using new autograd
+// pub mod autograd_v2;  // Using new autograd
+pub mod autograd_v3;  // This is used
+// pub mod autograd_simple;  // Replaced by autograd
 pub mod optimizers;
 pub mod attention;
 pub mod serialization;
@@ -42,6 +44,8 @@ pub use dtype::DType;
 pub use error::{FlameError, Result};
 pub use shape::Shape;
 pub use tensor::{Tensor, TensorId};
+pub use autograd::{AutogradContext, Op};
+pub use gradient::GradientMap;
 
 // Re-export cudarc types we use
 pub use cudarc::driver::CudaDevice;
