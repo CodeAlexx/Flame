@@ -1,0 +1,709 @@
+//! Extended tensor operations for FLAME
+//! Adds operations needed for diffusion model training
+
+use crate::{Tensor, Shape, Result, FlameError};
+use crate::autograd::{AutogradContext, Op};
+use std::sync::Arc;
+
+impl Tensor {
+    /// Chunk tensor into n chunks along specified dimension
+    pub fn chunk(&self, chunks: usize, dim: usize) -> Result<Vec<Tensor>> {
+        let shape = self.shape().dims();
+        if dim >= shape.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Dimension {} out of bounds for tensor with {} dimensions", dim, shape.len())
+            ));
+        }
+        
+        let dim_size = shape[dim];
+        if dim_size % chunks != 0 {
+            return Err(FlameError::InvalidOperation(
+                format!("Cannot evenly chunk dimension {} of size {} into {} chunks", dim, dim_size, chunks)
+            ));
+        }
+        
+        let chunk_size = dim_size / chunks;
+        let mut result = Vec::new();
+        
+        for i in 0..chunks {
+            let start = i * chunk_size;
+            let end = (i + 1) * chunk_size;
+            
+            // Create slice indices
+            let mut slice_ranges: Vec<(usize, usize)> = Vec::new();
+            for (d, &size) in shape.iter().enumerate() {
+                if d == dim {
+                    slice_ranges.push((start, end));
+                } else {
+                    slice_ranges.push((0, size));
+                }
+            }
+            
+            // Slice the tensor
+            let chunk = self.slice(&slice_ranges)?;
+            result.push(chunk);
+        }
+        
+        Ok(result)
+    }
+    
+    /// Slice tensor along multiple dimensions
+    pub fn slice(&self, ranges: &[(usize, usize)]) -> Result<Tensor> {
+        // Validate ranges
+        let shape = self.shape().dims();
+        if ranges.len() != shape.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Number of ranges {} doesn't match tensor dimensions {}", ranges.len(), shape.len())
+            ));
+        }
+        
+        // Calculate new shape
+        let mut new_shape = Vec::new();
+        for (i, &(start, end)) in ranges.iter().enumerate() {
+            if start >= end || end > shape[i] {
+                return Err(FlameError::InvalidOperation(
+                    format!("Invalid range [{}, {}) for dimension {} of size {}", start, end, i, shape[i])
+                ));
+            }
+            new_shape.push(end - start);
+        }
+        
+        // For now, implement as a copy operation
+        // In production, this would be a view into the original data
+        let new_size = new_shape.iter().product();
+        let mut output_data = vec![0.0f32; new_size];
+        
+        // Copy data (simplified - in production would use CUDA kernels)
+        let src_data = self.to_vec()?;
+        
+        // Calculate strides
+        let mut src_strides = vec![1; shape.len()];
+        for i in (0..shape.len() - 1).rev() {
+            src_strides[i] = src_strides[i + 1] * shape[i + 1];
+        }
+        
+        let mut dst_strides = vec![1; new_shape.len()];
+        for i in (0..new_shape.len() - 1).rev() {
+            dst_strides[i] = dst_strides[i + 1] * new_shape[i + 1];
+        }
+        
+        // Copy elements
+        fn copy_recursive(
+            src: &[f32],
+            dst: &mut [f32],
+            ranges: &[(usize, usize)],
+            src_shape: &[usize],
+            src_strides: &[usize],
+            dst_strides: &[usize],
+            dim: usize,
+            src_offset: usize,
+            dst_offset: usize,
+        ) {
+            if dim == ranges.len() {
+                dst[dst_offset] = src[src_offset];
+                return;
+            }
+            
+            let (start, end) = ranges[dim];
+            for i in start..end {
+                let new_src_offset = src_offset + i * src_strides[dim];
+                let new_dst_offset = dst_offset + (i - start) * dst_strides[dim];
+                copy_recursive(
+                    src, dst, ranges, src_shape, src_strides, dst_strides,
+                    dim + 1, new_src_offset, new_dst_offset
+                );
+            }
+        }
+        
+        copy_recursive(
+            &src_data, &mut output_data, ranges, shape, &src_strides, &dst_strides,
+            0, 0, 0
+        );
+        
+        // Create output tensor
+        Tensor::from_slice(&output_data, Shape::from_dims(&new_shape), self.device.clone())
+    }
+    
+    /// Concatenate tensors along a dimension
+    pub fn cat(tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
+        if tensors.is_empty() {
+            return Err(FlameError::InvalidOperation("Cannot concatenate empty tensor list".into()));
+        }
+        
+        // Check all tensors have same shape except for concat dimension
+        let first_shape = tensors[0].shape().dims();
+        let device = tensors[0].device().clone();
+        
+        for tensor in tensors.iter().skip(1) {
+            let shape = tensor.shape().dims();
+            if shape.len() != first_shape.len() {
+                return Err(FlameError::InvalidOperation(
+                    "All tensors must have same number of dimensions".into()
+                ));
+            }
+            
+            for (i, (&s1, &s2)) in first_shape.iter().zip(shape.iter()).enumerate() {
+                if i != dim && s1 != s2 {
+                    return Err(FlameError::InvalidOperation(
+                        format!("Dimension {} must match for concatenation (got {} and {})", i, s1, s2)
+                    ));
+                }
+            }
+        }
+        
+        // Calculate output shape
+        let mut output_shape = first_shape.to_vec();
+        output_shape[dim] = tensors.iter().map(|t| t.shape().dims()[dim]).sum();
+        
+        // Concatenate data
+        let output_size = output_shape.iter().product();
+        let mut output_data = vec![0.0f32; output_size];
+        
+        // Calculate strides
+        let mut strides = vec![1; output_shape.len()];
+        for i in (0..output_shape.len() - 1).rev() {
+            strides[i] = strides[i + 1] * output_shape[i + 1];
+        }
+        
+        let mut offset_along_dim = 0;
+        for tensor in tensors {
+            let tensor_data = tensor.to_vec()?;
+            let tensor_shape = tensor.shape().dims();
+            
+            // Copy tensor data to output
+            fn copy_tensor(
+                src: &[f32],
+                dst: &mut [f32],
+                shape: &[usize],
+                output_shape: &[usize],
+                strides: &[usize],
+                concat_dim: usize,
+                dim_offset: usize,
+                dim: usize,
+                src_idx: usize,
+                dst_idx: usize,
+            ) {
+                if dim == shape.len() {
+                    dst[dst_idx] = src[src_idx];
+                    return;
+                }
+                
+                let size = shape[dim];
+                for i in 0..size {
+                    let src_stride = if dim + 1 < shape.len() {
+                        shape[dim + 1..].iter().product::<usize>()
+                    } else {
+                        1
+                    };
+                    
+                    let dst_offset = if dim == concat_dim {
+                        (i + dim_offset) * strides[dim]
+                    } else {
+                        i * strides[dim]
+                    };
+                    
+                    copy_tensor(
+                        src, dst, shape, output_shape, strides, concat_dim, dim_offset,
+                        dim + 1,
+                        src_idx + i * src_stride,
+                        dst_idx + dst_offset
+                    );
+                }
+            }
+            
+            copy_tensor(
+                &tensor_data, &mut output_data,
+                tensor_shape, &output_shape, &strides,
+                dim, offset_along_dim,
+                0, 0, 0
+            );
+            
+            offset_along_dim += tensor_shape[dim];
+        }
+        
+        Tensor::from_slice(&output_data, Shape::from_dims(&output_shape), device)
+    }
+    
+    /// Index select along a dimension
+    pub fn index_select(&self, dim: usize, indices: &Tensor) -> Result<Tensor> {
+        let shape = self.shape().dims();
+        if dim >= shape.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Dimension {} out of bounds for tensor with {} dimensions", dim, shape.len())
+            ));
+        }
+        
+        // Indices should be 1D
+        let indices_shape = indices.shape().dims();
+        if indices_shape.len() != 1 {
+            return Err(FlameError::InvalidOperation(
+                format!("Indices must be 1D, got shape {:?}", indices_shape)
+            ));
+        }
+        
+        // Get indices as vec
+        let indices_data = indices.to_vec()?;
+        let num_indices = indices_data.len();
+        
+        // Calculate output shape
+        let mut output_shape = shape.to_vec();
+        output_shape[dim] = num_indices;
+        
+        // Gather data
+        let output_size: usize = output_shape.iter().product();
+        let mut output_data = vec![0.0f32; output_size];
+        let src_data = self.to_vec()?;
+        
+        // Calculate strides
+        let mut strides = vec![1; shape.len()];
+        for i in (0..shape.len() - 1).rev() {
+            strides[i] = strides[i + 1] * shape[i + 1];
+        }
+        
+        // Copy selected indices
+        fn copy_indexed(
+            src: &[f32],
+            dst: &mut [f32],
+            shape: &[usize],
+            output_shape: &[usize],
+            strides: &[usize],
+            indices: &[f32],
+            select_dim: usize,
+            dim: usize,
+            src_base: usize,
+            dst_idx: usize,
+        ) {
+            if dim == shape.len() {
+                // We've reached a single element
+                return;
+            }
+            
+            if dim == select_dim {
+                // Use indices for this dimension
+                for (out_i, &idx) in indices.iter().enumerate() {
+                    let src_idx = src_base + (idx as usize) * strides[dim];
+                    let dst_offset = out_i * strides[dim] * output_shape[dim] / shape[dim];
+                    
+                    if dim + 1 == shape.len() {
+                        dst[dst_idx + dst_offset] = src[src_idx];
+                    } else {
+                        copy_indexed(
+                            src, dst, shape, output_shape, strides, indices, select_dim,
+                            dim + 1, src_idx, dst_idx + dst_offset
+                        );
+                    }
+                }
+            } else {
+                // Normal iteration for other dimensions
+                for i in 0..shape[dim] {
+                    let src_offset = i * strides[dim];
+                    let dst_offset = i * strides[dim] * output_shape[dim] / shape[dim];
+                    
+                    if dim + 1 == shape.len() {
+                        dst[dst_idx + dst_offset] = src[src_base + src_offset];
+                    } else {
+                        copy_indexed(
+                            src, dst, shape, output_shape, strides, indices, select_dim,
+                            dim + 1, src_base + src_offset, dst_idx + dst_offset
+                        );
+                    }
+                }
+            }
+        }
+        
+        copy_indexed(
+            &src_data, &mut output_data,
+            shape, &output_shape, &strides, &indices_data,
+            dim, 0, 0, 0
+        );
+        
+        Tensor::from_slice(&output_data, Shape::from_dims(&output_shape), self.device.clone())
+    }
+    
+    /// Expand tensor to a new shape (broadcasting)
+    pub fn expand(&self, new_shape: &[usize]) -> Result<Tensor> {
+        let shape = self.shape().dims();
+        
+        // Validate expansion
+        if new_shape.len() < shape.len() {
+            return Err(FlameError::InvalidOperation(
+                "Cannot expand to fewer dimensions".into()
+            ));
+        }
+        
+        // Check compatibility
+        let offset = new_shape.len() - shape.len();
+        for (i, &dim) in shape.iter().enumerate() {
+            let new_dim = new_shape[i + offset];
+            if dim != new_dim && dim != 1 {
+                return Err(FlameError::InvalidOperation(
+                    format!("Cannot expand dimension {} from {} to {}", i, dim, new_dim)
+                ));
+            }
+        }
+        
+        // For now, implement as broadcast_to
+        self.broadcast_to(&Shape::from_dims(new_shape))
+    }
+    
+    /// Compute exponential
+    pub fn exp(&self) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let output: Vec<f32> = data.iter().map(|x| x.exp()).collect();
+        Tensor::from_slice(&output, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Compute natural logarithm
+    pub fn log(&self) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let output: Vec<f32> = data.iter().map(|x| x.ln()).collect();
+        Tensor::from_slice(&output, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Compute square root
+    pub fn sqrt(&self) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let output: Vec<f32> = data.iter().map(|x| x.sqrt()).collect();
+        Tensor::from_slice(&output, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Compute reciprocal square root
+    pub fn rsqrt(&self) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let output: Vec<f32> = data.iter().map(|x| 1.0 / x.sqrt()).collect();
+        Tensor::from_slice(&output, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Negate tensor
+    pub fn neg(&self) -> Result<Tensor> {
+        self.mul_scalar(-1.0)
+    }
+    
+    /// Compute absolute value
+    pub fn abs(&self) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let output: Vec<f32> = data.iter().map(|x| x.abs()).collect();
+        Tensor::from_slice(&output, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Clamp values between min and max
+    pub fn clamp(&self, min: f32, max: f32) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let output: Vec<f32> = data.iter().map(|x| x.clamp(min, max)).collect();
+        Tensor::from_slice(&output, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Compute element-wise maximum with another tensor
+    pub fn maximum(&self, other: &Tensor) -> Result<Tensor> {
+        // Check shapes are compatible for broadcasting
+        let broadcast_shape = broadcast_shapes(self.shape().dims(), other.shape().dims())?;
+        
+        // Broadcast both tensors if needed
+        let a = if self.shape().dims() != &broadcast_shape {
+            self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+        } else {
+            self.clone()?
+        };
+        
+        let b = if other.shape().dims() != &broadcast_shape {
+            other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+        } else {
+            other.clone()?
+        };
+        
+        // Compute maximum
+        let a_data = a.to_vec()?;
+        let b_data = b.to_vec()?;
+        let output: Vec<f32> = a_data.iter().zip(b_data.iter())
+            .map(|(a, b)| a.max(*b))
+            .collect();
+        
+        Tensor::from_slice(&output, Shape::from_dims(&broadcast_shape), self.device.clone())
+    }
+    
+    /// Compute element-wise minimum with another tensor
+    pub fn minimum(&self, other: &Tensor) -> Result<Tensor> {
+        // Check shapes are compatible for broadcasting
+        let broadcast_shape = broadcast_shapes(self.shape().dims(), other.shape().dims())?;
+        
+        // Broadcast both tensors if needed
+        let a = if self.shape().dims() != &broadcast_shape {
+            self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+        } else {
+            self.clone()?
+        };
+        
+        let b = if other.shape().dims() != &broadcast_shape {
+            other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+        } else {
+            other.clone()?
+        };
+        
+        // Compute minimum
+        let a_data = a.to_vec()?;
+        let b_data = b.to_vec()?;
+        let output: Vec<f32> = a_data.iter().zip(b_data.iter())
+            .map(|(a, b)| a.min(*b))
+            .collect();
+        
+        Tensor::from_slice(&output, Shape::from_dims(&broadcast_shape), self.device.clone())
+    }
+    
+    /// Compute softmax along a dimension
+    pub fn softmax(&self, dim: isize) -> Result<Tensor> {
+        let shape = self.shape().dims();
+        let ndim = shape.len() as isize;
+        
+        // Handle negative dimension
+        let dim = if dim < 0 { ndim + dim } else { dim } as usize;
+        
+        if dim >= shape.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Dimension {} out of bounds for tensor with {} dimensions", dim, shape.len())
+            ));
+        }
+        
+        // Compute max along dimension for numerical stability
+        let max_vals = self.max_dim(dim, true)?;
+        let shifted = self.sub(&max_vals)?;
+        
+        // Compute exp
+        let exp_vals = shifted.exp()?;
+        
+        // Sum along dimension
+        let sum_exp = exp_vals.sum_dim_keepdim(dim)?;
+        
+        // Divide by sum
+        exp_vals.div(&sum_exp)
+    }
+    
+    /// Get maximum value along a dimension
+    pub fn max_dim(&self, dim: usize, keepdim: bool) -> Result<Tensor> {
+        let shape = self.shape().dims();
+        if dim >= shape.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Dimension {} out of bounds", dim)
+            ));
+        }
+        
+        // Calculate output shape
+        let mut output_shape = shape.to_vec();
+        if keepdim {
+            output_shape[dim] = 1;
+        } else {
+            output_shape.remove(dim);
+        }
+        
+        // For now, implement with to_vec (in production would use CUDA kernels)
+        let data = self.to_vec()?;
+        
+        // Calculate strides
+        let mut strides = vec![1; shape.len()];
+        for i in (0..shape.len() - 1).rev() {
+            strides[i] = strides[i + 1] * shape[i + 1];
+        }
+        
+        let output_size: usize = output_shape.iter().product();
+        let mut output = vec![f32::NEG_INFINITY; output_size];
+        
+        // Compute max
+        for idx in 0..data.len() {
+            // Decompose linear index
+            let mut remaining = idx;
+            let mut indices = vec![0; shape.len()];
+            for i in 0..shape.len() {
+                indices[i] = remaining / strides[i];
+                remaining %= strides[i];
+            }
+            
+            // Calculate output index
+            let mut out_idx = 0;
+            let mut out_stride = 1;
+            for i in (0..shape.len()).rev() {
+                if i != dim {
+                    let dim_idx = if i > dim && !keepdim { i - 1 } else { i };
+                    if dim_idx < output_shape.len() {
+                        out_idx += indices[i] * out_stride;
+                        out_stride *= output_shape[dim_idx];
+                    }
+                }
+            }
+            
+            output[out_idx] = output[out_idx].max(data[idx]);
+        }
+        
+        Tensor::from_slice(&output, Shape::from_dims(&output_shape), self.device.clone())
+    }
+    
+    /// Sum along dimension keeping dimension
+    pub fn sum_dim_keepdim(&self, dim: usize) -> Result<Tensor> {
+        let shape = self.shape().dims();
+        if dim >= shape.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Dimension {} out of bounds", dim)
+            ));
+        }
+        
+        // Calculate output shape (keep dimension with size 1)
+        let mut output_shape = shape.to_vec();
+        output_shape[dim] = 1;
+        
+        // For now, implement with to_vec
+        let data = self.to_vec()?;
+        
+        // Calculate strides
+        let mut strides = vec![1; shape.len()];
+        for i in (0..shape.len() - 1).rev() {
+            strides[i] = strides[i + 1] * shape[i + 1];
+        }
+        
+        let output_size: usize = output_shape.iter().product();
+        let mut output = vec![0.0f32; output_size];
+        
+        // Sum along dimension
+        for idx in 0..data.len() {
+            // Decompose linear index
+            let mut remaining = idx;
+            let mut indices = vec![0; shape.len()];
+            for i in 0..shape.len() {
+                indices[i] = remaining / strides[i];
+                remaining %= strides[i];
+            }
+            
+            // Calculate output index (set dim index to 0)
+            indices[dim] = 0;
+            let mut out_idx = 0;
+            for i in 0..shape.len() {
+                out_idx += indices[i] * strides[i];
+            }
+            
+            output[out_idx] += data[idx];
+        }
+        
+        Tensor::from_slice(&output, Shape::from_dims(&output_shape), self.device.clone())
+    }
+    
+    /// Divide by another tensor
+    pub fn div(&self, other: &Tensor) -> Result<Tensor> {
+        // Check shapes are compatible for broadcasting
+        let broadcast_shape = broadcast_shapes(self.shape().dims(), other.shape().dims())?;
+        
+        // Broadcast both tensors if needed
+        let a = if self.shape().dims() != &broadcast_shape {
+            self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+        } else {
+            self.clone()?
+        };
+        
+        let b = if other.shape().dims() != &broadcast_shape {
+            other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+        } else {
+            other.clone()?
+        };
+        
+        // Compute division
+        let a_data = a.to_vec()?;
+        let b_data = b.to_vec()?;
+        let output: Vec<f32> = a_data.iter().zip(b_data.iter())
+            .map(|(a, b)| a / b)
+            .collect();
+        
+        Tensor::from_slice(&output, Shape::from_dims(&broadcast_shape), self.device.clone())
+    }
+    
+    /// Element-wise equality comparison
+    pub fn eq(&self, other: &Tensor) -> Result<Tensor> {
+        // Check shapes are compatible
+        if self.shape().dims() != other.shape().dims() {
+            return Err(FlameError::InvalidOperation(
+                "Tensors must have same shape for equality comparison".into()
+            ));
+        }
+        
+        let a_data = self.to_vec()?;
+        let b_data = other.to_vec()?;
+        let output: Vec<f32> = a_data.iter().zip(b_data.iter())
+            .map(|(a, b)| if a == b { 1.0 } else { 0.0 })
+            .collect();
+        
+        Tensor::from_slice(&output, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Create tensor filled with single value
+    pub fn full(shape: Shape, value: f32, device: Arc<CudaDevice>) -> Result<Tensor> {
+        let size = shape.elem_count();
+        let data = vec![value; size];
+        Tensor::from_slice(&data, shape, device)
+    }
+    
+    /// Create tensor filled with ones
+    pub fn ones(shape: Shape, device: Arc<CudaDevice>) -> Result<Tensor> {
+        Self::full(shape, 1.0, device)
+    }
+    
+    /// Create identity matrix
+    pub fn eye(n: usize, device: Arc<CudaDevice>) -> Result<Tensor> {
+        let mut data = vec![0.0f32; n * n];
+        for i in 0..n {
+            data[i * n + i] = 1.0;
+        }
+        Tensor::from_slice(&data, Shape::from_dims(&[n, n]), device)
+    }
+    
+    /// Create range tensor
+    pub fn arange(start: f32, end: f32, step: f32, device: Arc<CudaDevice>) -> Result<Tensor> {
+        let n = ((end - start) / step).ceil() as usize;
+        let data: Vec<f32> = (0..n).map(|i| start + i as f32 * step).collect();
+        Tensor::from_slice(&data, Shape::from_dims(&[n]), device)
+    }
+    
+    /// Convert to different dtype (for now just f32 -> f32)
+    pub fn to_dtype(&self, dtype: flame_core::DType) -> Result<Tensor> {
+        // For now, we only support f32
+        match dtype {
+            flame_core::DType::F32 => Ok(self.clone()?),
+            _ => Err(FlameError::InvalidOperation("Only F32 dtype is currently supported".into())),
+        }
+    }
+}
+
+/// Helper function to broadcast shapes
+fn broadcast_shapes(shape1: &[usize], shape2: &[usize]) -> Result<Vec<usize>> {
+    let max_len = shape1.len().max(shape2.len());
+    let mut result = vec![1; max_len];
+    
+    // Right-align shapes
+    let offset1 = max_len - shape1.len();
+    let offset2 = max_len - shape2.len();
+    
+    for i in 0..max_len {
+        let dim1 = if i >= offset1 { shape1[i - offset1] } else { 1 };
+        let dim2 = if i >= offset2 { shape2[i - offset2] } else { 1 };
+        
+        if dim1 == dim2 {
+            result[i] = dim1;
+        } else if dim1 == 1 {
+            result[i] = dim2;
+        } else if dim2 == 1 {
+            result[i] = dim1;
+        } else {
+            return Err(FlameError::InvalidOperation(
+                format!("Cannot broadcast dimensions {} and {}", dim1, dim2)
+            ));
+        }
+    }
+    
+    Ok(result)
+}
+
+/// Data type enum
+pub mod flame_core {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum DType {
+        F32,
+        F16,
+        BF16,
+        I32,
+        I64,
+    }
+}

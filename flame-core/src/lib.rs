@@ -39,6 +39,7 @@ pub mod samplers;
 pub mod tokenizer;
 pub mod fp16;
 pub mod kernel_launcher;
+pub mod tensor_ops_extended;
 
 pub use dtype::DType;
 pub use error::{FlameError, Result};
