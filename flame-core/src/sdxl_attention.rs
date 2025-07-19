@@ -218,11 +218,13 @@ impl SDXLAttention {
         let scale = 1.0 / (head_dim as f32).sqrt();
         
         // Compute attention scores: Q @ K^T / sqrt(d)
-        let scores = q.matmul(&k.transpose_dims(-2i32, -1i32)?)?
+        let k_dims = k.shape().dims();
+        let k_rank = k_dims.len();
+        let scores = q.matmul(&k.transpose_dims(k_rank - 2, k_rank - 1)?)?
             .mul_scalar(scale)?;
         
         // Apply softmax
-        let attn_weights = scores.softmax(-1)?;
+        let attn_weights = scores.softmax(-1isize)?;
         
         // Apply attention to values: attn @ V
         attn_weights.matmul(v)
