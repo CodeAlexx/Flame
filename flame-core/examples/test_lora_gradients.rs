@@ -67,7 +67,11 @@ fn main() -> Result<()> {
     let loss_value = loss.to_vec()?[0];
     println!("\nLoss: {:.4}", loss_value);
     
+    // Clear any previous computation graph
+    AutogradContext::clear();
+    
     // Backward pass
+    println!("Starting backward pass...");
     let mut gradients = AutogradContext::backward(&loss)?;
     println!("✅ Gradients computed!");
     

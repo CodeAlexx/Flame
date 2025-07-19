@@ -44,6 +44,7 @@ pub enum Op {
 }
 
 /// Entry in the computation tape
+#[derive(Clone)]
 struct TapeEntry {
     /// Output tensor ID
     output_id: TensorId,
@@ -138,18 +139,25 @@ impl AutogradContext {
             ));
         }
         
-        let ctx = AUTOGRAD_CONTEXT.lock().unwrap();
+        // Get tape and device before disabling autograd
+        let tape = {
+            let ctx = AUTOGRAD_CONTEXT.lock().unwrap();
+            ctx.tape.clone()
+        };
         let device = loss.device.clone();
+        
+        // Disable autograd during backward pass to prevent recording gradient operations
+        Self::set_enabled(false);
         
         // Initialize gradient storage
         let mut gradients = GradientMap::new(device.clone());
         gradients.set_ones(loss.id, loss.shape.clone())?;
         
         // Process tape in reverse
-        for entry in ctx.tape.iter().rev() {
+        for entry in tape.iter().rev() {
             if let Some(output_grad) = gradients.get(entry.output_id).cloned() {
                 // Compute input gradients
-                let input_grads = compute_gradients(entry, &output_grad, &device)?;
+                let input_grads = compute_gradients(&entry, &output_grad, &device)?;
                 
                 // Accumulate gradients
                 for (tensor_id, grad) in input_grads {
@@ -157,6 +165,9 @@ impl AutogradContext {
                 }
             }
         }
+        
+        // Re-enable autograd
+        Self::set_enabled(true);
         
         Ok(gradients)
     }
