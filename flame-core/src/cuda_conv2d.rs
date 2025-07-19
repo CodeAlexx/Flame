@@ -201,20 +201,18 @@ impl CudaConv2d {
             .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel".into()))?;
         
         let cfg = LaunchConfig::for_num_elems(col_size as u32);
-        // Launch with fewer parameters due to CUDA limit
-        let params = (
-            &*input.data() as *const f32 as *mut std::ffi::c_void,
-            &col_buffer as *const _ as *mut std::ffi::c_void,
-            batch_size as i32,
-            in_channels as i32,
-            in_height as i32,
-            in_width as i32,
-            kernel_h as i32,
-            kernel_w as i32,
-        );
-        
+        // Use proper device pointer types
         unsafe {
-            f.launch(cfg, params)?;
+            f.launch(cfg, (
+                input.data(),
+                &col_buffer,
+                batch_size as i32,
+                in_channels as i32,
+                in_height as i32,
+                in_width as i32,
+                kernel_h as i32,
+                kernel_w as i32,
+            ))?;
         }
         
         // Reshape for matrix multiplication
@@ -288,16 +286,15 @@ impl CudaConv2d {
             .ok_or_else(|| FlameError::Cuda("Failed to get add_bias kernel".into()))?;
         
         let cfg = LaunchConfig::for_num_elems((batch_size * channels * spatial_size) as u32);
-        let params = (
-            &*result.data() as *const f32 as *mut std::ffi::c_void,
-            &*bias.data() as *const f32 as *mut std::ffi::c_void,
-            batch_size as i32,
-            channels as i32,
-            spatial_size as i32,
-        );
         
         unsafe {
-            f.launch(cfg, params)?;
+            f.launch(cfg, (
+                result.data(),
+                bias.data(),
+                batch_size as i32,
+                channels as i32,
+                spatial_size as i32,
+            ))?;
         }
         
         Ok(result)

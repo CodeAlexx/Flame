@@ -1,6 +1,5 @@
 use crate::{Shape, Result, FlameError};
 use crate::autograd::{AutogradContext, Op};
-use crate::autograd_v3::{record_op, Op as OpV3};
 use crate::gradient::{GradientMap, TensorGradExt};
 use cudarc::driver::{CudaDevice, CudaSlice};
 use cudarc::cublas::CudaBlas;

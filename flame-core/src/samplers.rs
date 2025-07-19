@@ -3,8 +3,7 @@
 //! This module provides various sampling algorithms for diffusion models,
 //! including Euler, DPM++, and other popular methods.
 
-use crate::{Tensor, Shape, Result, FlameError};
-use std::sync::Arc;
+use crate::{Tensor, Result, FlameError};
 
 /// Base trait for all diffusion samplers
 pub trait DiffusionSampler {

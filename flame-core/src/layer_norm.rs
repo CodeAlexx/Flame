@@ -3,7 +3,7 @@
 use crate::{Tensor, Shape, Result, FlameError};
 use crate::autograd::{AutogradContext, Op};
 use std::sync::Arc;
-use cudarc::driver::CudaDevice;
+use cudarc::driver::{CudaDevice, CudaSlice};
 
 /// Layer normalization configuration
 pub struct LayerNormConfig {
@@ -231,8 +231,9 @@ pub fn layer_norm(
     let f = device.get_func("layer_norm_forward", "layer_norm_forward")
         .ok_or_else(|| FlameError::Cuda("Failed to get layer_norm kernel".into()))?;
     
-    let weight_ptr = weight.map(|w| w.data()).unwrap_or_else(|| std::ptr::null());
-    let bias_ptr = bias.map(|b| b.data()).unwrap_or_else(|| std::ptr::null());
+    // Handle optional weight and bias
+    let has_weight = weight.is_some();
+    let has_bias = bias.is_some();
     
     unsafe {
         use cudarc::driver::LaunchAsync;
@@ -242,17 +243,56 @@ pub fn layer_norm(
             shared_mem_bytes: 0,
         };
         
-        f.launch(cfg, (
-            input.data(),
-            weight_ptr,
-            bias_ptr,
-            &output_data,
-            &mean_data,
-            &rstd_data,
-            batch_size as i32,
-            norm_size as i32,
-            eps,
-        ))?;
+        // Create launch parameters based on whether weight/bias exist
+        if has_weight && has_bias {
+            f.launch(cfg, (
+                input.data(),
+                weight.unwrap().data(),
+                bias.unwrap().data(),
+                &output_data,
+                &mean_data,
+                &rstd_data,
+                batch_size as i32,
+                norm_size as i32,
+                eps,
+            ))?;
+        } else if has_weight {
+            f.launch(cfg, (
+                input.data(),
+                weight.unwrap().data(),
+                0usize, // null pointer for bias
+                &output_data,
+                &mean_data,
+                &rstd_data,
+                batch_size as i32,
+                norm_size as i32,
+                eps,
+            ))?;
+        } else if has_bias {
+            f.launch(cfg, (
+                input.data(),
+                0usize, // null pointer for weight
+                bias.unwrap().data(),
+                &output_data,
+                &mean_data,
+                &rstd_data,
+                batch_size as i32,
+                norm_size as i32,
+                eps,
+            ))?;
+        } else {
+            f.launch(cfg, (
+                input.data(),
+                0usize, // null pointer for weight
+                0usize, // null pointer for bias
+                &output_data,
+                &mean_data,
+                &rstd_data,
+                batch_size as i32,
+                norm_size as i32,
+                eps,
+            ))?;
+        }
     }
     
     let mut output = Tensor {

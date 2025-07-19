@@ -1,4 +1,4 @@
-use crate::{Result, FlameError, Tensor};
+use crate::{Result, Tensor};
 use crate::cuda_kernels::CudaKernels;
 use std::sync::Arc;
 use lazy_static::lazy_static;

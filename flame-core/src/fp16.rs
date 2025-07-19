@@ -3,7 +3,7 @@
 //! This module provides utilities for working with half-precision floating point
 //! formats to reduce memory usage and increase performance.
 
-use crate::{Tensor, Shape, Result, FlameError, CudaDevice, DType};
+use crate::{Tensor, Result, FlameError, CudaDevice, DType};
 use std::sync::Arc;
 use half::{f16, bf16};
 
