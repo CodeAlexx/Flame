@@ -1156,6 +1156,34 @@ extern "C" __global__ void slice_kernel(
         Ok(output)
     }
     
+    /// Compute softmax along a dimension
+    pub fn softmax(&self, dim: isize) -> Result<Tensor> {
+        let shape = self.shape().dims();
+        let ndim = shape.len() as isize;
+        
+        // Handle negative dimension
+        let dim = if dim < 0 { ndim + dim } else { dim } as usize;
+        
+        if dim >= shape.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Dimension {} out of bounds for tensor with {} dimensions", dim, shape.len())
+            ));
+        }
+        
+        // Compute max along dimension for numerical stability
+        let max_vals = self.max_dim(dim, true)?;
+        let shifted = self.sub(&max_vals)?;
+        
+        // Compute exp
+        let exp_vals = shifted.exp()?;
+        
+        // Sum along dimension
+        let sum_exp = exp_vals.sum_dim_keepdim(dim)?;
+        
+        // Divide by sum
+        exp_vals.div(&sum_exp)
+    }
+    
     /// Specific permutation: [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, num_heads, head_dim]
     fn permute_0213(&self) -> Result<Tensor> {
         let dims = self.shape.dims();

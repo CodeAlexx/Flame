@@ -52,6 +52,27 @@ impl Conv2d {
         Self::from_config(config, device)
     }
     
+    /// Create a new Conv2d layer with bias option
+    pub fn new_with_bias(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        device: Arc<cudarc::driver::CudaDevice>,
+        bias: bool,
+    ) -> Result<Self> {
+        let config = Conv2dConfig {
+            in_channels,
+            out_channels,
+            kernel_size: (kernel_size, kernel_size),
+            stride: (stride, stride),
+            padding: (padding, padding),
+            groups: 1,
+        };
+        Self::from_config_with_bias(config, device, bias)
+    }
+    
     /// Create a new Conv2d layer from config
     pub fn from_config(config: Conv2dConfig, device: Arc<cudarc::driver::CudaDevice>) -> Result<Self> {
         let (kh, kw) = config.kernel_size;
@@ -72,6 +93,36 @@ impl Conv2d {
         Ok(Self {
             weight,
             bias: None,
+            config,
+        })
+    }
+    
+    /// Create a new Conv2d layer from config with bias option
+    pub fn from_config_with_bias(config: Conv2dConfig, device: Arc<cudarc::driver::CudaDevice>, bias: bool) -> Result<Self> {
+        let (kh, kw) = config.kernel_size;
+        let weight_shape = Shape::from_dims(&[
+            config.out_channels,
+            config.in_channels / config.groups,
+            kh,
+            kw,
+        ]);
+        
+        // Initialize weights with Xavier/He initialization
+        let fan_in = (config.in_channels / config.groups) * kh * kw;
+        let fan_out = (config.out_channels / config.groups) * kh * kw;
+        let std = (2.0 / (fan_in + fan_out) as f32).sqrt();
+        
+        let weight = Tensor::randn(weight_shape, 0.0, std, device.clone())?;
+        
+        let bias = if bias {
+            Some(Tensor::zeros(Shape::from_dims(&[config.out_channels]), device)?)
+        } else {
+            None
+        };
+        
+        Ok(Self {
+            weight,
+            bias,
             config,
         })
     }

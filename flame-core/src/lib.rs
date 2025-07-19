@@ -43,6 +43,9 @@ pub mod tokenizer;
 pub mod fp16;
 pub mod kernel_launcher;
 pub mod tensor_ops_extended;
+pub mod lora;
+pub mod sdxl_attention;
+pub mod sdxl_unet_blocks;
 
 pub use dtype::DType;
 pub use error::{FlameError, Result};

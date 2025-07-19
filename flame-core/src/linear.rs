@@ -39,6 +39,16 @@ impl Linear {
         })
     }
     
+    /// Get input features
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+    
+    /// Get output features
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+    
     /// Forward pass
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
         // Input shape: [..., in_features]

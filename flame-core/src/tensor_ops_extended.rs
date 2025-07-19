@@ -450,33 +450,6 @@ impl Tensor {
         Tensor::from_slice(&output, Shape::from_dims(&broadcast_shape), self.device.clone())
     }
     
-    /// Compute softmax along a dimension
-    pub fn softmax(&self, dim: isize) -> Result<Tensor> {
-        let shape = self.shape().dims();
-        let ndim = shape.len() as isize;
-        
-        // Handle negative dimension
-        let dim = if dim < 0 { ndim + dim } else { dim } as usize;
-        
-        if dim >= shape.len() {
-            return Err(FlameError::InvalidOperation(
-                format!("Dimension {} out of bounds for tensor with {} dimensions", dim, shape.len())
-            ));
-        }
-        
-        // Compute max along dimension for numerical stability
-        let max_vals = self.max_dim(dim, true)?;
-        let shifted = self.sub(&max_vals)?;
-        
-        // Compute exp
-        let exp_vals = shifted.exp()?;
-        
-        // Sum along dimension
-        let sum_exp = exp_vals.sum_dim_keepdim(dim)?;
-        
-        // Divide by sum
-        exp_vals.div(&sum_exp)
-    }
     
     /// Get maximum value along a dimension
     pub fn max_dim(&self, dim: usize, keepdim: bool) -> Result<Tensor> {
@@ -736,3 +709,4 @@ pub mod flame_core {
         I64,
     }
 }
+// Note: softmax, unsqueeze, full_like, and gelu are already implemented in tensor.rs
