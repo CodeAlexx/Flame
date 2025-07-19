@@ -174,35 +174,7 @@ impl SGD {
     }
 }
 
-// Helper trait for tensor operations needed by optimizers
-impl Tensor {
-    /// Element-wise square root
-    pub fn sqrt(&self) -> Result<Tensor> {
-        let data = self.to_vec()?;
-        let result: Vec<f32> = data.iter().map(|&x| x.sqrt()).collect();
-        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
-    }
-    
-    /// Element-wise division
-    pub fn div(&self, other: &Tensor) -> Result<Tensor> {
-        if self.shape != other.shape {
-            return Err(FlameError::ShapeMismatch {
-                expected: self.shape.clone(),
-                got: other.shape.clone(),
-            });
-        }
-        
-        let a_data = self.to_vec()?;
-        let b_data = other.to_vec()?;
-        let mut result = vec![0.0f32; a_data.len()];
-        
-        for i in 0..a_data.len() {
-            result[i] = a_data[i] / b_data[i];
-        }
-        
-        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
-    }
-}
+// Helper operations are now defined in tensor_ops_extended.rs
 
 #[cfg(test)]
 mod tests {

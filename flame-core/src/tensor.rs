@@ -323,8 +323,8 @@ impl Tensor {
             let output_offset = b * m * n;
             
             // Create views for this batch
-            let self_batch = self_3d.slice(self_offset, m * k1)?;
-            let other_batch = other_3d.slice(other_offset, k1 * n)?;
+            let self_batch = self_3d.slice_internal(self_offset, m * k1)?;
+            let other_batch = other_3d.slice_internal(other_offset, k1 * n)?;
             
             // Perform matrix multiplication for this batch
             use cudarc::cublas::{GemmConfig, Gemm};
@@ -421,8 +421,8 @@ extern "C" __global__ void copy_at_offset(
         ))
     }
     
-    /// Create a slice view of the tensor
-    fn slice(&self, start: usize, len: usize) -> Result<Tensor> {
+    /// Create a slice view of the tensor (internal use)
+    fn slice_internal(&self, start: usize, len: usize) -> Result<Tensor> {
         // This is a simplified slice that assumes contiguous memory
         // Full implementation would handle strides
         if start + len > self.shape.elem_count() {
@@ -709,6 +709,33 @@ extern "C" __global__ void slice_kernel(
         }
         
         Ok(output)
+    }
+    
+    /// Error function (erf) - needed for GELU
+    pub fn erf(&self) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let result: Vec<f32> = data.iter()
+            .map(|&x| {
+                // Approximation of erf using a series expansion
+                // This is good for |x| < 3.7
+                let a1 =  0.254829592;
+                let a2 = -0.284496736;
+                let a3 =  1.421413741;
+                let a4 = -1.453152027;
+                let a5 =  1.061405429;
+                let p  =  0.3275911;
+                
+                let sign = if x < 0.0 { -1.0 } else { 1.0 };
+                let x = x.abs();
+                
+                let t = 1.0 / (1.0 + p * x);
+                let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp();
+                
+                sign * y
+            })
+            .collect();
+        
+        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
     }
 
     /// Square all elements
@@ -1263,6 +1290,155 @@ extern "C" __global__ void slice_kernel(
     /// Get a CUDA slice reference to the tensor data
     pub fn to_cuda_slice(&self) -> Result<&CudaSlice<f32>> {
         Ok(&*self.data)
+    }
+    
+    /// Transpose the last two dimensions (for batch operations)
+    pub fn transpose_batch(&self) -> Result<Tensor> {
+        let ndim = self.shape.dims().len();
+        if ndim < 2 {
+            return Err(FlameError::InvalidOperation(
+                "Transpose batch requires at least 2 dimensions".into()
+            ));
+        }
+        
+        // Swap last two dimensions
+        let mut perm: Vec<usize> = (0..ndim).collect();
+        perm[ndim - 2] = ndim - 1;
+        perm[ndim - 1] = ndim - 2;
+        
+        self.permute(&perm)
+    }
+    
+    /// Batch matrix multiplication
+    pub fn batch_matmul(&self, other: &Tensor) -> Result<Tensor> {
+        let self_dims = self.shape.dims();
+        let other_dims = other.shape.dims();
+        
+        if self_dims.len() < 2 || other_dims.len() < 2 {
+            return Err(FlameError::InvalidOperation(
+                "Batch matmul requires at least 2D tensors".into()
+            ));
+        }
+        
+        // Check batch dimensions match
+        if self_dims[..self_dims.len()-2] != other_dims[..other_dims.len()-2] {
+            return Err(FlameError::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: other.shape.clone(),
+            });
+        }
+        
+        // Check matrix dimensions are compatible
+        let m = self_dims[self_dims.len() - 2];
+        let k1 = self_dims[self_dims.len() - 1];
+        let k2 = other_dims[other_dims.len() - 2];
+        let n = other_dims[other_dims.len() - 1];
+        
+        if k1 != k2 {
+            return Err(FlameError::InvalidOperation(
+                format!("Matrix dimensions incompatible for matmul: ({}, {}) @ ({}, {})", 
+                    m, k1, k2, n)
+            ));
+        }
+        
+        // For now, implement using regular matmul on flattened batches
+        // TODO: Optimize with batched GEMM
+        let batch_size: usize = self_dims[..self_dims.len()-2].iter().product();
+        
+        // Reshape to [batch_size, m, k] and [batch_size, k, n]
+        let self_3d = self.reshape(&[batch_size, m, k1])?;
+        let other_3d = other.reshape(&[batch_size, k2, n])?;
+        
+        // Perform matmul for each batch element
+        let mut results = Vec::new();
+        for b in 0..batch_size {
+            // Get slice for this batch
+            let self_2d = self_3d.slice_1d(b * m * k1, (b + 1) * m * k1)?
+                .reshape(&[m, k1])?;
+            let other_2d = other_3d.slice_1d(b * k2 * n, (b + 1) * k2 * n)?
+                .reshape(&[k2, n])?;
+            
+            let result = self_2d.matmul(&other_2d)?;
+            results.push(result);
+        }
+        
+        // Stack results
+        let stacked = Self::stack(&results, 0)?;
+        
+        // Reshape back to original batch dimensions
+        let mut output_shape = self_dims[..self_dims.len()-2].to_vec();
+        output_shape.push(m);
+        output_shape.push(n);
+        
+        stacked.reshape(&output_shape)
+    }
+    
+    /// Stack tensors along a new dimension
+    pub fn stack(tensors: &[Tensor], axis: usize) -> Result<Tensor> {
+        if tensors.is_empty() {
+            return Err(FlameError::InvalidOperation("Cannot stack empty tensor list".into()));
+        }
+        
+        // Verify all tensors have the same shape
+        let first_shape = &tensors[0].shape;
+        for t in &tensors[1..] {
+            if t.shape != *first_shape {
+                return Err(FlameError::ShapeMismatch {
+                    expected: first_shape.clone(),
+                    got: t.shape.clone(),
+                });
+            }
+        }
+        
+        // Create new shape with added dimension
+        let mut new_dims = first_shape.dims().to_vec();
+        new_dims.insert(axis, tensors.len());
+        
+        // Concatenate data
+        let mut data = Vec::new();
+        for t in tensors {
+            data.extend(t.to_vec()?);
+        }
+        
+        Tensor::from_vec(data, Shape::from_dims(&new_dims), tensors[0].device.clone())
+    }
+    
+    /// Slice tensor data (renamed to avoid conflict)
+    pub fn slice_1d(&self, start: usize, end: usize) -> Result<Tensor> {
+        if end > self.shape.elem_count() || start > end {
+            return Err(FlameError::InvalidOperation(
+                format!("Invalid slice range {}..{} for tensor with {} elements", 
+                    start, end, self.shape.elem_count())
+            ));
+        }
+        
+        let data = self.to_vec()?;
+        let slice_data = data[start..end].to_vec();
+        
+        // Calculate shape of slice
+        let slice_len = end - start;
+        Tensor::from_vec(slice_data, Shape::from_dims(&[slice_len]), self.device.clone())
+    }
+    
+    /// Squeeze dimension (renamed to avoid conflict)
+    pub fn squeeze_dim(&self, dim: usize) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        if dim >= dims.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Dimension {} out of range for tensor with {} dimensions", dim, dims.len())
+            ));
+        }
+        
+        if dims[dim] != 1 {
+            return Err(FlameError::InvalidOperation(
+                format!("Cannot squeeze dimension {} with size {}", dim, dims[dim])
+            ));
+        }
+        
+        let mut new_dims = dims.to_vec();
+        new_dims.remove(dim);
+        
+        self.reshape(&new_dims)
     }
 }
 

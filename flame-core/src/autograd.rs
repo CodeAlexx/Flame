@@ -41,6 +41,7 @@ pub enum Op {
     Permute { input: TensorId, dims: Vec<usize> },
     AddBias { input: TensorId, bias: TensorId },
     SumDim { input: TensorId, dim: usize },
+    Clamp { input: TensorId, min: f32, max: f32 },
 }
 
 /// Entry in the computation tape
@@ -271,6 +272,36 @@ fn compute_gradients(
             Ok(vec![(*input, grad)])
         }
         
+        Op::GELU { input } => {
+            // Use the complete GELU backward implementation
+            let input_tensor = &entry.saved_tensors[input];
+            let grad = crate::autograd_ops_complete::gelu_backward(output_grad, input_tensor)?;
+            Ok(vec![(*input, grad)])
+        }
+        
+        Op::SiLU { input } => {
+            // Use the complete SiLU backward implementation
+            let input_tensor = &entry.saved_tensors[input];
+            let grad = crate::autograd_ops_complete::silu_backward(output_grad, input_tensor)?;
+            Ok(vec![(*input, grad)])
+        }
+        
+        Op::Tanh { input } => {
+            // Use the complete Tanh backward implementation
+            let input_tensor = &entry.saved_tensors[input];
+            let output_tensor = input_tensor.tanh()?;
+            let grad = crate::autograd_ops_complete::tanh_backward(output_grad, &output_tensor)?;
+            Ok(vec![(*input, grad)])
+        }
+        
+        Op::Sigmoid { input } => {
+            // Use the complete Sigmoid backward implementation
+            let input_tensor = &entry.saved_tensors[input];
+            let output_tensor = input_tensor.sigmoid()?;
+            let grad = crate::autograd_ops_complete::sigmoid_backward(output_grad, &output_tensor)?;
+            Ok(vec![(*input, grad)])
+        }
+        
         Op::Square { input } => {
             // d/dx(x^2) = 2x
             let input_tensor = &entry.saved_tensors[input];
@@ -333,14 +364,137 @@ fn compute_gradients(
         }
         
         Op::LayerNorm { input, normalized_shape } => {
-            // TODO: Implement layer norm backward pass
+            // Use the complete LayerNorm backward implementation
             let input_tensor = &entry.saved_tensors[input];
-            let grad = Tensor::zeros(input_tensor.shape().clone(), device.clone())?;
+            
+            // For now, assume no weight/bias (pure normalization)
+            // TODO: Add support for affine LayerNorm
+            let mean = input_tensor.mean_dims(&normalized_shape, true)?;
+            let var = input_tensor.var_dims(&normalized_shape, true, true)?;
+            let normalized = input_tensor.sub(&mean)?.div(&var.add_scalar(1e-5)?.sqrt()?)?;
+            
+            let (grad_input, _, _) = crate::autograd_ops_complete::layer_norm_backward(
+                output_grad,
+                input_tensor,
+                &normalized,
+                None,  // weight
+                None,  // bias
+                &mean,
+                &var,
+                normalized_shape,
+                1e-5,  // eps
+            )?;
+            
+            Ok(vec![(*input, grad_input)])
+        }
+        
+        Op::Linear { input, weight, bias } => {
+            // d/dx(Wx + b) = W^T @ grad
+            // d/dW(Wx + b) = grad @ x^T
+            // d/db(Wx + b) = grad
+            let input_tensor = &entry.saved_tensors[input];
+            let weight_tensor = &entry.saved_tensors[weight];
+            
+            // Gradient w.r.t. input: W^T @ grad
+            let weight_t = weight_tensor.transpose()?;
+            let grad_input = output_grad.matmul(&weight_t)?;
+            
+            // Gradient w.r.t. weight: grad @ input^T
+            let input_t = input_tensor.transpose()?;
+            let grad_weight = output_grad.transpose()?.matmul(&input_t)?.transpose()?;
+            
+            let mut grads = vec![
+                (*input, grad_input),
+                (*weight, grad_weight),
+            ];
+            
+            // Gradient w.r.t. bias (if present)
+            if let Some(bias_id) = bias {
+                // Sum over all dimensions except the last (features)
+                let grad_bias = output_grad.sum_dims(&(0..output_grad.shape().dims().len()-1).collect::<Vec<_>>())?;
+                grads.push((*bias_id, grad_bias));
+            }
+            
+            Ok(grads)
+        }
+        
+        Op::BatchMatMul { lhs, rhs } => {
+            // Similar to MatMul but preserves batch dimension
+            let lhs_tensor = &entry.saved_tensors[lhs];
+            let rhs_tensor = &entry.saved_tensors[rhs];
+            
+            // Gradient w.r.t. lhs: grad @ rhs^T (batched)
+            let rhs_t = rhs_tensor.transpose_batch()?;
+            let grad_lhs = output_grad.batch_matmul(&rhs_t)?;
+            
+            // Gradient w.r.t. rhs: lhs^T @ grad (batched)
+            let lhs_t = lhs_tensor.transpose_batch()?;
+            let grad_rhs = lhs_t.batch_matmul(output_grad)?;
+            
+            Ok(vec![
+                (*lhs, grad_lhs),
+                (*rhs, grad_rhs),
+            ])
+        }
+        
+        Op::Reshape { input, .. } => {
+            // Gradient of reshape is reshape of gradient back to original shape
+            let input_tensor = &entry.saved_tensors[input];
+            let grad = output_grad.reshape(input_tensor.shape().dims())?;
+            Ok(vec![(*input, grad)])
+        }
+        
+        Op::Permute { input, dims } => {
+            // Gradient of permute is inverse permute
+            let inverse_dims = inverse_permutation(dims);
+            let grad = output_grad.permute(&inverse_dims)?;
+            Ok(vec![(*input, grad)])
+        }
+        
+        Op::AddBias { input, bias } => {
+            // d/dx(x + b) = grad
+            // d/db(x + b) = sum(grad) over batch and spatial dims
+            let grad_input = output_grad.clone()?;
+            
+            // Sum over all dimensions except the bias dimension (usually channels)
+            let ndims = output_grad.shape().dims().len();
+            let mut sum_dims = vec![0]; // batch dimension
+            if ndims > 2 {
+                // Add spatial dimensions
+                sum_dims.extend(2..ndims);
+            }
+            let grad_bias = output_grad.sum_dims(&sum_dims)?;
+            
+            Ok(vec![
+                (*input, grad_input),
+                (*bias, grad_bias),
+            ])
+        }
+        
+        Op::SumDim { input, dim } => {
+            // Gradient of sum is broadcast back to original shape
+            let input_tensor = &entry.saved_tensors[input];
+            let mut grad_shape = input_tensor.shape().dims().to_vec();
+            grad_shape[*dim] = 1;
+            let grad_reshaped = output_grad.reshape(&grad_shape)?;
+            let grad = grad_reshaped.broadcast_to(input_tensor.shape())?;
+            Ok(vec![(*input, grad)])
+        }
+        
+        Op::Clamp { input, min, max } => {
+            // Use the clamp backward implementation
+            let input_tensor = &entry.saved_tensors[input];
+            let grad = crate::autograd_ops_complete::clamp_backward(
+                output_grad, 
+                input_tensor, 
+                *min, 
+                *max
+            )?;
             Ok(vec![(*input, grad)])
         }
         
         _ => {
-            // TODO: Implement remaining operations
+            // This should not happen if all operations are implemented
             Err(FlameError::InvalidOperation(
                 format!("Gradient not implemented for operation: {:?}", entry.op)
             ))
@@ -376,6 +530,15 @@ fn broadcast_to(tensor: &Tensor, target_shape: &Shape) -> Result<Tensor> {
         format!("Broadcasting from {:?} to {:?} not yet implemented", 
                 tensor.shape.dims(), target_shape.dims())
     ))
+}
+
+/// Helper function to compute inverse permutation
+fn inverse_permutation(perm: &[usize]) -> Vec<usize> {
+    let mut inverse = vec![0; perm.len()];
+    for (i, &p) in perm.iter().enumerate() {
+        inverse[p] = i;
+    }
+    inverse
 }
 
 /// Comparison operations

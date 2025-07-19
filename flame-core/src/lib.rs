@@ -13,6 +13,9 @@ pub mod cuda_kernels;
 pub mod cuda_kernel_sources;
 pub mod cuda_ops;
 pub mod cuda_kernels_v2;
+pub mod cuda_conv2d_kernels;
+pub mod cuda_gradient_ops;
+pub mod autograd_ops_complete;
 pub mod autograd;
 // pub mod autograd_ops;  // Using new autograd
 // pub mod autograd_engine;  // Using new autograd

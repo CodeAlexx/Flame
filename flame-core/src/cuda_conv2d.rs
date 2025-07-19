@@ -6,147 +6,8 @@ use crate::tensor::TensorId;
 use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
 
-/// CUDA kernel source for im2col transformation
-pub const IM2COL_KERNEL: &str = r#"
-extern "C" __global__ void im2col_kernel(
-    const float* input,
-    float* output,
-    int batch_size,
-    int channels,
-    int height,
-    int width,
-    int kernel_h,
-    int kernel_w
-) {
-    // For now, use fixed padding and stride
-    int pad_h = 1;
-    int pad_w = 1;
-    int stride_h = 1;
-    int stride_w = 1;
-    int out_height = (height + 2 * pad_h - kernel_h) / stride_h + 1;
-    int out_width = (width + 2 * pad_w - kernel_w) / stride_w + 1;
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = batch_size * channels * kernel_h * kernel_w * out_height * out_width;
-    
-    if (index < total_elements) {
-        int w_out = index % out_width;
-        int h_out = (index / out_width) % out_height;
-        int kw = (index / (out_width * out_height)) % kernel_w;
-        int kh = (index / (out_width * out_height * kernel_w)) % kernel_h;
-        int c = (index / (out_width * out_height * kernel_w * kernel_h)) % channels;
-        int batch = index / (out_width * out_height * kernel_w * kernel_h * channels);
-        
-        int h_in = h_out * stride_h - pad_h + kh;
-        int w_in = w_out * stride_w - pad_w + kw;
-        
-        if (h_in >= 0 && h_in < height && w_in >= 0 && w_in < width) {
-            int input_idx = batch * (channels * height * width) + 
-                           c * (height * width) + 
-                           h_in * width + 
-                           w_in;
-            output[index] = input[input_idx];
-        } else {
-            output[index] = 0.0f;
-        }
-    }
-}
-"#;
-
-/// CUDA kernel for col2im (backward pass)
-pub const COL2IM_KERNEL: &str = r#"
-extern "C" __global__ void col2im_kernel(
-    const float* col,
-    float* im,
-    int batch_size,
-    int channels,
-    int height,
-    int width,
-    int kernel_h,
-    int kernel_w
-) {
-    // For now, use fixed padding and stride
-    int pad_h = 1;
-    int pad_w = 1;
-    int stride_h = 1;
-    int stride_w = 1;
-    int out_height = (height + 2 * pad_h - kernel_h) / stride_h + 1;
-    int out_width = (width + 2 * pad_w - kernel_w) / stride_w + 1;
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = batch_size * channels * height * width;
-    
-    if (index < total_elements) {
-        int w = index % width;
-        int h = (index / width) % height;
-        int c = (index / (width * height)) % channels;
-        int batch = index / (width * height * channels);
-        
-        float val = 0.0f;
-        
-        // Find all positions in col that map to this pixel
-        for (int kh = 0; kh < kernel_h; kh++) {
-            for (int kw = 0; kw < kernel_w; kw++) {
-                int h_out_start = (h + pad_h - kh + stride_h - 1) / stride_h;
-                int w_out_start = (w + pad_w - kw + stride_w - 1) / stride_w;
-                
-                if (h_out_start < out_height && w_out_start < out_width &&
-                    (h + pad_h - kh) % stride_h == 0 && 
-                    (w + pad_w - kw) % stride_w == 0) {
-                    
-                    int col_idx = batch * (channels * kernel_h * kernel_w * out_height * out_width) +
-                                 (c * kernel_h * kernel_w + kh * kernel_w + kw) * out_height * out_width +
-                                 h_out_start * out_width + w_out_start;
-                    val += col[col_idx];
-                }
-            }
-        }
-        
-        im[index] = val;
-    }
-}
-"#;
-
-/// CUDA kernel for gradient w.r.t. bias
-pub const BIAS_GRAD_KERNEL: &str = r#"
-extern "C" __global__ void bias_grad_kernel(
-    const float* grad_output,
-    float* grad_bias,
-    int batch_size,
-    int channels,
-    int spatial_size
-) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= channels) return;
-    
-    float sum = 0.0f;
-    for (int b = 0; b < batch_size; b++) {
-        for (int i = 0; i < spatial_size; i++) {
-            int idx = b * channels * spatial_size + c * spatial_size + i;
-            sum += grad_output[idx];
-        }
-    }
-    
-    grad_bias[c] = sum;
-}
-"#;
-
-/// CUDA kernel for bias addition
-pub const ADD_BIAS_KERNEL: &str = r#"
-extern "C" __global__ void add_bias_kernel(
-    float* output,
-    const float* bias,
-    int batch_size,
-    int channels,
-    int spatial_size
-) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = batch_size * channels * spatial_size;
-    
-    if (index < total_elements) {
-        int c = (index / spatial_size) % channels;
-        output[index] += bias[c];
-    }
-}
-"#;
+// Import kernel source from dedicated module
+use crate::cuda_conv2d_kernels::CONV2D_KERNELS;
 
 /// GPU-accelerated 2D convolution
 pub struct CudaConv2d;
@@ -154,13 +15,17 @@ pub struct CudaConv2d;
 impl CudaConv2d {
     /// Ensure kernels are loaded
     fn ensure_kernels(device: &Arc<CudaDevice>) -> Result<()> {
-        use crate::cuda_kernels::CudaKernels;
-        
-        CudaKernels::ensure_kernel(device, "im2col_kernel", IM2COL_KERNEL)?;
-        CudaKernels::ensure_kernel(device, "col2im_kernel", COL2IM_KERNEL)?;
-        CudaKernels::ensure_kernel(device, "add_bias_kernel", ADD_BIAS_KERNEL)?;
-        CudaKernels::ensure_kernel(device, "bias_grad_kernel", BIAS_GRAD_KERNEL)?;
-        
+        device
+            .load_ptx(CONV2D_KERNELS.into(), "conv2d_ops", &[
+                "im2col_kernel",
+                "col2im_kernel",
+                "add_bias_nhwc_kernel",
+                "add_bias_nchw_kernel",
+                "bias_grad_kernel",
+                "im2col_optimized_kernel",
+                "check_conv_dimensions_kernel",
+            ])
+            .map_err(|e| FlameError::Cuda(format!("Failed to load Conv2D kernels: {}", e)))?;
         Ok(())
     }
     
@@ -206,15 +71,47 @@ impl CudaConv2d {
         let col_size = batch_size * in_channels * kernel_h * kernel_w * out_height * out_width;
         let col_buffer = device.alloc_zeros::<f32>(col_size)?;
         
+        // Check dimensions first
+        let error_flag = device.alloc_zeros::<i32>(1)?;
+        let check_f = device.get_func("conv2d_ops", "check_conv_dimensions_kernel")
+            .ok_or_else(|| FlameError::Cuda("Failed to get check_conv_dimensions kernel".into()))?;
+        
+        unsafe {
+            check_f.launch(LaunchConfig::for_num_elems(1), (
+                batch_size as i32,
+                in_channels as i32,
+                out_channels as i32,
+                in_height as i32,
+                in_width as i32,
+                kernel_h as i32,
+                kernel_w as i32,
+                stride_h as i32,
+                stride_w as i32,
+                pad_h as i32,
+                pad_w as i32,
+                &error_flag,
+            ))?;
+        }
+        
+        // Check error flag
+        device.synchronize()?;
+        let error_val: Vec<i32> = device.dtoh_sync_copy(&error_flag)?;
+        
+        match error_val[0] {
+            1 => return Err(FlameError::InvalidOperation("Conv2D: Invalid output dimensions".into())),
+            2 => return Err(FlameError::InvalidOperation("Conv2D: Kernel larger than padded input".into())),
+            _ => {}
+        }
+        
         // Perform im2col
-        let f = device.get_func("im2col_kernel", "im2col_kernel")
+        let f = device.get_func("conv2d_ops", "im2col_kernel")
             .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel".into()))?;
         
         let cfg = LaunchConfig::for_num_elems(col_size as u32);
         // Use proper device pointer types
         unsafe {
             f.launch(cfg, (
-                input.data(),
+                input.data.as_ref(),
                 &col_buffer,
                 batch_size as i32,
                 in_channels as i32,
@@ -222,6 +119,12 @@ impl CudaConv2d {
                 in_width as i32,
                 kernel_h as i32,
                 kernel_w as i32,
+                pad_h as i32,
+                pad_w as i32,
+                stride_h as i32,
+                stride_w as i32,
+                out_height as i32,
+                out_width as i32,
             ))?;
         }
         
@@ -292,21 +195,22 @@ impl CudaConv2d {
         
         let mut result = output.clone()?;
         
-        let f = device.get_func("add_bias_kernel", "add_bias_kernel")
+        let f = device.get_func("conv2d_ops", "add_bias_nchw_kernel")
             .ok_or_else(|| FlameError::Cuda("Failed to get add_bias kernel".into()))?;
         
         let cfg = LaunchConfig::for_num_elems((batch_size * channels * spatial_size) as u32);
         
         unsafe {
             f.launch(cfg, (
-                result.data(),
-                bias.data(),
+                result.data.as_ref(),
+                bias.data.as_ref(),
                 batch_size as i32,
                 channels as i32,
                 spatial_size as i32,
             ))?;
         }
         
+        device.synchronize()?;
         Ok(result)
     }
     
@@ -351,13 +255,13 @@ impl CudaConv2d {
         let input_col_size = batch_size * in_channels * kernel_h * kernel_w * out_height * out_width;
         let input_col_buffer = device.alloc_zeros::<f32>(input_col_size)?;
         
-        let f_im2col = device.get_func("im2col_kernel", "im2col_kernel")
+        let f_im2col = device.get_func("conv2d_ops", "im2col_kernel")
             .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel".into()))?;
         
         let cfg = LaunchConfig::for_num_elems(input_col_size as u32);
         unsafe {
             f_im2col.launch(cfg, (
-                input.data(),
+                input.data.as_ref(),
                 &input_col_buffer,
                 batch_size as i32,
                 in_channels as i32,
@@ -365,8 +269,16 @@ impl CudaConv2d {
                 in_width as i32,
                 kernel_h as i32,
                 kernel_w as i32,
+                pad_h as i32,
+                pad_w as i32,
+                stride_h as i32,
+                stride_w as i32,
+                out_height as i32,
+                out_width as i32,
             ))?;
         }
+        
+        device.synchronize()?;
         
         // Compute weight gradient
         let input_col_tensor = Tensor {
@@ -390,13 +302,13 @@ impl CudaConv2d {
         // Now use col2im to get grad_input
         let grad_input_data = device.alloc_zeros::<f32>(input.shape().elem_count())?;
         
-        let f_col2im = device.get_func("col2im_kernel", "col2im_kernel")
+        let f_col2im = device.get_func("conv2d_ops", "col2im_kernel")
             .ok_or_else(|| FlameError::Cuda("Failed to get col2im kernel".into()))?;
         
         let cfg = LaunchConfig::for_num_elems(input.shape().elem_count() as u32);
         unsafe {
             f_col2im.launch(cfg, (
-                grad_input_col.data(),
+                grad_input_col.data.as_ref(),
                 &grad_input_data,
                 batch_size as i32,
                 in_channels as i32,
@@ -404,8 +316,16 @@ impl CudaConv2d {
                 in_width as i32,
                 kernel_h as i32,
                 kernel_w as i32,
+                pad_h as i32,
+                pad_w as i32,
+                stride_h as i32,
+                stride_w as i32,
+                out_height as i32,
+                out_width as i32,
             ))?;
         }
+        
+        device.synchronize()?;
         
         let grad_input = Tensor {
             data: Arc::new(grad_input_data),
@@ -419,19 +339,21 @@ impl CudaConv2d {
         let grad_bias = if grad_output.shape().dims().len() == 4 {
             let grad_bias_data = device.alloc_zeros::<f32>(out_channels)?;
             
-            let f_bias_grad = device.get_func("bias_grad_kernel", "bias_grad_kernel")
+            let f_bias_grad = device.get_func("conv2d_ops", "bias_grad_kernel")
                 .ok_or_else(|| FlameError::Cuda("Failed to get bias_grad kernel".into()))?;
             
             let cfg = LaunchConfig::for_num_elems(out_channels as u32);
             unsafe {
                 f_bias_grad.launch(cfg, (
-                    grad_output.data(),
+                    grad_output.data.as_ref(),
                     &grad_bias_data,
                     batch_size as i32,
                     out_channels as i32,
                     (out_height * out_width) as i32,
                 ))?;
             }
+            
+            device.synchronize()?;
             
             Some(Tensor {
                 data: Arc::new(grad_bias_data),

@@ -44,12 +44,20 @@ pub fn layer_norm_backward(
     let grad_normalized = &grad_out_scaled;
     
     // Compute intermediate values for input gradient
-    let mean_grad_normalized = grad_normalized.sum_keepdim(&normalized_shape)?
-        .div_scalar(norm_size as f32)?;
+    // Sum over normalized dimensions
+    let mut mean_grad_normalized = grad_normalized.clone()?;
+    for i in 0..normalized_shape.len() {
+        let dim = ndim - normalized_shape.len() + i;
+        mean_grad_normalized = mean_grad_normalized.sum_keepdim(dim as isize)?;
+    }
+    mean_grad_normalized = mean_grad_normalized.div_scalar(norm_size as f32)?;
     
-    let dot_p = normalized.mul(grad_normalized)?
-        .sum_keepdim(&normalized_shape)?
-        .div_scalar(norm_size as f32)?;
+    let mut dot_p = normalized.mul(grad_normalized)?;
+    for i in 0..normalized_shape.len() {
+        let dim = ndim - normalized_shape.len() + i;
+        dot_p = dot_p.sum_keepdim(dim as isize)?;
+    }
+    dot_p = dot_p.div_scalar(norm_size as f32)?;
     
     // Compute input gradient using the formula:
     // grad_input = (grad_normalized - mean(grad_normalized) - normalized * mean(normalized * grad_normalized)) / std
@@ -309,7 +317,7 @@ pub fn broadcast_backward(
     // Then, sum over dimensions that were size 1
     for (i, &orig_size) in original_shape.iter().enumerate() {
         if orig_size == 1 && grad.shape().dims()[i] > 1 {
-            grad = grad.sum_keepdim(i)?;
+            grad = grad.sum_keepdim(i as isize)?;
         }
     }
     
@@ -341,7 +349,7 @@ pub fn reduce_grad_to_shape(
     // Sum over broadcasted dimensions
     for (i, &target_dim) in target_shape.iter().enumerate() {
         if target_dim == 1 && result.shape().dims()[i] > 1 {
-            result = result.sum_keepdim(i)?;
+            result = result.sum_keepdim(i as isize)?;
         }
     }
     
@@ -431,8 +439,8 @@ impl Tensor {
         ones.div(self)
     }
     
-    /// Clamp tensor values with gradient preservation
-    pub fn clamp(&self, min: f32, max: f32) -> Result<Tensor> {
+    /// Clamp tensor values with gradient preservation (internal implementation)
+    pub fn clamp_with_grad(&self, min: f32, max: f32) -> Result<Tensor> {
         let data = self.to_vec()?;
         let clamped: Vec<f32> = data.iter()
             .map(|&x| x.clamp(min, max))

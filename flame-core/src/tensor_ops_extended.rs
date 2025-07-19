@@ -4,6 +4,7 @@
 use crate::{Tensor, Shape, Result, FlameError};
 use crate::autograd::{AutogradContext, Op};
 use std::sync::Arc;
+use cudarc::driver::CudaDevice;
 
 impl Tensor {
     /// Chunk tensor into n chunks along specified dimension
@@ -611,6 +612,34 @@ impl Tensor {
         Tensor::from_slice(&output, Shape::from_dims(&broadcast_shape), self.device.clone())
     }
     
+    /// Divide tensor by scalar
+    pub fn div_scalar(&self, scalar: f32) -> Result<Tensor> {
+        if scalar == 0.0 {
+            return Err(FlameError::InvalidOperation("Division by zero".into()));
+        }
+        
+        let data = self.to_vec()?;
+        let result: Vec<f32> = data.iter().map(|&x| x / scalar).collect();
+        
+        let mut output = Tensor::from_vec(result, self.shape.clone(), self.device.clone())?;
+        
+        // AUTOGRAD: Record as mul_scalar with reciprocal
+        if self.requires_grad {
+            output.requires_grad = true;
+            
+            AutogradContext::record_op(
+                output.id,
+                Op::MulScalar { 
+                    input: self.id, 
+                    scalar: 1.0 / scalar 
+                },
+                vec![(self.id, Clone::clone(self))]
+            );
+        }
+        
+        Ok(output)
+    }
+    
     /// Element-wise equality comparison
     pub fn eq(&self, other: &Tensor) -> Result<Tensor> {
         // Check shapes are compatible
@@ -636,8 +665,8 @@ impl Tensor {
         Tensor::from_slice(&data, shape, device)
     }
     
-    /// Create tensor filled with ones
-    pub fn ones(shape: Shape, device: Arc<CudaDevice>) -> Result<Tensor> {
+    /// Create tensor filled with ones (static method)
+    pub fn ones_like_shape(shape: Shape, device: Arc<CudaDevice>) -> Result<Tensor> {
         Self::full(shape, 1.0, device)
     }
     
