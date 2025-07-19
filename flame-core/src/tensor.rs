@@ -836,6 +836,11 @@ extern "C" __global__ void slice_kernel(
     pub fn device(&self) -> &Arc<CudaDevice> {
         &self.device
     }
+    
+    /// Get tensor ID for gradient tracking
+    pub fn id(&self) -> TensorId {
+        self.id
+    }
 
     /// Copy to CPU
     pub fn to_vec(&self) -> Result<Vec<f32>> {

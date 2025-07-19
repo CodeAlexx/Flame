@@ -41,6 +41,11 @@ impl GradientMap {
         self.gradients.get_mut(&id)
     }
     
+    /// Insert or replace gradient
+    pub fn insert(&mut self, id: TensorId, grad: Tensor) {
+        self.gradients.insert(id, grad);
+    }
+    
     /// Check if gradient exists
     pub fn contains(&self, id: TensorId) -> bool {
         self.gradients.contains_key(&id)

@@ -112,3 +112,12 @@ name = "test_eridiffusion_adapter"
 
 [[example]]
 name = "kernel_launcher_example"
+
+[[example]]
+name = "test_gradient_modification"
+
+[[example]]
+name = "test_flame_training_loop"
+
+[[example]]
+name = "test_gradient_simple"
