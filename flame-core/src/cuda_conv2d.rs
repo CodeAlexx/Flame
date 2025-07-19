@@ -8,22 +8,6 @@ use std::sync::Arc;
 
 /// CUDA kernel source for im2col transformation
 pub const IM2COL_KERNEL: &str = r#"
-// Kernel parameters struct to reduce argument count
-struct Im2ColParams {
-    int batch_size;
-    int channels;
-    int height;
-    int width;
-    int kernel_h;
-    int kernel_w;
-    int pad_h;
-    int pad_w;
-    int stride_h;
-    int stride_w;
-    int out_height;
-    int out_width;
-};
-
 extern "C" __global__ void im2col_kernel(
     const float* input,
     float* output,
@@ -78,14 +62,15 @@ extern "C" __global__ void col2im_kernel(
     int height,
     int width,
     int kernel_h,
-    int kernel_w,
-    int pad_h,
-    int pad_w,
-    int stride_h,
-    int stride_w,
-    int out_height,
-    int out_width
+    int kernel_w
 ) {
+    // For now, use fixed padding and stride
+    int pad_h = 1;
+    int pad_w = 1;
+    int stride_h = 1;
+    int stride_w = 1;
+    int out_height = (height + 2 * pad_h - kernel_h) / stride_h + 1;
+    int out_width = (width + 2 * pad_w - kernel_w) / stride_w + 1;
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elements = batch_size * channels * height * width;
     
@@ -120,6 +105,30 @@ extern "C" __global__ void col2im_kernel(
 }
 "#;
 
+/// CUDA kernel for gradient w.r.t. bias
+pub const BIAS_GRAD_KERNEL: &str = r#"
+extern "C" __global__ void bias_grad_kernel(
+    const float* grad_output,
+    float* grad_bias,
+    int batch_size,
+    int channels,
+    int spatial_size
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    
+    float sum = 0.0f;
+    for (int b = 0; b < batch_size; b++) {
+        for (int i = 0; i < spatial_size; i++) {
+            int idx = b * channels * spatial_size + c * spatial_size + i;
+            sum += grad_output[idx];
+        }
+    }
+    
+    grad_bias[c] = sum;
+}
+"#;
+
 /// CUDA kernel for bias addition
 pub const ADD_BIAS_KERNEL: &str = r#"
 extern "C" __global__ void add_bias_kernel(
@@ -150,6 +159,7 @@ impl CudaConv2d {
         CudaKernels::ensure_kernel(device, "im2col_kernel", IM2COL_KERNEL)?;
         CudaKernels::ensure_kernel(device, "col2im_kernel", COL2IM_KERNEL)?;
         CudaKernels::ensure_kernel(device, "add_bias_kernel", ADD_BIAS_KERNEL)?;
+        CudaKernels::ensure_kernel(device, "bias_grad_kernel", BIAS_GRAD_KERNEL)?;
         
         Ok(())
     }
@@ -311,15 +321,125 @@ impl CudaConv2d {
         let device = input.device();
         Self::ensure_kernels(device)?;
         
-        // TODO: Implement proper backward pass using col2im
-        // For now, return placeholder gradients
-        let grad_input = Tensor::zeros(input.shape().clone(), device.clone())?;
-        let grad_weight = Tensor::zeros(weight.shape().clone(), device.clone())?;
+        // Get dimensions
+        let grad_dims = grad_output.shape().dims();
+        let input_dims = input.shape().dims();
+        let weight_dims = weight.shape().dims();
+        
+        let batch_size = grad_dims[0];
+        let out_channels = grad_dims[1];
+        let out_height = grad_dims[2];
+        let out_width = grad_dims[3];
+        
+        let in_channels = input_dims[1];
+        let in_height = input_dims[2];
+        let in_width = input_dims[3];
+        
+        let kernel_h = weight_dims[2];
+        let kernel_w = weight_dims[3];
+        
+        let (stride_h, stride_w) = stride;
+        let (pad_h, pad_w) = padding;
+        
+        // Gradient w.r.t. input using transposed convolution
+        // First, perform im2col on grad_output
+        let col_size = batch_size * out_channels * out_height * out_width;
+        let grad_col = grad_output.reshape(&[batch_size * out_height * out_width, out_channels])?;
+        
+        // Weight gradient: grad_output @ input^T (after im2col)
+        // First, im2col on input
+        let input_col_size = batch_size * in_channels * kernel_h * kernel_w * out_height * out_width;
+        let input_col_buffer = device.alloc_zeros::<f32>(input_col_size)?;
+        
+        let f_im2col = device.get_func("im2col_kernel", "im2col_kernel")
+            .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel".into()))?;
+        
+        let cfg = LaunchConfig::for_num_elems(input_col_size as u32);
+        unsafe {
+            f_im2col.launch(cfg, (
+                input.data(),
+                &input_col_buffer,
+                batch_size as i32,
+                in_channels as i32,
+                in_height as i32,
+                in_width as i32,
+                kernel_h as i32,
+                kernel_w as i32,
+            ))?;
+        }
+        
+        // Compute weight gradient
+        let input_col_tensor = Tensor {
+            data: Arc::new(input_col_buffer),
+            shape: Shape::from_dims(&[batch_size * out_height * out_width, in_channels * kernel_h * kernel_w]),
+            device: device.clone(),
+            id: TensorId::new(),
+            requires_grad: false,
+        };
+        
+        // grad_weight = grad_output^T @ input_col
+        let grad_col_t = grad_col.transpose()?;
+        let grad_weight_2d = grad_col_t.matmul(&input_col_tensor)?;
+        let grad_weight = grad_weight_2d.reshape(&[out_channels, in_channels, kernel_h, kernel_w])?;
+        
+        // Gradient w.r.t. input using col2im
+        // First compute weight^T @ grad_output
+        let weight_t = weight.reshape(&[out_channels, in_channels * kernel_h * kernel_w])?.transpose()?;
+        let grad_input_col = grad_col.matmul(&weight_t)?;
+        
+        // Now use col2im to get grad_input
+        let grad_input_data = device.alloc_zeros::<f32>(input.shape().elem_count())?;
+        
+        let f_col2im = device.get_func("col2im_kernel", "col2im_kernel")
+            .ok_or_else(|| FlameError::Cuda("Failed to get col2im kernel".into()))?;
+        
+        let cfg = LaunchConfig::for_num_elems(input.shape().elem_count() as u32);
+        unsafe {
+            f_col2im.launch(cfg, (
+                grad_input_col.data(),
+                &grad_input_data,
+                batch_size as i32,
+                in_channels as i32,
+                in_height as i32,
+                in_width as i32,
+                kernel_h as i32,
+                kernel_w as i32,
+            ))?;
+        }
+        
+        let grad_input = Tensor {
+            data: Arc::new(grad_input_data),
+            shape: input.shape().clone(),
+            device: device.clone(),
+            id: TensorId::new(),
+            requires_grad: false,
+        };
         
         // Bias gradient is sum over batch and spatial dimensions
         let grad_bias = if grad_output.shape().dims().len() == 4 {
-            let channels = grad_output.shape().dims()[1];
-            Some(Tensor::zeros(Shape::from_dims(&[channels]), device.clone())?)
+            let grad_bias_data = device.alloc_zeros::<f32>(out_channels)?;
+            
+            let f_bias_grad = device.get_func("bias_grad_kernel", "bias_grad_kernel")
+                .ok_or_else(|| FlameError::Cuda("Failed to get bias_grad kernel".into()))?;
+            
+            let cfg = LaunchConfig::for_num_elems(out_channels as u32);
+            unsafe {
+                f_bias_grad.launch(cfg, (
+                    grad_output.data(),
+                    &grad_bias_data,
+                    batch_size as i32,
+                    out_channels as i32,
+                    (out_height * out_width) as i32,
+                ))?;
+            }
+            
+            Some(Tensor {
+                data: Arc::new(grad_bias_data),
+                shape: Shape::from_dims(&[out_channels]),
+                device: device.clone(),
+                id: TensorId::new(),
+                requires_grad: false,
+            })
         } else {
             None
         };
