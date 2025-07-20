@@ -37,6 +37,8 @@ pub enum Op {
     Conv2d { input: TensorId, weight: TensorId, stride: usize, padding: usize },
     Linear { input: TensorId, weight: TensorId, bias: Option<TensorId> },
     LayerNorm { input: TensorId, normalized_shape: Vec<usize> },
+    GroupNorm { input: TensorId, num_groups: usize, weight: Option<TensorId>, bias: Option<TensorId> },
+    RMSNorm { input: TensorId, weight: Option<TensorId>, eps: f32 },
     BatchMatMul { lhs: TensorId, rhs: TensorId },
     Reshape { input: TensorId, new_shape: Vec<usize> },
     Permute { input: TensorId, dims: Vec<usize> },
@@ -410,6 +412,105 @@ fn compute_gradients(
             )?;
             
             Ok(vec![(*input, grad_input)])
+        }
+        
+        Op::GroupNorm { input, num_groups, weight, bias } => {
+            // GroupNorm backward pass
+            let input_tensor = &entry.saved_tensors[input];
+            let shape = input_tensor.shape().dims();
+            let channels = shape[1];
+            let batch_size = shape[0];
+            
+            // Reshape for group norm: [N, G, C/G, H, W]
+            let group_size = channels / num_groups;
+            let mut new_shape = vec![batch_size, *num_groups, group_size];
+            new_shape.extend_from_slice(&shape[2..]);
+            
+            let reshaped = input_tensor.reshape(&new_shape)?;
+            
+            // Calculate mean and variance per group
+            let mut dims_to_reduce = vec![2];
+            for i in 3..new_shape.len() {
+                dims_to_reduce.push(i);
+            }
+            let mean = reshaped.mean_dims(&dims_to_reduce, true)?;
+            let var = reshaped.var_dims(&dims_to_reduce, true, true)?;
+            
+            // Normalize
+            let eps = 1e-5;
+            let std = var.add_scalar(eps)?.sqrt()?;
+            let normalized = reshaped.sub(&mean)?.div(&std)?;
+            
+            // Reshape back
+            let normalized = normalized.reshape(shape)?;
+            
+            // Compute gradients
+            let weight_tensor = weight.and_then(|w| entry.saved_tensors.get(&w));
+            let bias_tensor = bias.and_then(|b| entry.saved_tensors.get(&b));
+            
+            let (grad_input, grad_weight, grad_bias) = crate::autograd_ops_complete::layer_norm_backward(
+                output_grad,
+                input_tensor,
+                &normalized,
+                weight_tensor,
+                bias_tensor,
+                &mean.reshape(&[batch_size, *num_groups, 1])?,
+                &var.reshape(&[batch_size, *num_groups, 1])?,
+                &[channels],
+                eps,
+            )?;
+            
+            let mut grads = vec![(*input, grad_input)];
+            if let (Some(w_id), Some(gw)) = (*weight, grad_weight) {
+                grads.push((w_id, gw));
+            }
+            if let (Some(b_id), Some(gb)) = (*bias, grad_bias) {
+                grads.push((b_id, gb));
+            }
+            
+            Ok(grads)
+        }
+        
+        Op::RMSNorm { input, weight, eps } => {
+            // RMSNorm backward pass
+            let input_tensor = &entry.saved_tensors[input];
+            
+            // Calculate RMS
+            let square = input_tensor.square()?;
+            let mean_square = square.mean_dims(&[input_tensor.shape().dims().len() - 1], true)?;
+            let rms = mean_square.add_scalar(*eps)?.sqrt()?;
+            
+            // Normalize
+            let normalized = input_tensor.div(&rms)?;
+            
+            // Compute gradients
+            let weight_tensor = weight.and_then(|w| entry.saved_tensors.get(&w));
+            
+            // Gradient w.r.t input
+            let grad_norm = if let Some(w) = weight_tensor {
+                output_grad.mul(w)?
+            } else {
+                output_grad.clone()?
+            };
+            
+            // Compute d(loss)/d(rms)
+            let d_rms = grad_norm.mul(&normalized)?.neg()?.div(&rms)?
+                .mean_dims(&[input_tensor.shape().dims().len() - 1], true)?;
+            
+            // Gradient w.r.t input: d(loss)/d(x) = d(loss)/d(norm) * 1/rms + d(loss)/d(rms) * x/rms^2
+            let grad_input = grad_norm.div(&rms)?
+                .add(&d_rms.mul(input_tensor)?.div(&rms.square()?)?)?;
+            
+            let mut grads = vec![(*input, grad_input)];
+            
+            // Gradient w.r.t weight if present
+            if let Some(w_id) = weight {
+                let grad_weight = output_grad.mul(&normalized)?
+                    .sum_dims(&(0..input_tensor.shape().dims().len()-1).collect::<Vec<_>>())?;
+                grads.push((w_id, grad_weight));
+            }
+            
+            Ok(grads)
         }
         
         Op::Linear { input, weight, bias } => {
