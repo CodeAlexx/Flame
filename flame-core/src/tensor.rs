@@ -1206,7 +1206,23 @@ extern "C" __global__ void slice_kernel(
         let sum_exp = exp_vals.sum_dim_keepdim(dim)?;
         
         // Divide by sum
-        exp_vals.div(&sum_exp)
+        let mut output = exp_vals.div(&sum_exp)?;
+        
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            output.requires_grad = true;
+            
+            AutogradContext::record_op(
+                output.id,
+                Op::Softmax { 
+                    input: self.id,
+                    dim: dim as isize
+                },
+                vec![(self.id, self.clone()?)]
+            );
+        }
+        
+        Ok(output)
     }
     
     /// Specific permutation: [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, num_heads, head_dim]

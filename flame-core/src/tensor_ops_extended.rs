@@ -720,9 +720,40 @@ impl Tensor {
     
     /// Log softmax along a dimension
     pub fn log_softmax(&self, dim: isize) -> Result<Tensor> {
-        // Compute softmax first, then take log
-        let softmax = self.softmax(dim)?;
-        softmax.log()
+        // More numerically stable implementation
+        let shape = self.shape().dims();
+        let ndim = shape.len() as isize;
+        
+        // Handle negative dimension
+        let dim = if dim < 0 { ndim + dim } else { dim } as usize;
+        
+        // Compute max for numerical stability
+        let max_vals = self.max_dim(dim, true)?;
+        let shifted = self.sub(&max_vals)?;
+        
+        // Compute log(sum(exp(x - max)))
+        let exp_vals = shifted.exp()?;
+        let sum_exp = exp_vals.sum_dim_keepdim(dim)?;
+        let log_sum_exp = sum_exp.log()?;
+        
+        // log_softmax = x - max - log(sum(exp(x - max)))
+        let mut output = shifted.sub(&log_sum_exp)?;
+        
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            output.requires_grad = true;
+            
+            AutogradContext::record_op(
+                output.id,
+                Op::LogSoftmax { 
+                    input: self.id,
+                    dim: dim as isize
+                },
+                vec![(self.id, self.clone()?)]
+            );
+        }
+        
+        Ok(output)
     }
     
     /// Get data as 1D vector of i64
