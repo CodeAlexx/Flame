@@ -1,0 +1,350 @@
+# FLAME-EriDiffusion Integration Development Prompt
+
+You will operate as three specialized sub-agents to ensure the complete FLAME-EriDiffusion integration works with REAL implementations:
+
+## Architecture Context
+- **FLAME**: Pure Rust tensor framework (like PyTorch core) - handles tensors, autograd, CUDA kernels, basic NN layers
+- **EriDiffusion**: Trainer application - handles VAE, text encoders, model architectures, training loops, data loading
+- **Migration Status**: Moving from Candle to FLAME for tensor operations
+- **Critical Success Metric**: Must produce working LoRAs loadable in ComfyUI
+
+## Sub-Agent 1: Implementation Hunter & Validator
+Find and verify ALL critical components are REAL implementations (not placeholders):
+
+### 1. FLAME Framework (Tensor Operations)
+**Required Real Implementations:**
+- [ ] **Tensor Operations**: Basic math (+, -, *, /), matrix multiply, convolution
+- [ ] **Autograd Engine**: Gradient computation, backward pass, gradient maps
+- [ ] **CUDA Kernels**: Actual GPU computation, memory management
+- [ ] **Basic NN Layers**: Linear, Conv2D, Attention with forward/backward
+- [ ] **Device Management**: CPU/GPU transfers, memory allocation
+- [ ] **Data Types**: F32, F16, proper dtype handling
+
+**Validate These Work:**
+```rust
+// Must actually compute on GPU
+let a = Tensor::randn(&[1024, 1024], Device::Cuda(0))?;
+let b = Tensor::randn(&[1024, 1024], Device::Cuda(0))?;
+let c = a.matmul(&b)?; // Real CUDA kernel call
+
+// Must compute real gradients
+let x = Tensor::randn(&[10, 10], device).requires_grad();
+let y = &x * &x;
+let loss = y.sum();
+let grad_map = loss.backward(); // Real autograd
+```
+
+### 2. EriDiffusion Components (Model & Training)
+**Required Real Implementations:**
+- [ ] **DataLoader**: Actually loads images from filesystem, applies transforms
+- [ ] **Text Encoders**: CLIP-L, CLIP-G, T5-XXL - real tokenization and encoding
+- [ ] **VAE**: Real encode/decode operations with proper latent dimensions
+- [ ] **SDXL Model**: Complete UNet architecture with attention blocks
+- [ ] **LoRA Injection**: Real parameter modification, not fake adapters
+- [ ] **Training Loop**: Real forward/backward/optimizer steps
+- [ ] **Checkpointing**: Actually saves/loads .safetensors files
+- [ ] **Sampling/Inference**: Real denoising process that generates images
+
+**Validate These Work:**
+```rust
+// DataLoader must load real files
+let batch = dataloader.next()?; // Real image tensors from disk
+assert_eq!(batch.images.shape(), &[batch_size, 3, height, width]);
+
+// Text encoder must tokenize and encode
+let tokens = tokenizer.encode("a photo of a cat")?; // Real tokenization
+let embeddings = text_encoder.forward(&tokens)?; // Real embedding computation
+
+// Training must modify real parameters
+let initial_params = model.state_dict();
+trainer.step(&batch)?; // Real gradient computation and parameter updates
+let updated_params = model.state_dict();
+assert_ne!(initial_params["layers.0.weight"], updated_params["layers.0.weight"]);
+```
+
+### 3. Integration Points
+**Critical Connections That Must Work:**
+- [ ] **FLAME → EriDiffusion**: Tensor operations called from training code
+- [ ] **Gradient Flow**: FLAME autograd → EriDiffusion optimizer
+- [ ] **Memory Management**: Unified CUDA memory between FLAME and models
+- [ ] **Data Pipeline**: Images → FLAME tensors → model processing
+- [ ] **Sampling Integration**: FLAME operations in denoising loop
+
+## Sub-Agent 2: Make It Actually Work Developer
+Replace ALL placeholders with real implementations that attempt to work:
+
+### 1. FLAME Implementation Requirements
+**NO MORE PLACEHOLDER CODE:**
+```rust
+// BAD - Fake implementation
+fn matmul(&self, other: &Tensor) -> Result<Tensor> {
+    Ok(Tensor::zeros(self.shape(), self.device())) // FAKE!
+}
+
+// GOOD - Real CUDA kernel call
+fn matmul(&self, other: &Tensor) -> Result<Tensor> {
+    unsafe {
+        let mut result = Tensor::zeros(&[self.shape()[0], other.shape()[1]], self.device())?;
+        cublas_sgemm(
+            self.data_ptr(), other.data_ptr(), result.data_ptr(),
+            self.shape()[0], self.shape()[1], other.shape()[1]
+        )?;
+        Ok(result)
+    }
+}
+```
+
+**Autograd Must Actually Track:**
+```rust
+// Must maintain real computation graph
+pub struct AutogradEngine {
+    computation_graph: Vec<Operation>,
+    gradient_map: HashMap<TensorId, Tensor>,
+}
+
+impl AutogradEngine {
+    pub fn backward(&mut self, loss: &Tensor) -> Result<GradientMap> {
+        // Real backward pass through computation graph
+        for op in self.computation_graph.iter().rev() {
+            let grad_inputs = op.backward(&self.gradient_map)?;
+            for (tensor_id, grad) in grad_inputs {
+                self.accumulate_gradient(tensor_id, grad)?;
+            }
+        }
+        Ok(self.gradient_map.clone())
+    }
+}
+```
+
+### 2. EriDiffusion Implementation Requirements
+**DataLoader Must Load Real Images:**
+```rust
+pub struct ImageDataLoader {
+    image_paths: Vec<PathBuf>,
+    transform: ImageTransform,
+    batch_size: usize,
+}
+
+impl ImageDataLoader {
+    pub fn next(&mut self) -> Result<Batch> {
+        let mut images = Vec::new();
+        let mut captions = Vec::new();
+        
+        for _ in 0..self.batch_size {
+            // Actually read from filesystem
+            let image_path = &self.image_paths[self.current_index];
+            let image = image::open(image_path)
+                .with_context(|| format!("Failed to load image: {:?}", image_path))?;
+            
+            // Real image processing
+            let processed = self.transform.apply(image)?;
+            let tensor = Tensor::from_image(processed, self.device)?;
+            images.push(tensor);
+            
+            // Load real caption
+            let caption_path = image_path.with_extension("txt");
+            let caption = std::fs::read_to_string(caption_path)?;
+            captions.push(caption);
+        }
+        
+        Ok(Batch {
+            images: Tensor::stack(&images, 0)?,
+            captions,
+        })
+    }
+}
+```
+
+**Text Encoders Must Really Encode:**
+```rust
+pub struct CLIPTextEncoder {
+    tokenizer: CLIPTokenizer,
+    transformer: CLIPTransformer,
+}
+
+impl CLIPTextEncoder {
+    pub fn encode(&self, text: &str) -> Result<Tensor> {
+        // Real tokenization
+        let tokens = self.tokenizer.encode(text)
+            .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
+        
+        // Real transformer forward pass using FLAME
+        let token_tensor = Tensor::from_slice(&tokens, self.device)?;
+        let embeddings = self.transformer.forward(&token_tensor)?;
+        
+        Ok(embeddings)
+    }
+}
+```
+
+**Training Loop Must Actually Train:**
+```rust
+pub fn train_step(&mut self, batch: &Batch) -> Result<f32> {
+    // Real forward pass
+    let latents = self.vae.encode(&batch.images)?;
+    let text_embeds = self.text_encoder.encode(&batch.captions[0])?;
+    
+    // Real noise and timesteps
+    let noise = Tensor::randn(latents.shape(), self.device)?;
+    let timesteps = Tensor::randint(0, 1000, &[batch.images.shape()[0]], self.device)?;
+    
+    // Real diffusion forward
+    let noisy_latents = self.scheduler.add_noise(&latents, &noise, &timesteps)?;
+    let pred_noise = self.unet.forward(&noisy_latents, &timesteps, &text_embeds)?;
+    
+    // Real loss computation
+    let loss = mse_loss(&pred_noise, &noise)?;
+    
+    // Real backward pass using FLAME autograd
+    let grad_map = loss.backward()?;
+    
+    // Real optimizer step
+    self.optimizer.step(grad_map)?;
+    
+    Ok(loss.item()?)
+}
+```
+
+### 3. Integration Implementation
+**Memory Must Be Unified:**
+```rust
+// FLAME tensors must work with EriDiffusion models
+let flame_tensor = Tensor::randn(&[1, 3, 512, 512], Device::Cuda(0))?;
+let vae_output = vae.encode(&flame_tensor)?; // Must work seamlessly
+```
+
+**Sampling Must Generate Real Images:**
+```rust
+pub fn sample(&self, prompt: &str, steps: usize) -> Result<Image> {
+    // Real text encoding
+    let text_embeds = self.text_encoder.encode(prompt)?;
+    
+    // Real denoising loop
+    let mut latents = Tensor::randn(&[1, 4, 64, 64], self.device)?;
+    
+    for step in 0..steps {
+        let timestep = Tensor::full(&[1], (steps - step) as f32, self.device)?;
+        
+        // Real model prediction using FLAME operations
+        let noise_pred = self.unet.forward(&latents, &timestep, &text_embeds)?;
+        
+        // Real scheduler step
+        latents = self.scheduler.step(&noise_pred, &timestep, &latents)?;
+    }
+    
+    // Real VAE decode
+    let image_tensor = self.vae.decode(&latents)?;
+    let image = tensor_to_image(&image_tensor)?;
+    
+    Ok(image)
+}
+```
+
+## Sub-Agent 3: Integration Validator & Success Verifier
+Ensure complete functionality and ComfyUI compatibility:
+
+### 1. End-to-End Testing Requirements
+**Must Pass These Integration Tests:**
+```rust
+#[test]
+fn test_complete_training_pipeline() {
+    // Load real dataset
+    let dataloader = ImageDataLoader::new("/path/to/real/images")?;
+    
+    // Load real models
+    let vae = VAE::from_safetensors("/path/to/vae.safetensors")?;
+    let text_encoder = CLIPTextEncoder::from_safetensors("/path/to/clip.safetensors")?;
+    let mut unet = UNet::from_safetensors("/path/to/unet.safetensors")?;
+    
+    // Real training steps
+    for batch in dataloader.take(10) {
+        let loss = train_step(&mut unet, &vae, &text_encoder, &batch)?;
+        assert!(loss > 0.0 && loss < 100.0);
+    }
+    
+    // Must save real LoRA
+    unet.save_lora("/tmp/test_lora.safetensors")?;
+    
+    // Must be loadable
+    let saved_lora = LoRA::from_safetensors("/tmp/test_lora.safetensors")?;
+    assert!(saved_lora.rank > 0);
+}
+
+#[test]
+fn test_sampling_generates_images() {
+    let sampler = SDXLSampler::new()?;
+    let image = sampler.sample("a red car", 20)?;
+    
+    // Must be real image data
+    assert_eq!(image.width(), 1024);
+    assert_eq!(image.height(), 1024);
+    
+    // Save and verify
+    image.save("/tmp/test_sample.png")?;
+    assert!(std::path::Path::new("/tmp/test_sample.png").exists());
+}
+```
+
+### 2. ComfyUI Compatibility Verification
+**LoRA Format Must Match ComfyUI Requirements:**
+- [ ] **Tensor Names**: Must match expected LoRA naming convention
+- [ ] **Tensor Shapes**: Must match base model dimensions  
+- [ ] **Data Types**: Must be F16 for ComfyUI compatibility
+- [ ] **Metadata**: Must include alpha, rank, and module information
+
+```rust
+// Verify saved LoRA structure
+let lora_dict = safetensors::load("output_lora.safetensors")?;
+assert!(lora_dict.contains_key("lora_unet_down_blocks_0_attentions_0_to_k.lora_down.weight"));
+assert!(lora_dict.contains_key("lora_unet_down_blocks_0_attentions_0_to_k.lora_up.weight"));
+```
+
+### 3. Performance and Memory Validation
+**Must Handle 24GB VRAM Efficiently:**
+- [ ] **Memory Usage**: Training must fit in 24GB VRAM
+- [ ] **Gradient Accumulation**: Must work with batch_size=1
+- [ ] **Mixed Precision**: F16/BF16 must reduce memory usage
+- [ ] **Checkpointing**: Must save/resume without memory leaks
+
+### 4. Success Criteria Summary
+**FLAME Integration Success Metrics:**
+1. ✅ **Tensor Operations**: All FLAME operations work on GPU
+2. ✅ **Autograd**: Real gradients computed and applied
+3. ✅ **Memory Management**: No CUDA memory leaks
+4. ✅ **Data Pipeline**: Real images loaded and processed
+5. ✅ **Training**: Loss decreases over steps
+6. ✅ **Sampling**: Generates viewable images
+7. ✅ **LoRA Output**: Loadable in ComfyUI with visible effects
+
+**Documentation Requirements:**
+```markdown
+## Integration Test Results
+- [ ] FLAME tensor operations: PASS/FAIL
+- [ ] Autograd gradient computation: PASS/FAIL  
+- [ ] DataLoader image loading: PASS/FAIL
+- [ ] Text encoder tokenization: PASS/FAIL
+- [ ] Training loop convergence: PASS/FAIL
+- [ ] Sampling image generation: PASS/FAIL
+- [ ] LoRA ComfyUI compatibility: PASS/FAIL
+
+## Memory Usage Report
+- Peak VRAM usage: X GB / 24 GB
+- Training batch size achieved: X
+- Gradient accumulation steps: X
+
+## Performance Benchmarks
+- Training step time: X ms
+- Sampling time (20 steps): X seconds
+- Memory allocation overhead: X%
+```
+
+## Implementation Priority Order
+1. **FLAME Core**: Tensor ops, autograd, CUDA kernels
+2. **EriDiffusion Models**: VAE, text encoders, UNet loading
+3. **Data Pipeline**: Real image loading and preprocessing
+4. **Training Integration**: FLAME tensors → model training
+5. **Sampling Pipeline**: FLAME operations → image generation
+6. **LoRA Saving**: ComfyUI-compatible format
+7. **End-to-End Testing**: Full training → sampling → ComfyUI load
+
+**NO PLACEHOLDERS. NO SIMULATIONS. EVERYTHING MUST ACTUALLY WORK.**

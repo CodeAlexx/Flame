@@ -507,7 +507,7 @@ fn compute_gradients(
             if let Some(w_id) = weight {
                 let grad_weight = output_grad.mul(&normalized)?
                     .sum_dims(&(0..input_tensor.shape().dims().len()-1).collect::<Vec<_>>())?;
-                grads.push((w_id, grad_weight));
+                grads.push((*w_id, grad_weight));
             }
             
             Ok(grads)
@@ -861,7 +861,8 @@ fn compute_gradients(
             
             let diff = predictions_tensor.sub(targets_tensor)?;
             let abs_diff = diff.abs()?;
-            let delta_tensor = Tensor::full(*delta, diff.shape().clone(), diff.device().clone())?;
+            let delta_vec = vec![*delta; diff.shape().elem_count()];
+            let delta_tensor = Tensor::from_vec(delta_vec, diff.shape().clone(), diff.device().clone())?;
             
             // Create mask for |diff| <= delta
             let mask = abs_diff.le(&delta_tensor)?;

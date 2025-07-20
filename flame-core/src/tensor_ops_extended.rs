@@ -831,12 +831,12 @@ impl Tensor {
             }
         }
         
-        Tensor::from_vec(flat_data, vec![rows, cols], device)
+        Tensor::from_vec(flat_data, Shape::from_dims(&[rows, cols]), device)
     }
     
     /// Create scalar tensor
     pub fn from_scalar(value: f32, device: Arc<CudaDevice>) -> Result<Tensor> {
-        Tensor::from_vec(vec![value], vec![1], device)
+        Tensor::from_vec(vec![value], Shape::from_dims(&[1]), device)
     }
     
     /// Get scalar value from tensor

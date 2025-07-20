@@ -21,7 +21,7 @@ pub fn mse_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
     let squared = diff.square()?;
     
     // Mean over all elements
-    let loss = squared.mean_all()?;
+    let loss = squared.mean()?;
     
     // Record for autograd if needed
     if predictions.requires_grad || targets.requires_grad {
@@ -63,7 +63,7 @@ pub fn l1_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
     let abs_diff = diff.abs()?;
     
     // Mean over all elements
-    let loss = abs_diff.mean_all()?;
+    let loss = abs_diff.mean()?;
     
     // Record for autograd if needed
     if predictions.requires_grad || targets.requires_grad {
@@ -103,7 +103,7 @@ pub fn huber_loss(predictions: &Tensor, targets: &Tensor, delta: f32) -> Result<
     }
     
     if delta <= 0.0 {
-        return Err(FlameError::InvalidValue(
+        return Err(FlameError::InvalidOperation(
             format!("Huber loss delta must be positive, got {}", delta)
         ));
     }
@@ -112,20 +112,23 @@ pub fn huber_loss(predictions: &Tensor, targets: &Tensor, delta: f32) -> Result<
     let abs_diff = diff.abs()?;
     
     // Create mask for |diff| <= delta
-    let delta_tensor = Tensor::full(delta, diff.shape.clone(), diff.device.clone())?;
+    let delta_vec = vec![delta; diff.shape.elem_count()];
+    let delta_tensor = Tensor::from_vec(delta_vec, diff.shape.clone(), diff.device.clone())?;
     let mask = abs_diff.le(&delta_tensor)?;
     
     // Quadratic part: 0.5 * diff^2
     let squared = diff.square()?.mul_scalar(0.5)?;
     
     // Linear part: delta * (|diff| - 0.5 * delta)
-    let linear = abs_diff.sub_scalar(0.5 * delta)?.mul_scalar(delta)?;
+    let half_delta_vec = vec![0.5 * delta; abs_diff.shape.elem_count()];
+    let half_delta = Tensor::from_vec(half_delta_vec, abs_diff.shape.clone(), abs_diff.device.clone())?;
+    let linear = abs_diff.sub(&half_delta)?.mul_scalar(delta)?;
     
     // Combine using mask
     let loss_elements = mask.where_tensor(&squared, &linear)?;
     
     // Mean over all elements
-    let loss = loss_elements.mean_all()?;
+    let loss = loss_elements.mean()?;
     
     // Record for autograd if needed
     if predictions.requires_grad || targets.requires_grad {
@@ -178,7 +181,7 @@ pub fn binary_cross_entropy(predictions: &Tensor, targets: &Tensor) -> Result<Te
     let term2 = one_minus_targets.mul(&log_one_minus_pred)?;
     
     let loss_elements = term1.add(&term2)?.neg()?;
-    let loss = loss_elements.mean_all()?;
+    let loss = loss_elements.mean()?;
     
     // Record for autograd if needed
     if predictions.requires_grad || targets.requires_grad {
@@ -239,7 +242,7 @@ pub fn nll_loss(log_probs: &Tensor, targets: &Tensor) -> Result<Tensor> {
     
     for (i, &target) in target_indices.iter().enumerate() {
         if target < 0 || target >= num_classes as i64 {
-            return Err(FlameError::InvalidValue(
+            return Err(FlameError::InvalidOperation(
                 format!("Target index {} out of range [0, {})", target, num_classes)
             ));
         }
