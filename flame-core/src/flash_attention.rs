@@ -3,7 +3,7 @@
 //! Efficient attention mechanism that reduces memory usage from O(N²) to O(N)
 //! Based on "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness"
 
-use crate::{Tensor, Shape, Result, FlameError, CudaDevice};
+use crate::{Tensor, Shape, Result, FlameError, CudaDevice, DType};
 use std::sync::Arc;
 use cudarc::driver::LaunchAsync;
 
