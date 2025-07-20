@@ -98,7 +98,10 @@ impl FlashAttention {
             .unwrap_or(1.0 / (head_dim as f32).sqrt());
         
         // Use Flash Attention if conditions are met
+        // Note: Flash attention kernels require F16/BF16, so we need to check dtype
         if self.can_use_flash_attention(seq_len_q, seq_len_kv, head_dim) {
+            // For now, always use the tiled CPU implementation
+            // TODO: Add F16/BF16 support for GPU kernels
             self.flash_attention_forward(q, k, v, softmax_scale)
         } else {
             // Fall back to standard attention for unsupported configurations
@@ -116,7 +119,124 @@ impl FlashAttention {
         seq_len_kv <= 16384
     }
     
-    /// Flash Attention forward with tiling
+    /// Flash Attention using CUDA kernels
+    fn flash_attention_cuda_kernel(&self, q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
+        // This implementation uses the optimized CUDA kernels from flash-attention
+        let q_shape = q.shape().dims();
+        let (batch_size, seq_len_q, num_heads, head_dim) = (
+            q_shape[0], q_shape[1], q_shape[2], q_shape[3]
+        );
+        let seq_len_kv = k.shape().dims()[1];
+        let num_heads_k = k.shape().dims()[2];
+        
+        // Prepare window sizes
+        let mut window_size_left = self.config.window_size_left
+            .filter(|v| v <= &seq_len_kv)
+            .map(|v| v as i32)
+            .unwrap_or(-1);
+        let mut window_size_right = self.config.window_size_right
+            .filter(|v| v <= &seq_len_kv)
+            .map(|v| v as i32)
+            .unwrap_or(-1);
+        
+        // Special handling for causal
+        let is_causal = if self.config.is_causal {
+            window_size_right = 0;
+            1
+        } else {
+            0
+        };
+        
+        // Adjust window sizes for local attention
+        if window_size_left < 0 && window_size_right >= 0 {
+            window_size_left = seq_len_kv as i32;
+        }
+        if window_size_left >= 0 && window_size_right < 0 {
+            window_size_right = seq_len_kv as i32;
+        }
+        
+        // Round dimensions for kernel efficiency
+        let head_size = round_multiple(head_dim, 8);
+        let head_size_rounded = round_multiple(head_size, 32);
+        let seqlen_q_rounded = round_multiple(seq_len_q, 128);
+        let seqlen_k_rounded = round_multiple(seq_len_kv, 128);
+        
+        // Allocate output and workspace
+        let out_shape = q.shape().clone();
+        let output = unsafe { self.device.alloc::<f16>(out_shape.elem_count())? };
+        let softmax_lse = self.device.alloc_zeros::<f32>(batch_size * 128 * num_heads * seq_len_q)?;
+        
+        // Handle alibi slopes if provided
+        let alibi_slopes_ptr = if let Some(alibi_slopes) = &self.config.alibi_slopes {
+            alibi_slopes.data()
+        } else {
+            std::ptr::null()
+        };
+        
+        // Get tensor strides
+        let q_strides = q.stride();
+        let k_strides = k.stride();
+        let v_strides = v.stride();
+        let o_strides = vec![seq_len_q * num_heads * head_dim, num_heads * head_dim, head_dim, 1];
+        
+        let is_bf16 = match q.dtype() {
+            DType::BF16 => 1,
+            DType::F16 => 0,
+            _ => return Err(FlameError::InvalidOperation("Flash attention only supports F16/BF16".into())),
+        };
+        
+        // Call the CUDA kernel
+        unsafe {
+            ffi::run_mha(
+                q.data() as *const c_void,
+                k.data() as *const c_void,
+                v.data() as *const c_void,
+                output.as_ptr() as *const c_void,
+                softmax_lse.as_ptr() as *const c_void,
+                alibi_slopes_ptr as *const c_void,
+                std::ptr::null(), // cu_seqlens_q_ptr
+                std::ptr::null(), // cu_seqlens_k_ptr
+                q_strides[0] as u32, // q_batch_stride
+                k_strides[0] as u32, // k_batch_stride
+                v_strides[0] as u32, // v_batch_stride
+                o_strides[0] as u32, // o_batch_stride
+                0, // alibi_slopes_batch_stride
+                q_strides[1] as u32, // q_row_stride
+                k_strides[1] as u32, // k_row_stride
+                v_strides[1] as u32, // v_row_stride
+                o_strides[1] as u32, // o_row_stride
+                q_strides[2] as u32, // q_head_stride
+                k_strides[2] as u32, // k_head_stride
+                v_strides[2] as u32, // v_head_stride
+                o_strides[2] as u32, // o_head_stride
+                batch_size as u32,
+                num_heads as u32,
+                num_heads_k as u32,
+                head_size as u32,
+                head_size_rounded as u32,
+                scale,
+                seq_len_q as u32,
+                seq_len_kv as u32,
+                seqlen_q_rounded as u32,
+                seqlen_k_rounded as u32,
+                is_bf16,
+                is_causal,
+                0, // unpadded_lse
+                window_size_left,
+                window_size_right,
+                self.config.softcap.unwrap_or(0.0),
+            );
+        }
+        
+        // Wrap output in a Tensor
+        Ok(crate::cuda_kernels::create_output_tensor(
+            output,
+            out_shape,
+            self.device.clone()
+        )?)
+    }
+    
+    /// Flash Attention forward with tiling (CPU implementation)
     fn flash_attention_forward(&self, q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
         // Implement the tiled Flash Attention algorithm
         // This is a simplified version - production would use optimized CUDA kernels
@@ -621,6 +741,69 @@ impl FlashAttentionV2 {
         // TODO: Implement v2 specific optimizations
         self.base.forward(q, k, v)
     }
+}
+
+/// Simple API for Flash Attention v2 layer.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `(batch, seq_len_q, num_heads, head_size)`.
+/// * `k` - Key tensor with shape `(batch, seq_len_kv, num_heads_kv, head_size)`.
+/// * `v` - Value tensor with shape `(batch, seq_len_kv, num_heads_kv, head_size)`.
+/// * `softmax_scale` - Scale factor for the softmax.
+/// * `causal` - Whether to apply causal masking.
+///
+/// The resulting tensor has dimensions `(batch, seq_len_q, num_heads, head_size)`.
+pub fn flash_attn(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    let device = q.device();
+    let config = FlashAttentionConfig {
+        is_causal: causal,
+        softmax_scale: Some(softmax_scale),
+        ..Default::default()
+    };
+    let flash_attn = FlashAttention::new(config, device);
+    flash_attn.forward(q, k, v)
+}
+
+/// Flash Attention with variable-length sequences.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `(total_q, num_heads, head_size)`.
+/// * `k` - Key tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `v` - Value tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `seqlens_q` - Cumulative sequence lengths for queries.
+/// * `seqlens_k` - Cumulative sequence lengths for keys/values.
+/// * `max_seqlen_q` - Maximum sequence length in queries.
+/// * `max_seqlen_k` - Maximum sequence length in keys/values.
+/// * `softmax_scale` - Scale factor for the softmax.
+/// * `causal` - Whether to apply causal masking.
+///
+/// The resulting tensor has dimensions `(total_q, num_heads, head_size)`.
+pub fn flash_attn_varlen(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seqlens_q: &Tensor,
+    seqlens_k: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    // For now, this falls back to the regular implementation
+    // TODO: Implement variable-length support with cu_seqlens
+    flash_attn(q, k, v, softmax_scale, causal)
 }
 
 #[cfg(test)]

@@ -986,6 +986,22 @@ extern "C" __global__ void slice_kernel(
         &*self.data
     }
     
+    /// Get the strides of this tensor
+    /// Assumes C-contiguous (row-major) layout
+    pub fn stride(&self) -> Vec<usize> {
+        let dims = self.shape.dims();
+        let ndim = dims.len();
+        if ndim == 0 {
+            return vec![];
+        }
+        
+        let mut strides = vec![1; ndim];
+        for i in (0..ndim - 1).rev() {
+            strides[i] = strides[i + 1] * dims[i + 1];
+        }
+        strides
+    }
+    
     
     /// Convert tensor to a Vec<f32> on CPU
     pub fn to_vec_f32(&self) -> Result<Vec<f32>> {

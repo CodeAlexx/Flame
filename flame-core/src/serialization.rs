@@ -393,3 +393,13 @@ impl Tensor {
         load_tensor(path, device, SerializationFormat::Binary)
     }
 }
+
+/// Load a safetensors file (convenience function)
+pub fn load_file<P: AsRef<Path>>(path: P, device: &Arc<CudaDevice>) -> Result<HashMap<String, Tensor>> {
+    load_tensors(path.as_ref(), device.clone(), SerializationFormat::SafeTensors)
+}
+
+/// Save a safetensors file (convenience function)  
+pub fn save_file<P: AsRef<Path>>(tensors: &HashMap<String, Tensor>, path: P) -> Result<()> {
+    save_tensors(tensors, path.as_ref(), SerializationFormat::SafeTensors)
+}
