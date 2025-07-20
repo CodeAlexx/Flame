@@ -734,6 +734,7 @@ extern "C" __global__ void slice_kernel(
         let result: Vec<f32> = data.iter().map(|&x| x.exp()).collect();
         Tensor::from_vec(result, self.shape.clone(), self.device.clone())
     }
+    
 
     /// Square all elements
     pub fn square(&self) -> Result<Tensor> {
@@ -1492,6 +1493,7 @@ extern "C" __global__ void slice_kernel(
         
         self.reshape(&new_dims)
     }
+    
 }
 
 /// Implementation of gradient access trait

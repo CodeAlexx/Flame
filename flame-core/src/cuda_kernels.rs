@@ -715,6 +715,109 @@ impl CudaKernels {
     pub fn ensure_kernel(_device: &CudaDevice, _kernel_name: &str, _kernel_code: &str) -> Result<()> {
         Ok(())
     }
+    
+    /// Element-wise division
+    pub fn div(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        if a.shape != b.shape {
+            return Err(FlameError::ShapeMismatch {
+                expected: a.shape.clone(),
+                got: b.shape.clone(),
+            });
+        }
+        
+        let data = a.to_vec()?;
+        let b_data = b.to_vec()?;
+        let result: Vec<f32> = data.iter()
+            .zip(b_data.iter())
+            .map(|(x, y)| x / y)
+            .collect();
+            
+        Tensor::from_vec(result, a.shape.clone(), a.device.clone())
+    }
+    
+    /// Max reduction along dimension
+    pub fn max_dim(&self, tensor: &Tensor, dim: usize, keepdim: bool) -> Result<Tensor> {
+        let dims = tensor.shape.dims();
+        if dim >= dims.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Dimension {} out of range for tensor with {} dimensions", dim, dims.len())
+            ));
+        }
+        
+        // For now, implement on CPU
+        let data = tensor.to_vec()?;
+        let mut output_shape = dims.to_vec();
+        
+        if keepdim {
+            output_shape[dim] = 1;
+        } else {
+            output_shape.remove(dim);
+        }
+        
+        // Calculate strides for dimension iteration
+        let mut strides = vec![1; dims.len()];
+        for i in (0..dims.len() - 1).rev() {
+            strides[i] = strides[i + 1] * dims[i + 1];
+        }
+        
+        let outer_size: usize = dims[..dim].iter().product();
+        let dim_size = dims[dim];
+        let inner_size: usize = dims[dim + 1..].iter().product();
+        
+        let mut result = Vec::new();
+        
+        for outer in 0..outer_size {
+            for inner in 0..inner_size {
+                let mut max_val = f32::NEG_INFINITY;
+                
+                for d in 0..dim_size {
+                    let idx = outer * dim_size * inner_size + d * inner_size + inner;
+                    max_val = max_val.max(data[idx]);
+                }
+                
+                result.push(max_val);
+            }
+        }
+        
+        Tensor::from_vec(result, Shape::from_dims(&output_shape), tensor.device.clone())
+    }
+    
+    /// Sum along dimension with keepdim
+    pub fn sum_dim_keepdim(&self, tensor: &Tensor, dim: usize) -> Result<Tensor> {
+        let dims = tensor.shape.dims();
+        if dim >= dims.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Dimension {} out of range for tensor with {} dimensions", dim, dims.len())
+            ));
+        }
+        
+        // For now, implement on CPU
+        let data = tensor.to_vec()?;
+        let mut output_shape = dims.to_vec();
+        output_shape[dim] = 1;
+        
+        // Calculate strides for dimension iteration
+        let outer_size: usize = dims[..dim].iter().product();
+        let dim_size = dims[dim];
+        let inner_size: usize = dims[dim + 1..].iter().product();
+        
+        let mut result = Vec::new();
+        
+        for outer in 0..outer_size {
+            for inner in 0..inner_size {
+                let mut sum = 0.0f32;
+                
+                for d in 0..dim_size {
+                    let idx = outer * dim_size * inner_size + d * inner_size + inner;
+                    sum += data[idx];
+                }
+                
+                result.push(sum);
+            }
+        }
+        
+        Tensor::from_vec(result, Shape::from_dims(&output_shape), tensor.device.clone())
+    }
 }
 
 /// Compile CUDA kernel from source to PTX

@@ -128,6 +128,24 @@ impl GpuOps {
         CudaKernels::broadcast(tensor, target_shape)
     }
     
+    /// Element-wise division
+    pub fn div(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&a.device)?;
+        kernels.div(a, b)
+    }
+    
+    /// Max reduction along dimension
+    pub fn max_dim(tensor: &Tensor, dim: usize, keepdim: bool) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&tensor.device)?;
+        kernels.max_dim(tensor, dim, keepdim)
+    }
+    
+    /// Sum along dimension with keepdim
+    pub fn sum_dim_keepdim(tensor: &Tensor, dim: usize) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&tensor.device)?;
+        kernels.sum_dim_keepdim(tensor, dim)
+    }
+    
     // Upsampling operations
     pub fn upsample2d_nearest(input: &Tensor, output_size: (usize, usize)) -> Result<Tensor> {
         let kernels = Self::get_kernels(&input.device)?;

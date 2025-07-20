@@ -21,6 +21,7 @@ pub enum Op {
     Add { lhs: TensorId, rhs: TensorId },
     Sub { lhs: TensorId, rhs: TensorId },
     Mul { lhs: TensorId, rhs: TensorId },
+    Div { lhs: TensorId, rhs: TensorId },
     MulScalar { input: TensorId, scalar: f32 },
     AddScalar { input: TensorId, scalar: f32 },
     MatMul { lhs: TensorId, rhs: TensorId },
@@ -41,6 +42,8 @@ pub enum Op {
     Permute { input: TensorId, dims: Vec<usize> },
     AddBias { input: TensorId, bias: TensorId },
     SumDim { input: TensorId, dim: usize },
+    SumDimKeepdim { input: TensorId, dim: usize },
+    MaxDim { input: TensorId, dim: usize, keepdim: bool },
     Clamp { input: TensorId, min: f32, max: f32 },
 }
 
@@ -508,6 +511,65 @@ fn compute_gradients(
                 *min, 
                 *max
             )?;
+            Ok(vec![(*input, grad)])
+        }
+        
+        Op::Div { lhs, rhs } => {
+            // d/dx (x/y) = 1/y
+            // d/dy (x/y) = -x/y^2
+            let lhs_tensor = &entry.saved_tensors[lhs];
+            let rhs_tensor = &entry.saved_tensors[rhs];
+            
+            // Gradient w.r.t. lhs: grad * (1/rhs)
+            let grad_lhs = output_grad.div(rhs_tensor)?;
+            
+            // Gradient w.r.t. rhs: grad * (-lhs/rhs^2)
+            let rhs_squared = rhs_tensor.square()?;
+            let neg_lhs = lhs_tensor.mul_scalar(-1.0)?;
+            let grad_rhs_term = neg_lhs.div(&rhs_squared)?;
+            let grad_rhs = output_grad.mul(&grad_rhs_term)?;
+            
+            Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
+        }
+        
+        Op::MaxDim { input, dim, keepdim } => {
+            // For max reduction, gradient flows only through the max elements
+            let input_tensor = &entry.saved_tensors[input];
+            
+            // Get the max values and indices
+            let max_vals = input_tensor.max_dim(*dim, *keepdim)?;
+            
+            // Create a mask where input equals max (handling broadcasting)
+            let max_broadcast = if *keepdim {
+                max_vals.clone()?
+            } else {
+                max_vals.unsqueeze(*dim)?
+            };
+            
+            // Create mask where input == max_broadcast
+            let mask = input_tensor.eq(&max_broadcast)?;
+            
+            // Broadcast gradient if needed
+            let grad_broadcast = if *keepdim {
+                output_grad.clone()?
+            } else {
+                output_grad.unsqueeze(*dim)?
+            };
+            
+            // Apply mask
+            let grad = grad_broadcast.mul(&mask)?;
+            
+            Ok(vec![(*input, grad)])
+        }
+        
+        Op::SumDimKeepdim { input, dim } => {
+            // For sum with keepdim, gradient is broadcast back
+            let input_tensor = &entry.saved_tensors[input];
+            let input_shape = input_tensor.shape();
+            
+            // Broadcast gradient back to input shape
+            let grad = output_grad.broadcast_to(input_shape)?;
+            
             Ok(vec![(*input, grad)])
         }
         
