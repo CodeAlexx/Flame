@@ -223,7 +223,33 @@ impl Tensor {
             offset_along_dim += tensor_shape[dim];
         }
         
-        Tensor::from_slice(&output_data, Shape::from_dims(&output_shape), device)
+        let mut output = Tensor::from_slice(&output_data, Shape::from_dims(&output_shape), device)?;
+        
+        // AUTOGRAD: Record operation if needed
+        let requires_grad = tensors.iter().any(|t| t.requires_grad);
+        if requires_grad {
+            output.requires_grad = true;
+            
+            let mut saved_tensors = Vec::new();
+            let mut input_ids = Vec::new();
+            
+            for tensor in tensors {
+                let id = tensor.id;
+                saved_tensors.push((id, (*tensor).clone()?));
+                input_ids.push(id);
+            }
+            
+            AutogradContext::record_op(
+                output.id,
+                Op::Cat { 
+                    inputs: input_ids,
+                    dim
+                },
+                saved_tensors
+            );
+        }
+        
+        Ok(output)
     }
     
     /// Index select along a dimension
@@ -823,6 +849,63 @@ impl Tensor {
         
         let data = self.to_vec()?;
         Ok(T::from(data[0]))
+    }
+    
+    /// Split tensor into multiple tensors along a dimension
+    pub fn split(&self, sizes: &[usize], dim: usize) -> Result<Vec<Tensor>> {
+        let shape = self.shape().dims();
+        if dim >= shape.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Dimension {} out of bounds for tensor with {} dimensions", dim, shape.len())
+            ));
+        }
+        
+        // Check sizes sum to dimension size
+        let total_size: usize = sizes.iter().sum();
+        if total_size != shape[dim] {
+            return Err(FlameError::InvalidOperation(
+                format!("Split sizes {:?} don't sum to dimension size {}", sizes, shape[dim])
+            ));
+        }
+        
+        let mut result = Vec::new();
+        let mut offset = 0;
+        
+        for &size in sizes {
+            // Create slice ranges
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            for (d, &dim_size) in shape.iter().enumerate() {
+                if d == dim {
+                    ranges.push((offset, offset + size));
+                } else {
+                    ranges.push((0, dim_size));
+                }
+            }
+            
+            let chunk = self.slice(&ranges)?;
+            result.push(chunk);
+            offset += size;
+        }
+        
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            for (i, tensor) in result.iter_mut().enumerate() {
+                tensor.requires_grad = true;
+                
+                // Record split operation for each output
+                AutogradContext::record_op(
+                    tensor.id,
+                    Op::Split { 
+                        input: self.id,
+                        sizes: sizes.to_vec(),
+                        dim
+                    },
+                    vec![(self.id, self.clone()?)]
+                );
+            }
+        }
+        
+        Ok(result)
     }
 }
 

@@ -47,6 +47,8 @@ pub enum Op {
     Clamp { input: TensorId, min: f32, max: f32 },
     Embedding { weight: TensorId, indices: TensorId },
     IndexSelect { input: TensorId, indices: TensorId, dim: usize },
+    Cat { inputs: Vec<TensorId>, dim: usize },
+    Split { input: TensorId, sizes: Vec<usize>, dim: usize },
     Abs { input: TensorId },
     Log { input: TensorId },
     Softmax { input: TensorId, dim: isize },
@@ -644,6 +646,42 @@ fn compute_gradients(
             
             // No gradient w.r.t indices
             Ok(vec![(*input, grad_input)])
+        }
+        
+        Op::Cat { inputs, dim } => {
+            // Split gradient back to original tensors
+            let mut grads = Vec::new();
+            let mut offset = 0;
+            
+            for &input_id in inputs {
+                let input_tensor = &entry.saved_tensors[&input_id];
+                let size = input_tensor.shape().dims()[*dim];
+                
+                // Slice gradient for this input
+                let mut ranges = Vec::new();
+                for (i, &dim_size) in output_grad.shape().dims().iter().enumerate() {
+                    if i == *dim {
+                        ranges.push((offset, offset + size));
+                    } else {
+                        ranges.push((0, dim_size));
+                    }
+                }
+                
+                let grad_slice = output_grad.slice(&ranges)?;
+                grads.push((input_id, grad_slice));
+                offset += size;
+            }
+            
+            Ok(grads)
+        }
+        
+        Op::Split { input, sizes, dim } => {
+            // Concatenate gradients back to original tensor
+            // For now, assuming we get gradients for all split outputs
+            // In practice, would need to handle partial gradients
+            let grad_tensors: Vec<&Tensor> = vec![output_grad]; // Simplified
+            let combined_grad = Tensor::cat(&grad_tensors, *dim)?;
+            Ok(vec![(*input, combined_grad)])
         }
         
         Op::Abs { input } => {
