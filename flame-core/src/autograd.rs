@@ -45,6 +45,7 @@ pub enum Op {
     SumDimKeepdim { input: TensorId, dim: usize },
     MaxDim { input: TensorId, dim: usize, keepdim: bool },
     Clamp { input: TensorId, min: f32, max: f32 },
+    Embedding { weight: TensorId, indices: TensorId },
 }
 
 /// Entry in the computation tape
@@ -571,6 +572,43 @@ fn compute_gradients(
             let grad = output_grad.broadcast_to(input_shape)?;
             
             Ok(vec![(*input, grad)])
+        }
+        
+        Op::Embedding { weight, indices } => {
+            // For embedding, gradient flows back to weight matrix
+            // Gradient w.r.t weight: scatter_add gradients to corresponding rows
+            let indices_tensor = &entry.saved_tensors[indices];
+            let weight_tensor = &entry.saved_tensors[weight];
+            
+            // Create zero gradient for weight
+            let mut weight_grad = Tensor::zeros(weight_tensor.shape().clone(), weight_tensor.device().clone())?;
+            
+            // Scatter add gradients
+            // This is a simplified implementation - a real one would use scatter_add kernel
+            let indices_data = indices_tensor.to_vec()?;
+            let grad_data = output_grad.to_vec()?;
+            let embedding_dim = weight_tensor.shape().dims()[1];
+            
+            let mut weight_grad_data = weight_grad.to_vec()?;
+            
+            for (i, &idx) in indices_data.iter().enumerate() {
+                let idx = idx as usize;
+                let grad_start = i * embedding_dim;
+                let weight_start = idx * embedding_dim;
+                
+                for j in 0..embedding_dim {
+                    weight_grad_data[weight_start + j] += grad_data[grad_start + j];
+                }
+            }
+            
+            let weight_grad = Tensor::from_vec(
+                weight_grad_data,
+                weight_tensor.shape().clone(),
+                weight_tensor.device().clone()
+            )?;
+            
+            // No gradient w.r.t indices (they're discrete)
+            Ok(vec![(*weight, weight_grad)])
         }
         
         _ => {

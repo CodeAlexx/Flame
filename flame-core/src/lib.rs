@@ -9,6 +9,7 @@ pub mod conv;
 pub mod cuda_conv2d;
 pub mod layer_norm;
 pub mod norm;
+pub mod embedding;
 pub mod cuda_kernels;
 pub mod cuda_kernel_sources;
 pub mod cuda_ops;
