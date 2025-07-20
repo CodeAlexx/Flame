@@ -74,18 +74,8 @@ impl AsRef<Tensor> for Tensor {
     }
 }
 
-impl Clone for Tensor {
-    fn clone(&self) -> Self {
-        // With Arc, cloning is cheap - just increment reference count
-        Self {
-            data: self.data.clone(),
-            shape: self.shape.clone(),
-            device: self.device.clone(),
-            id: TensorId::new(),  // New clone gets new ID
-            requires_grad: self.requires_grad,
-        }
-    }
-}
+// Note: We don't implement the standard Clone trait because we have a custom clone() method
+// that returns Result<Tensor> for consistency with other operations
 
 impl Tensor {
     /// Create a new tensor filled with zeros
@@ -259,8 +249,8 @@ impl Tensor {
                     rhs: other.id
                 },
                 vec![
-                    (self.id, Clone::clone(self)),
-                    (other.id, Clone::clone(other))
+                    (self.id, self.clone()?),
+                    (other.id, other.clone()?)
                 ]
             );
         }
@@ -394,8 +384,8 @@ extern "C" __global__ void copy_at_offset(
                     rhs: other.id
                 },
                 vec![
-                    (self.id, Clone::clone(self)),
-                    (other.id, Clone::clone(other))
+                    (self.id, self.clone()?),
+                    (other.id, other.clone()?)
                 ]
             );
         }
@@ -490,8 +480,8 @@ extern "C" __global__ void slice_kernel(
                     rhs: other.id
                 },
                 vec![
-                    (self.id, Clone::clone(self)),
-                    (other.id, Clone::clone(other))
+                    (self.id, self.clone()?),
+                    (other.id, other.clone()?)
                 ]
             );
         }
@@ -523,8 +513,8 @@ extern "C" __global__ void slice_kernel(
                     rhs: other.id
                 },
                 vec![
-                    (self.id, Clone::clone(self)),
-                    (other.id, Clone::clone(other))
+                    (self.id, self.clone()?),
+                    (other.id, other.clone()?)
                 ]
             );
         }
@@ -548,8 +538,8 @@ extern "C" __global__ void slice_kernel(
                     rhs: other.id
                 },
                 vec![
-                    (self.id, Clone::clone(self)),
-                    (other.id, Clone::clone(other))
+                    (self.id, self.clone()?),
+                    (other.id, other.clone()?)
                 ]
             );
         }
@@ -572,7 +562,7 @@ extern "C" __global__ void slice_kernel(
                     input: self.id,
                     scalar
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
             );
         }
         
@@ -599,7 +589,7 @@ extern "C" __global__ void slice_kernel(
                     input: self.id,
                     scalar
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
             );
         }
         
@@ -620,7 +610,7 @@ extern "C" __global__ void slice_kernel(
                 Op::ReLU { 
                     input: self.id
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
             );
         }
         
@@ -641,7 +631,7 @@ extern "C" __global__ void slice_kernel(
                 Op::GELU { 
                     input: self.id
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
             );
         }
         
@@ -662,7 +652,7 @@ extern "C" __global__ void slice_kernel(
                 Op::SiLU { 
                     input: self.id
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
             );
         }
         
@@ -683,7 +673,7 @@ extern "C" __global__ void slice_kernel(
                 Op::Tanh { 
                     input: self.id
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
             );
         }
         
@@ -704,7 +694,7 @@ extern "C" __global__ void slice_kernel(
                 Op::Sigmoid { 
                     input: self.id
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
             );
         }
         
@@ -737,6 +727,13 @@ extern "C" __global__ void slice_kernel(
         
         Tensor::from_vec(result, self.shape.clone(), self.device.clone())
     }
+    
+    /// Exponential function
+    pub fn exp(&self) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let result: Vec<f32> = data.iter().map(|&x| x.exp()).collect();
+        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+    }
 
     /// Square all elements
     pub fn square(&self) -> Result<Tensor> {
@@ -750,7 +747,7 @@ extern "C" __global__ void slice_kernel(
                 Op::Square { 
                     input: self.id
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
             );
         }
         
@@ -773,7 +770,7 @@ extern "C" __global__ void slice_kernel(
                     input: self.id,
                     input_shape: self.shape.clone()
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
             );
         }
         
@@ -795,7 +792,29 @@ extern "C" __global__ void slice_kernel(
                     input: self.id,
                     input_shape: self.shape.clone()
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
+            );
+        }
+        
+        Ok(output)
+    }
+    
+    /// Sum along specific dimensions
+    pub fn sum_dims(&self, dims: &[usize]) -> Result<Tensor> {
+        // Use CUDA kernel for GPU-accelerated sum reduction along dims
+        let mut output = GpuOps::sum_dims(self, dims)?;
+        
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            output.requires_grad = true;
+            
+            AutogradContext::record_op(
+                output.id,
+                Op::SumDim { 
+                    input: self.id,
+                    dim: dims[0] // For now, handle single dim - TODO: extend for multiple dims
+                },
+                vec![(self.id, self.clone()?)]
             );
         }
         
@@ -847,7 +866,7 @@ extern "C" __global__ void slice_kernel(
                     input: self.id,
                     dim
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
             );
         }
         
@@ -867,6 +886,11 @@ extern "C" __global__ void slice_kernel(
     /// Get tensor ID for gradient tracking
     pub fn id(&self) -> TensorId {
         self.id
+    }
+    
+    /// Check if this tensor requires gradients
+    pub fn requires_grad(&self) -> bool {
+        self.requires_grad
     }
 
     /// Copy to CPU
@@ -897,7 +921,7 @@ extern "C" __global__ void slice_kernel(
                 Op::Transpose { 
                     input: self.id
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
             );
         }
         
@@ -1068,7 +1092,7 @@ extern "C" __global__ void slice_kernel(
                 ));
             }
             if dims[d] != 1 {
-                return Ok(Clone::clone(self));
+                return Ok(self.clone()?);
             }
             dims.iter().enumerate()
                 .filter(|(i, _)| *i != d)
@@ -1149,7 +1173,7 @@ extern "C" __global__ void slice_kernel(
                     input: self.id,
                     dims: dims.to_vec()
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
             );
         }
         
@@ -1288,8 +1312,8 @@ extern "C" __global__ void slice_kernel(
                     bias: bias.id
                 },
                 vec![
-                    (self.id, Clone::clone(self)),
-                    (bias.id, Clone::clone(bias))
+                    (self.id, self.clone()?),
+                    (bias.id, bias.clone()?)
                 ]
             );
         }

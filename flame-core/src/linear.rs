@@ -79,7 +79,39 @@ impl Linear {
         // Reshape back to original batch dimensions
         let mut output_shape = input_shape[..input_shape.len() - 1].to_vec();
         output_shape.push(self.out_features);
-        output.reshape(&output_shape)
+        let output = output.reshape(&output_shape)?;
+        
+        // Record operation for autograd if needed
+        if input.requires_grad() || self.weight.requires_grad() {
+            use crate::autograd::{AutogradContext, Op};
+            
+            let mut saved = vec![
+                (input.id(), input.clone()?),
+                (self.weight.id(), self.weight.clone()?),
+            ];
+            
+            // Save bias if it exists and requires grad
+            let bias_id = if let Some(bias) = &self.bias {
+                if bias.requires_grad() {
+                    saved.push((bias.id(), bias.clone()?));
+                }
+                Some(bias.id())
+            } else {
+                None
+            };
+            
+            AutogradContext::record_op(
+                output.id(),
+                Op::Linear {
+                    input: input.id(),
+                    weight: self.weight.id(),
+                    bias: bias_id,
+                },
+                saved,
+            );
+        }
+        
+        Ok(output)
     }
     
     /// Get trainable parameters

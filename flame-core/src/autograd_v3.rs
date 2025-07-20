@@ -117,7 +117,8 @@ impl AutogradEngine {
         
         // Process tape in reverse - no mutation of self!
         for entry in self.tape.iter().rev() {
-            if let Some(output_grad) = gradients.get(entry.output_id).cloned() {
+            if let Some(output_grad) = gradients.get(entry.output_id) {
+                let output_grad = output_grad.clone()?;
                 // Compute input gradients - pure functions
                 let input_grads = self.compute_gradients(entry, &output_grad)?;
                 

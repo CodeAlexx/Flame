@@ -122,40 +122,15 @@ impl MultiHeadAttention {
     ) -> Result<Tensor> {
         // q: [batch, num_heads, q_seq_len, head_dim]
         // k, v: [batch, num_heads, kv_seq_len, head_dim]
-        let q_shape = q.shape().dims();
-        let k_shape = k.shape().dims();
-        let batch_size = q_shape[0];
-        let num_heads = q_shape[1];
-        let q_seq_len = q_shape[2];
-        let kv_seq_len = k_shape[2];
-        let head_dim = q_shape[3];
         
         // Compute attention scores: Q @ K^T / sqrt(d_k)
         // First transpose K: [batch, num_heads, head_dim, kv_seq_len]
-        let k_t = k.permute(&[0, 1, 3, 2])?;
+        let k_t = k.transpose_dims(2, 3)?;
         
-        // Batch matrix multiply for each head
-        let mut scores_data = Vec::new();
-        
-        for b in 0..batch_size {
-            for h in 0..num_heads {
-                // Extract head data
-                let q_head = self.extract_head(q, b, h, q_seq_len, head_dim)?;
-                let k_t_head = self.extract_head(&k_t, b, h, head_dim, kv_seq_len)?;
-                
-                // Compute scores for this head
-                let scores_head = q_head.matmul(&k_t_head)?;
-                let scores_head = scores_head.mul_scalar(1.0 / scale)?;
-                
-                scores_data.extend(scores_head.to_vec()?);
-            }
-        }
-        
-        let scores = Tensor::from_vec(
-            scores_data,
-            Shape::from_dims(&[batch_size, num_heads, q_seq_len, kv_seq_len]),
-            q.device.clone()
-        )?;
+        // Batch matrix multiply: [batch, num_heads, q_seq_len, head_dim] @ [batch, num_heads, head_dim, kv_seq_len]
+        // Result: [batch, num_heads, q_seq_len, kv_seq_len]
+        let scores = q.bmm(&k_t)?;
+        let scores = scores.mul_scalar(1.0 / scale)?;
         
         // Apply mask if provided
         let scores = if let Some(mask) = mask {
@@ -164,27 +139,17 @@ impl MultiHeadAttention {
             scores
         };
         
-        // Softmax
-        let attention = self.softmax(&scores, 3)?;
+        // Softmax along last dimension
+        let attention = scores.softmax(-1)?;
         
-        // Apply attention to values
-        let mut output_data = Vec::new();
+        // Apply attention to values: [batch, num_heads, q_seq_len, kv_seq_len] @ [batch, num_heads, kv_seq_len, head_dim]
+        // Result: [batch, num_heads, q_seq_len, head_dim]
+        let output = attention.bmm(v)?;
         
-        for b in 0..batch_size {
-            for h in 0..num_heads {
-                let attn_head = self.extract_head(&attention, b, h, q_seq_len, kv_seq_len)?;
-                let v_head = self.extract_head(v, b, h, kv_seq_len, head_dim)?;
-                
-                let output_head = attn_head.matmul(&v_head)?;
-                output_data.extend(output_head.to_vec()?);
-            }
-        }
+        // The backward pass will be handled by the individual operations
+        // (bmm, mul_scalar, softmax) which already record their gradients
         
-        Tensor::from_vec(
-            output_data,
-            Shape::from_dims(&[batch_size, num_heads, q_seq_len, head_dim]),
-            q.device.clone()
-        )
+        Ok(output)
     }
     
     /// Extract a single head from the attention tensor

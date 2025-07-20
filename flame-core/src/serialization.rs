@@ -256,8 +256,8 @@ fn save_tensor_safetensors(tensor: &Tensor, path: &Path) -> Result<()> {
 fn load_tensor_safetensors(path: &Path, device: Arc<CudaDevice>) -> Result<Tensor> {
     let tensors = load_tensors_safetensors(path, device)?;
     tensors.get("tensor")
-        .cloned()
-        .ok_or_else(|| FlameError::InvalidOperation("No 'tensor' key found".to_string()))
+        .ok_or_else(|| FlameError::InvalidOperation("No 'tensor' key found".to_string()))?
+        .clone()
 }
 
 fn save_tensors_safetensors<T: AsRef<Tensor>>(tensors: &HashMap<String, T>, path: &Path) -> Result<()> {

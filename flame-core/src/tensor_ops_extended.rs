@@ -347,12 +347,6 @@ impl Tensor {
         self.broadcast_to(&Shape::from_dims(new_shape))
     }
     
-    /// Compute exponential
-    pub fn exp(&self) -> Result<Tensor> {
-        let data = self.to_vec()?;
-        let output: Vec<f32> = data.iter().map(|x| x.exp()).collect();
-        Tensor::from_slice(&output, self.shape.clone(), self.device.clone())
-    }
     
     /// Compute natural logarithm
     pub fn log(&self) -> Result<Tensor> {
@@ -606,7 +600,7 @@ impl Tensor {
                     input: self.id, 
                     scalar: 1.0 / scalar 
                 },
-                vec![(self.id, Clone::clone(self))]
+                vec![(self.id, self.clone()?)]
             );
         }
         

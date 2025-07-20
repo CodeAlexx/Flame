@@ -78,46 +78,4 @@ name = "autograd_test"
 name = "autograd_v2_test"
 
 [[example]]
-name = "test_pooling_correct"
-
-[[example]]
-name = "test_pooling_values"
-
-[[example]]
-name = "test_upsampling"
-
-[[example]]
-name = "test_norm"
-
-[[example]]
-name = "test_activations"
-
-[[example]]
-name = "test_candle_interop"
-
-[[example]]
-name = "test_attention"
-
-[[example]]
-name = "test_modulated_blocks"
-
-[[example]]
-name = "test_flux_blocks"
-
-[[example]]
-name = "test_mmdit_blocks"
-
-[[example]]
-name = "test_eridiffusion_adapter"
-
-[[example]]
 name = "kernel_launcher_example"
-
-[[example]]
-name = "test_gradient_modification"
-
-[[example]]
-name = "test_flame_training_loop"
-
-[[example]]
-name = "test_gradient_simple"

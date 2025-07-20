@@ -45,7 +45,6 @@ pub enum Op {
 }
 
 /// Entry in the computation tape
-#[derive(Clone)]
 struct TapeEntry {
     /// Output tensor ID
     output_id: TensorId,
@@ -140,35 +139,40 @@ impl AutogradContext {
             ));
         }
         
-        // Get tape and device before disabling autograd
-        let tape = {
-            let ctx = AUTOGRAD_CONTEXT.lock().unwrap();
-            ctx.tape.clone()
-        };
         let device = loss.device.clone();
-        
-        // Disable autograd during backward pass to prevent recording gradient operations
-        Self::set_enabled(false);
         
         // Initialize gradient storage
         let mut gradients = GradientMap::new(device.clone());
         gradients.set_ones(loss.id, loss.shape.clone())?;
         
-        // Process tape in reverse
-        for entry in tape.iter().rev() {
-            if let Some(output_grad) = gradients.get(entry.output_id).cloned() {
-                // Compute input gradients
-                let input_grads = compute_gradients(&entry, &output_grad, &device)?;
-                
-                // Accumulate gradients
-                for (tensor_id, grad) in input_grads {
-                    gradients.accumulate(tensor_id, grad)?;
+        // Process tape in reverse under lock
+        {
+            let mut ctx = AUTOGRAD_CONTEXT.lock().unwrap();
+            
+            // Disable autograd during backward pass
+            let prev_enabled = ctx.enabled;
+            ctx.enabled = false;
+            
+            // Process tape in reverse
+            for entry in ctx.tape.iter().rev() {
+                if let Some(output_grad) = gradients.get(entry.output_id) {
+                    let output_grad = output_grad.clone()?;
+                    // Compute input gradients
+                    let input_grads = compute_gradients(&entry, &output_grad, &device)?;
+                    
+                    // Accumulate gradients
+                    for (tensor_id, grad) in input_grads {
+                        gradients.accumulate(tensor_id, grad)?;
+                    }
                 }
             }
+            
+            // Re-enable autograd
+            ctx.enabled = prev_enabled;
+            
+            // Clear tape after backward pass
+            ctx.tape.clear();
         }
-        
-        // Re-enable autograd
-        Self::set_enabled(true);
         
         Ok(gradients)
     }
@@ -358,7 +362,21 @@ fn compute_gradients(
                 (*weight, grad_weight),
             ];
             
-            // TODO: Handle bias gradient if present
+            // Handle bias gradient if present
+            if let Some(grad_bias) = grad_bias {
+                // Check if bias was saved in the tape entry
+                // The bias would be the third saved tensor if it exists
+                if entry.saved_tensors.len() > 2 {
+                    // Get the bias tensor ID from the saved tensors
+                    let bias_id = entry.saved_tensors.keys()
+                        .find(|&&id| id != *input && id != *weight)
+                        .copied();
+                    
+                    if let Some(bias_id) = bias_id {
+                        grads.push((bias_id, grad_bias));
+                    }
+                }
+            }
             
             Ok(grads)
         }

@@ -88,7 +88,7 @@ impl Conv2d {
         let fan_out = (config.out_channels / config.groups) * kh * kw;
         let std = (2.0 / (fan_in + fan_out) as f32).sqrt();
         
-        let weight = Tensor::randn(weight_shape, 0.0, std, device.clone())?;
+        let weight = Tensor::randn(weight_shape, 0.0, std, device.clone())?.requires_grad_(true);
         
         Ok(Self {
             weight,
@@ -112,10 +112,10 @@ impl Conv2d {
         let fan_out = (config.out_channels / config.groups) * kh * kw;
         let std = (2.0 / (fan_in + fan_out) as f32).sqrt();
         
-        let weight = Tensor::randn(weight_shape, 0.0, std, device.clone())?;
+        let weight = Tensor::randn(weight_shape, 0.0, std, device.clone())?.requires_grad_(true);
         
         let bias = if bias {
-            Some(Tensor::zeros(Shape::from_dims(&[config.out_channels]), device)?)
+            Some(Tensor::zeros(Shape::from_dims(&[config.out_channels]), device)?.requires_grad_(true))
         } else {
             None
         };
@@ -174,11 +174,46 @@ impl Conv2d {
         let output = self.conv2d_im2col(input, output_shape)?;
         
         // Add bias if present
-        if let Some(bias) = &self.bias {
-            self.add_bias(&output, bias)
+        let mut output = if let Some(bias) = &self.bias {
+            self.add_bias(&output, bias)?
         } else {
-            Ok(output)
+            output
+        };
+        
+        // Record operation for autograd if needed
+        if input.requires_grad() || self.weight.requires_grad() {
+            use crate::autograd::{AutogradContext, Op};
+            
+            output.requires_grad = true;
+            
+            let mut saved = vec![
+                (input.id(), input.clone()?),
+                (self.weight.id(), self.weight.clone()?),
+            ];
+            
+            // Save bias if it exists and requires grad
+            let bias_id = if let Some(bias) = &self.bias {
+                if bias.requires_grad() {
+                    saved.push((bias.id(), bias.clone()?));
+                }
+                Some(bias.id())
+            } else {
+                None
+            };
+            
+            AutogradContext::record_op(
+                output.id(),
+                Op::Conv2d {
+                    input: input.id(),
+                    weight: self.weight.id(),
+                    stride: self.config.stride.0,
+                    padding: self.config.padding.0,
+                },
+                saved,
+            );
         }
+        
+        Ok(output)
     }
     
     /// Convolution using im2col algorithm

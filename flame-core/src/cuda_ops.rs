@@ -87,6 +87,12 @@ impl GpuOps {
         kernels.sum(tensor)
     }
     
+    /// Sum reduction along specific dimensions
+    pub fn sum_dims(tensor: &Tensor, dims: &[usize]) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&tensor.device)?;
+        kernels.sum_dims(tensor, dims)
+    }
+    
     /// Transpose
     pub fn transpose(tensor: &Tensor) -> Result<Tensor> {
         let kernels = Self::get_kernels(&tensor.device)?;

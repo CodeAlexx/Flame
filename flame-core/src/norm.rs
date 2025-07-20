@@ -999,7 +999,10 @@ impl RMSNorm1d {
             normalized_shape: vec![self.normalized_shape],
             eps: self.eps,
             elementwise_affine: self.weight.is_some(),
-            weight: self.weight.clone(),
+            weight: match &self.weight {
+                Some(w) => Some(w.clone()?),
+                None => None,
+            },
         };
         
         rms_norm.forward(input)

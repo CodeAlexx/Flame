@@ -260,7 +260,7 @@ impl FeedForward {
     }
     
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mut h = Clone::clone(x);
+        let mut h = x.clone()?;
         for module in &self.net {
             let h_new = module.forward(&h)?;
             h = h_new;
@@ -365,7 +365,7 @@ impl SDXLDownBlock {
         temb: &Tensor,
         context: Option<&Tensor>,
     ) -> Result<(Tensor, Vec<Tensor>)> {
-        let mut h = Clone::clone(x);
+        let mut h = x.clone()?;
         let mut outputs = Vec::new();
         
         for (resnet, attention) in self.resnets.iter().zip(&self.attentions) {
@@ -377,13 +377,13 @@ impl SDXLDownBlock {
                 h = h_attn;
             }
             
-            outputs.push(Clone::clone(&h));
+            outputs.push(h.clone()?);
         }
         
         if let Some(Some(ref downsampler)) = self.downsamplers.get(0) {
             let h_down = downsampler.forward(&h)?;
             h = h_down;
-            outputs.push(Clone::clone(&h));
+            outputs.push(h.clone()?);
         }
         
         Ok((h, outputs))

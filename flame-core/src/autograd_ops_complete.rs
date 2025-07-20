@@ -407,18 +407,6 @@ impl Tensor {
         }
     }
     
-    /// Sum along multiple dimensions
-    pub fn sum_dims(&self, dims: &[usize]) -> Result<Tensor> {
-        let mut result = self.clone()?;
-        let mut sorted_dims = dims.to_vec();
-        sorted_dims.sort_by(|a, b| b.cmp(a)); // Sort in descending order
-        
-        for &dim in &sorted_dims {
-            result = result.sum_dim(dim)?;
-        }
-        
-        Ok(result)
-    }
     
     /// Sum along dimension keeping the dimension
     pub fn sum_keepdim(&self, dim: isize) -> Result<Tensor> {

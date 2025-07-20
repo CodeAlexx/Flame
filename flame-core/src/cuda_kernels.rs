@@ -346,6 +346,92 @@ impl CudaKernels {
         })
     }
     
+    /// Sum reduction along specific dimensions
+    pub fn sum_dims(&self, tensor: &Tensor, dims: &[usize]) -> Result<Tensor> {
+        // Calculate output shape
+        let mut output_shape = tensor.shape().dims().to_vec();
+        for &dim in dims {
+            output_shape[dim] = 1;
+        }
+        
+        // For now, implement a simple version that handles the common case
+        // of summing along batch dimensions for bias gradients
+        if dims.is_empty() {
+            return self.sum(tensor);
+        }
+        
+        // Calculate strides and sizes
+        let input_shape = tensor.shape().dims();
+        let ndims = input_shape.len();
+        let mut strides = vec![1; ndims];
+        for i in (0..ndims-1).rev() {
+            strides[i] = strides[i+1] * input_shape[i+1];
+        }
+        
+        // Total output elements
+        let output_elems: usize = output_shape.iter().product();
+        let mut output = Tensor::zeros(Shape::from_dims(&output_shape), tensor.device.clone())?;
+        
+        // For now, use a simple CPU implementation and copy to GPU
+        // TODO: Implement proper GPU kernel for multi-dimensional reduction
+        let input_data = tensor.to_vec()?;
+        let mut output_data = vec![0.0f32; output_elems];
+        
+        // Iterate over output positions
+        for out_idx in 0..output_elems {
+            // Convert output index to multi-dimensional position
+            let mut out_pos = vec![0; ndims];
+            let mut idx = out_idx;
+            for i in (0..ndims).rev() {
+                out_pos[i] = idx % output_shape[i];
+                idx /= output_shape[i];
+            }
+            
+            // Sum over all positions that map to this output position
+            let mut sum = 0.0f32;
+            let mut count = 0;
+            
+            // Create iterator over dimensions to sum
+            let mut pos = vec![0; ndims];
+            loop {
+                // Copy fixed dimensions from output position
+                for i in 0..ndims {
+                    if !dims.contains(&i) {
+                        pos[i] = out_pos[i];
+                    }
+                }
+                
+                // Calculate linear index
+                let lin_idx: usize = pos.iter().zip(&strides).map(|(p, s)| p * s).sum();
+                sum += input_data[lin_idx];
+                count += 1;
+                
+                // Increment position over dimensions we're summing
+                let mut carry = true;
+                for &dim in dims {
+                    if carry {
+                        pos[dim] += 1;
+                        if pos[dim] < input_shape[dim] {
+                            carry = false;
+                        } else {
+                            pos[dim] = 0;
+                        }
+                    }
+                }
+                
+                if carry {
+                    break;
+                }
+            }
+            
+            output_data[out_idx] = sum;
+        }
+        
+        // Copy result back to GPU
+        output.set_data(&output_data)?;
+        Ok(output)
+    }
+    
     /// Transpose kernel for 2D matrices  
     pub fn transpose(&self, tensor: &Tensor) -> Result<Tensor> {
         let dims = tensor.shape().dims();
@@ -390,7 +476,7 @@ impl CudaKernels {
             });
         }
         
-        let output: Tensor = Clone::clone(weights);
+        let output = weights.clone()?;
         let n = weights.shape.elem_count();
         
         let kernel = self.kernels.get("update_weights_kernel")
@@ -590,7 +676,7 @@ impl CudaKernels {
         // For now, simplified broadcast that requires compatible shapes
         // Full broadcasting with PTX would be complex
         if input.shape == *target_shape {
-            return Ok(Clone::clone(input));
+            return Ok(input.clone()?);
         }
         
         // Check if it's a simple broadcast case (e.g., [1, C] -> [B, C])
