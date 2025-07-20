@@ -47,6 +47,7 @@ pub mod tensor_ops_extended;
 pub mod lora;
 pub mod sdxl_attention;
 pub mod sdxl_unet_blocks;
+pub mod loss;
 
 pub use dtype::DType;
 pub use error::{FlameError, Result};

@@ -3,6 +3,7 @@
 
 use crate::{Tensor, Shape, Result, FlameError};
 use crate::autograd::{AutogradContext, Op};
+use crate::cuda_ops::GpuOps;
 use std::sync::Arc;
 use cudarc::driver::CudaDevice;
 
@@ -654,12 +655,143 @@ impl Tensor {
     }
     
     /// Convert to different dtype (for now just f32 -> f32)
-    pub fn to_dtype(&self, dtype: flame_core::DType) -> Result<Tensor> {
+    pub fn to_dtype(&self, dtype: crate::DType) -> Result<Tensor> {
         // For now, we only support f32
         match dtype {
-            flame_core::DType::F32 => Ok(self.clone()?),
+            crate::DType::F32 => Ok(self.clone()?),
             _ => Err(FlameError::InvalidOperation("Only F32 dtype is currently supported".into())),
         }
+    }
+    
+    /// Compute sign of elements (-1, 0, or 1)
+    pub fn sign(&self) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let sign_data: Vec<f32> = data.iter()
+            .map(|&x| {
+                if x > 0.0 { 1.0 }
+                else if x < 0.0 { -1.0 }
+                else { 0.0 }
+            })
+            .collect();
+        
+        Tensor::from_vec(sign_data, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Element-wise less than or equal comparison
+    pub fn le(&self, other: &Tensor) -> Result<Tensor> {
+        if self.shape != other.shape {
+            return Err(FlameError::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: other.shape.clone(),
+            });
+        }
+        
+        let self_data = self.to_vec()?;
+        let other_data = other.to_vec()?;
+        
+        let result: Vec<f32> = self_data.iter()
+            .zip(other_data.iter())
+            .map(|(a, b)| if a <= b { 1.0 } else { 0.0 })
+            .collect();
+        
+        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Conditional selection based on mask
+    pub fn where_tensor(&self, true_tensor: &Tensor, false_tensor: &Tensor) -> Result<Tensor> {
+        if self.shape != true_tensor.shape || self.shape != false_tensor.shape {
+            return Err(FlameError::InvalidOperation(
+                "All tensors must have the same shape for where operation".into()
+            ));
+        }
+        
+        let mask_data = self.to_vec()?;
+        let true_data = true_tensor.to_vec()?;
+        let false_data = false_tensor.to_vec()?;
+        
+        let result: Vec<f32> = mask_data.iter()
+            .zip(true_data.iter())
+            .zip(false_data.iter())
+            .map(|((&m, &t), &f)| if m > 0.0 { t } else { f })
+            .collect();
+        
+        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Log softmax along a dimension
+    pub fn log_softmax(&self, dim: isize) -> Result<Tensor> {
+        // Compute softmax first, then take log
+        let softmax = self.softmax(dim)?;
+        softmax.log()
+    }
+    
+    /// Get data as 1D vector of i64
+    pub fn to_vec1<T: From<f32>>(&self) -> Result<Vec<T>> {
+        let data = self.to_vec()?;
+        Ok(data.into_iter().map(|x| T::from(x)).collect())
+    }
+    
+    /// Get data as 2D vector
+    pub fn to_vec2<T: From<f32>>(&self) -> Result<Vec<Vec<T>>> {
+        if self.shape.dims().len() != 2 {
+            return Err(FlameError::InvalidOperation(
+                format!("to_vec2 requires 2D tensor, got {:?}", self.shape.dims())
+            ));
+        }
+        
+        let data = self.to_vec()?;
+        let rows = self.shape.dims()[0];
+        let cols = self.shape.dims()[1];
+        
+        let mut result = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let row: Vec<T> = data[i * cols..(i + 1) * cols]
+                .iter()
+                .map(|&x| T::from(x))
+                .collect();
+            result.push(row);
+        }
+        
+        Ok(result)
+    }
+    
+    /// Create tensor from 2D vector
+    pub fn from_vec2<T: Into<f32> + Copy>(data: Vec<Vec<T>>, device: Arc<CudaDevice>) -> Result<Tensor> {
+        let rows = data.len();
+        if rows == 0 {
+            return Err(FlameError::InvalidOperation("Empty 2D vector".into()));
+        }
+        
+        let cols = data[0].len();
+        let mut flat_data = Vec::with_capacity(rows * cols);
+        
+        for row in data {
+            if row.len() != cols {
+                return Err(FlameError::InvalidOperation("Inconsistent row lengths".into()));
+            }
+            for val in row {
+                flat_data.push(val.into());
+            }
+        }
+        
+        Tensor::from_vec(flat_data, vec![rows, cols], device)
+    }
+    
+    /// Create scalar tensor
+    pub fn from_scalar(value: f32, device: Arc<CudaDevice>) -> Result<Tensor> {
+        Tensor::from_vec(vec![value], vec![1], device)
+    }
+    
+    /// Get scalar value from tensor
+    pub fn to_scalar<T: From<f32>>(&self) -> Result<T> {
+        if self.shape.elem_count() != 1 {
+            return Err(FlameError::InvalidOperation(
+                format!("to_scalar requires scalar tensor, got shape {:?}", self.shape.dims())
+            ));
+        }
+        
+        let data = self.to_vec()?;
+        Ok(T::from(data[0]))
     }
 }
 
@@ -692,15 +824,4 @@ fn broadcast_shapes(shape1: &[usize], shape2: &[usize]) -> Result<Vec<usize>> {
     Ok(result)
 }
 
-/// Data type enum
-pub mod flame_core {
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub enum DType {
-        F32,
-        F16,
-        BF16,
-        I32,
-        I64,
-    }
-}
 // Note: softmax, unsqueeze, full_like, and gelu are already implemented in tensor.rs

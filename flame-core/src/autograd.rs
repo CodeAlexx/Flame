@@ -46,6 +46,13 @@ pub enum Op {
     MaxDim { input: TensorId, dim: usize, keepdim: bool },
     Clamp { input: TensorId, min: f32, max: f32 },
     Embedding { weight: TensorId, indices: TensorId },
+    Abs { input: TensorId },
+    Log { input: TensorId },
+    MSELoss { predictions: TensorId, targets: TensorId, num_elements: usize },
+    L1Loss { predictions: TensorId, targets: TensorId, num_elements: usize },
+    HuberLoss { predictions: TensorId, targets: TensorId, delta: f32, num_elements: usize },
+    BCELoss { predictions: TensorId, targets: TensorId, num_elements: usize },
+    NLLLoss { log_probs: TensorId, targets: TensorId, batch_size: usize },
 }
 
 /// Entry in the computation tape
@@ -609,6 +616,137 @@ fn compute_gradients(
             
             // No gradient w.r.t indices (they're discrete)
             Ok(vec![(*weight, weight_grad)])
+        }
+        
+        Op::Abs { input } => {
+            // d/dx |x| = sign(x) 
+            let input_tensor = &entry.saved_tensors[input];
+            let sign = input_tensor.sign()?;
+            let grad = output_grad.mul(&sign)?;
+            Ok(vec![(*input, grad)])
+        }
+        
+        Op::Log { input } => {
+            // d/dx log(x) = 1/x
+            let input_tensor = &entry.saved_tensors[input];
+            let reciprocal = Tensor::ones(input_tensor.shape().clone(), input_tensor.device().clone())?
+                .div(input_tensor)?;
+            let grad = output_grad.mul(&reciprocal)?;
+            Ok(vec![(*input, grad)])
+        }
+        
+        Op::MSELoss { predictions, targets, num_elements } => {
+            // For MSE: d/dx[(x-y)^2] = 2(x-y)/n
+            let predictions_tensor = &entry.saved_tensors[predictions];
+            let targets_tensor = &entry.saved_tensors[targets];
+            
+            // Gradient is 2 * (predictions - targets) / num_elements
+            let diff = predictions_tensor.sub(targets_tensor)?;
+            let scale = 2.0 / (*num_elements as f32);
+            let grad_predictions = output_grad.mul_scalar(scale)?.mul(&diff)?;
+            let grad_targets = grad_predictions.mul_scalar(-1.0)?;
+            
+            Ok(vec![
+                (*predictions, grad_predictions),
+                (*targets, grad_targets),
+            ])
+        }
+        
+        Op::L1Loss { predictions, targets, num_elements } => {
+            // For L1: d/dx|x-y| = sign(x-y)/n
+            let predictions_tensor = &entry.saved_tensors[predictions];
+            let targets_tensor = &entry.saved_tensors[targets];
+            
+            let diff = predictions_tensor.sub(targets_tensor)?;
+            let sign = diff.sign()?;
+            let scale = 1.0 / (*num_elements as f32);
+            let grad_predictions = output_grad.mul_scalar(scale)?.mul(&sign)?;
+            let grad_targets = grad_predictions.mul_scalar(-1.0)?;
+            
+            Ok(vec![
+                (*predictions, grad_predictions),
+                (*targets, grad_targets),
+            ])
+        }
+        
+        Op::HuberLoss { predictions, targets, delta, num_elements } => {
+            // Huber gradient: 
+            // if |x-y| <= delta: (x-y)/n
+            // if |x-y| > delta: delta*sign(x-y)/n
+            let predictions_tensor = &entry.saved_tensors[predictions];
+            let targets_tensor = &entry.saved_tensors[targets];
+            
+            let diff = predictions_tensor.sub(targets_tensor)?;
+            let abs_diff = diff.abs()?;
+            let delta_tensor = Tensor::full(*delta, diff.shape().clone(), diff.device().clone())?;
+            
+            // Create mask for |diff| <= delta
+            let mask = abs_diff.le(&delta_tensor)?;
+            
+            // Quadratic gradient: diff
+            let quad_grad = diff.clone()?;
+            
+            // Linear gradient: delta * sign(diff)
+            let linear_grad = diff.sign()?.mul_scalar(*delta)?;
+            
+            // Combine using mask
+            let combined_grad = mask.where_tensor(&quad_grad, &linear_grad)?;
+            
+            let scale = 1.0 / (*num_elements as f32);
+            let grad_predictions = output_grad.mul_scalar(scale)?.mul(&combined_grad)?;
+            let grad_targets = grad_predictions.mul_scalar(-1.0)?;
+            
+            Ok(vec![
+                (*predictions, grad_predictions),
+                (*targets, grad_targets),
+            ])
+        }
+        
+        Op::BCELoss { predictions, targets, num_elements } => {
+            // BCE gradient: d/dp[-y*log(p) - (1-y)*log(1-p)] = (p-y)/(p(1-p))/n
+            let predictions_tensor = &entry.saved_tensors[predictions];
+            let targets_tensor = &entry.saved_tensors[targets];
+            
+            // Clamp predictions to avoid division by zero
+            let eps = 1e-7;
+            let pred_clamped = predictions_tensor.clamp(eps, 1.0 - eps)?;
+            
+            // Compute (predictions - targets) / (predictions * (1 - predictions))
+            let numerator = pred_clamped.sub(targets_tensor)?;
+            let one_minus_pred = pred_clamped.neg()?.add_scalar(1.0)?;
+            let denominator = pred_clamped.mul(&one_minus_pred)?;
+            
+            let grad_base = numerator.div(&denominator)?;
+            let scale = 1.0 / (*num_elements as f32);
+            let grad_predictions = output_grad.mul_scalar(scale)?.mul(&grad_base)?;
+            
+            // No gradient w.r.t targets for BCE
+            Ok(vec![(*predictions, grad_predictions)])
+        }
+        
+        Op::NLLLoss { log_probs, targets, batch_size } => {
+            // NLL gradient: sparse gradient, -1/batch_size at target indices
+            let log_probs_tensor = &entry.saved_tensors[log_probs];
+            let targets_tensor = &entry.saved_tensors[targets];
+            
+            // Create zero gradient tensor
+            let mut grad_log_probs = Tensor::zeros(log_probs_tensor.shape().clone(), log_probs_tensor.device().clone())?;
+            
+            // Set gradients at target indices
+            let target_data = targets_tensor.to_vec()?;
+            let target_indices: Vec<i64> = target_data.iter().map(|&x| x as i64).collect();
+            let scale = -1.0 / (*batch_size as f32);
+            
+            // This is simplified - real implementation would use scatter operation
+            let mut grad_data = grad_log_probs.to_vec2::<f32>()?;
+            for (i, &target) in target_indices.iter().enumerate() {
+                grad_data[i][target as usize] = scale;
+            }
+            
+            let grad_log_probs = Tensor::from_vec2(grad_data, log_probs_tensor.device().clone())?;
+            let final_grad = output_grad.mul(&grad_log_probs)?;
+            
+            Ok(vec![(*log_probs, final_grad)])
         }
         
         _ => {
