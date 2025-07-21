@@ -1,317 +1,695 @@
-# Autograd Remaining Operations Fix Agent
+# Direct EriDiffusion → FLAME Migration Agents
 
-**Context**: Deadlock issue is SOLVED! The pattern is proven: use GpuOps directly in compute_gradients to avoid re-acquiring autograd lock.
+**Mission**: Replace ALL Candle dependencies with direct FLAME usage. NO compatibility layers, NO wrappers, NO abstraction overhead.
 
-**Mission**: Fix all remaining operations (matmul, conv2d, etc.) to use low-level GpuOps during backward pass, following the successful pattern.
+**Architecture Rule**: Clean direct migration - EriDiffusion talks directly to FLAME.
 
-## Agent: Operation Backward Pass Fixer
+## Agent 1: Candle Purge Agent
+**Mission**: Find and eliminate every single Candle dependency
 
-### 1. Apply the Proven Pattern to All Operations
+### 1. Complete Candle Elimination
 
-#### Update MatMul Backward
-```rust
-// In compute_gradients function
-Op::MatMul { lhs, rhs } => {
-    let output_grad = grads.get(&op.output_id).unwrap();
+#### Remove All Candle Imports
+```bash
+# Find every Candle reference and kill it
+cd eridiffusion/
+
+# Search and destroy all Candle imports
+find src/ -name "*.rs" -exec grep -l "candle" {} \; | while read file; do
+    echo "Processing: $file"
     
-    // OLD - CAUSES DEADLOCK:
-    // let grad_lhs = output_grad.matmul(&rhs.transpose(-1, -2)?)?;
+    # Remove Candle imports
+    sed -i '/use candle/d' "$file"
+    sed -i '/candle::/d' "$file"
+    sed -i '/candle_/d' "$file"
     
-    // NEW - USE GPU_OPS DIRECTLY:
-    let rhs_t = gpu_ops::transpose(rhs, -1, -2)?;
-    let grad_lhs = gpu_ops::matmul(output_grad, &rhs_t)?;
-    
-    let lhs_t = gpu_ops::transpose(lhs, -1, -2)?;  
-    let grad_rhs = gpu_ops::matmul(&lhs_t, output_grad)?;
-    
-    vec![
-        (lhs.id(), grad_lhs),
-        (rhs.id(), grad_rhs),
-    ]
-}
+    echo "Cleaned: $file"
+done
+
+# Remove Candle from Cargo.toml
+sed -i '/candle/d' Cargo.toml
 ```
 
-#### Update Conv2D Backward
+#### Replace With Direct FLAME Imports
 ```rust
-Op::Conv2d { input, weight, bias, stride, padding, .. } => {
-    let output_grad = grads.get(&op.output_id).unwrap();
-    
-    // Use direct GPU operations, not tensor methods
-    let grad_input = gpu_ops::conv2d_backward_input(
-        output_grad,
-        weight,
-        input.shape(),
-        *stride,
-        *padding
-    )?;
-    
-    let grad_weight = gpu_ops::conv2d_backward_weight(
-        input,
-        output_grad,
-        weight.shape(),
-        *stride,
-        *padding
-    )?;
-    
-    let mut grads = vec![
-        (input.id(), grad_input),
-        (weight.id(), grad_weight),
-    ];
-    
-    if let Some(bias) = bias {
-        // Use gpu_ops for bias gradient too
-        let grad_bias = gpu_ops::sum_dims(output_grad, &[0, 2, 3])?;
-        grads.push((bias.id(), grad_bias));
+// In EVERY file that used Candle, add:
+use flame::{Tensor, Device, DType, Result};
+use flame::nn::{Conv2d, Linear, LayerNorm, GroupNorm};
+use flame::optim::{Adam, AdamW, SGD};
+
+// NO candle_compat
+// NO compatibility layers  
+// NO wrappers
+// ONLY direct FLAME usage
+```
+
+#### Verify Complete Removal
+```bash
+# These should return ZERO results:
+grep -r "candle" src/ --include="*.rs" | wc -l
+grep -r "VarBuilder" src/ --include="*.rs" | wc -l
+grep -r "candle_" Cargo.toml | wc -l
+
+# If any results found, eliminate them
+```
+
+### Agent 1 Success Criteria
+- [ ] Zero Candle imports in any .rs file
+- [ ] Zero Candle dependencies in Cargo.toml
+- [ ] All files have FLAME imports instead
+- [ ] Complete Candle purge verified
+
+---
+
+## Agent 2: Core API Replacement Agent
+**Mission**: Replace Candle APIs with direct FLAME equivalents
+
+### 1. Tensor Operations Direct Replacement
+
+#### Basic Tensor Creation
+```rust
+// Replace ALL instances of Candle tensor creation:
+
+// OLD Candle API:
+let tensor = Tensor::zeros(&shape, DType::F32, &device)?;
+let tensor = Tensor::ones(&shape, DType::F32, &device)?;
+let tensor = Tensor::randn(&shape, DType::F32, &device)?;
+
+// NEW Direct FLAME API:
+let tensor = Tensor::zeros(&shape, device)?;
+let tensor = Tensor::ones(&shape, device)?;
+let tensor = Tensor::randn(&shape, device)?;
+```
+
+#### Tensor Operations
+```rust
+// Replace ALL tensor operations:
+
+// OLD Candle:
+tensor.to_device(&device)?
+tensor.to_dtype(DType::F16)?
+tensor.broadcast_as(&other_shape)?
+
+// NEW Direct FLAME:
+tensor.to(device)?
+tensor.to_dtype(DType::F16)?
+tensor.broadcast_to(&other_shape)?
+```
+
+#### Arithmetic Operations
+```rust
+// Ensure these work with FLAME tensors:
+let result = &tensor1 + &tensor2;
+let result = &tensor1 * &tensor2;
+let result = &tensor1 - &tensor2;
+let result = &tensor1 / &tensor2;
+
+// Matrix operations:
+let result = tensor1.matmul(&tensor2)?;
+let result = tensor.transpose(-1, -2)?;
+```
+
+### 2. Model Loading Direct Replacement
+
+#### Eliminate VarBuilder Pattern Completely
+```rust
+// OLD Candle VarBuilder (ELIMINATE):
+let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], dtype, &device)? };
+let weight = vb.get(&[dims], "layer.weight")?;
+
+// NEW Direct FLAME Loading:
+let weights_map = flame::load_safetensors(path, device)?;
+let weight = weights_map.get("layer.weight")
+    .ok_or_else(|| Error::WeightNotFound("layer.weight"))?;
+
+// Create helper for model loading:
+pub struct WeightLoader {
+    weights: HashMap<String, Tensor>,
+}
+
+impl WeightLoader {
+    pub fn from_safetensors(path: &str, device: Device) -> Result<Self> {
+        let weights = flame::load_safetensors(path, device)?;
+        Ok(Self { weights })
     }
     
-    grads
+    pub fn get(&self, key: &str) -> Result<&Tensor> {
+        self.weights.get(key).ok_or_else(|| Error::WeightNotFound(key))
+    }
+    
+    pub fn tensor(&self, key: &str, shape: &[usize]) -> Result<Tensor> {
+        let weight = self.get(key)?;
+        if weight.shape() != shape {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(weight.clone())
+    }
 }
 ```
 
-#### Update ReLU Backward
+### 3. Neural Network Layers Direct Replacement
+
+#### Convert All Layer Constructors
 ```rust
-Op::ReLU { input } => {
-    let output_grad = grads.get(&op.output_id).unwrap();
+// OLD Candle layer creation:
+pub struct MyConv {
+    conv: candle_nn::Conv2d,
+}
+
+impl MyConv {
+    pub fn new(vb: VarBuilder, in_ch: usize, out_ch: usize) -> Result<Self> {
+        let conv = candle_nn::conv2d(in_ch, out_ch, 3, Default::default(), vb.pp("conv"))?;
+        Ok(Self { conv })
+    }
+}
+
+// NEW Direct FLAME:
+pub struct MyConv {
+    conv: flame::nn::Conv2d,
+}
+
+impl MyConv {
+    pub fn new(weights: &WeightLoader, in_ch: usize, out_ch: usize) -> Result<Self> {
+        let weight = weights.tensor("conv.weight", &[out_ch, in_ch, 3, 3])?;
+        let bias = weights.tensor("conv.bias", &[out_ch])?;
+        let conv = flame::nn::Conv2d::from_weights(weight, Some(bias), 1, 1)?;
+        Ok(Self { conv })
+    }
     
-    // ReLU gradient: output_grad where input > 0, else 0
-    let grad_input = gpu_ops::relu_backward(output_grad, input)?;
-    
-    vec![(input.id(), grad_input)]
+    // Alternative: Create new layer
+    pub fn new_random(in_ch: usize, out_ch: usize, device: Device) -> Result<Self> {
+        let conv = flame::nn::Conv2d::new(in_ch, out_ch, 3, 1, 1, device)?;
+        Ok(Self { conv })
+    }
 }
 ```
 
-#### Update Sum/Mean Backward
+### Agent 2 Success Criteria
+- [ ] All tensor operations use direct FLAME API
+- [ ] VarBuilder completely eliminated
+- [ ] Direct weight loading implemented
+- [ ] All layers use FLAME nn modules
+
+---
+
+## Agent 3: Training System Migration Agent
+**Mission**: Convert training loops to use FLAME's mutable gradients
+
+### 1. Replace Immutable Candle Training
+
+#### Convert Training Loops
 ```rust
-Op::Sum { input, dims } => {
-    let output_grad = grads.get(&op.output_id).unwrap();
-    
-    // Broadcast gradient back to input shape
-    let grad_input = gpu_ops::broadcast_to(output_grad, input.shape())?;
-    
-    vec![(input.id(), grad_input)]
+// OLD Candle training (BROKEN - immutable gradients):
+for batch in dataloader {
+    let output = model.forward(&batch.input)?;
+    let loss = loss_fn(&output, &batch.target)?;
+    // ❌ Can't update gradients - Candle limitation
 }
 
-Op::Mean { input, dims } => {
-    let output_grad = grads.get(&op.output_id).unwrap();
-    
-    // Scale by number of elements that were averaged
-    let num_elements = dims.iter().map(|&d| input.shape()[d]).product::<usize>() as f32;
-    let scaled_grad = gpu_ops::div_scalar(output_grad, num_elements)?;
-    let grad_input = gpu_ops::broadcast_to(&scaled_grad, input.shape())?;
-    
-    vec![(input.id(), grad_input)]
-}
-```
+// NEW FLAME training (WORKING - mutable gradients):
+let mut optimizer = flame::optim::AdamW::new(0.001, 0.9, 0.999, 1e-8, 0.01);
 
-#### Update Reshape/View Backward
-```rust
-Op::Reshape { input, old_shape } => {
-    let output_grad = grads.get(&op.output_id).unwrap();
+for batch in dataloader {
+    // Forward pass
+    let output = model.forward(&batch.input)?;
+    let loss = loss_fn(&output, &batch.target)?;
     
-    // Just reshape gradient back to original shape
-    let grad_input = gpu_ops::reshape(output_grad, old_shape)?;
+    // Backward pass - THIS WORKS WITH FLAME!
+    let grad_map = loss.backward()?;
     
-    vec![(input.id(), grad_input)]
-}
-```
-
-### 2. Ensure All GPU Operations Exist
-
-#### Check What's Available in gpu_ops
-```rust
-// Verify these functions exist in gpu_ops module:
-mod gpu_ops {
-    pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor>;
-    pub fn transpose(input: &Tensor, dim1: i32, dim2: i32) -> Result<Tensor>;
-    pub fn conv2d_backward_input(...) -> Result<Tensor>;
-    pub fn conv2d_backward_weight(...) -> Result<Tensor>;
-    pub fn relu_backward(grad_out: &Tensor, input: &Tensor) -> Result<Tensor>;
-    pub fn sum_dims(input: &Tensor, dims: &[usize]) -> Result<Tensor>;
-    pub fn broadcast_to(input: &Tensor, shape: &[usize]) -> Result<Tensor>;
-    pub fn div_scalar(input: &Tensor, scalar: f32) -> Result<Tensor>;
-    pub fn reshape(input: &Tensor, shape: &[usize]) -> Result<Tensor>;
+    // Update parameters - MUTABLE GRADIENTS!
+    optimizer.step(&model.parameters(), &grad_map)?;
+    optimizer.zero_grad();
 }
 ```
 
-#### Implement Missing GPU Operations
+### 2. Parameter Management
+
+#### Implement Parameter Access
 ```rust
-// If any are missing, implement them as direct CUDA calls
-impl gpu_ops {
-    pub fn relu_backward(grad_out: &Tensor, input: &Tensor) -> Result<Tensor> {
-        let mut grad_input = Tensor::zeros_like(input)?;
+// Each model needs to expose parameters for optimizer
+pub trait FLAMEModel {
+    fn parameters(&self) -> Vec<&flame::Parameter>;
+    fn named_parameters(&self) -> HashMap<String, &flame::Parameter>;
+}
+
+impl FLAMEModel for UNetModel {
+    fn parameters(&self) -> Vec<&flame::Parameter> {
+        let mut params = Vec::new();
         
-        unsafe {
-            launch_kernel!(
-                "relu_backward_kernel",
-                input.device(),
-                (input.numel(),),
-                grad_out.data_ptr(),
-                input.data_ptr(),
-                grad_input.data_ptr(),
-                input.numel()
-            )?;
+        // Collect all conv layer parameters
+        for conv in &self.conv_layers {
+            params.extend(conv.parameters());
         }
         
-        Ok(grad_input)
-    }
-    
-    pub fn broadcast_to(input: &Tensor, target_shape: &[usize]) -> Result<Tensor> {
-        let mut output = Tensor::zeros(target_shape, input.device())?;
-        
-        unsafe {
-            launch_kernel!(
-                "broadcast_kernel",
-                input.device(),
-                (output.numel(),),
-                input.data_ptr(),
-                output.data_ptr(),
-                input.shape().as_ptr(),
-                target_shape.as_ptr(),
-                input.dims(),
-                target_shape.len()
-            )?;
+        // Collect all linear layer parameters
+        for linear in &self.linear_layers {
+            params.extend(linear.parameters());
         }
         
-        Ok(output)
+        params
     }
 }
 ```
 
-### 3. Test Each Operation Fix
+### 3. Optimizer Integration
 
-#### Test MatMul Backward
+#### Direct Optimizer Usage
 ```rust
-#[test]
-fn test_matmul_backward_fixed() {
-    let device = Device::Cuda(0);
-    
-    let a = Tensor::randn(&[2, 3], device)?.requires_grad();
-    let b = Tensor::randn(&[3, 4], device)?.requires_grad();
-    
-    let c = a.matmul(&b)?;
-    let loss = c.sum();
-    
-    // This should NOT hang anymore
-    let grad_map = loss.backward()?;
-    
-    assert!(grad_map.contains_key(&a.id()));
-    assert!(grad_map.contains_key(&b.id()));
-    
-    println!("✅ MatMul backward works!");
+// Configure optimizers for different components
+pub struct TrainingConfig {
+    unet_lr: f32,
+    text_encoder_lr: f32,
+    vae_lr: f32,
+}
+
+pub struct MultiOptimizer {
+    unet_optimizer: flame::optim::AdamW,
+    text_encoder_optimizer: flame::optim::AdamW,
+}
+
+impl MultiOptimizer {
+    pub fn step(&mut self, 
+                unet_params: &[&flame::Parameter], 
+                text_encoder_params: &[&flame::Parameter],
+                grad_map: &GradientMap) -> Result<()> {
+        
+        self.unet_optimizer.step(unet_params, grad_map)?;
+        self.text_encoder_optimizer.step(text_encoder_params, grad_map)?;
+        
+        Ok(())
+    }
 }
 ```
 
-#### Test Conv2D Backward
+### Agent 3 Success Criteria
+- [ ] All training loops use FLAME gradients
+- [ ] Parameter management implemented
+- [ ] Optimizers work with FLAME parameters
+- [ ] Gradient updates actually modify weights
+
+---
+
+## Agent 4: Model Architecture Migration Agent
+**Mission**: Convert specific model implementations (VAE, UNet, CLIP, etc.)
+
+### 1. VAE Model Migration
+
+#### Convert VAE to Direct FLAME
 ```rust
-#[test]
-fn test_conv2d_backward_fixed() {
-    let device = Device::Cuda(0);
+// OLD Candle VAE:
+pub struct VAE {
+    encoder: VAEEncoder,
+    decoder: VAEDecoder,
+}
+
+impl VAE {
+    pub fn load(vb: VarBuilder) -> Result<Self> {
+        let encoder = VAEEncoder::load(vb.pp("encoder"))?;
+        let decoder = VAEDecoder::load(vb.pp("decoder"))?;
+        Ok(Self { encoder, decoder })
+    }
+}
+
+// NEW Direct FLAME VAE:
+pub struct VAE {
+    encoder: VAEEncoder,
+    decoder: VAEDecoder,
+}
+
+impl VAE {
+    pub fn load(weights: &WeightLoader) -> Result<Self> {
+        let encoder = VAEEncoder::load(weights, "encoder")?;
+        let decoder = VAEDecoder::load(weights, "decoder")?;
+        Ok(Self { encoder, decoder })
+    }
     
-    let input = Tensor::randn(&[1, 3, 8, 8], device)?.requires_grad();
-    let conv = Conv2d::new(3, 16, 3, 1, 1, device)?;
+    pub fn encode(&self, x: &Tensor) -> Result<Tensor> {
+        self.encoder.forward(x)
+    }
     
-    let output = conv.forward(&input)?;
-    let loss = output.sum();
-    
-    // This should NOT hang anymore
-    let grad_map = loss.backward()?;
-    
-    assert!(grad_map.contains_key(&input.id()));
-    
-    println!("✅ Conv2D backward works!");
+    pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
+        self.decoder.forward(z)
+    }
+}
+
+impl FLAMEModel for VAE {
+    fn parameters(&self) -> Vec<&flame::Parameter> {
+        [self.encoder.parameters(), self.decoder.parameters()].concat()
+    }
 }
 ```
 
-#### Test Complete CNN Backward
+### 2. UNet Model Migration
+
+#### Convert UNet Architecture
 ```rust
-#[test]
-fn test_complete_cnn_backward() {
-    let device = Device::Cuda(0);
+pub struct UNet2DConditionModel {
+    conv_in: flame::nn::Conv2d,
+    down_blocks: Vec<DownBlock2D>,
+    mid_block: MidBlock2D,
+    up_blocks: Vec<UpBlock2D>,
+    conv_out: flame::nn::Conv2d,
+}
+
+impl UNet2DConditionModel {
+    pub fn load(weights: &WeightLoader) -> Result<Self> {
+        // Load each component directly from weights
+        let conv_in = load_conv_layer(weights, "conv_in", 4, 320)?;
+        
+        let mut down_blocks = Vec::new();
+        for i in 0..4 {
+            let block = DownBlock2D::load(weights, &format!("down_blocks.{}", i))?;
+            down_blocks.push(block);
+        }
+        
+        let mid_block = MidBlock2D::load(weights, "mid_block")?;
+        
+        let mut up_blocks = Vec::new();
+        for i in 0..4 {
+            let block = UpBlock2D::load(weights, &format!("up_blocks.{}", i))?;
+            up_blocks.push(block);
+        }
+        
+        let conv_out = load_conv_layer(weights, "conv_out", 320, 4)?;
+        
+        Ok(Self {
+            conv_in,
+            down_blocks,
+            mid_block,
+            up_blocks,
+            conv_out,
+        })
+    }
     
-    let input = Tensor::randn(&[2, 3, 16, 16], device)?.requires_grad();
-    
-    let conv1 = Conv2d::new(3, 32, 3, 1, 1, device)?;
-    let conv2 = Conv2d::new(32, 64, 3, 1, 1, device)?;
-    
-    let h1 = conv1.forward(&input)?.relu()?;
-    let h2 = conv2.forward(&h1)?.relu()?;
-    let h3 = h2.mean(); // Global average pool
-    let loss = h3.sum();
-    
-    // This is the REAL test - complex graph should work
-    let grad_map = loss.backward()?;
-    
-    assert!(grad_map.contains_key(&input.id()));
-    
-    println!("✅ Complete CNN backward works!");
+    pub fn forward(&self, 
+                   latent: &Tensor, 
+                   timestep: &Tensor, 
+                   encoder_hidden_states: &Tensor) -> Result<Tensor> {
+        
+        let mut sample = self.conv_in.forward(latent)?;
+        
+        // Down blocks
+        let mut down_samples = Vec::new();
+        for down_block in &self.down_blocks {
+            sample = down_block.forward(&sample, timestep, encoder_hidden_states)?;
+            down_samples.push(sample.clone());
+        }
+        
+        // Mid block
+        sample = self.mid_block.forward(&sample, timestep, encoder_hidden_states)?;
+        
+        // Up blocks
+        for (up_block, down_sample) in self.up_blocks.iter().zip(down_samples.iter().rev()) {
+            sample = up_block.forward(&sample, down_sample, timestep, encoder_hidden_states)?;
+        }
+        
+        // Output
+        self.conv_out.forward(&sample)
+    }
 }
 ```
 
-### 4. Test with Realistic Image/Video Operations
+### 3. Text Encoder Migration
 
-#### Test Diffusion Training Operations
+#### Convert CLIP Text Encoder
 ```rust
-#[test]
-fn test_diffusion_operations_complete() {
-    let device = Device::Cuda(0);
+pub struct CLIPTextModel {
+    embeddings: CLIPTextEmbeddings,
+    encoder: CLIPEncoder,
+    final_layer_norm: flame::nn::LayerNorm,
+}
+
+impl CLIPTextModel {
+    pub fn load(weights: &WeightLoader) -> Result<Self> {
+        let embeddings = CLIPTextEmbeddings::load(weights, "text_model.embeddings")?;
+        let encoder = CLIPEncoder::load(weights, "text_model.encoder")?;
+        let final_layer_norm = load_layer_norm(weights, "text_model.final_layer_norm", 768)?;
+        
+        Ok(Self {
+            embeddings,
+            encoder,
+            final_layer_norm,
+        })
+    }
     
-    // Realistic diffusion model operations
-    let latents = Tensor::randn(&[4, 4, 32, 32], device)?.requires_grad();
-    let noise = Tensor::randn(&[4, 4, 32, 32], device)?;
-    let timesteps = Tensor::randint(0, 1000, &[4], device)?;
-    
-    // Add noise (diffusion forward)
-    let noisy_latents = &latents + &noise * 0.1;
-    
-    // Simple U-Net style prediction
-    let conv_in = Conv2d::new(4, 64, 3, 1, 1, device)?;
-    let conv_mid = Conv2d::new(64, 128, 3, 1, 1, device)?;
-    let conv_out = Conv2d::new(128, 4, 3, 1, 1, device)?;
-    
-    let h1 = conv_in.forward(&noisy_latents)?.relu()?;
-    let h2 = conv_mid.forward(&h1)?.relu()?;
-    let pred_noise = conv_out.forward(&h2)?;
-    
-    // MSE loss
-    let diff = &pred_noise - &noise;
-    let loss = (&diff * &diff)?.mean();
-    
-    // This should work for diffusion training
-    let grad_map = loss.backward()?;
-    
-    assert!(grad_map.contains_key(&latents.id()));
-    
-    println!("✅ Diffusion training operations work!");
+    pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let hidden_states = self.embeddings.forward(input_ids)?;
+        let encoded = self.encoder.forward(&hidden_states)?;
+        self.final_layer_norm.forward(&encoded)
+    }
 }
 ```
 
-### 5. Systematic Operation Checklist
+### Agent 4 Success Criteria
+- [ ] VAE model fully migrated to FLAME
+- [ ] UNet model fully migrated to FLAME
+- [ ] CLIP text encoder migrated to FLAME
+- [ ] All models work with FLAME tensors
+- [ ] Models can be trained with FLAME gradients
 
-#### All Operations to Fix
-- [ ] MatMul backward
-- [ ] Conv2D backward
-- [ ] ReLU backward  
-- [ ] Sum backward
-- [ ] Mean backward
-- [ ] Reshape/View backward
-- [ ] Transpose backward
-- [ ] Pow backward
-- [ ] Add/Sub/Mul/Div backward (already working)
+---
 
-#### For Each Operation:
-1. Update compute_gradients to use gpu_ops
-2. Ensure gpu_ops function exists
-3. Test with simple case
-4. Test with complex graph
-5. Verify no deadlock
+## Agent 5: Data Pipeline Migration Agent
+**Mission**: Make data loading output FLAME tensors directly
+
+### 1. DataLoader Migration
+
+#### Convert Image Loading to FLAME
+```rust
+// OLD Candle DataLoader:
+impl DataLoader {
+    fn load_batch(&self) -> Result<Batch> {
+        let mut images = Vec::new();
+        
+        for image_path in &self.batch_paths {
+            let img = image::open(image_path)?;
+            let tensor = candle_tensor_from_image(img, &self.device)?; // Candle
+            images.push(tensor);
+        }
+        
+        let batch_tensor = Tensor::stack(&images, 0)?; // Candle
+        Ok(Batch { images: batch_tensor })
+    }
+}
+
+// NEW Direct FLAME DataLoader:
+impl DataLoader {
+    fn load_batch(&self) -> Result<Batch> {
+        let mut images = Vec::new();
+        
+        for image_path in &self.batch_paths {
+            let img = image::open(image_path)?;
+            let tensor = flame_tensor_from_image(img, self.device)?; // FLAME
+            images.push(tensor);
+        }
+        
+        let batch_tensor = flame::Tensor::stack(&images, 0)?; // FLAME
+        Ok(Batch { images: batch_tensor })
+    }
+}
+
+// Implement image → FLAME tensor conversion
+fn flame_tensor_from_image(img: DynamicImage, device: Device) -> Result<Tensor> {
+    let (width, height) = img.dimensions();
+    let rgb_img = img.to_rgb8();
+    let pixels: Vec<f32> = rgb_img.pixels()
+        .flat_map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0])
+        .collect();
+    
+    let tensor = flame::Tensor::from_vec(pixels, &[3, height as usize, width as usize], device)?;
+    
+    // Normalize to [-1, 1] for diffusion models
+    let normalized = (&tensor * 2.0)? - 1.0;
+    Ok(normalized)
+}
+```
+
+### 2. Preprocessing Pipeline
+
+#### Convert All Transforms to FLAME
+```rust
+pub struct ImageTransforms {
+    target_size: (usize, usize),
+    device: Device,
+}
+
+impl ImageTransforms {
+    pub fn apply(&self, tensor: &Tensor) -> Result<Tensor> {
+        // Resize using FLAME operations
+        let resized = flame::vision::resize(tensor, self.target_size)?;
+        
+        // Center crop using FLAME operations  
+        let cropped = flame::vision::center_crop(&resized, self.target_size)?;
+        
+        // Random flip (if training)
+        let flipped = if rand::random::<bool>() {
+            flame::vision::horizontal_flip(&cropped)?
+        } else {
+            cropped
+        };
+        
+        Ok(flipped)
+    }
+}
+```
+
+### Agent 5 Success Criteria
+- [ ] DataLoader outputs FLAME tensors
+- [ ] Image preprocessing uses FLAME operations
+- [ ] No Candle tensor conversions
+- [ ] Direct FLAME pipeline throughout
+
+---
+
+## Agent 6: Integration Validation Agent
+**Mission**: Verify complete migration works end-to-end
+
+### 1. Complete Training Pipeline Test
+
+#### End-to-End SDXL LoRA Training
+```rust
+#[test]
+fn test_complete_sdxl_lora_training_direct_flame() {
+    let device = Device::Cuda(0);
+    
+    // Load all models with direct FLAME
+    let weights = WeightLoader::from_safetensors("/path/to/sdxl.safetensors", device)?;
+    let vae = VAE::load(&weights)?;
+    let unet = UNet2DConditionModel::load(&weights)?;
+    let text_encoder = CLIPTextModel::load(&weights)?;
+    
+    // Setup LoRA on UNet
+    let lora_config = LoRAConfig { rank: 16, alpha: 16 };
+    let mut lora_unet = LoRAUNet::new(unet, lora_config)?;
+    
+    // Direct FLAME optimizer
+    let mut optimizer = flame::optim::AdamW::new(0.0001, 0.9, 0.999, 1e-8, 0.01);
+    
+    // Direct FLAME dataloader
+    let dataloader = FLAMEDataLoader::new("/path/to/images", device)?;
+    
+    let mut losses = Vec::new();
+    
+    // Training loop with NO compatibility layers
+    for (step, batch) in dataloader.take(100).enumerate() {
+        // Encode images to latents (VAE)
+        let latents = vae.encode(&batch.images)?;
+        
+        // Encode text (CLIP)
+        let text_embeds = text_encoder.forward(&batch.input_ids)?;
+        
+        // Add noise (diffusion forward process)
+        let noise = flame::Tensor::randn_like(&latents)?;
+        let timesteps = flame::Tensor::randint(0, 1000, &[batch.batch_size], device)?;
+        let noisy_latents = scheduler.add_noise(&latents, &noise, &timesteps)?;
+        
+        // UNet prediction (with LoRA)
+        let pred_noise = lora_unet.forward(&noisy_latents, &timesteps, &text_embeds)?;
+        
+        // Diffusion loss
+        let loss = mse_loss(&pred_noise, &noise)?;
+        losses.push(loss.item::<f32>());
+        
+        // Backward pass (FLAME mutable gradients!)
+        let grad_map = loss.backward()?;
+        
+        // Update LoRA parameters
+        optimizer.step(&lora_unet.lora_parameters(), &grad_map)?;
+        optimizer.zero_grad();
+        
+        if step % 10 == 0 {
+            println!("Step {}: Loss = {:.6}", step, loss.item::<f32>());
+        }
+    }
+    
+    // Verify convergence
+    let initial_loss = losses[0];
+    let final_loss = losses[losses.len() - 1];
+    assert!(final_loss < initial_loss * 0.8, "Training should converge");
+    
+    // Save LoRA in ComfyUI format
+    lora_unet.save_lora("direct_flame_lora.safetensors")?;
+    
+    // Verify LoRA format
+    let lora_weights = flame::load_safetensors("direct_flame_lora.safetensors", device)?;
+    assert!(lora_weights.contains_key("lora_unet_down_blocks_0_attentions_0_to_k.lora_down.weight"));
+    
+    println!("✅ Complete direct FLAME training successful!");
+}
+```
+
+### 2. Performance Validation
+
+#### Memory and Speed Comparison
+```rust
+#[test]
+fn test_direct_flame_vs_candle_performance() {
+    let device = Device::Cuda(0);
+    
+    // Test memory usage
+    let initial_memory = get_gpu_memory_usage()?;
+    
+    // Create large model with direct FLAME
+    let model = create_large_diffusion_model_flame(device)?;
+    let dataloader = FLAMEDataLoader::new("/path/to/data", device)?;
+    
+    // Time training steps
+    let start_time = std::time::Instant::now();
+    
+    for batch in dataloader.take(50) {
+        let loss = model.training_step(&batch)?;
+        let grad_map = loss.backward()?;
+        // ... optimizer step
+    }
+    
+    let training_time = start_time.elapsed();
+    let final_memory = get_gpu_memory_usage()?;
+    
+    println!("Direct FLAME Performance:");
+    println!("  Training time: {:?}", training_time);
+    println!("  Memory used: {} MB", (final_memory - initial_memory) / (1024 * 1024));
+    
+    // Should be faster than Candle (no compatibility overhead)
+    // Should use reasonable memory
+    assert!(training_time.as_secs() < 300); // 50 steps in under 5 minutes
+}
+```
+
+### Agent 6 Success Criteria
+- [ ] Complete training works with direct FLAME
+- [ ] No Candle dependencies anywhere
+- [ ] Performance better than Candle approach
+- [ ] LoRA output is ComfyUI compatible
+- [ ] Memory usage is reasonable
+
+---
+
+## Execution Timeline
+
+### Week 1: Purge & Replace (Agents 1-2)
+- Complete Candle elimination
+- Direct API replacement
+- Fix compilation errors
+
+### Week 2: Training & Models (Agents 3-4)
+- Training loop migration
+- Model architecture conversion
+- Parameter management
+
+### Week 3: Data & Integration (Agents 5-6)
+- Data pipeline migration
+- End-to-end validation
+- Performance testing
 
 ## Success Criteria
 
 **COMPLETE when:**
-- [ ] All operations use gpu_ops in backward pass
-- [ ] No autograd deadlocks on any operation
-- [ ] Complex CNN graphs work
-- [ ] Diffusion model operations work
-- [ ] Complete training loops work
+- [ ] Zero Candle code remains anywhere
+- [ ] All operations use direct FLAME APIs
+- [ ] Training converges with mutable gradients
+- [ ] Models work with FLAME tensors
+- [ ] LoRA files are ComfyUI compatible
+- [ ] Performance exceeds Candle baseline
 
-**This fixes autograd completely for image/video model training.**
+**NO COMPATIBILITY LAYERS. NO WRAPPERS. CLEAN DIRECT MIGRATION.**
