@@ -97,6 +97,81 @@ impl AutogradEngine {
         self.tape.clear();
     }
     
+    /// Backward pass with detailed debugging information
+    pub fn backward_debug(&self, loss: &Tensor) -> Result<GradientMap> {
+        println!("=== AUTOGRAD DEBUG START ===");
+        println!("Root tensor shape: {:?}", loss.shape());
+        println!("Tape length: {}", self.tape.len());
+        
+        // Print all operations in tape
+        for (i, entry) in self.tape.iter().enumerate() {
+            println!("Op {}: {:?} -> tensor_id {:?}", i, entry.op, entry.output_id);
+        }
+        
+        if !loss.requires_grad {
+            return Err(FlameError::InvalidOperation(
+                "backward() called on tensor that doesn't require grad".into()
+            ));
+        }
+        
+        if loss.shape.elem_count() != 1 {
+            return Err(FlameError::InvalidOperation(
+                "backward() requires scalar loss tensor".into()
+            ));
+        }
+        
+        // Initialize gradient storage
+        let mut gradients = GradientMap::new(self.device.clone());
+        gradients.set_ones(loss.id, loss.shape.clone())?;
+        println!("Root gradient initialized");
+        
+        // Process tape in reverse with timing
+        for (i, entry) in self.tape.iter().enumerate().rev() {
+            let tape_idx = self.tape.len() - 1 - i;
+            println!("\nProcessing op {} (reverse index {}): {:?}", tape_idx, i, entry.op);
+            let start = std::time::Instant::now();
+            
+            if let Some(output_grad) = gradients.get(entry.output_id) {
+                println!("  Output grad shape: {:?}", output_grad.shape());
+                let output_grad = output_grad.clone()?;
+                
+                // Compute input gradients with error handling
+                match self.compute_gradients(entry, &output_grad) {
+                    Ok(input_grads) => {
+                        println!("  Computed {} input gradients", input_grads.len());
+                        
+                        // Accumulate gradients
+                        for (tensor_id, grad) in input_grads {
+                            println!("    Accumulating grad for tensor {:?}, shape: {:?}", 
+                                tensor_id, grad.shape());
+                            gradients.accumulate(tensor_id, grad)?;
+                        }
+                    }
+                    Err(e) => {
+                        println!("  ERROR computing gradients: {:?}", e);
+                        return Err(e);
+                    }
+                }
+            } else {
+                println!("  No output gradient found, skipping");
+            }
+            
+            let elapsed = start.elapsed();
+            println!("  Op {} completed in {:?}", tape_idx, elapsed);
+            
+            if elapsed > std::time::Duration::from_secs(2) {
+                println!("  !!! SLOW OPERATION DETECTED !!!");
+                return Err(FlameError::InvalidOperation(
+                    format!("Op {} took too long: {:?}", tape_idx, elapsed)
+                ));
+            }
+        }
+        
+        println!("\n=== AUTOGRAD DEBUG COMPLETE ===");
+        println!("Total gradients computed: {}", gradients.len());
+        Ok(gradients)
+    }
+    
     /// Backward pass - returns gradients separately
     pub fn backward(&self, loss: &Tensor) -> Result<GradientMap> {
         if !loss.requires_grad {

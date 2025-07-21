@@ -444,11 +444,12 @@ pub fn create_sampler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CudaDevice;
+    use crate::{CudaDevice, Shape};
+    use std::sync::Arc;
     
     #[test]
     fn test_euler_sampler() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         
         let mut sampler = EulerSampler::new(1000, PredictionType::Epsilon);
         sampler.set_timesteps(50);
@@ -480,7 +481,7 @@ mod tests {
     
     #[test]
     fn test_dpm_sampler() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         
         let mut sampler = DPMPlusPlus2MSampler::new(1000, PredictionType::Epsilon);
         sampler.set_timesteps(25);

@@ -154,6 +154,11 @@ impl Tensor {
         AutogradContext::backward(self)
     }
     
+    /// Compute gradients with debug information
+    pub fn backward_debug(&self) -> Result<GradientMap> {
+        AutogradContext::backward_debug(self)
+    }
+    
     /// Set data from slice (useful for initialization)
     /// This creates a new tensor with the provided data
     pub fn set_data(&self, data: &[f32]) -> Result<Tensor> {
@@ -738,11 +743,14 @@ extern "C" __global__ void slice_kernel(
 
     /// Square all elements
     pub fn square(&self) -> Result<Tensor> {
-        let mut output = self.mul(self)?;
+        // Use GpuOps directly to avoid recording during backward
+        let mut output = GpuOps::mul(self, self)?;
         
-        // Record square operation if needed
+        // Set requires_grad if input requires grad
         if self.requires_grad {
-            // Record as square
+            output.requires_grad = true;
+            
+            // Record as square operation
             AutogradContext::record_op(
                 output.id,
                 Op::Square { 

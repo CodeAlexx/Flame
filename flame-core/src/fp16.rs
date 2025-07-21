@@ -363,10 +363,12 @@ extern "C" __global__ void cast_bf16_to_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Shape;
+    use std::sync::Arc;
     
     #[test]
     fn test_fp16_conversion() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         
         let tensor = Tensor::randn(
             Shape::from_dims(&[2, 3, 4]),
@@ -398,7 +400,7 @@ mod tests {
     
     #[test] 
     fn test_mixed_precision_scaler() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         
         let mut mp = MixedPrecisionTraining::new(
             Precision::FP16,

@@ -121,7 +121,7 @@ mod tests {
     
     #[test]
     fn test_flame_to_candle_conversion() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         
         // Create Flame tensor
         let flame_tensor = Tensor::randn(
@@ -156,7 +156,7 @@ mod tests {
     
     #[test]
     fn test_batch_conversion() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         
         // Create batch of Flame tensors
         let tensors: Vec<Tensor> = (0..3)

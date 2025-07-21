@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         groups: 1,
     };
     
-    let conv = Conv2d::new(config, device.clone())?.with_bias(device.clone())?;
+    let conv = Conv2d::from_config(config, device.clone())?.with_bias(device.clone())?;
     println!("Created Conv2d layer: {} -> {} channels", 
              conv.config.in_channels, conv.config.out_channels);
     
@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         groups: 1,
     };
     
-    let conv2 = Conv2d::new(config2, device.clone())?;
+    let conv2 = Conv2d::from_config(config2, device.clone())?;
     let output2 = conv2.forward(&input)?;
     println!("With stride=2, output shape: {:?}", output2.shape());
     
@@ -65,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         groups: 1,
     };
     
-    let conv3 = Conv2d::new(config3, device.clone())?;
+    let conv3 = Conv2d::from_config(config3, device.clone())?;
     let output3 = conv3.forward(&input)?;
     println!("1x1 conv output shape: {:?}", output3.shape());
     
@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     groups: 3,
     // };
     // 
-    // let conv4 = Conv2d::new(config4, device.clone())?;
+    // let conv4 = Conv2d::from_config(config4, device.clone())?;
     // let output4 = conv4.forward(&input)?;
     // println!("Depthwise conv output shape: {:?}", output4.shape());
     

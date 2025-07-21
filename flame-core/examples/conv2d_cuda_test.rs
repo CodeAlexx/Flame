@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         groups: 1,
     };
     
-    let conv = Conv2d::new(config, device.clone())?;
+    let conv = Conv2d::from_config(config, device.clone())?;
     
     // Create test input: [batch=2, channels=3, height=32, width=32]
     let input = Tensor::randn(
@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         groups: 1,
     };
     
-    let conv2 = Conv2d::new(config2, device.clone())?;
+    let conv2 = Conv2d::from_config(config2, device.clone())?;
     let output2 = conv2.forward(&output)?;
     println!("5x5 stride 2: {:?} -> {:?}", output.shape().dims(), output2.shape().dims());
     
@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         groups: 1,
     };
     
-    let conv3 = Conv2d::new(config3, device.clone())?;
+    let conv3 = Conv2d::from_config(config3, device.clone())?;
     let output3 = conv3.forward(&output2)?;
     println!("1x1 pointwise: {:?} -> {:?}", output2.shape().dims(), output3.shape().dims());
     

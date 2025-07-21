@@ -243,7 +243,7 @@ mod tests {
     
     #[test]
     fn test_flash_attention() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         
         let config = FlashAttentionConfig::default();
         let flash_attn = FlashAttention::new(config, device.clone());
@@ -280,7 +280,7 @@ mod tests {
     
     #[test]
     fn test_causal_flash_attention() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         
         let config = FlashAttentionConfig {
             is_causal: true,

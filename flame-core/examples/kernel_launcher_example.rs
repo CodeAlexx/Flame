@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 fn main() -> Result<()> {
     // Initialize CUDA device
-    let device = Arc::new(CudaDevice::new(0)?);
+    let device = CudaDevice::new(0)?;
     println!("Using CUDA device: {:?}", device.ordinal());
     
     // Example 1: Using pre-built kernels

@@ -403,7 +403,7 @@ mod tests {
     
     #[test]
     fn test_tensor_adapter() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         let adapter = TensorAdapter::new(device.clone());
         
         let batch_size = 2;
@@ -435,7 +435,7 @@ mod tests {
     
     #[test]
     fn test_loss_adapter() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         let adapter = LossAdapter::new(device.clone());
         
         let pred = Tensor::randn(

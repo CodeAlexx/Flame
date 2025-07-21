@@ -125,7 +125,7 @@ mod tests {
     
     #[test]
     fn test_activations() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         let input = Tensor::randn(Shape::from_dims(&[2, 3, 4, 4]), 0.0, 1.0, device.clone())?;
         
         // Test LeakyReLU

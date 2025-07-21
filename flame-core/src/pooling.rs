@@ -298,7 +298,7 @@ mod tests {
     
     #[test]
     fn test_maxpool2d_output_shape() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         let input = Tensor::randn(Shape::from_dims(&[2, 3, 8, 8]), 0.0, 1.0, device)?;
         
         let config = MaxPool2dConfig::new((2, 2));
@@ -312,7 +312,7 @@ mod tests {
     
     #[test]
     fn test_avgpool2d_output_shape() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         let input = Tensor::randn(Shape::from_dims(&[1, 16, 32, 32]), 0.0, 1.0, device)?;
         
         let mut config = AvgPool2dConfig::new((3, 3));
@@ -330,7 +330,7 @@ mod tests {
     
     #[test]
     fn test_global_pooling() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         let input = Tensor::randn(Shape::from_dims(&[2, 64, 7, 7]), 0.0, 1.0, device)?;
         
         let global_avg = GlobalAvgPool2d::new();

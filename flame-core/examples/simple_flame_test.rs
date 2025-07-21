@@ -6,7 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test 1: CUDA device creation
     println!("1. Testing CUDA device creation...");
-    let device = Arc::new(CudaDevice::new(0)?);
+    let device = CudaDevice::new(0)?;
     println!("✓ CUDA device created successfully");
 
     // Test 2: Basic memory allocation

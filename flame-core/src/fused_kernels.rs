@@ -535,7 +535,7 @@ mod tests {
     
     #[test]
     fn test_bias_gelu() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         
         let batch_size = 2;
         let seq_len = 4;

@@ -258,7 +258,7 @@ mod tests {
     
     #[test]
     fn test_upsample2d_output_shape() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         let input = Tensor::randn(Shape::from_dims(&[1, 3, 4, 4]), 0.0, 1.0, device)?;
         
         // Test with size
@@ -280,7 +280,7 @@ mod tests {
     
     #[test]
     fn test_conv_transpose2d_output_shape() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         let input = Tensor::randn(Shape::from_dims(&[1, 16, 4, 4]), 0.0, 1.0, device.clone())?;
         
         // Test basic transposed convolution

@@ -3,7 +3,7 @@
 //! This module provides common loss functions used in deep learning,
 //! with full backward pass implementations for autograd.
 
-use crate::{Tensor, Result, FlameError, AutogradContext, Op, TensorId};
+use crate::{Tensor, Result, FlameError, AutogradContext, Op, TensorId, Shape};
 
 /// Mean Squared Error (MSE) loss
 /// 
@@ -280,6 +280,8 @@ pub fn nll_loss(log_probs: &Tensor, targets: &Tensor) -> Result<Tensor> {
 mod tests {
     use super::*;
     use crate::DType;
+    use cudarc::driver::CudaDevice;
+    use std::sync::Arc;
     
     #[test]
     fn test_mse_loss() -> Result<()> {
@@ -288,12 +290,12 @@ mod tests {
         // Simple test case
         let predictions = Tensor::from_slice(
             &[1.0, 2.0, 3.0, 4.0],
-            vec![2, 2],
+            Shape::from_dims(&[2, 2]),
             device.clone()
         )?;
         let targets = Tensor::from_slice(
             &[1.5, 2.5, 3.5, 4.5],
-            vec![2, 2],
+            Shape::from_dims(&[2, 2]),
             device.clone()
         )?;
         
@@ -312,12 +314,12 @@ mod tests {
         
         let predictions = Tensor::from_slice(
             &[1.0, 2.0, 3.0, 4.0],
-            vec![2, 2],
+            Shape::from_dims(&[2, 2]),
             device.clone()
         )?;
         let targets = Tensor::from_slice(
             &[1.5, 2.5, 3.5, 4.5],
-            vec![2, 2],
+            Shape::from_dims(&[2, 2]),
             device.clone()
         )?;
         
@@ -337,12 +339,12 @@ mod tests {
         // Mix of small and large differences
         let predictions = Tensor::from_slice(
             &[1.0, 2.0, 3.0, 10.0],
-            vec![4],
+            Shape::from_dims(&[4]),
             device.clone()
         )?;
         let targets = Tensor::from_slice(
             &[1.2, 2.3, 3.0, 5.0],
-            vec![4],
+            Shape::from_dims(&[4]),
             device.clone()
         )?;
         

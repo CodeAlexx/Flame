@@ -224,9 +224,64 @@ extern "C" __global__ void elu_kernel(
 }
 "#;
 
+pub const POW_KERNEL: &str = r#"
+extern "C" __global__ void pow_kernel(
+    const float* input,
+    float* output,
+    float exponent,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = powf(input[idx], exponent);
+    }
+}
+"#;
+
+pub const SIN_KERNEL: &str = r#"
+extern "C" __global__ void sin_kernel(
+    const float* input,
+    float* output,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = sinf(input[idx]);
+    }
+}
+"#;
+
+pub const COS_KERNEL: &str = r#"
+extern "C" __global__ void cos_kernel(
+    const float* input,
+    float* output,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = cosf(input[idx]);
+    }
+}
+"#;
+
+pub const SQRT_KERNEL: &str = r#"
+extern "C" __global__ void sqrt_kernel(
+    const float* input,
+    float* output,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = sqrtf(input[idx]);
+    }
+}
+"#;
+
 /// Helper to compile CUDA C to PTX
-pub fn compile_cuda_kernel(source: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    // For now, return the source as bytes - real implementation would use NVRTC
-    // This is a placeholder that assumes pre-compiled PTX
-    Ok(source.as_bytes().to_vec())
+/// DEPRECATED: Use cuda_kernel_compiler::compile_cuda_kernel instead
+pub fn compile_cuda_kernel(source: &str) -> Result<cudarc::nvrtc::Ptx, Box<dyn std::error::Error>> {
+    // Delegate to real implementation
+    use crate::cuda_kernel_compiler;
+    cuda_kernel_compiler::compile_cuda_kernel(source, "kernel")
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }

@@ -260,11 +260,10 @@ extern "C" __global__ void matmul_kernel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CudaDevice;
     
     #[test]
     fn test_kernel_launcher() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device: Arc<CudaDevice> = CudaDevice::new(0)?;
         let kernels = CudaKernelsV2::new(device.clone());
         
         // Test element-wise addition

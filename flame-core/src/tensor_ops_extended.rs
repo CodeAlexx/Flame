@@ -382,12 +382,6 @@ impl Tensor {
         Tensor::from_slice(&output, self.shape.clone(), self.device.clone())
     }
     
-    /// Compute square root
-    pub fn sqrt(&self) -> Result<Tensor> {
-        let data = self.to_vec()?;
-        let output: Vec<f32> = data.iter().map(|x| x.sqrt()).collect();
-        Tensor::from_slice(&output, self.shape.clone(), self.device.clone())
-    }
     
     /// Compute reciprocal square root
     pub fn rsqrt(&self) -> Result<Tensor> {
@@ -580,59 +574,29 @@ impl Tensor {
     
     /// Divide by another tensor
     pub fn div(&self, other: &Tensor) -> Result<Tensor> {
-        // Check shapes are compatible for broadcasting
-        let broadcast_shape = broadcast_shapes(self.shape().dims(), other.shape().dims())?;
+        // Use CUDA kernel for GPU-accelerated division
+        let mut output = GpuOps::div(self, other)?;
         
-        // Broadcast both tensors if needed
-        let a = if self.shape().dims() != &broadcast_shape {
-            self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-        } else {
-            self.clone()?
-        };
-        
-        let b = if other.shape().dims() != &broadcast_shape {
-            other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-        } else {
-            other.clone()?
-        };
-        
-        // Compute division
-        let a_data = a.to_vec()?;
-        let b_data = b.to_vec()?;
-        let output: Vec<f32> = a_data.iter().zip(b_data.iter())
-            .map(|(a, b)| a / b)
-            .collect();
-        
-        Tensor::from_slice(&output, Shape::from_dims(&broadcast_shape), self.device.clone())
-    }
-    
-    /// Divide tensor by scalar
-    pub fn div_scalar(&self, scalar: f32) -> Result<Tensor> {
-        if scalar == 0.0 {
-            return Err(FlameError::InvalidOperation("Division by zero".into()));
-        }
-        
-        let data = self.to_vec()?;
-        let result: Vec<f32> = data.iter().map(|&x| x / scalar).collect();
-        
-        let mut output = Tensor::from_vec(result, self.shape.clone(), self.device.clone())?;
-        
-        // AUTOGRAD: Record as mul_scalar with reciprocal
-        if self.requires_grad {
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
             
             AutogradContext::record_op(
                 output.id,
-                Op::MulScalar { 
-                    input: self.id, 
-                    scalar: 1.0 / scalar 
+                Op::Div { 
+                    lhs: self.id,
+                    rhs: other.id
                 },
-                vec![(self.id, self.clone()?)]
+                vec![
+                    (self.id, self.clone()?),
+                    (other.id, other.clone()?)
+                ]
             );
         }
         
         Ok(output)
     }
+    
     
     /// Element-wise equality comparison
     pub fn eq(&self, other: &Tensor) -> Result<Tensor> {

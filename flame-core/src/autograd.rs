@@ -6,6 +6,7 @@
 use crate::{Tensor, Result, FlameError, Shape};
 use crate::tensor::TensorId;
 use crate::gradient::GradientMap;
+use crate::cuda_ops::GpuOps;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use cudarc::driver::CudaDevice;
@@ -114,6 +115,11 @@ impl AutogradContext {
     ) {
         let mut ctx = AUTOGRAD_CONTEXT.lock().unwrap();
         
+        // Only record if autograd is enabled
+        if !ctx.enabled {
+            return;
+        }
+        
         let mut saved = HashMap::new();
         for (id, tensor) in saved_tensors {
             saved.insert(id, tensor);
@@ -141,6 +147,99 @@ impl AutogradContext {
     /// Context manager for no_grad mode
     pub fn no_grad() -> NoGradGuard {
         NoGradGuard::new()
+    }
+    
+    /// Compute gradients via backpropagation with debug logging
+    pub fn backward_debug(loss: &Tensor) -> Result<GradientMap> {
+        println!("=== AUTOGRAD DEBUG START ===");
+        println!("Loss tensor shape: {:?}", loss.shape);
+        println!("Loss requires_grad: {}", loss.requires_grad);
+        
+        if !loss.requires_grad {
+            return Err(FlameError::InvalidOperation(
+                "backward() called on tensor that doesn't require grad".into()
+            ));
+        }
+        
+        if loss.shape.elem_count() != 1 {
+            return Err(FlameError::InvalidOperation(
+                "backward() requires scalar loss tensor".into()
+            ));
+        }
+        
+        let device = loss.device.clone();
+        
+        // Initialize gradient storage
+        let mut gradients = GradientMap::new(device.clone());
+        gradients.set_ones(loss.id, loss.shape.clone())?;
+        println!("Root gradient initialized");
+        
+        // Process tape in reverse under lock
+        {
+            let mut ctx = AUTOGRAD_CONTEXT.lock().unwrap();
+            println!("Tape length: {}", ctx.tape.len());
+            
+            // Print all operations in tape
+            for (i, entry) in ctx.tape.iter().enumerate() {
+                println!("Op {}: {:?} -> tensor_id {:?}", i, entry.op, entry.output_id);
+            }
+            
+            // Disable autograd during backward pass
+            let prev_enabled = ctx.enabled;
+            ctx.enabled = false;
+            
+            // Process tape in reverse with timing
+            for (i, entry) in ctx.tape.iter().enumerate().rev() {
+                let tape_idx = ctx.tape.len() - 1 - i;
+                println!("\nProcessing op {} (reverse index {}): {:?}", tape_idx, i, entry.op);
+                let start = std::time::Instant::now();
+                
+                if let Some(output_grad) = gradients.get(entry.output_id) {
+                    println!("  Output grad shape: {:?}", output_grad.shape());
+                    let output_grad = output_grad.clone()?;
+                    
+                    // Process gradients based on operation type
+                    match compute_gradients(entry, &output_grad, &device) {
+                        Ok(input_grads) => {
+                            println!("  Computed {} input gradients", input_grads.len());
+                            
+                            // Accumulate gradients
+                            for (tensor_id, grad) in input_grads {
+                                println!("    Accumulating grad for tensor {:?}, shape: {:?}", 
+                                    tensor_id, grad.shape());
+                                gradients.accumulate(tensor_id, grad)?;
+                            }
+                        }
+                        Err(e) => {
+                            println!("  ERROR computing gradients: {:?}", e);
+                            ctx.enabled = prev_enabled;
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    println!("  No output gradient found, skipping");
+                }
+                
+                let elapsed = start.elapsed();
+                println!("  Op {} completed in {:?}", tape_idx, elapsed);
+                
+                if elapsed > std::time::Duration::from_secs(2) {
+                    println!("  !!! SLOW OPERATION DETECTED !!!");
+                    ctx.enabled = prev_enabled;
+                    return Err(FlameError::InvalidOperation(
+                        format!("Op {} took too long: {:?}", tape_idx, elapsed)
+                    ));
+                }
+            }
+            
+            // Clear tape and restore state
+            ctx.tape.clear();
+            ctx.enabled = prev_enabled;
+        }
+        
+        println!("\n=== AUTOGRAD DEBUG COMPLETE ===");
+        println!("Total gradients computed: {}", gradients.len());
+        Ok(gradients)
     }
     
     /// Compute gradients via backpropagation
@@ -235,7 +334,7 @@ fn compute_gradients(
         
         Op::Sub { lhs, rhs } => {
             // d/dx(x-y) = 1, d/dy(x-y) = -1
-            let neg_grad = output_grad.mul_scalar(-1.0)?;
+            let neg_grad = GpuOps::mul_scalar(output_grad, -1.0)?;
             Ok(vec![
                 (*lhs, output_grad.clone()?),
                 (*rhs, neg_grad),
@@ -244,11 +343,18 @@ fn compute_gradients(
         
         Op::Mul { lhs, rhs } => {
             // d/dx(x*y) = y, d/dy(x*y) = x
+            println!("  Computing Mul gradients...");
+            println!("  Getting saved tensors for lhs={:?}, rhs={:?}", lhs, rhs);
+            
             let lhs_tensor = &entry.saved_tensors[lhs];
             let rhs_tensor = &entry.saved_tensors[rhs];
             
-            let grad_lhs = output_grad.mul(rhs_tensor)?;
-            let grad_rhs = output_grad.mul(lhs_tensor)?;
+            println!("  Got saved tensors, computing grad_lhs...");
+            // Use GPU ops directly to avoid autograd recording
+            let grad_lhs = GpuOps::mul(output_grad, rhs_tensor)?;
+            println!("  grad_lhs computed, computing grad_rhs...");
+            let grad_rhs = GpuOps::mul(output_grad, lhs_tensor)?;
+            println!("  Both gradients computed");
             
             Ok(vec![
                 (*lhs, grad_lhs),
@@ -273,13 +379,14 @@ fn compute_gradients(
             let lhs_tensor = &entry.saved_tensors[lhs];
             let rhs_tensor = &entry.saved_tensors[rhs];
             
-            // Gradient w.r.t. lhs
-            let rhs_t = rhs_tensor.transpose()?;
-            let grad_lhs = output_grad.matmul(&rhs_t)?;
+            // Gradient w.r.t. lhs: grad @ B^T
+            // Use GPU ops directly to avoid autograd recording
+            let rhs_t = GpuOps::transpose(rhs_tensor)?;
+            let grad_lhs = GpuOps::matmul(output_grad, &rhs_t)?;
             
-            // Gradient w.r.t. rhs
-            let lhs_t = lhs_tensor.transpose()?;
-            let grad_rhs = lhs_t.matmul(output_grad)?;
+            // Gradient w.r.t. rhs: A^T @ grad
+            let lhs_t = GpuOps::transpose(lhs_tensor)?;
+            let grad_rhs = GpuOps::matmul(&lhs_t, output_grad)?;
             
             Ok(vec![
                 (*lhs, grad_lhs),
@@ -327,8 +434,8 @@ fn compute_gradients(
         Op::Square { input } => {
             // d/dx(x^2) = 2x
             let input_tensor = &entry.saved_tensors[input];
-            let two_x = input_tensor.mul_scalar(2.0)?;
-            let grad = output_grad.mul(&two_x)?;
+            let two_x = GpuOps::mul_scalar(input_tensor, 2.0)?;
+            let grad = GpuOps::mul(output_grad, &two_x)?;
             Ok(vec![(*input, grad)])
         }
         
@@ -341,14 +448,14 @@ fn compute_gradients(
         Op::Mean { input, input_shape } => {
             // d/dx mean(x) = 1/n for each element
             let n = input_shape.elem_count() as f32;
-            let grad_scaled = output_grad.mul_scalar(1.0 / n)?;
+            let grad_scaled = GpuOps::mul_scalar(output_grad, 1.0 / n)?;
             let expanded = broadcast_to(&grad_scaled, input_shape)?;
             Ok(vec![(*input, expanded)])
         }
         
         Op::Transpose { input } => {
             // Gradient of transpose is transpose of gradient
-            let grad = output_grad.transpose()?;
+            let grad = GpuOps::transpose(output_grad)?;
             Ok(vec![(*input, grad)])
         }
         
@@ -625,13 +732,13 @@ fn compute_gradients(
             let rhs_tensor = &entry.saved_tensors[rhs];
             
             // Gradient w.r.t. lhs: grad * (1/rhs)
-            let grad_lhs = output_grad.div(rhs_tensor)?;
+            let grad_lhs = GpuOps::div(output_grad, rhs_tensor)?;
             
             // Gradient w.r.t. rhs: grad * (-lhs/rhs^2)
-            let rhs_squared = rhs_tensor.square()?;
-            let neg_lhs = lhs_tensor.mul_scalar(-1.0)?;
-            let grad_rhs_term = neg_lhs.div(&rhs_squared)?;
-            let grad_rhs = output_grad.mul(&grad_rhs_term)?;
+            let rhs_squared = GpuOps::mul(rhs_tensor, rhs_tensor)?; // x^2 = x * x
+            let neg_lhs = GpuOps::mul_scalar(lhs_tensor, -1.0)?;
+            let grad_rhs_term = GpuOps::div(&neg_lhs, &rhs_squared)?;
+            let grad_rhs = GpuOps::mul(output_grad, &grad_rhs_term)?;
             
             Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
         }
@@ -944,12 +1051,25 @@ fn compute_gradients(
 
 /// ReLU backward pass
 fn relu_backward(grad_output: &Tensor, input: &Tensor) -> Result<Tensor> {
-    // Create a mask where input > 0
-    let zero = Tensor::zeros(input.shape.clone(), input.device.clone())?;
+    // ReLU backward: gradient passes through where input > 0
+    // We need to create a mask without using tensor operations that record to autograd
+    
+    // Create zero tensor for comparison
+    let zero_data = unsafe { input.device.alloc_zeros::<f32>(input.shape.elem_count()) }
+        .map_err(|_| FlameError::CudaDriver)?;
+    let zero = Tensor {
+        data: Arc::new(zero_data),
+        shape: input.shape.clone(),
+        device: input.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+    };
+    
+    // Use comparison to create mask
     let mask = input.gt(&zero)?;
     
-    // Apply mask to gradient
-    grad_output.mul(&mask)
+    // Apply mask to gradient using GPU ops
+    GpuOps::mul(grad_output, &mask)
 }
 
 /// Broadcast tensor to target shape

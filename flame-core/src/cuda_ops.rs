@@ -1,5 +1,7 @@
-use crate::{Result, Tensor};
+use crate::{Result, Tensor, FlameError, Shape};
+use crate::tensor::TensorId;
 use crate::cuda_kernels::CudaKernels;
+use cudarc::cublas::CudaBlas;
 use std::sync::Arc;
 use lazy_static::lazy_static;
 use std::sync::Mutex;
@@ -144,6 +146,65 @@ impl GpuOps {
     pub fn sum_dim_keepdim(tensor: &Tensor, dim: usize) -> Result<Tensor> {
         let kernels = Self::get_kernels(&tensor.device)?;
         kernels.sum_dim_keepdim(tensor, dim)
+    }
+    
+    /// Matrix multiplication using cuBLAS
+    pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        // Validate shapes
+        let (m, k) = match a.shape.dims() {
+            [m, k] => (*m, *k),
+            _ => return Err(FlameError::InvalidOperation("matmul requires 2D tensors".into())),
+        };
+        
+        let (k2, n) = match b.shape.dims() {
+            [k2, n] => (*k2, *n),
+            _ => return Err(FlameError::InvalidOperation("matmul requires 2D tensors".into())),
+        };
+        
+        if k != k2 {
+            return Err(FlameError::ShapeMismatch {
+                expected: Shape::from_dims(&[k, n]),
+                got: b.shape.clone(),
+            });
+        }
+        
+        let out_shape = Shape::from_dims(&[m, n]);
+        
+        // Use cuBLAS gemm
+        let blas = CudaBlas::new(a.device.clone())
+            .map_err(|_| FlameError::CuBlas)?;
+            
+        use cudarc::cublas::{GemmConfig, Gemm};
+        let cfg = GemmConfig {
+            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: 1.0f32,
+            lda: n as i32,
+            ldb: k as i32,
+            beta: 0.0f32,
+            ldc: n as i32,
+        };
+        
+        // Allocate output data
+        let mut output_data = unsafe { a.device.alloc::<f32>(m * n) }
+            .map_err(|_| FlameError::CudaDriver)?;
+        
+        unsafe {
+            blas.gemm(cfg, &*b.data, &*a.data, &mut output_data)
+                .map_err(|_| FlameError::CuBlas)?;
+        }
+        
+        // Create output tensor without autograd recording
+        Ok(Tensor {
+            data: Arc::new(output_data),
+            shape: out_shape,
+            device: a.device.clone(),
+            id: TensorId::new(),
+            requires_grad: false,
+        })
     }
     
     // Upsampling operations

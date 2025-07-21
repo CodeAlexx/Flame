@@ -1,4 +1,6 @@
-use crate::{Tensor, Result, FlameError};
+use crate::{Tensor, Result, FlameError, Shape};
+use std::sync::Arc;
+use cudarc::driver::CudaDevice;
 use std::collections::HashMap;
 
 /// Adam optimizer configuration
@@ -182,7 +184,7 @@ mod tests {
     
     #[test]
     fn test_adam_optimizer() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         
         // Create test parameters
         let mut param = Tensor::from_vec(

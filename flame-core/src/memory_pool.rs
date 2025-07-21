@@ -332,7 +332,7 @@ mod tests {
     
     #[test]
     fn test_memory_pool() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         let mut pool = DeviceMemoryPool::new(device.clone(), Some(1024 * 1024 * 100)); // 100MB limit
         
         // Test allocation

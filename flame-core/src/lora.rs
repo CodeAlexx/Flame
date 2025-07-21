@@ -196,7 +196,7 @@ mod tests {
     
     #[test]
     fn test_lora_forward() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         
         // Create test tensors
         let batch_size = 2;
@@ -237,7 +237,7 @@ mod tests {
     
     #[test]
     fn test_lora_collection() -> Result<()> {
-        let device = Arc::new(CudaDevice::new(0)?);
+        let device = CudaDevice::new(0)?;
         let config = LoRAConfig::default();
         
         let mut collection = LoRACollection::new(config, device.clone());

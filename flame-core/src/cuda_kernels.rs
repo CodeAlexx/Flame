@@ -59,6 +59,10 @@ impl CudaKernels {
         kernels.insert("update_weights_kernel".to_string(), compile_and_load_kernel(&device, UPDATE_WEIGHTS_KERNEL, "update_weights_kernel")?);
         kernels.insert("leaky_relu_kernel".to_string(), compile_and_load_kernel(&device, LEAKY_RELU_KERNEL, "leaky_relu_kernel")?);
         kernels.insert("elu_kernel".to_string(), compile_and_load_kernel(&device, ELU_KERNEL, "elu_kernel")?);
+        kernels.insert("pow_kernel".to_string(), compile_and_load_kernel(&device, POW_KERNEL, "pow_kernel")?);
+        kernels.insert("sin_kernel".to_string(), compile_and_load_kernel(&device, SIN_KERNEL, "sin_kernel")?);
+        kernels.insert("cos_kernel".to_string(), compile_and_load_kernel(&device, COS_KERNEL, "cos_kernel")?);
+        kernels.insert("sqrt_kernel".to_string(), compile_and_load_kernel(&device, SQRT_KERNEL, "sqrt_kernel")?);
         
         Ok(Self { device, kernels })
     }
@@ -556,6 +560,106 @@ impl CudaKernels {
         Err(FlameError::InvalidOperation("PReLU GPU kernel not yet implemented".into()))
     }
     
+    pub fn pow(&self, tensor: &Tensor, exponent: f32) -> Result<Tensor> {
+        let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+        let n = tensor.shape.elem_count();
+        
+        let kernel = self.kernels.get("pow_kernel")
+            .ok_or_else(|| FlameError::KernelError("pow_kernel not found".into()))?
+            .clone();
+        
+        let block_size = 256;
+        let grid_size = (n + block_size - 1) / block_size;
+        
+        let config = LaunchConfig {
+            grid_dim: (grid_size as u32, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        
+        unsafe {
+            kernel.launch(config, (tensor.data.as_ref(), &*output.data, exponent, n as u32))?;
+        }
+        
+        self.device.synchronize()?;
+        Ok(output)
+    }
+    
+    pub fn sin(&self, tensor: &Tensor) -> Result<Tensor> {
+        let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+        let n = tensor.shape.elem_count();
+        
+        let kernel = self.kernels.get("sin_kernel")
+            .ok_or_else(|| FlameError::KernelError("sin_kernel not found".into()))?
+            .clone();
+        
+        let block_size = 256;
+        let grid_size = (n + block_size - 1) / block_size;
+        
+        let config = LaunchConfig {
+            grid_dim: (grid_size as u32, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        
+        unsafe {
+            kernel.launch(config, (tensor.data.as_ref(), &*output.data, n as u32))?;
+        }
+        
+        self.device.synchronize()?;
+        Ok(output)
+    }
+    
+    pub fn cos(&self, tensor: &Tensor) -> Result<Tensor> {
+        let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+        let n = tensor.shape.elem_count();
+        
+        let kernel = self.kernels.get("cos_kernel")
+            .ok_or_else(|| FlameError::KernelError("cos_kernel not found".into()))?
+            .clone();
+        
+        let block_size = 256;
+        let grid_size = (n + block_size - 1) / block_size;
+        
+        let config = LaunchConfig {
+            grid_dim: (grid_size as u32, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        
+        unsafe {
+            kernel.launch(config, (tensor.data.as_ref(), &*output.data, n as u32))?;
+        }
+        
+        self.device.synchronize()?;
+        Ok(output)
+    }
+    
+    pub fn sqrt(&self, tensor: &Tensor) -> Result<Tensor> {
+        let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+        let n = tensor.shape.elem_count();
+        
+        let kernel = self.kernels.get("sqrt_kernel")
+            .ok_or_else(|| FlameError::KernelError("sqrt_kernel not found".into()))?
+            .clone();
+        
+        let block_size = 256;
+        let grid_size = (n + block_size - 1) / block_size;
+        
+        let config = LaunchConfig {
+            grid_dim: (grid_size as u32, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        
+        unsafe {
+            kernel.launch(config, (tensor.data.as_ref(), &*output.data, n as u32))?;
+        }
+        
+        self.device.synchronize()?;
+        Ok(output)
+    }
+    
     // Transposed convolution operations
     pub fn conv_transpose2d_forward(
         &self,
@@ -585,53 +689,94 @@ impl CudaKernels {
         Err(FlameError::InvalidOperation("ConvTranspose2d backward GPU kernel not yet implemented".into()))
     }
     
-    // Pooling operations - these need actual GPU implementations
+    // Pooling operations - using CPU implementations for now
     pub fn maxpool2d_forward(
-        _input: &Tensor,
-        _kernel_size: (usize, usize),
-        _stride: (usize, usize),
-        _padding: (usize, usize),
+        input: &Tensor,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
     ) -> Result<Tensor> {
-        Err(FlameError::InvalidOperation("MaxPool2d GPU kernel not yet implemented".into()))
+        // Use CPU implementation
+        let (output, _indices) = crate::pooling_impl::maxpool2d_forward(input, kernel_size, stride, padding)?;
+        Ok(output)
     }
     
     pub fn maxpool2d_backward(
-        _grad_output: &Tensor,
-        _input: &Tensor,
-        _kernel_size: (usize, usize),
-        _stride: (usize, usize),
-        _padding: (usize, usize),
+        grad_output: &Tensor,
+        input: &Tensor,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
     ) -> Result<Tensor> {
-        Err(FlameError::InvalidOperation("MaxPool2d backward GPU kernel not yet implemented".into()))
+        // First do forward pass to get indices
+        let (_output, indices) = crate::pooling_impl::maxpool2d_forward(input, kernel_size, stride, padding)?;
+        // Then use indices for backward pass
+        crate::pooling_impl::maxpool2d_backward(grad_output, input.shape.clone(), &indices)
     }
     
     pub fn avgpool2d_forward(
-        _input: &Tensor,
-        _kernel_size: (usize, usize),
-        _stride: (usize, usize),
-        _padding: (usize, usize),
-        _count_include_pad: bool,
+        input: &Tensor,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+        count_include_pad: bool,
     ) -> Result<Tensor> {
-        Err(FlameError::InvalidOperation("AvgPool2d GPU kernel not yet implemented".into()))
+        // Use CPU implementation
+        crate::pooling_impl::avgpool2d_forward(input, kernel_size, stride, padding, count_include_pad)
     }
     
     pub fn avgpool2d_backward(
-        _grad_output: &Tensor,
-        _input: &Tensor,
-        _kernel_size: (usize, usize),
-        _stride: (usize, usize),
-        _padding: (usize, usize),
-        _count_include_pad: bool,
+        grad_output: &Tensor,
+        input: &Tensor,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+        count_include_pad: bool,
     ) -> Result<Tensor> {
-        Err(FlameError::InvalidOperation("AvgPool2d backward GPU kernel not yet implemented".into()))
+        // Use CPU implementation
+        crate::pooling_impl::avgpool2d_backward(grad_output, input.shape.clone(), kernel_size, stride, padding, count_include_pad)
     }
     
-    pub fn adaptive_maxpool2d_forward(_input: &Tensor, _output_size: (usize, usize)) -> Result<Tensor> {
-        Err(FlameError::InvalidOperation("AdaptiveMaxPool2d GPU kernel not yet implemented".into()))
+    pub fn adaptive_maxpool2d_forward(input: &Tensor, output_size: (usize, usize)) -> Result<Tensor> {
+        // Calculate adaptive kernel size and stride
+        let shape = input.shape().dims();
+        let (_, _, h_in, w_in) = (shape[0], shape[1], shape[2], shape[3]);
+        let (h_out, w_out) = output_size;
+        
+        let stride_h = h_in / h_out;
+        let stride_w = w_in / w_out;
+        let kernel_h = h_in - (h_out - 1) * stride_h;
+        let kernel_w = w_in - (w_out - 1) * stride_w;
+        
+        // Use regular maxpool with calculated parameters
+        let (output, _indices) = crate::pooling_impl::maxpool2d_forward(
+            input, 
+            (kernel_h, kernel_w), 
+            (stride_h, stride_w), 
+            (0, 0)
+        )?;
+        Ok(output)
     }
     
-    pub fn adaptive_avgpool2d_forward(_input: &Tensor, _output_size: (usize, usize)) -> Result<Tensor> {
-        Err(FlameError::InvalidOperation("AdaptiveAvgPool2d GPU kernel not yet implemented".into()))
+    pub fn adaptive_avgpool2d_forward(input: &Tensor, output_size: (usize, usize)) -> Result<Tensor> {
+        // Calculate adaptive kernel size and stride
+        let shape = input.shape().dims();
+        let (_, _, h_in, w_in) = (shape[0], shape[1], shape[2], shape[3]);
+        let (h_out, w_out) = output_size;
+        
+        let stride_h = h_in / h_out;
+        let stride_w = w_in / w_out;
+        let kernel_h = h_in - (h_out - 1) * stride_h;
+        let kernel_w = w_in - (w_out - 1) * stride_w;
+        
+        // Use regular avgpool with calculated parameters
+        crate::pooling_impl::avgpool2d_forward(
+            input, 
+            (kernel_h, kernel_w), 
+            (stride_h, stride_w), 
+            (0, 0),
+            false
+        )
     }
     
     // Upsampling operations

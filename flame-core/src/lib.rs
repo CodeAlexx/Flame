@@ -12,6 +12,7 @@ pub mod norm;
 pub mod embedding;
 pub mod cuda_kernels;
 pub mod cuda_kernel_sources;
+pub mod cuda_kernel_compiler;
 pub mod cuda_ops;
 pub mod cuda_kernels_v2;
 pub mod cuda_conv2d_kernels;
@@ -30,23 +31,28 @@ pub mod regularization;
 pub mod mixed_precision;
 pub mod gradient_clip;
 pub mod pooling;
+pub mod pooling_impl;
 pub mod upsampling;
 pub mod activations;
 // pub mod candle_interop;  // Temporarily disable due to cudarc version conflict
-pub mod modulated_blocks;
-pub mod flux_blocks;
-pub mod mmdit_blocks;
+// Model-specific blocks removed - these belong in the application layer, not the framework
+// pub mod modulated_blocks;  // Removed: model-specific
+// pub mod flux_blocks;  // Removed: model-specific
+// pub mod mmdit_blocks;  // Removed: model-specific
 // pub mod eridiffusion_adapter;  // Temporarily disable due to candle_interop dependency
 pub mod conv3d;
 pub mod flash_attention;
 pub mod samplers;
-pub mod tokenizer;
+// pub mod tokenizer;  // Removed: model-specific
 pub mod fp16;
 pub mod kernel_launcher;
 pub mod tensor_ops_extended;
+pub mod tensor_ops_missing;
+pub mod parameter;
+pub mod adam;
 pub mod lora;
-pub mod sdxl_attention;
-pub mod sdxl_unet_blocks;
+// pub mod sdxl_attention;  // Removed: model-specific
+// pub mod sdxl_unet_blocks;  // Removed: model-specific
 pub mod loss;
 
 pub use dtype::DType;
