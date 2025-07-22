@@ -139,6 +139,12 @@ impl AutogradContext {
         ctx.clear();
     }
     
+    /// Reset the entire autograd context (for testing)
+    pub fn reset() {
+        let mut ctx = AUTOGRAD_CONTEXT.lock().unwrap();
+        *ctx = AutogradContextInner::new();
+    }
+    
     /// Disable autograd (e.g., for inference)
     pub fn set_enabled(enabled: bool) {
         let mut ctx = AUTOGRAD_CONTEXT.lock().unwrap();

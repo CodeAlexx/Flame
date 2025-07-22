@@ -10,6 +10,13 @@ fn test_device() -> Arc<CudaDevice> {
     CudaDevice::new(0).expect("Failed to create CUDA device")
 }
 
+/// Helper to setup test environment
+fn setup_test() -> Arc<CudaDevice> {
+    // Reset autograd context to ensure clean state
+    AutogradContext::reset();
+    test_device()
+}
+
 /// Helper to check if gradients are approximately equal
 fn assert_grad_close(actual: &Tensor, expected: &[f32], tolerance: f32) {
     let actual_data = actual.to_vec().expect("Failed to get tensor data");
@@ -27,7 +34,7 @@ fn assert_grad_close(actual: &Tensor, expected: &[f32], tolerance: f32) {
 
 #[test]
 fn test_basic_gradient_flow() -> Result<()> {
-    let device = test_device();
+    let device = setup_test();
     
     // Create input tensor with requires_grad
     let x = Tensor::from_vec(vec![2.0, 3.0, 4.0], Shape::from_dims(&[3]), device.clone())?;
@@ -54,7 +61,7 @@ fn test_basic_gradient_flow() -> Result<()> {
 
 #[test]
 fn test_matrix_multiplication_gradients() -> Result<()> {
-    let device = test_device();
+    let device = setup_test();
     
     // A: [2, 3], B: [3, 2]
     let a_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -109,7 +116,7 @@ fn test_matrix_multiplication_gradients() -> Result<()> {
 
 #[test]
 fn test_activation_gradients() -> Result<()> {
-    let device = test_device();
+    let device = setup_test();
     
     // Test ReLU gradient
     let x = Tensor::from_vec(
@@ -132,7 +139,7 @@ fn test_activation_gradients() -> Result<()> {
 
 #[test]
 fn test_conv2d_gradients() -> Result<()> {
-    let device = test_device();
+    let device = setup_test();
     
     // Small conv2d test: [1, 1, 3, 3] input, [1, 1, 2, 2] kernel
     let input_data = vec![
@@ -182,7 +189,7 @@ fn test_conv2d_gradients() -> Result<()> {
 
 #[test]
 fn test_layer_norm_gradients() -> Result<()> {
-    let device = test_device();
+    let device = setup_test();
     
     // Test LayerNorm gradient computation
     let batch_size = 2;
@@ -240,7 +247,7 @@ fn test_layer_norm_gradients() -> Result<()> {
 
 #[test]
 fn test_gradient_accumulation() -> Result<()> {
-    let device = test_device();
+    let device = setup_test();
     
     // Test that gradients accumulate correctly across multiple backward passes
     let x = Tensor::from_vec(vec![1.0, 2.0, 3.0], Shape::from_dims(&[3]), device.clone())?
@@ -268,7 +275,7 @@ fn test_gradient_accumulation() -> Result<()> {
 
 #[test]
 fn test_complex_computation_graph() -> Result<()> {
-    let device = test_device();
+    let device = setup_test();
     
     // Build a more complex computation graph
     let x = Tensor::from_vec(vec![1.0, 2.0], Shape::from_dims(&[2, 1]), device.clone())?
@@ -303,7 +310,7 @@ fn test_complex_computation_graph() -> Result<()> {
 
 #[test]
 fn test_batch_operations() -> Result<()> {
-    let device = test_device();
+    let device = setup_test();
     
     // Test batch matrix multiplication
     let batch_size = 3;
@@ -338,7 +345,7 @@ fn test_batch_operations() -> Result<()> {
 
 #[test]
 fn test_broadcasting_gradients() -> Result<()> {
-    let device = test_device();
+    let device = setup_test();
     
     // Test gradient computation with broadcasting
     let a = Tensor::from_vec(
@@ -373,7 +380,7 @@ fn test_broadcasting_gradients() -> Result<()> {
 
 #[test]
 fn test_reshape_operations() -> Result<()> {
-    let device = test_device();
+    let device = setup_test();
     
     // Test gradient flow through reshape operations
     let x = Tensor::from_vec(
@@ -402,7 +409,7 @@ fn test_reshape_operations() -> Result<()> {
 
 #[test]
 fn test_memory_efficient_gradients() -> Result<()> {
-    let device = test_device();
+    let device = setup_test();
     
     // Test gradient computation with memory-efficient operations
     let size = 100;
@@ -433,7 +440,7 @@ fn test_memory_efficient_gradients() -> Result<()> {
 
 #[test]
 fn test_gradient_computation_for_squared_values() -> Result<()> {
-    let device = test_device();
+    let device = setup_test();
     
     // Test gradient computation for x^2
     let x = Tensor::from_vec(
