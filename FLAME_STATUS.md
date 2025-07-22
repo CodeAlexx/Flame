@@ -43,11 +43,15 @@ FLAME (Fast Learning Accelerated Matrix Engine) is a GPU-only tensor computation
 | test_basic_gradient_flow | ✅ Pass | ❌ Fail | Gradient computation correct |
 | test_activation_gradients | ✅ Pass | ❌ Fail | ReLU gradients working |
 | test_broadcasting_gradients | ✅ Pass | ❌ Fail | Broadcast reduction working |
-| test_gradient_accumulation | ✅ Pass | ✅ Pass | Independent gradients verified |
-| test_matrix_multiplication | ❌ Fail | ❌ Fail | Shape mismatch in backward |
+| test_matrix_multiplication_gradients | ✅ Pass | ❌ Fail | Matrix multiplication gradients working |
+| test_gradient_accumulation | ✅ Pass | ❌ Fail | Independent gradients verified |
 | test_conv2d_gradients | ❌ Fail | ❌ Fail | Conv2D kernel not implemented |
-| test_layer_norm_gradients | ❌ Fail | ❌ Fail | Shape mismatch |
-| test_complex_computation | ❌ Fail | ❌ Fail | Multi-layer gradient flow |
+| test_layer_norm_gradients | ❌ Fail | ❌ Fail | mean_dim shape issue |
+| test_complex_computation_graph | ❌ Fail | ❌ Fail | Multi-layer gradient flow |
+| test_batch_operations | ❌ Fail | ❌ Fail | Batch matmul not implemented |
+| test_reshape_operations | ❌ Fail | ❌ Fail | Missing gradients |
+| test_memory_efficient_gradients | ❌ Fail | ❌ Fail | Missing gradients |
+| test_gradient_computation_for_squared_values | ❌ Fail | ❌ Fail | Missing gradients |
 
 ### Test Isolation Issue ✅ FIXED
 - **Symptom**: Tests pass individually but fail when run together
