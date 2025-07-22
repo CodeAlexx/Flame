@@ -38,21 +38,35 @@ fn test_basic_gradient_flow() -> Result<()> {
     
     // Create input tensor with requires_grad
     let x = Tensor::from_vec(vec![2.0, 3.0, 4.0], Shape::from_dims(&[3]), device.clone())?;
+    println!("Created x with shape: {:?}, id: {:?}", x.shape(), x.id());
     let x = x.requires_grad_(true);
+    println!("x.requires_grad: {}", x.requires_grad());
     
     // y = x * 2
     let y = x.mul_scalar(2.0)?;
+    println!("Created y with shape: {:?}, id: {:?}, requires_grad: {}", y.shape(), y.id(), y.requires_grad());
     
     // z = y + 3 = 2x + 3
     let z = y.add_scalar(3.0)?;
+    println!("Created z with shape: {:?}, id: {:?}, requires_grad: {}", z.shape(), z.id(), z.requires_grad());
     
     // loss = sum(z) = sum(2x + 3) = 2*sum(x) + 9
     let loss = z.sum()?;
+    println!("Created loss with shape: {:?}, id: {:?}, requires_grad: {}", loss.shape(), loss.id(), loss.requires_grad());
     
     // Compute gradients
+    println!("Computing backward pass...");
     let grads = AutogradContext::backward(&loss)?;
+    println!("Backward pass complete. Number of gradients: {}", grads.len());
+    
+    // Print all gradient IDs
+    println!("Available gradient IDs:");
+    for (id, _) in grads.iter() {
+        println!("  {:?}", id);
+    }
     
     // d(loss)/dx = 2 for all elements
+    println!("Looking for gradient of x with id: {:?}", x.id());
     let x_grad = x.grad(&grads).expect("Missing gradient for x");
     assert_grad_close(&x_grad, &[2.0, 2.0, 2.0], 1e-5);
     

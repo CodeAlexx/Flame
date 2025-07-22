@@ -602,30 +602,8 @@ extern "C" __global__ void slice_kernel(
 
     /// Element-wise addition
     pub fn add(&self, other: &Tensor) -> Result<Tensor> {
-        // Handle broadcasting if shapes don't match
-        let (lhs, rhs) = if self.shape != other.shape {
-            // Determine which tensor needs broadcasting
-            let target_shape = self.shape.broadcast_shape_binary_op(&other.shape)?;
-            
-            let lhs = if self.shape != target_shape {
-                GpuOps::broadcast(self, &target_shape)?
-            } else {
-                self.clone()?
-            };
-            
-            let rhs = if other.shape != target_shape {
-                GpuOps::broadcast(other, &target_shape)?
-            } else {
-                other.clone()?
-            };
-            
-            (lhs, rhs)
-        } else {
-            (self.clone()?, other.clone()?)
-        };
-        
         // Use CUDA kernel for GPU-accelerated addition
-        let mut output = GpuOps::add(&lhs, &rhs)?;
+        let mut output = GpuOps::add(self, other)?;
         
         // AUTOGRAD: Record operation if needed
         if self.requires_grad || other.requires_grad {

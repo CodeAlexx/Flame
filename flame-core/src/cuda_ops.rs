@@ -31,14 +31,54 @@ impl GpuOps {
     
     /// Element-wise addition
     pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        let kernels = Self::get_kernels(&a.device)?;
-        kernels.add(a, b)
+        // Handle broadcasting if shapes don't match
+        if a.shape != b.shape {
+            let target_shape = a.shape.broadcast_shape_binary_op(&b.shape)?;
+            
+            let a_broadcast = if a.shape != target_shape {
+                Self::broadcast(a, &target_shape)?
+            } else {
+                a.clone()?
+            };
+            
+            let b_broadcast = if b.shape != target_shape {
+                Self::broadcast(b, &target_shape)?
+            } else {
+                b.clone()?
+            };
+            
+            let kernels = Self::get_kernels(&a.device)?;
+            kernels.add(&a_broadcast, &b_broadcast)
+        } else {
+            let kernels = Self::get_kernels(&a.device)?;
+            kernels.add(a, b)
+        }
     }
     
     /// Element-wise multiplication  
     pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        let kernels = Self::get_kernels(&a.device)?;
-        kernels.mul(a, b)
+        // Handle broadcasting if shapes don't match
+        if a.shape != b.shape {
+            let target_shape = a.shape.broadcast_shape_binary_op(&b.shape)?;
+            
+            let a_broadcast = if a.shape != target_shape {
+                Self::broadcast(a, &target_shape)?
+            } else {
+                a.clone()?
+            };
+            
+            let b_broadcast = if b.shape != target_shape {
+                Self::broadcast(b, &target_shape)?
+            } else {
+                b.clone()?
+            };
+            
+            let kernels = Self::get_kernels(&a.device)?;
+            kernels.mul(&a_broadcast, &b_broadcast)
+        } else {
+            let kernels = Self::get_kernels(&a.device)?;
+            kernels.mul(a, b)
+        }
     }
     
     /// Scalar multiplication
