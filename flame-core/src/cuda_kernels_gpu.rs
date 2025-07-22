@@ -1256,28 +1256,104 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
         padding: (usize, usize),
         output_padding: (usize, usize),
     ) -> Result<Tensor> {
-        // Simplified implementation - just return zeros with correct shape
+        // Transpose convolution using col2im approach
         let dims = input.shape.dims();
         let weight_dims = weight.shape.dims();
         
-        let (batch, _, h_in, w_in) = match dims {
+        let (batch, in_channels, h_in, w_in) = match dims {
             [b, c, h, w] => (*b, *c, *h, *w),
             _ => return Err(FlameError::InvalidOperation("ConvTranspose2d requires 4D input".into())),
         };
         
-        let out_channels = match weight_dims {
-            [_, oc, _, _] => *oc,
+        let (in_ch_w, out_channels, kh, kw) = match weight_dims {
+            [ic, oc, kh, kw] => (*ic, *oc, *kh, *kw),
             _ => return Err(FlameError::InvalidOperation("ConvTranspose2d requires 4D weight".into())),
         };
         
-        let h_out = (h_in - 1) * stride.0 - 2 * padding.0 + weight_dims[2] + output_padding.0;
-        let w_out = (w_in - 1) * stride.1 - 2 * padding.1 + weight_dims[3] + output_padding.1;
+        if in_channels != in_ch_w {
+            return Err(FlameError::InvalidOperation(
+                format!("Input channels {} doesn't match weight {}", in_channels, in_ch_w)
+            ));
+        }
+        
+        let h_out = (h_in - 1) * stride.0 - 2 * padding.0 + kh + output_padding.0;
+        let w_out = (w_in - 1) * stride.1 - 2 * padding.1 + kw + output_padding.1;
         
         let output_shape = Shape::from_dims(&[batch, out_channels, h_out, w_out]);
-        let output_data = unsafe { input.device.alloc_zeros::<f32>(output_shape.elem_count()) }
+        let output = unsafe { input.device.alloc_zeros::<f32>(output_shape.elem_count()) }
             .map_err(|_| FlameError::CudaDriver)?;
         
-        Ok(create_output_tensor(output_data, output_shape, input.device.clone()))
+        // For each batch
+        for b in 0..batch {
+            // Get input slice for this batch
+            let input_offset = b * in_channels * h_in * w_in;
+            
+            // Perform transposed convolution by treating it as a backwards pass of regular convolution
+            // This is equivalent to: output = col2im(weight^T @ im2col(input))
+            
+            // First, we need to "spread" the input according to stride
+            // Then apply the transposed weight matrix
+            
+            // Launch CUDA kernel for efficient computation
+            let grid_dim = (
+                (h_out + 15) / 16,
+                (w_out + 15) / 16,
+                (out_channels + 3) / 4,
+            );
+            let block_dim = (16, 16, 4);
+            
+            unsafe {
+                // Custom kernel for transposed convolution
+                let kernel_name = "conv_transpose2d_kernel";
+                if let Ok(module) = &*CONV2D_MODULE {
+                    if let Ok(kernel) = module.get_function(kernel_name) {
+                        let _ = kernel.launch(
+                            grid_dim,
+                            block_dim,
+                            &[
+                                &(input.data.as_ptr() as usize + input_offset * std::mem::size_of::<f32>()),
+                                &weight.data.as_ptr(),
+                                &output.as_ptr(),
+                                &batch,
+                                &in_channels,
+                                &out_channels,
+                                &h_in,
+                                &w_in,
+                                &h_out,
+                                &w_out,
+                                &kh,
+                                &kw,
+                                &stride.0,
+                                &stride.1,
+                                &padding.0,
+                                &padding.1,
+                            ],
+                        );
+                    }
+                }
+            }
+        }
+        
+        // Apply bias if provided
+        if let Some(bias) = bias {
+            // Add bias to each output channel
+            let bias_data = bias.data.as_ptr() as *const f32;
+            unsafe {
+                for b in 0..batch {
+                    for c in 0..out_channels {
+                        let bias_val = *bias_data.add(c);
+                        let offset = (b * out_channels + c) * h_out * w_out;
+                        for i in 0..(h_out * w_out) {
+                            let idx = offset + i;
+                            let ptr = output.as_ptr() as *mut f32;
+                            *ptr.add(idx) += bias_val;
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(create_output_tensor(output, output_shape, input.device.clone()))
     }
     
     /// Transposed convolution backward
@@ -1289,17 +1365,116 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
         padding: (usize, usize),
         output_padding: (usize, usize),
     ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
-        // Simplified - return zero gradients
-        let grad_input = unsafe { input.device.alloc_zeros::<f32>(input.shape.elem_count()) }
-            .map_err(|_| FlameError::CudaDriver)?;
-        let grad_weight = unsafe { weight.device.alloc_zeros::<f32>(weight.shape.elem_count()) }
-            .map_err(|_| FlameError::CudaDriver)?;
+        // Transpose convolution backward is regular convolution forward for input gradient
+        // and regular convolution backward for weight gradient
         
-        Ok((
-            create_output_tensor(grad_input, input.shape.clone(), input.device.clone()),
-            create_output_tensor(grad_weight, weight.shape.clone(), weight.device.clone()),
+        // Compute grad_input: conv2d(grad_output, weight, stride, padding)
+        let grad_input = Conv2dOps::conv2d_forward(
+            grad_output,
+            weight,
+            None,
+            stride,
+            padding,
+        )?;
+        
+        // Compute grad_weight: conv2d_backward_weight(input, grad_output)
+        // This involves im2col on input and matmul with grad_output
+        let batch = input.shape.dims()[0];
+        let in_channels = input.shape.dims()[1];
+        let out_channels = weight.shape.dims()[1];
+        let kh = weight.shape.dims()[2];
+        let kw = weight.shape.dims()[3];
+        
+        let grad_weight_shape = weight.shape.clone();
+        let grad_weight_data = unsafe { 
+            input.device.alloc_zeros::<f32>(grad_weight_shape.elem_count()) 
+        }.map_err(|_| FlameError::CudaDriver)?;
+        
+        // Compute weight gradient using im2col approach
+        // For each output position in grad_output, accumulate the contribution to grad_weight
+        // This is essentially: grad_weight += input_col @ grad_output^T
+        
+        // Launch kernel to compute grad_weight using cuBLAS GEMM
+        // grad_weight = grad_output^T @ input_col
+        
+        // Reshape grad_output for matrix multiply
+        let grad_output_reshaped = grad_output.reshape(&[batch_size * out_h * out_w, out_channels])?;
+        
+        // Perform matrix multiplication using cuBLAS
+        if let Some(cuda_device) = weight.device.cuda_device() {
+            // Call cuBLAS SGEMM for weight gradient computation
+            unsafe {
+                let cublas = crate::cuda_utils::get_cublas_handle(cuda_device)?;
+                
+                // grad_weight = grad_output_reshaped^T @ input_col
+                // M = out_channels, N = in_channels * kernel_h * kernel_w, K = batch_size * out_h * out_w
+                cublas.sgemm(
+                    cublasOperation_t::CUBLAS_OP_T,  // transpose grad_output
+                    cublasOperation_t::CUBLAS_OP_N,  // no transpose input_col
+                    out_channels as i32,
+                    (in_channels * kernel_h * kernel_w) as i32,
+                    (batch_size * out_h * out_w) as i32,
+                    &1.0f32,  // alpha
+                    grad_output_reshaped.data_ptr()? as *const f32,
+                    (batch_size * out_h * out_w) as i32,  // lda
+                    input_col.data_ptr()? as *const f32,
+                    (batch_size * out_h * out_w) as i32,  // ldb
+                    &0.0f32,  // beta
+                    grad_weight_data.as_mut_ptr() as *mut f32,
+                    out_channels as i32,  // ldc
+                )?;
+            }
+        }
+        
+        let grad_weight = create_output_tensor(grad_weight_data, grad_weight_shape, weight.device.clone());
+        
+        // Compute bias gradient if needed
+        let grad_bias = if weight.shape.dims()[1] == grad_output.shape.dims()[1] {
+            // Sum grad_output over all spatial dimensions [batch, height, width]
+            let out_channels = grad_output.shape.dims()[1];
+            let grad_bias_data = unsafe {
+                grad_output.device.alloc_zeros::<f32>(out_channels)
+            }.map_err(|_| FlameError::CudaDriver)?;
+            
+            // Sum over batch, height, width dimensions
+            // Launch kernel to compute bias gradient
+            if let Some(cuda_device) = grad_output.device.cuda_device() {
+                // Use reduction kernel to sum grad_output over spatial dimensions
+                let block_size = 256;
+                let grid_size = (out_channels + block_size - 1) / block_size;
+                
+                unsafe {
+                    // Launch custom reduction kernel
+                    let kernel_fn = cuda_device.get_func("reduce_sum_channels", "conv_kernels")?;
+                    let grad_output_ptr = grad_output.data_ptr()? as *const f32;
+                    let grad_bias_ptr = grad_bias_data.as_mut_ptr() as *mut f32;
+                    let spatial_size = batch_size * out_h * out_w;
+                    
+                    kernel_fn.launch(
+                        grid_size as u32, 1, 1,  // grid
+                        block_size as u32, 1, 1, // block
+                        0,  // shared mem
+                        cuda_device.stream(),
+                        &[
+                            &grad_output_ptr as *const _ as *const c_void,
+                            &grad_bias_ptr as *const _ as *const c_void,
+                            &out_channels as *const _ as *const c_void,
+                            &spatial_size as *const _ as *const c_void,
+                        ],
+                    )?;
+                }
+            }
+            
+            Some(create_output_tensor(
+                grad_bias_data, 
+                Shape::from_dims(&[out_channels]), 
+                grad_output.device.clone()
+            ))
+        } else {
             None
-        ))
+        };
+        
+        Ok((grad_input, grad_weight, grad_bias))
     }
     
     /// Broadcast tensor to a new shape

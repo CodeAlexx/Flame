@@ -376,8 +376,12 @@ impl CudaKernels {
         let output_elems: usize = output_shape.iter().product();
         let mut output = Tensor::zeros(Shape::from_dims(&output_shape), tensor.device.clone())?;
         
-        // For now, use a simple CPU implementation and copy to GPU
-        // TODO: Implement proper GPU kernel for multi-dimensional reduction
+        // Implement GPU kernel for multi-dimensional reduction
+        if tensor.device.is_cuda() {
+            return crate::cuda_kernels_gpu::mean_reduce_dims(tensor, dims);
+        }
+        
+        // For CPU tensors, use existing implementation
         let input_data = tensor.to_vec()?;
         let mut output_data = vec![0.0f32; output_elems];
         

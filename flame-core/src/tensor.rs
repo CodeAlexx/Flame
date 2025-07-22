@@ -310,8 +310,50 @@ impl Tensor {
         let blas = CudaBlas::new(self.device.clone())
             .map_err(|_| FlameError::CuBlas)?;
         
-        // For now, implement as loop over batches
-        // TODO: Use cuBLAS batched GEMM for better performance
+        // Use cuBLAS batched GEMM for efficient batch matrix multiplication
+        if self.device.is_cuda() && batch_size > 1 {
+            // Prepare arrays of pointers for batched GEMM
+            let mut a_ptrs = Vec::with_capacity(batch_size);
+            let mut b_ptrs = Vec::with_capacity(batch_size);
+            let mut c_ptrs = Vec::with_capacity(batch_size);
+            
+            for b in 0..batch_size {
+                let self_offset = b * m * k1;
+                let other_offset = b * k1 * n;
+                let output_offset = b * m * n;
+                
+                a_ptrs.push(unsafe { self_3d.data_ptr_offset(self_offset)? });
+                b_ptrs.push(unsafe { other_3d.data_ptr_offset(other_offset)? });
+                c_ptrs.push(unsafe { output.data_ptr_offset(output_offset)? });
+            }
+            
+            // Call cuBLAS batched SGEMM
+            unsafe {
+                let alpha = 1.0f32;
+                let beta = 0.0f32;
+                
+                blas.sgemm_batched(
+                    cublasOperation_t::CUBLAS_OP_N,
+                    cublasOperation_t::CUBLAS_OP_N,
+                    n as i32,
+                    m as i32,
+                    k1 as i32,
+                    &alpha,
+                    b_ptrs.as_ptr() as *const *const f32,
+                    n as i32,
+                    a_ptrs.as_ptr() as *const *const f32,
+                    k1 as i32,
+                    &beta,
+                    c_ptrs.as_mut_ptr() as *mut *mut f32,
+                    n as i32,
+                    batch_size as i32,
+                )?;
+            }
+            
+            return Ok(output);
+        }
+        
+        // Fallback to loop implementation for single batch or CPU
         for b in 0..batch_size {
             let self_offset = b * m * k1;
             let other_offset = b * k1 * n;

@@ -236,41 +236,53 @@ extern "C" __global__ void fused_attention_kernel(
     int head_dim,
     bool has_mask
 ) {
-    // Simplified version - in production would use shared memory
+    // Optimized version using shared memory for better performance
     extern __shared__ float shared_mem[];
+    
+    // Shared memory layout:
+    // - First head_dim floats: Q vector for current position
+    // - Next seq_len floats: attention scores
+    // - Next seq_len floats: attention weights (after softmax)
+    float* shared_q = shared_mem;
+    float* shared_scores = &shared_mem[head_dim];
+    float* shared_weights = &shared_mem[head_dim + seq_len];
     
     int batch_head = blockIdx.x;
     int seq_idx = blockIdx.y;
-    int head_elem = threadIdx.x;
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
     
-    if (batch_head >= batch_size * num_heads || seq_idx >= seq_len || head_elem >= head_dim) {
+    if (batch_head >= batch_size * num_heads || seq_idx >= seq_len) {
         return;
     }
     
     int batch_idx = batch_head / num_heads;
     int head_idx = batch_head % num_heads;
     
-    // Compute attention scores for this query position
+    // Load Q vector into shared memory
+    for (int d = tid; d < head_dim; d += block_size) {
+        int q_idx = batch_idx * num_heads * seq_len * head_dim +
+                   head_idx * seq_len * head_dim +
+                   seq_idx * head_dim + d;
+        shared_q[d] = q[q_idx];
+    }
+    __syncthreads();
+    
+    // Compute attention scores using all threads
     float max_score = -1e20f;
     
-    // First pass: compute scores and find max
-    for (int kv_idx = 0; kv_idx <= seq_idx; kv_idx++) {
+    // Each thread computes scores for a subset of K positions
+    for (int kv_idx = tid; kv_idx <= seq_idx; kv_idx += block_size) {
         float score = 0.0f;
         
-        // Compute Q @ K^T for this position
-        if (head_elem == 0) {
-            for (int d = 0; d < head_dim; d++) {
-                int q_idx = batch_idx * num_heads * seq_len * head_dim +
-                           head_idx * seq_len * head_dim +
-                           seq_idx * head_dim + d;
-                           
-                int k_idx = batch_idx * num_heads * seq_len * head_dim +
-                           head_idx * seq_len * head_dim +
-                           kv_idx * head_dim + d;
-                           
-                score += q[q_idx] * k[k_idx];
-            }
-            score *= scale;
+        // Compute dot product Q @ K^T
+        for (int d = 0; d < head_dim; d++) {
+            int k_idx = batch_idx * num_heads * seq_len * head_dim +
+                       head_idx * seq_len * head_dim +
+                       kv_idx * head_dim + d;
+            score += shared_q[d] * k[k_idx];
+        }
+        score *= scale;
             
             if (has_mask) {
                 int mask_idx = batch_idx * seq_len * seq_len + seq_idx * seq_len + kv_idx;

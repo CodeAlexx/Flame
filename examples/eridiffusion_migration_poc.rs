@@ -74,8 +74,54 @@ impl ResnetBlock2D {
 
 impl GroupNorm {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Simplified group norm - in practice would use proper implementation
-        x.clone()
+        // Group normalization: normalize across groups of channels
+        let shape = x.shape();
+        let dims = shape.dims();
+        
+        // Expected shape: [batch, channels, height, width]
+        if dims.len() != 4 {
+            return Err(FlameError::ShapeError(format!(
+                "GroupNorm expects 4D input, got {}D", dims.len()
+            )));
+        }
+        
+        let batch_size = dims[0];
+        let num_channels = dims[1];
+        let height = dims[2];
+        let width = dims[3];
+        
+        if num_channels != self.num_channels {
+            return Err(FlameError::ShapeError(format!(
+                "Expected {} channels, got {}", self.num_channels, num_channels
+            )));
+        }
+        
+        if num_channels % self.num_groups != 0 {
+            return Err(FlameError::ShapeError(format!(
+                "num_channels {} must be divisible by num_groups {}", 
+                num_channels, self.num_groups
+            )));
+        }
+        
+        let channels_per_group = num_channels / self.num_groups;
+        
+        // Reshape to [batch, num_groups, channels_per_group, height, width]
+        let reshaped = x.reshape(&[batch_size, self.num_groups, channels_per_group, height, width])?;
+        
+        // Compute mean and variance per group
+        // Mean over dimensions [2, 3, 4] (channels_per_group, height, width)
+        let mean = reshaped.mean_keepdim(&[2, 3, 4])?;
+        let x_centered = reshaped.sub(&mean)?;
+        
+        // Variance
+        let var = x_centered.mul(&x_centered)?.mean_keepdim(&[2, 3, 4])?;
+        
+        // Normalize
+        let std = var.add_scalar(self.eps)?.sqrt()?;
+        let normalized = x_centered.div(&std)?;
+        
+        // Reshape back to original shape
+        normalized.reshape(&[batch_size, num_channels, height, width])
     }
 }
 

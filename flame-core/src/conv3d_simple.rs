@@ -218,23 +218,35 @@ extern "C" __global__ void conv3d_forward(
     
     /// Add bias to output tensor
     fn add_bias_3d(&self, output: &mut Tensor, bias: &Tensor) -> Result<()> {
-        // Simple CPU implementation
-        // TODO: Replace with CUDA kernel when available
-        
-        let output_data = output.to_vec()?;
-        let bias_data = bias.to_vec()?;
-        let mut result = output_data;
-        
-        let dims = output.shape().dims();
-        let spatial_size = dims[2] * dims[3] * dims[4];
-        
-        for idx in 0..result.len() {
-            let channel = (idx / spatial_size) % self.out_channels;
-            result[idx] += bias_data[channel];
+        if output.device.is_cuda() {
+            // Use CUDA kernel for efficient bias addition
+            let dims = output.shape().dims();
+            let out_channels = dims[1];
+            
+            // Reshape bias for broadcasting and add
+            let bias_shape = Shape::from_dims(&[1, out_channels, 1, 1, 1]);
+            let bias_reshaped = bias.reshape(&bias_shape)?;
+            
+            // Broadcast and add using CUDA operations
+            *output = output.add(&bias_reshaped)?;
+            Ok(())
+        } else {
+            // CPU implementation
+            let output_data = output.to_vec()?;
+            let bias_data = bias.to_vec()?;
+            let mut result = output_data;
+            
+            let dims = output.shape().dims();
+            let spatial_size = dims[2] * dims[3] * dims[4];
+            
+            for idx in 0..result.len() {
+                let channel = (idx / spatial_size) % self.out_channels;
+                result[idx] += bias_data[channel];
+            }
+            
+            *output = Tensor::from_vec(result, output.shape().clone(), output.device.clone())?;
+            Ok(())
         }
-        
-        *output = Tensor::from_vec(result, output.shape().clone(), output.device.clone())?;
-        Ok(())
     }
 }
 

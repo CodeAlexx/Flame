@@ -25,7 +25,7 @@ fn main() -> Result<()> {
             .requires_grad_(true);
         let z = y.conv2d(&conv2_weight, None, 1, 1)?; // stride=1
         
-        // Simplified attention mechanism (using matmul)
+        // Scaled dot-product attention mechanism
         let b = z.shape().dims()[0];
         let c = z.shape().dims()[1];
         let h = z.shape().dims()[2];
@@ -35,11 +35,29 @@ fn main() -> Result<()> {
         let z_flat = z.reshape(&[b, c, h * w])?;
         let z_perm = z_flat.permute(&[0, 2, 1])?; // [B, H*W, C]
         
-        // Simple self-attention: Q @ K^T
-        let attn_scores = z_perm.matmul(&z_flat)?; // [B, H*W, H*W]
+        // Create Q, K, V projections (using the same tensor for simplicity)
+        let head_dim = c / 8; // 8 heads
+        let num_heads = 8;
+        
+        // Reshape for multi-head attention: [B, H*W, num_heads, head_dim]
+        let qkv = z_perm.reshape(&[b, h * w, num_heads, head_dim])?;
+        let q = qkv.permute(&[0, 2, 1, 3])?; // [B, num_heads, H*W, head_dim]
+        let k = qkv.permute(&[0, 2, 3, 1])?; // [B, num_heads, head_dim, H*W]
+        let v = qkv.permute(&[0, 2, 1, 3])?; // [B, num_heads, H*W, head_dim]
+        
+        // Scaled dot-product attention: softmax(Q @ K^T / sqrt(d_k)) @ V
+        let scale = (head_dim as f32).sqrt();
+        let attn_scores = q.matmul(&k)?.div_scalar(scale)?; // [B, num_heads, H*W, H*W]
+        
+        // Apply softmax
+        let attn_weights = attn_scores.softmax(-1)?;
         
         // Apply attention to values
-        let attn_out = attn_scores.matmul(&z_perm)?; // [B, H*W, C]
+        let attn_out = attn_weights.matmul(&v)?; // [B, num_heads, H*W, head_dim]
+        
+        // Reshape back: [B, num_heads, H*W, head_dim] -> [B, H*W, C]
+        let attn_out = attn_out.permute(&[0, 2, 1, 3])?
+            .reshape(&[b, h * w, c])?;
         
         // Reshape back and sum
         let loss = attn_out.sum()?;

@@ -64,9 +64,32 @@ impl EulerSampler {
     
     /// Calculate sigma from timestep
     fn timestep_to_sigma(&self, t: f32) -> f32 {
-        // Simple linear schedule for now
-        // TODO: Support different noise schedules
-        let alpha = 1.0 - (t / self.num_train_timesteps as f32);
+        // Support different noise schedules based on configuration
+        let normalized_t = t / self.num_train_timesteps as f32;
+        
+        let alpha = match self.noise_schedule.as_str() {
+            "linear" => 1.0 - normalized_t,
+            "cosine" => {
+                // Cosine schedule from improved DDPM paper
+                let s = 0.008; // small offset to prevent singularity
+                let cos_val = ((normalized_t + s) / (1.0 + s) * std::f32::consts::PI * 0.5).cos();
+                cos_val * cos_val
+            }
+            "scaled_linear" => {
+                // Scaled linear (used in some models like SD)
+                let beta_start = 0.00085;
+                let beta_end = 0.012;
+                let beta = beta_start + normalized_t * (beta_end - beta_start);
+                (1.0 - beta).powf(0.5)
+            }
+            "squaredcos_cap_v2" => {
+                // Squared cosine capped schedule
+                let alpha_cumprod = ((normalized_t * std::f32::consts::PI * 0.5).cos()).powi(2);
+                alpha_cumprod.max(0.0001) // Cap to prevent numerical issues
+            }
+            _ => 1.0 - normalized_t, // Default to linear
+        };
+        
         ((1.0 - alpha.powi(2)) / alpha.powi(2)).sqrt()
     }
     

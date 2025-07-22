@@ -131,10 +131,15 @@ impl FlashAttention {
         // Softmax
         let attn_weights = scores.softmax(-1)?;
         
-        // Apply dropout if needed (skip for now)
-        let attn_weights = if self.config.dropout_p > 0.0 {
-            // TODO: Implement dropout when needed
-            attn_weights
+        // Apply dropout if needed
+        let attn_weights = if self.config.dropout_p > 0.0 && self.training {
+            // Apply dropout mask during training
+            let dropout_mask = Tensor::rand_like(&attn_weights)?;
+            let keep_prob = 1.0 - self.config.dropout_p;
+            let dropout_mask = dropout_mask.ge_scalar(self.config.dropout_p)?;
+            
+            // Scale by keep probability to maintain expected value
+            attn_weights.mul(&dropout_mask)?.mul_scalar(1.0 / keep_prob)?
         } else {
             attn_weights
         };
@@ -232,9 +237,57 @@ pub fn flash_attn_varlen(
     softmax_scale: f32,
     causal: bool,
 ) -> Result<Tensor> {
-    // For now, this falls back to the regular implementation
-    // TODO: Implement variable-length support with cu_seqlens
-    flash_attn(q, k, v, softmax_scale, causal)
+    // Variable-length attention support
+    // Process sequences with different lengths using cumulative sequence lengths
+    
+    let device = q.device();
+    let dtype = q.dtype();
+    let (total_q, num_heads, head_dim) = {
+        let shape = q.shape().dims();
+        (shape[0], shape[1], shape[2])
+    };
+    
+    // Create output tensor
+    let mut output = Tensor::zeros(&[total_q, num_heads, head_dim], dtype, device)?;
+    
+    // Get cumulative sequence lengths
+    let cu_seqlens_q = seqlens_q.to_vec::<i32>()?;
+    let cu_seqlens_k = seqlens_k.to_vec::<i32>()?;
+    let batch_size = cu_seqlens_q.len() - 1;
+    
+    // Process each sequence in the batch
+    for b in 0..batch_size {
+        let q_start = cu_seqlens_q[b] as usize;
+        let q_end = cu_seqlens_q[b + 1] as usize;
+        let k_start = cu_seqlens_k[b] as usize;
+        let k_end = cu_seqlens_k[b + 1] as usize;
+        
+        let seq_len_q = q_end - q_start;
+        let seq_len_k = k_end - k_start;
+        
+        if seq_len_q == 0 || seq_len_k == 0 {
+            continue;
+        }
+        
+        // Extract subsequences
+        let q_seq = q.narrow(0, q_start, seq_len_q)?;
+        let k_seq = k.narrow(0, k_start, seq_len_k)?;
+        let v_seq = v.narrow(0, k_start, seq_len_k)?;
+        
+        // Reshape to [1, num_heads, seq_len, head_dim]
+        let q_seq = q_seq.unsqueeze(0)?.transpose(1, 2)?;
+        let k_seq = k_seq.unsqueeze(0)?.transpose(1, 2)?;
+        let v_seq = v_seq.unsqueeze(0)?.transpose(1, 2)?;
+        
+        // Run attention on this sequence
+        let attn_output = flash_attn(&q_seq, &k_seq, &v_seq, softmax_scale, causal)?;
+        
+        // Copy back to output
+        let attn_output = attn_output.squeeze(0)?.transpose(1, 2)?;
+        output.narrow(0, q_start, seq_len_q)?.copy_(&attn_output)?;
+    }
+    
+    Ok(output)
 }
 
 #[cfg(test)]

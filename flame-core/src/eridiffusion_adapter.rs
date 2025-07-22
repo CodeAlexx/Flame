@@ -283,17 +283,47 @@ impl LossAdapter {
     
     /// Compute SNR-based loss weight
     fn compute_snr_weight(&self, timesteps: &Tensor, gamma: f32) -> Result<Tensor> {
-        // Simplified SNR weighting for now
-        // In practice, this depends on the noise schedule
-        let t_data = timesteps.to_vec()?;
-        let weights: Vec<f32> = t_data.iter()
-            .map(|&t| {
-                let snr = ((1.0 - t) / t).max(1e-8);
-                (snr / (1.0 + snr)).powf(gamma)
-            })
-            .collect();
+        // Compute signal-to-noise ratio (SNR) based on DDPM formulation
+        // For DDPM: alpha_t = prod(1 - beta_i) for i=1 to t
+        // SNR(t) = alpha_t^2 / (1 - alpha_t^2)
         
-        Tensor::from_vec(weights, timesteps.shape().clone(), self.device.clone())
+        // Linear beta schedule (can be customized)
+        let num_train_timesteps = 1000.0;
+        let beta_start = 0.0001;
+        let beta_end = 0.02;
+        
+        // Normalize timesteps to [0, 1]
+        let normalized_timesteps = timesteps.div_scalar(num_train_timesteps)?;
+        
+        // Compute betas for continuous timesteps
+        let betas = normalized_timesteps.mul_scalar(beta_end - beta_start)?
+            .add_scalar(beta_start)?;
+        
+        // Compute alpha = 1 - beta
+        let alphas = Tensor::ones_like(&betas)?
+            .sub(&betas)?;
+        
+        // Compute cumulative product of alphas (alpha_bar)
+        // For continuous time: alpha_bar(t) = exp(-0.5 * integral of log(1-beta))
+        // Approximation: alpha_bar(t) ≈ exp(-0.5 * t * (beta_start + beta_end)/2)
+        let avg_beta = (beta_start + beta_end) / 2.0;
+        let log_alpha_bar = normalized_timesteps.mul_scalar(-avg_beta)?;
+        let alpha_bar = log_alpha_bar.exp()?;
+        
+        // Compute SNR = alpha_bar^2 / (1 - alpha_bar^2)
+        let alpha_bar_sq = alpha_bar.mul(&alpha_bar)?;
+        let one_minus_alpha_bar_sq = Tensor::ones_like(&alpha_bar_sq)?
+            .sub(&alpha_bar_sq)?;
+        
+        // Add small epsilon to avoid division by zero
+        let snr = alpha_bar_sq.div(&one_minus_alpha_bar_sq.add_scalar(1e-8)?)?;
+        
+        // Apply Min-SNR weighting: min(snr, gamma) / snr
+        // This prevents overweighting of easy timesteps
+        let snr_clipped = snr.minimum_scalar(gamma)?;
+        let weights = snr_clipped.div(&snr.add_scalar(1e-8)?)?;
+        
+        weights
     }
 }
 

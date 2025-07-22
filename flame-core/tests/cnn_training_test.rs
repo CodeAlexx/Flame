@@ -78,13 +78,27 @@ impl SimpleCNN {
 
 /// Cross-entropy loss for classification
 fn cross_entropy_loss(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
-    // Simplified version - just MSE loss for now
-    // Real cross-entropy would need softmax and log
-    let diff = logits.sub(targets)?;
-    let squared = diff.mul(&diff)?;
-    let loss = squared.sum()?;
-    let batch_size = logits.shape().dims()[0] as f32;
-    loss.div_scalar(batch_size)
+    // Compute log_softmax: log(exp(x_i) / sum(exp(x_j)))
+    let max_logits = logits.max_keepdim(1)?;
+    let shifted_logits = logits.sub(&max_logits)?;
+    let exp_logits = shifted_logits.exp()?;
+    let sum_exp = exp_logits.sum_keepdim(1)?;
+    let log_sum_exp = sum_exp.log()?;
+    let log_softmax = shifted_logits.sub(&log_sum_exp)?;
+    
+    // Gather log probabilities for target classes
+    // targets should be class indices
+    let batch_size = logits.shape().dims()[0];
+    let num_classes = logits.shape().dims()[1];
+    
+    // Create one-hot encoding of targets
+    let targets_long = targets.to_dtype(DType::I64)?;
+    let one_hot = Tensor::zeros(&[batch_size, num_classes], DType::F32, targets.device())?;
+    let one_hot = one_hot.scatter(1, &targets_long.unsqueeze(1)?, &Tensor::ones(&[batch_size, 1], DType::F32, targets.device())?)?;
+    
+    // Compute negative log likelihood
+    let nll = log_softmax.mul(&one_hot)?.sum()?;
+    nll.neg()?.div_scalar(batch_size as f32)
 }
 
 #[test]

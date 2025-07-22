@@ -76,9 +76,12 @@ impl AutocastContext {
 
 /// Cast tensor to different precision
 pub fn cast_tensor(tensor: &Tensor, target_dtype: DType) -> Result<Tensor> {
-    // For now, implement CPU casting
-    // TODO: Add CUDA kernels for efficient casting
+    // Use CUDA kernels for efficient casting when available
+    if tensor.device().is_cuda() && tensor.dtype() != target_dtype {
+        return crate::cuda_kernels_gpu::cast_dtype(tensor, target_dtype);
+    }
     
+    // CPU casting implementation
     let data = tensor.to_vec()?;
     let shape = tensor.shape().clone();
     let device = tensor.device().clone();

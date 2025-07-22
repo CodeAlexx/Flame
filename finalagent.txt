@@ -1,0 +1,737 @@
+# Final EriDiffusion-FLAME Integration Verification Agents
+
+**Mission**: Comprehensively verify the direct migration worked correctly and everything functions as intended. NO assumptions, TEST everything.
+
+## Agent 1: Code Purity Auditor
+**Mission**: Verify complete Candle elimination and clean FLAME integration
+
+### 1. Zero Candle Dependencies Verification
+
+#### Complete Candle Purge Check
+```bash
+# These MUST return 0 results:
+echo "=== CANDLE DEPENDENCY AUDIT ==="
+
+echo "Candle imports in source code:"
+find eridiffusion/src -name "*.rs" -exec grep -l "candle" {} \; | wc -l
+
+echo "Candle references in source:"
+grep -r "candle" eridiffusion/src --include="*.rs" | wc -l
+
+echo "VarBuilder references:"
+grep -r "VarBuilder" eridiffusion/src --include="*.rs" | wc -l
+
+echo "Compatibility layer references:"
+grep -r "compat" eridiffusion/src --include="*.rs" | wc -l
+
+echo "Candle in Cargo.toml:"
+grep -c "candle" eridiffusion/Cargo.toml
+
+# ALL of these MUST be 0
+```
+
+#### FLAME Integration Verification
+```bash
+echo "=== FLAME INTEGRATION AUDIT ==="
+
+echo "FLAME imports:"
+grep -r "use flame" eridiffusion/src --include="*.rs" | wc -l
+
+echo "FLAME tensor usage:"
+grep -r "flame::Tensor" eridiffusion/src --include="*.rs" | wc -l
+
+echo "FLAME nn modules:"
+grep -r "flame::nn::" eridiffusion/src --include="*.rs" | wc -l
+
+# These should be > 0 and match expected usage
+```
+
+#### Source Code Quality Check
+```rust
+// Verify clean direct usage patterns
+// Look for these GOOD patterns:
+use flame::{Tensor, Device, DType};
+use flame::nn::{Conv2d, Linear};
+
+let tensor = Tensor::randn(&[batch, channels, height, width], device)?;
+let result = model.forward(&tensor)?;
+
+// Look for these BAD patterns (should be ZERO):
+use candle_compat::*;
+use some_wrapper::*;
+let compat_tensor = CompatTensor::new(...);
+```
+
+### 2. Architecture Compliance Verification
+
+#### Verify Separation of Concerns
+```bash
+# Check that model-specific code stays in EriDiffusion
+echo "=== ARCHITECTURE COMPLIANCE ==="
+
+# FLAME should NOT contain these (model-specific):
+grep -r "SDXL\|UNet\|VAE\|CLIP" flame/src --include="*.rs" | wc -l
+
+# EriDiffusion should contain these:
+grep -r "SDXL\|UNet\|VAE\|CLIP" eridiffusion/src --include="*.rs" | wc -l
+
+# Verify clean imports (no circular dependencies)
+grep -r "use eridiffusion" flame/src --include="*.rs" | wc -l  # Should be 0
+grep -r "use flame" eridiffusion/src --include="*.rs" | wc -l   # Should be > 0
+```
+
+### Agent 1 Success Criteria
+- [ ] Zero Candle references in source code
+- [ ] Zero compatibility layer code
+- [ ] FLAME imports present and correct
+- [ ] Clean architectural separation maintained
+- [ ] No circular dependencies
+
+---
+
+## Agent 2: Compilation & Basic Functionality Verifier
+**Mission**: Ensure everything compiles and basic operations work
+
+### 1. Compilation Verification
+
+#### Full Clean Build Test
+```bash
+cd eridiffusion/
+
+# Clean build from scratch
+cargo clean
+cargo check --all-targets --all-features
+
+# Should compile without errors
+echo "Compilation status: $?"
+
+# Build tests
+cargo test --no-run --all
+
+# Should build all tests successfully
+echo "Test compilation status: $?"
+```
+
+#### Dependency Resolution Check
+```bash
+# Verify FLAME dependency is correctly specified
+grep -A5 -B5 "flame" eridiffusion/Cargo.toml
+
+# Check for version conflicts
+cargo tree | grep flame
+
+# Verify no duplicate dependencies
+cargo tree --duplicates
+```
+
+### 2. Basic Functionality Tests
+
+#### FLAME Tensor Operations Test
+```rust
+#[test]
+fn test_basic_flame_operations() {
+    let device = Device::Cuda(0);
+    
+    // Test tensor creation
+    let a = Tensor::randn(&[10, 10], device)?;
+    let b = Tensor::randn(&[10, 10], device)?;
+    
+    // Test basic operations
+    let add_result = &a + &b;
+    let mul_result = &a * &b;
+    let matmul_result = a.matmul(&b)?;
+    
+    // Verify results are valid
+    assert!(add_result.is_finite());
+    assert!(mul_result.is_finite());
+    assert!(matmul_result.is_finite());
+    
+    println!("✅ Basic FLAME operations work");
+}
+```
+
+#### Model Loading Test
+```rust
+#[test]
+fn test_model_loading_flame() {
+    let device = Device::Cuda(0);
+    
+    // Test that models can be loaded with FLAME
+    let result = VAEModel::load_from_safetensors("/path/to/vae.safetensors", device);
+    match result {
+        Ok(model) => {
+            println!("✅ Model loading with FLAME works");
+            
+            // Test forward pass
+            let input = Tensor::randn(&[1, 3, 512, 512], device)?;
+            let output = model.encode(&input)?;
+            assert!(output.is_finite());
+        }
+        Err(e) => {
+            panic!("❌ Model loading failed: {}", e);
+        }
+    }
+}
+```
+
+### Agent 2 Success Criteria
+- [ ] Clean compilation with no errors
+- [ ] No dependency conflicts
+- [ ] Basic FLAME operations work
+- [ ] Model loading functions
+- [ ] Forward passes complete successfully
+
+---
+
+## Agent 3: Training System Verifier
+**Mission**: Verify training loops work with FLAME's mutable gradients
+
+### 1. Autograd System Verification
+
+#### Complex Gradient Flow Test
+```rust
+#[test]
+fn test_complex_autograd_flow() {
+    let device = Device::Cuda(0);
+    
+    // Create complex computation graph (similar to diffusion training)
+    let latents = Tensor::randn(&[2, 4, 32, 32], device)?.requires_grad();
+    let noise = Tensor::randn(&[2, 4, 32, 32], device)?;
+    let timesteps = Tensor::randint(0, 1000, &[2], device)?;
+    
+    // Simulate UNet forward pass
+    let conv1 = flame::nn::Conv2d::new(4, 64, 3, 1, 1, device)?;
+    let conv2 = flame::nn::Conv2d::new(64, 128, 3, 1, 1, device)?;
+    let conv3 = flame::nn::Conv2d::new(128, 4, 3, 1, 1, device)?;
+    
+    let h1 = conv1.forward(&latents)?.relu()?;
+    let h2 = conv2.forward(&h1)?.relu()?;
+    let pred_noise = conv3.forward(&h2)?;
+    
+    // Diffusion loss
+    let loss = (&pred_noise - &noise).pow(2.0)?.mean();
+    
+    // Critical test: backward pass should work
+    let grad_map = loss.backward()?;
+    
+    // Verify gradients exist
+    assert!(grad_map.contains_key(&latents.id()));
+    assert!(grad_map.len() > 0);
+    
+    // Verify gradients are finite
+    for (name, grad) in grad_map.iter() {
+        assert!(grad.is_finite(), "Gradient {} is not finite", name);
+    }
+    
+    println!("✅ Complex autograd flow works");
+}
+```
+
+#### Parameter Update Test
+```rust
+#[test]
+fn test_parameter_updates() {
+    let device = Device::Cuda(0);
+    
+    // Create model with parameters
+    let mut model = flame::nn::Linear::new(10, 1, true, device)?;
+    let mut optimizer = flame::optim::AdamW::new(0.01, 0.9, 0.999, 1e-8, 0.01);
+    
+    // Get initial parameters
+    let initial_weight = model.weight().clone();
+    let initial_bias = model.bias().unwrap().clone();
+    
+    // Training step
+    let input = Tensor::randn(&[32, 10], device)?;
+    let target = Tensor::randn(&[32, 1], device)?;
+    
+    let output = model.forward(&input)?;
+    let loss = (&output - &target).pow(2.0)?.mean();
+    let grad_map = loss.backward()?;
+    
+    // Update parameters
+    optimizer.step(&model.parameters(), &grad_map)?;
+    
+    // Verify parameters actually changed
+    let final_weight = model.weight();
+    let final_bias = model.bias().unwrap();
+    
+    let weight_diff = (&initial_weight - final_weight).abs().sum().item::<f32>();
+    let bias_diff = (&initial_bias - final_bias).abs().sum().item::<f32>();
+    
+    assert!(weight_diff > 1e-6, "Weights should have changed");
+    assert!(bias_diff > 1e-6, "Bias should have changed");
+    
+    println!("✅ Parameter updates work");
+}
+```
+
+### 2. Training Loop Integration Test
+
+#### Multi-Step Training Verification
+```rust
+#[test]
+fn test_multi_step_training() {
+    let device = Device::Cuda(0);
+    
+    let mut model = create_simple_diffusion_model(device)?;
+    let mut optimizer = flame::optim::AdamW::new(0.001, 0.9, 0.999, 1e-8, 0.01);
+    
+    let mut losses = Vec::new();
+    
+    // Train for multiple steps
+    for step in 0..20 {
+        // Generate batch
+        let latents = Tensor::randn(&[4, 4, 16, 16], device)?;
+        let noise = Tensor::randn(&[4, 4, 16, 16], device)?;
+        let timesteps = Tensor::randint(0, 1000, &[4], device)?;
+        
+        // Forward pass
+        let pred_noise = model.forward(&latents, &timesteps)?;
+        let loss = (&pred_noise - &noise).pow(2.0)?.mean();
+        losses.push(loss.item::<f32>());
+        
+        // Backward pass
+        let grad_map = loss.backward()?;
+        
+        // Parameter update
+        optimizer.step(&model.parameters(), &grad_map)?;
+        optimizer.zero_grad();
+        
+        // Verify no NaN losses
+        assert!(loss.item::<f32>().is_finite(), "Loss became NaN at step {}", step);
+    }
+    
+    // Verify training stability (loss shouldn't explode)
+    let max_loss = losses.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let min_loss = losses.iter().cloned().fold(f32::INFINITY, f32::min);
+    
+    assert!(max_loss / min_loss < 100.0, "Training unstable: loss ratio too high");
+    
+    println!("✅ Multi-step training stable");
+    println!("Loss range: {:.6} - {:.6}", min_loss, max_loss);
+}
+```
+
+### Agent 3 Success Criteria
+- [ ] Complex autograd graphs work
+- [ ] Parameters update correctly
+- [ ] Multi-step training is stable
+- [ ] No NaN/infinite gradients
+- [ ] Memory usage stays reasonable
+
+---
+
+## Agent 4: Model Architecture Verifier
+**Mission**: Verify all model components work with FLAME
+
+### 1. Individual Model Component Tests
+
+#### VAE Component Test
+```rust
+#[test]
+fn test_vae_with_flame() {
+    let device = Device::Cuda(0);
+    
+    // Test VAE encode/decode cycle
+    let vae = VAEModel::load_or_create(device)?;
+    
+    let input_image = Tensor::randn(&[1, 3, 512, 512], device)?;
+    
+    // Encode
+    let latents = vae.encode(&input_image)?;
+    assert_eq!(latents.shape(), &[1, 4, 64, 64]); // 8x downsampling
+    assert!(latents.is_finite());
+    
+    // Decode
+    let reconstructed = vae.decode(&latents)?;
+    assert_eq!(reconstructed.shape(), &[1, 3, 512, 512]);
+    assert!(reconstructed.is_finite());
+    
+    println!("✅ VAE encode/decode works with FLAME");
+}
+```
+
+#### UNet Component Test
+```rust
+#[test]
+fn test_unet_with_flame() {
+    let device = Device::Cuda(0);
+    
+    let unet = UNetModel::load_or_create(device)?;
+    
+    // Test UNet forward pass
+    let latents = Tensor::randn(&[2, 4, 32, 32], device)?;
+    let timesteps = Tensor::randint(0, 1000, &[2], device)?;
+    let context = Tensor::randn(&[2, 77, 768], device)?;
+    
+    let pred_noise = unet.forward(&latents, &timesteps, &context)?;
+    
+    assert_eq!(pred_noise.shape(), &[2, 4, 32, 32]);
+    assert!(pred_noise.is_finite());
+    
+    println!("✅ UNet forward pass works with FLAME");
+}
+```
+
+#### Text Encoder Test
+```rust
+#[test]
+fn test_text_encoder_with_flame() {
+    let device = Device::Cuda(0);
+    
+    let text_encoder = CLIPTextEncoder::load_or_create(device)?;
+    
+    // Test text encoding
+    let input_ids = Tensor::randint(0, 49407, &[2, 77], device)?;
+    let text_embeds = text_encoder.forward(&input_ids)?;
+    
+    assert_eq!(text_embeds.shape(), &[2, 77, 768]);
+    assert!(text_embeds.is_finite());
+    
+    println!("✅ Text encoder works with FLAME");
+}
+```
+
+### 2. Model Integration Test
+
+#### Complete Model Pipeline Test
+```rust
+#[test]
+fn test_complete_model_pipeline() {
+    let device = Device::Cuda(0);
+    
+    // Load all components
+    let vae = VAEModel::load_or_create(device)?;
+    let unet = UNetModel::load_or_create(device)?;
+    let text_encoder = CLIPTextEncoder::load_or_create(device)?;
+    
+    // Test complete pipeline
+    let images = Tensor::randn(&[2, 3, 512, 512], device)?;
+    let input_ids = Tensor::randint(0, 49407, &[2, 77], device)?;
+    
+    // Encode images to latents
+    let latents = vae.encode(&images)?;
+    
+    // Encode text
+    let text_embeds = text_encoder.forward(&input_ids)?;
+    
+    // Add noise for diffusion
+    let noise = Tensor::randn_like(&latents)?;
+    let timesteps = Tensor::randint(0, 1000, &[2], device)?;
+    let noisy_latents = &latents + &noise * 0.1;
+    
+    // UNet prediction
+    let pred_noise = unet.forward(&noisy_latents, &timesteps, &text_embeds)?;
+    
+    // Compute loss
+    let loss = (&pred_noise - &noise).pow(2.0)?.mean();
+    
+    // Test backward pass through entire pipeline
+    let grad_map = loss.backward()?;
+    
+    assert!(grad_map.len() > 0);
+    assert!(loss.is_finite());
+    
+    println!("✅ Complete model pipeline works with FLAME");
+}
+```
+
+### Agent 4 Success Criteria
+- [ ] VAE encode/decode works
+- [ ] UNet forward pass works
+- [ ] Text encoder works
+- [ ] Complete pipeline integrates correctly
+- [ ] Gradients flow through all components
+
+---
+
+## Agent 5: Data Pipeline Verifier
+**Mission**: Verify data loading produces FLAME tensors correctly
+
+### 1. DataLoader Verification
+
+#### FLAME Tensor Output Test
+```rust
+#[test]
+fn test_dataloader_flame_output() {
+    let device = Device::Cuda(0);
+    
+    // Create test dataloader
+    let dataloader = EriDataLoader::new("/path/to/test/images", device)?;
+    
+    // Get batch
+    let batch = dataloader.next()?;
+    
+    // Verify batch contains FLAME tensors
+    assert!(batch.images.is_flame_tensor(), "Batch should contain FLAME tensors");
+    assert_eq!(batch.images.device(), device, "Batch should be on correct device");
+    
+    // Verify tensor properties
+    assert_eq!(batch.images.shape().len(), 4); // [batch, channels, height, width]
+    assert_eq!(batch.images.shape()[1], 3);    // RGB channels
+    assert!(batch.images.is_finite(), "Image tensors should be finite");
+    
+    // Verify value range (should be normalized)
+    let min_val = batch.images.min().item::<f32>();
+    let max_val = batch.images.max().item::<f32>();
+    
+    assert!(min_val >= -1.1, "Min pixel value too low: {}", min_val);
+    assert!(max_val <= 1.1, "Max pixel value too high: {}", max_val);
+    
+    println!("✅ DataLoader produces FLAME tensors correctly");
+}
+```
+
+#### Batch Processing Test
+```rust
+#[test]
+fn test_batch_processing() {
+    let device = Device::Cuda(0);
+    
+    let dataloader = EriDataLoader::new("/path/to/test/images", device)?;
+    
+    // Process multiple batches
+    for (i, batch) in dataloader.take(5).enumerate() {
+        // Each batch should be valid
+        assert!(batch.images.is_finite(), "Batch {} has invalid values", i);
+        assert_eq!(batch.images.device(), device, "Batch {} on wrong device", i);
+        
+        // Test that batch can be used with models
+        let dummy_model = flame::nn::Conv2d::new(3, 16, 3, 1, 1, device)?;
+        let output = dummy_model.forward(&batch.images)?;
+        assert!(output.is_finite(), "Model output invalid for batch {}", i);
+    }
+    
+    println!("✅ Batch processing works correctly");
+}
+```
+
+### 2. Data Preprocessing Verification
+
+#### Transform Pipeline Test
+```rust
+#[test]
+fn test_data_transforms() {
+    let device = Device::Cuda(0);
+    
+    let transforms = ImageTransforms::new((512, 512), device)?;
+    
+    // Test with various input sizes
+    let test_sizes = vec![(256, 256), (512, 512), (1024, 1024)];
+    
+    for (h, w) in test_sizes {
+        let input = Tensor::randn(&[1, 3, h, w], device)?;
+        let transformed = transforms.apply(&input)?;
+        
+        // Should resize to target size
+        assert_eq!(transformed.shape(), &[1, 3, 512, 512]);
+        assert!(transformed.is_finite());
+    }
+    
+    println!("✅ Data transforms work with FLAME");
+}
+```
+
+### Agent 5 Success Criteria
+- [ ] DataLoader outputs FLAME tensors
+- [ ] Correct tensor shapes and value ranges
+- [ ] Batch processing works reliably
+- [ ] Transforms work with FLAME tensors
+- [ ] Data can be consumed by models
+
+---
+
+## Agent 6: End-to-End Training Verifier
+**Mission**: Verify complete training pipeline works
+
+### 1. Complete Training Test
+
+#### SDXL LoRA Training Verification
+```rust
+#[test]
+fn test_complete_sdxl_lora_training() {
+    let device = Device::Cuda(0);
+    
+    // Setup complete training pipeline
+    let vae = VAEModel::load_or_create(device)?;
+    let unet = UNetModel::load_or_create(device)?;
+    let text_encoder = CLIPTextEncoder::load_or_create(device)?;
+    
+    // Add LoRA to UNet
+    let lora_config = LoRAConfig { rank: 16, alpha: 16 };
+    let mut lora_unet = LoRAWrapper::new(unet, lora_config)?;
+    
+    let mut optimizer = flame::optim::AdamW::new(0.0001, 0.9, 0.999, 1e-8, 0.01);
+    let dataloader = EriDataLoader::new("/path/to/training/data", device)?;
+    
+    let mut losses = Vec::new();
+    let start_time = std::time::Instant::now();
+    
+    // Training loop
+    for (step, batch) in dataloader.take(50).enumerate() {
+        // Forward pass through complete pipeline
+        let latents = vae.encode(&batch.images)?;
+        let text_embeds = text_encoder.forward(&batch.input_ids)?;
+        
+        // Diffusion training step
+        let noise = Tensor::randn_like(&latents)?;
+        let timesteps = Tensor::randint(0, 1000, &[batch.batch_size], device)?;
+        let noisy_latents = add_noise(&latents, &noise, &timesteps)?;
+        
+        let pred_noise = lora_unet.forward(&noisy_latents, &timesteps, &text_embeds)?;
+        let loss = mse_loss(&pred_noise, &noise)?;
+        
+        losses.push(loss.item::<f32>());
+        
+        // Backward pass
+        let grad_map = loss.backward()?;
+        
+        // Update LoRA parameters
+        optimizer.step(&lora_unet.lora_parameters(), &grad_map)?;
+        optimizer.zero_grad();
+        
+        // Verify training progress
+        assert!(loss.item::<f32>().is_finite(), "Loss NaN at step {}", step);
+        
+        if step % 10 == 0 {
+            println!("Step {}: Loss = {:.6}", step, loss.item::<f32>());
+        }
+    }
+    
+    let training_time = start_time.elapsed();
+    
+    // Verify training characteristics
+    assert!(!losses.is_empty(), "No training steps completed");
+    
+    let initial_loss = losses[0];
+    let final_loss = losses[losses.len() - 1];
+    
+    // Loss should be stable (not exploding)
+    assert!(final_loss < initial_loss * 10.0, "Loss exploded during training");
+    assert!(final_loss > initial_loss * 0.01, "Loss collapsed too quickly");
+    
+    // Performance check
+    let steps_per_second = 50.0 / training_time.as_secs_f32();
+    println!("Training speed: {:.2} steps/sec", steps_per_second);
+    
+    // Save LoRA
+    lora_unet.save_lora("verification_lora.safetensors")?;
+    
+    // Verify LoRA file format
+    let lora_dict = flame::load_safetensors("verification_lora.safetensors", device)?;
+    assert!(lora_dict.len() > 0, "LoRA file should contain weights");
+    
+    // Check for ComfyUI-compatible naming
+    let has_lora_weights = lora_dict.keys()
+        .any(|k| k.contains("lora_down") || k.contains("lora_up"));
+    assert!(has_lora_weights, "LoRA should have proper weight naming");
+    
+    println!("✅ Complete SDXL LoRA training successful");
+    println!("  - {} steps completed", losses.len());
+    println!("  - Training time: {:?}", training_time);
+    println!("  - Loss: {:.6} → {:.6}", initial_loss, final_loss);
+}
+```
+
+### 2. Memory and Performance Verification
+
+#### Memory Usage Test
+```rust
+#[test]
+fn test_memory_usage() {
+    let device = Device::Cuda(0);
+    let initial_memory = get_gpu_memory_usage().unwrap_or(0);
+    
+    // Run training with memory monitoring
+    let model = create_test_diffusion_model(device)?;
+    let dataloader = EriDataLoader::new("/path/to/data", device)?;
+    
+    for (step, batch) in dataloader.take(20).enumerate() {
+        let loss = model.training_step(&batch)?;
+        let grad_map = loss.backward()?;
+        // ... optimizer step
+        
+        if step % 5 == 0 {
+            let current_memory = get_gpu_memory_usage().unwrap_or(0);
+            let used_memory = current_memory.saturating_sub(initial_memory);
+            
+            println!("Step {}: Memory used = {} MB", step, used_memory / (1024 * 1024));
+            
+            // Memory shouldn't grow excessively
+            assert!(used_memory < 20 * 1024 * 1024 * 1024, "Memory usage too high: {} GB", used_memory / (1024 * 1024 * 1024));
+        }
+    }
+    
+    println!("✅ Memory usage reasonable");
+}
+```
+
+#### Performance Comparison Test
+```rust
+#[test]
+fn test_performance_vs_baseline() {
+    let device = Device::Cuda(0);
+    
+    // Test training speed
+    let model = create_benchmark_model(device)?;
+    let dataloader = create_benchmark_dataloader(device)?;
+    
+    let start_time = std::time::Instant::now();
+    
+    for batch in dataloader.take(100) {
+        let loss = model.training_step(&batch)?;
+        let grad_map = loss.backward()?;
+        // ... optimizer step
+    }
+    
+    let total_time = start_time.elapsed();
+    let steps_per_second = 100.0 / total_time.as_secs_f32();
+    
+    println!("Performance: {:.2} steps/second", steps_per_second);
+    
+    // Should be reasonable performance (adjust based on hardware)
+    assert!(steps_per_second > 0.1, "Training too slow: {} steps/sec", steps_per_second);
+    
+    println!("✅ Performance meets baseline");
+}
+```
+
+### Agent 6 Success Criteria
+- [ ] Complete training loop works end-to-end
+- [ ] Training converges (loss stable, not exploding)
+- [ ] LoRA files saved in ComfyUI format
+- [ ] Memory usage stays reasonable
+- [ ] Training performance meets baseline
+- [ ] No crashes or hangs during training
+
+---
+
+## Final Verification Report
+
+### Overall Success Criteria
+All agents must report SUCCESS for complete verification:
+
+- [ ] **Agent 1**: Zero Candle code, clean FLAME integration
+- [ ] **Agent 2**: Compilation works, basic functionality verified
+- [ ] **Agent 3**: Training system works with mutable gradients
+- [ ] **Agent 4**: All model components work with FLAME
+- [ ] **Agent 5**: Data pipeline produces FLAME tensors
+- [ ] **Agent 6**: End-to-end training produces working LoRAs
+
+### Integration Success Metrics
+- **Functional**: Complete training pipeline works without errors
+- **Performance**: Training speed meets or exceeds baseline
+- **Quality**: LoRA files are ComfyUI compatible
+- **Stability**: No memory leaks or crashes during training
+- **Correctness**: Training converges and produces valid results
+
+### Failure Handling
+If ANY agent reports failure:
+1. **STOP immediately** - do not proceed
+2. **Identify specific failure point**
+3. **Fix the issue completely** 
+4. **Re-run verification from failed agent**
+5. **Do not skip verification steps**
+
+**COMPLETE SUCCESS REQUIRED BEFORE DECLARING MIGRATION FINISHED.**

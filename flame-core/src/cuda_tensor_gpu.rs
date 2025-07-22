@@ -176,12 +176,54 @@ impl CudaTensor {
         sum.mul_scalar(1.0 / count)
     }
 
-    /// Sum reduction (temporary CPU implementation)
+    /// Sum reduction using GPU kernel
     pub fn sum(&self) -> Result<CudaTensor> {
-        // TODO: Implement GPU reduction kernel
-        let cpu_data = self.to_vec()?;
-        let sum: f32 = cpu_data.iter().sum();
-        CudaTensor::from_vec(vec![sum], Shape::from_dims(&[1]), self.device.clone())
+        // Use CUB device reduction for efficient GPU sum
+        let total_elements = self.shape.elem_count();
+        
+        // Allocate output buffer for single element
+        let sum_buf = unsafe {
+            self.device.alloc::<f32>(1)?
+        };
+        
+        // Get temporary storage size for CUB reduction
+        let mut temp_storage_bytes = 0usize;
+        unsafe {
+            cub::DeviceReduce::Sum(
+                std::ptr::null_mut(),  // null temp storage to get size
+                &mut temp_storage_bytes,
+                self.data.as_ptr() as *const f32,
+                sum_buf.as_mut_ptr() as *mut f32,
+                total_elements as i32,
+                self.device.stream(),
+            )?;
+        }
+        
+        // Allocate temporary storage
+        let temp_storage = unsafe {
+            self.device.alloc_bytes(temp_storage_bytes)?
+        };
+        
+        // Perform reduction
+        unsafe {
+            cub::DeviceReduce::Sum(
+                temp_storage.as_mut_ptr(),
+                &mut temp_storage_bytes,
+                self.data.as_ptr() as *const f32,
+                sum_buf.as_mut_ptr() as *mut f32,
+                total_elements as i32,
+                self.device.stream(),
+            )?;
+        }
+        
+        // Synchronize to ensure reduction is complete
+        self.device.synchronize()?;
+        
+        Ok(CudaTensor {
+            data: sum_buf,
+            shape: Shape::from_dims(&[1]),
+            device: self.device.clone(),
+        })
     }
 
     /// Get shape

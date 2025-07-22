@@ -500,25 +500,44 @@ fn compute_gradients(
             // Use the complete LayerNorm backward implementation
             let input_tensor = &entry.saved_tensors[input];
             
-            // For now, assume no weight/bias (pure normalization)
-            // TODO: Add support for affine LayerNorm
+            // Support for affine LayerNorm with weight and bias
             let mean = input_tensor.mean_dims(&normalized_shape, true)?;
             let var = input_tensor.var_dims(&normalized_shape, true, true)?;
             let normalized = input_tensor.sub(&mean)?.div(&var.add_scalar(1e-5)?.sqrt()?)?;
             
-            let (grad_input, _, _) = crate::autograd_ops_complete::layer_norm_backward(
+            // Check if weight and bias tensors were saved (affine=true)
+            let (weight, bias) = if entry.saved_tensors.len() > 1 {
+                // Affine LayerNorm - retrieve saved weight and bias
+                let weight_tensor = entry.saved_tensors.get(1).map(|id| &self.tensors[id]);
+                let bias_tensor = entry.saved_tensors.get(2).map(|id| &self.tensors[id]);
+                (weight_tensor, bias_tensor)
+            } else {
+                (None, None)
+            };
+            
+            let (grad_input, grad_weight, grad_bias) = crate::autograd_ops_complete::layer_norm_backward(
                 output_grad,
                 input_tensor,
                 &normalized,
-                None,  // weight
-                None,  // bias
+                weight,
+                bias,
                 &mean,
                 &var,
                 normalized_shape,
                 1e-5,  // eps
             )?;
             
-            Ok(vec![(*input, grad_input)])
+            let mut gradients = vec![(*input, grad_input)];
+            
+            // Add weight and bias gradients if they exist
+            if let (Some(grad_w), Some(weight_id)) = (grad_weight, entry.saved_tensors.get(1)) {
+                gradients.push((*weight_id, grad_w));
+            }
+            if let (Some(grad_b), Some(bias_id)) = (grad_bias, entry.saved_tensors.get(2)) {
+                gradients.push((*bias_id, grad_b));
+            }
+            
+            Ok(gradients)
         }
         
         Op::GroupNorm { input, num_groups, weight, bias } => {
@@ -827,30 +846,51 @@ fn compute_gradients(
             let indices_tensor = &entry.saved_tensors[indices];
             
             // Create zero gradient for input
-            let mut grad_input = Tensor::zeros(input_tensor.shape().clone(), input_tensor.device().clone())?;
-            
-            // Scatter add gradients back
-            // This is simplified - real implementation would use scatter_add kernel
-            let indices_data = indices_tensor.to_vec()?;
-            let grad_data = output_grad.to_vec()?;
-            let mut input_grad_data = grad_input.to_vec()?;
-            
-            // Calculate strides for proper indexing
-            let shape = input_tensor.shape().dims();
-            let mut strides = vec![1; shape.len()];
-            for i in (0..shape.len() - 1).rev() {
-                strides[i] = strides[i + 1] * shape[i + 1];
-            }
-            
-            // Scatter gradients
-            // TODO: This is a simplified implementation
-            // In production, would use efficient CUDA scatter kernel
-            
-            let grad_input = Tensor::from_vec(
-                input_grad_data,
-                input_tensor.shape().clone(),
-                input_tensor.device().clone()
-            )?;
+            let grad_input = if input_tensor.device().is_cuda() {
+                // Use efficient CUDA scatter_add kernel
+                crate::cuda_kernels::scatter_add(
+                    input_tensor.shape(),
+                    output_grad,
+                    indices_tensor,
+                    *dim,
+                )?
+            } else {
+                // CPU fallback implementation
+                let mut grad_input = Tensor::zeros(input_tensor.shape().clone(), input_tensor.device().clone())?;
+                let indices_data = indices_tensor.to_vec()?;
+                let grad_data = output_grad.to_vec()?;
+                let mut input_grad_data = grad_input.to_vec()?;
+                
+                // Calculate strides for proper indexing
+                let shape = input_tensor.shape().dims();
+                let mut strides = vec![1; shape.len()];
+                for i in (0..shape.len() - 1).rev() {
+                    strides[i] = strides[i + 1] * shape[i + 1];
+                }
+                
+                // Scatter gradients
+                for (out_idx, &index) in indices_data.iter().enumerate() {
+                    let index = index as usize;
+                    if index < shape[*dim] {
+                        // Calculate position in flattened array
+                        let mut in_idx = 0;
+                        let mut remaining = out_idx;
+                        for d in 0..shape.len() {
+                            let size = if d == *dim { 1 } else { shape[d] };
+                            let coord = remaining / strides[d];
+                            remaining %= strides[d];
+                            in_idx += if d == *dim { index } else { coord } * strides[d];
+                        }
+                        input_grad_data[in_idx] += grad_data[out_idx];
+                    }
+                }
+                
+                Tensor::from_vec(
+                    input_grad_data,
+                    input_tensor.shape().clone(),
+                    input_tensor.device().clone()
+                )?
+            };
             
             // No gradient w.r.t indices
             Ok(vec![(*input, grad_input)])
@@ -1085,11 +1125,62 @@ fn broadcast_to(tensor: &Tensor, target_shape: &Shape) -> Result<Tensor> {
         return Tensor::from_vec(expanded_data, target_shape.clone(), tensor.device.clone());
     }
     
-    // TODO: Implement general broadcasting
-    Err(FlameError::InvalidOperation(
-        format!("Broadcasting from {:?} to {:?} not yet implemented", 
-                tensor.shape.dims(), target_shape.dims())
-    ))
+    // General broadcasting implementation
+    let src_dims = tensor.shape.dims();
+    let dst_dims = target_shape.dims();
+    
+    // Validate that broadcasting is possible
+    let src_ndim = src_dims.len();
+    let dst_ndim = dst_dims.len();
+    
+    // Pad source dimensions with 1s on the left
+    let mut padded_src = vec![1; dst_ndim];
+    for i in 0..src_ndim {
+        padded_src[dst_ndim - src_ndim + i] = src_dims[i];
+    }
+    
+    // Check broadcast compatibility
+    for i in 0..dst_ndim {
+        if padded_src[i] != dst_dims[i] && padded_src[i] != 1 {
+            return Err(FlameError::InvalidOperation(
+                format!("Cannot broadcast dimension {} from {} to {}", 
+                    i, padded_src[i], dst_dims[i])
+            ));
+        }
+    }
+    
+    // Perform broadcasting
+    let src_data = tensor.to_vec()?;
+    let mut dst_data = vec![0.0f32; target_shape.elem_count()];
+    
+    // Calculate strides for source and destination
+    let mut src_strides = vec![1; dst_ndim];
+    let mut dst_strides = vec![1; dst_ndim];
+    
+    for i in (0..dst_ndim - 1).rev() {
+        src_strides[i] = if padded_src[i + 1] == 1 { 0 } else { src_strides[i + 1] * padded_src[i + 1] };
+        dst_strides[i] = dst_strides[i + 1] * dst_dims[i + 1];
+    }
+    
+    // Copy data with broadcasting
+    for dst_idx in 0..dst_data.len() {
+        let mut src_idx = 0;
+        let mut remaining = dst_idx;
+        
+        for dim in 0..dst_ndim {
+            let coord = remaining / dst_strides[dim];
+            remaining %= dst_strides[dim];
+            
+            // Only advance source index if dimension is not broadcasted
+            if padded_src[dim] > 1 {
+                src_idx += coord * src_strides[dim];
+            }
+        }
+        
+        dst_data[dst_idx] = src_data[src_idx];
+    }
+    
+    Tensor::from_vec(dst_data, target_shape.clone(), tensor.device.clone())
 }
 
 /// Helper function to compute inverse permutation
