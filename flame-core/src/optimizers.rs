@@ -83,9 +83,11 @@ impl Adam {
             // Apply weight decay if needed
             if self.config.weight_decay > 0.0 {
                 let decay = param.mul_scalar(self.config.weight_decay)?;
-                param.update_weights(&decay.add(&update)?, step_size)?;
+                let new_param = param.update_weights(&decay.add(&update)?, step_size)?;
+                param.copy_(&new_param)?;
             } else {
-                param.update_weights(&update, step_size)?;
+                let new_param = param.update_weights(&update, step_size)?;
+                param.copy_(&new_param)?;
             }
         }
         
@@ -164,7 +166,8 @@ impl SGD {
             }
             
             // Update parameters
-            param.update_weights(&update, self.config.lr)?;
+            let new_param = param.update_weights(&update, self.config.lr)?;
+            param.copy_(&new_param)?;
         }
         
         Ok(())
