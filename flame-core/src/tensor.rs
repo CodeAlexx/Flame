@@ -333,8 +333,8 @@ impl Tensor {
                 let beta = 0.0f32;
                 
                 blas.sgemm_batched(
-                    cublasOperation_t::CUBLAS_OP_N,
-                    cublasOperation_t::CUBLAS_OP_N,
+                    cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+                    cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
                     n as i32,
                     m as i32,
                     k1 as i32,

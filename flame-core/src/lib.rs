@@ -11,12 +11,14 @@ pub mod layer_norm;
 pub mod norm;
 pub mod embedding;
 pub mod cuda_kernels;
+pub mod cuda_kernels_gpu;
 pub mod cuda_kernel_sources;
 pub mod cuda_kernel_compiler;
 pub mod cuda_ops;
 pub mod cuda_kernels_v2;
 pub mod cuda_conv2d_kernels;
 pub mod cuda_gradient_ops;
+pub mod cuda_tensor_gpu;
 pub mod autograd_ops_complete;
 pub mod autograd;
 // pub mod autograd_ops;  // Using new autograd
@@ -41,7 +43,9 @@ pub mod activations;
 // pub mod mmdit_blocks;  // Removed: model-specific
 // pub mod eridiffusion_adapter;  // Temporarily disable due to candle_interop dependency
 pub mod conv3d;
+pub mod conv3d_simple;
 pub mod flash_attention;
+pub mod fused_kernels;
 pub mod samplers;
 // pub mod tokenizer;  // Removed: model-specific
 pub mod fp16;

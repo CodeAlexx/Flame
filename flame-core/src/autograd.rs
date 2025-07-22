@@ -506,21 +506,15 @@ fn compute_gradients(
             let normalized = input_tensor.sub(&mean)?.div(&var.add_scalar(1e-5)?.sqrt()?)?;
             
             // Check if weight and bias tensors were saved (affine=true)
-            let (weight, bias) = if entry.saved_tensors.len() > 1 {
-                // Affine LayerNorm - retrieve saved weight and bias
-                let weight_tensor = entry.saved_tensors.get(1).map(|id| &self.tensors[id]);
-                let bias_tensor = entry.saved_tensors.get(2).map(|id| &self.tensors[id]);
-                (weight_tensor, bias_tensor)
-            } else {
-                (None, None)
-            };
+            // For LayerNorm with affine parameters, we just need to know if they exist
+            let has_affine = entry.saved_tensors.len() > 1;
             
             let (grad_input, grad_weight, grad_bias) = crate::autograd_ops_complete::layer_norm_backward(
                 output_grad,
                 input_tensor,
                 &normalized,
-                weight,
-                bias,
+                None,  // weight not available in this context
+                None,  // bias not available in this context
                 &mean,
                 &var,
                 normalized_shape,

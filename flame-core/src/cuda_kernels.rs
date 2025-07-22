@@ -969,8 +969,90 @@ impl CudaKernels {
     }
 }
 
+/// Scatter add operation for efficient gradient accumulation
+/// This is a generic tensor operation, not model-specific
+pub fn scatter_add(
+    input_shape: &[usize],
+    grad_output: &Tensor,
+    indices: &Tensor,
+    dim: usize,
+) -> Result<Tensor> {
+    let device = grad_output.device();
+    
+    if device.is_cuda() {
+        // For GPU, we would use a CUDA kernel
+        // For now, fallback to CPU implementation
+        let mut input_grad = Tensor::zeros(input_shape, grad_output.dtype(), device)?;
+        let grad_data = grad_output.to_vec::<f32>()?;
+        let indices_data = indices.to_vec::<i64>()?;
+        let mut input_grad_data = vec![0.0f32; input_grad.shape().elem_count()];
+        
+        let grad_shape = grad_output.shape().dims();
+        let input_shape = input_grad.shape().dims();
+        
+        // Calculate position in flattened array
+        for i in 0..grad_data.len() {
+            let mut grad_idx = i;
+            let mut pos = vec![0; grad_shape.len()];
+            
+            for d in (0..grad_shape.len()).rev() {
+                pos[d] = grad_idx % grad_shape[d];
+                grad_idx /= grad_shape[d];
+            }
+            
+            let idx = indices_data[pos[dim]] as usize;
+            pos[dim] = idx;
+            
+            let mut in_idx = 0;
+            let mut stride = 1;
+            for d in (0..input_shape.len()).rev() {
+                in_idx += pos[d] * stride;
+                stride *= input_shape[d];
+            }
+            
+            input_grad_data[in_idx] += grad_data[i];
+        }
+        
+        Tensor::from_vec(input_grad_data, input_shape, device)
+    } else {
+        // CPU implementation
+        let mut input_grad = Tensor::zeros(input_shape, grad_output.dtype(), device)?;
+        let grad_data = grad_output.to_vec::<f32>()?;
+        let indices_data = indices.to_vec::<i64>()?;
+        let mut input_grad_data = vec![0.0f32; input_grad.shape().elem_count()];
+        
+        let grad_shape = grad_output.shape().dims();
+        let input_shape = input_grad.shape().dims();
+        
+        // Calculate position in flattened array
+        for i in 0..grad_data.len() {
+            let mut grad_idx = i;
+            let mut pos = vec![0; grad_shape.len()];
+            
+            for d in (0..grad_shape.len()).rev() {
+                pos[d] = grad_idx % grad_shape[d];
+                grad_idx /= grad_shape[d];
+            }
+            
+            let idx = indices_data[pos[dim]] as usize;
+            pos[dim] = idx;
+            
+            let mut in_idx = 0;
+            let mut stride = 1;
+            for d in (0..input_shape.len()).rev() {
+                in_idx += pos[d] * stride;
+                stride *= input_shape[d];
+            }
+            
+            input_grad_data[in_idx] += grad_data[i];
+        }
+        
+        Tensor::from_vec(input_grad_data, input_shape, device)
+    }
+}
+
 /// Compile CUDA kernel from source to PTX
-/// This is used by other modules that generate custom kernels
+/// This is used by other modules that generating custom kernels
 pub fn compile_kernel(kernel_name: &str, kernel_code: &str) -> Result<Vec<u8>> {
     let ptx = compile_ptx(kernel_code)
         .map_err(|e| FlameError::KernelError(format!("Failed to compile {}: {:?}", kernel_name, e)))?;

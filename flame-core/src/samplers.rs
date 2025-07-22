@@ -38,6 +38,7 @@ pub struct EulerSampler {
     timesteps: Vec<f32>,
     sigmas: Vec<f32>,
     prediction_type: PredictionType,
+    noise_schedule: String,
 }
 
 /// Prediction type for model output
@@ -59,6 +60,7 @@ impl EulerSampler {
             timesteps: Vec::new(),
             sigmas: Vec::new(),
             prediction_type,
+            noise_schedule: "linear".to_string(),
         }
     }
     
@@ -445,6 +447,94 @@ impl DiffusionSampler for DDIMSampler {
     
     fn timesteps(&self) -> &[f32] {
         &self.timesteps
+    }
+}
+
+/// DDPM Scheduler for diffusion models
+pub struct DDPMScheduler {
+    num_train_timesteps: usize,
+    noise_schedule: String,
+    prediction_type: String,
+    alphas: Vec<f32>,
+    betas: Vec<f32>,
+    alphas_cumprod: Vec<f32>,
+}
+
+impl DDPMScheduler {
+    pub fn new(
+        num_train_timesteps: usize,
+        noise_schedule: String,
+        prediction_type: String,
+    ) -> Self {
+        let betas = match noise_schedule.as_str() {
+            "linear" => {
+                let beta_start = 0.0001;
+                let beta_end = 0.02;
+                (0..num_train_timesteps)
+                    .map(|i| beta_start + (beta_end - beta_start) * i as f32 / (num_train_timesteps - 1) as f32)
+                    .collect()
+            }
+            "cosine" => {
+                let s = 0.008;
+                (0..num_train_timesteps)
+                    .map(|i| {
+                        let t = i as f32 / (num_train_timesteps - 1) as f32;
+                        let alpha_bar = ((t + s) / (1.0 + s) * std::f32::consts::PI * 0.5).cos().powi(2);
+                        let alpha_bar_prev = if i > 0 {
+                            let t_prev = (i - 1) as f32 / (num_train_timesteps - 1) as f32;
+                            ((t_prev + s) / (1.0 + s) * std::f32::consts::PI * 0.5).cos().powi(2)
+                        } else {
+                            1.0
+                        };
+                        1.0 - alpha_bar / alpha_bar_prev
+                    })
+                    .collect()
+            }
+            "scaled_linear" => {
+                let beta_start = 0.00085_f32.sqrt();
+                let beta_end = 0.012_f32.sqrt();
+                (0..num_train_timesteps)
+                    .map(|i| {
+                        let beta = beta_start + (beta_end - beta_start) * i as f32 / (num_train_timesteps - 1) as f32;
+                        beta * beta
+                    })
+                    .collect()
+            }
+            _ => {
+                // Default to linear
+                let beta_start = 0.0001;
+                let beta_end = 0.02;
+                (0..num_train_timesteps)
+                    .map(|i| beta_start + (beta_end - beta_start) * i as f32 / (num_train_timesteps - 1) as f32)
+                    .collect()
+            }
+        };
+        
+        let alphas: Vec<f32> = betas.iter().map(|b| 1.0 - b).collect();
+        let mut alphas_cumprod = Vec::with_capacity(num_train_timesteps);
+        let mut cumprod = 1.0;
+        for alpha in &alphas {
+            cumprod *= alpha;
+            alphas_cumprod.push(cumprod);
+        }
+        
+        Self {
+            num_train_timesteps,
+            noise_schedule,
+            prediction_type,
+            alphas,
+            betas,
+            alphas_cumprod,
+        }
+    }
+    
+    pub fn timestep_to_sigma(&self, t: f32) -> f32 {
+        let idx = t.round() as usize;
+        if idx >= self.alphas_cumprod.len() {
+            return 0.0;
+        }
+        let alpha_cumprod = self.alphas_cumprod[idx];
+        ((1.0 - alpha_cumprod) / alpha_cumprod).sqrt()
     }
 }
 
