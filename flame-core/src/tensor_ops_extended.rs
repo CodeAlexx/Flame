@@ -574,27 +574,49 @@ impl Tensor {
     
     /// Divide by another tensor
     pub fn div(&self, other: &Tensor) -> Result<Tensor> {
-        // Use CUDA kernel for GPU-accelerated division
-        let mut output = GpuOps::div(self, other)?;
-        
-        // AUTOGRAD: Record operation if needed
-        if self.requires_grad || other.requires_grad {
-            output.requires_grad = true;
+        // Check if shapes match exactly
+        if self.shape == other.shape {
+            // Use CUDA kernel for GPU-accelerated division
+            let mut output = GpuOps::div(self, other)?;
             
-            AutogradContext::record_op(
-                output.id,
-                Op::Div { 
-                    lhs: self.id,
-                    rhs: other.id
-                },
-                vec![
-                    (self.id, self.clone()?),
-                    (other.id, other.clone()?)
-                ]
-            );
+            // AUTOGRAD: Record operation if needed
+            if self.requires_grad || other.requires_grad {
+                output.requires_grad = true;
+                
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Div { 
+                        lhs: self.id,
+                        rhs: other.id
+                    },
+                    vec![
+                        (self.id, self.clone()?),
+                        (other.id, other.clone()?)
+                    ]
+                );
+            }
+            
+            Ok(output)
+        } else {
+            // Broadcasting case
+            let broadcast_shape = broadcast_shapes(self.shape().dims(), other.shape().dims())?;
+            
+            // Broadcast both tensors to the target shape
+            let self_broadcast = if self.shape().dims() == &broadcast_shape {
+                self.clone()?
+            } else {
+                self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+            };
+            
+            let other_broadcast = if other.shape().dims() == &broadcast_shape {
+                other.clone()?
+            } else {
+                other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+            };
+            
+            // Now divide with matching shapes
+            self_broadcast.div(&other_broadcast)
         }
-        
-        Ok(output)
     }
     
     

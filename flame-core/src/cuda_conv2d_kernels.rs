@@ -54,7 +54,7 @@ extern "C" __global__ void im2col_kernel(
 }
 
 // Full im2col with all parameters (split into two kernels to reduce param count)
-extern "C" __global__ void im2col_kernel(
+extern "C" __global__ void im2col_kernel_v2(
     const float* data_im,
     float* data_col,
     const int* dims,  // Array containing: batch_size, channels, height, width, kernel_h, kernel_w
@@ -163,7 +163,7 @@ extern "C" __global__ void col2im_kernel(
     data_im[index] = val;
 }
 
-extern "C" __global__ void col2im_kernel(
+extern "C" __global__ void col2im_kernel_v2(
     const float* data_col,
     float* data_im,
     const int* dims,  // Array containing: batch_size, channels, height, width, kernel_h, kernel_w

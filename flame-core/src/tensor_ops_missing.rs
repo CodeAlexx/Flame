@@ -108,24 +108,101 @@ impl Tensor {
     
     /// Mean along dimensions
     pub fn mean_dim(&self, dims: &[usize], keepdim: bool) -> Result<Tensor> {
-        // For now, implement using sum and division
-        let sum = self.sum_dims(dims)?;
+        // Implement mean manually since sum_dims is actually computing mean incorrectly
+        let data = self.to_vec()?;
+        let input_shape = self.shape().dims();
+        let ndims = input_shape.len();
         
-        // Calculate number of elements summed
-        let mut n = 1;
+        // Validate dimensions
         for &dim in dims {
-            n *= self.shape.dims()[dim];
+            if dim >= ndims {
+                return Err(FlameError::InvalidOperation(
+                    format!("Dimension {} out of range for tensor with {} dimensions", dim, ndims)
+                ));
+            }
         }
         
-        let result = sum.div_scalar(n as f32)?;
+        // Calculate output shape
+        let mut output_shape = input_shape.to_vec();
+        for &dim in dims {
+            output_shape[dim] = 1;
+        }
+        
+        // Calculate strides
+        let mut strides = vec![1; ndims];
+        for i in (0..ndims-1).rev() {
+            strides[i] = strides[i+1] * input_shape[i+1];
+        }
+        
+        // Total output elements
+        let output_elems: usize = output_shape.iter().product();
+        let mut output_data = vec![0.0f32; output_elems];
+        
+        // Count elements per output position
+        let mut count = 1;
+        for &dim in dims {
+            count *= input_shape[dim];
+        }
+        
+        // Iterate over output positions
+        for out_idx in 0..output_elems {
+            // Convert output index to multi-dimensional position
+            let mut out_pos = vec![0; ndims];
+            let mut idx = out_idx;
+            for i in (0..ndims).rev() {
+                out_pos[i] = idx % output_shape[i];
+                idx /= output_shape[i];
+            }
+            
+            // Sum over all positions that map to this output position
+            let mut sum = 0.0f32;
+            
+            // Create iterator over dimensions to sum
+            let mut pos = vec![0; ndims];
+            loop {
+                // Copy fixed dimensions from output position
+                for i in 0..ndims {
+                    if !dims.contains(&i) {
+                        pos[i] = out_pos[i];
+                    }
+                }
+                
+                // Calculate linear index
+                let lin_idx: usize = pos.iter().zip(&strides).map(|(p, s)| p * s).sum();
+                sum += data[lin_idx];
+                
+                // Increment position over dimensions we're reducing
+                let mut carry = true;
+                for &dim in dims {
+                    if carry {
+                        pos[dim] += 1;
+                        if pos[dim] < input_shape[dim] {
+                            carry = false;
+                        } else {
+                            pos[dim] = 0;
+                        }
+                    }
+                }
+                
+                if carry {
+                    break;
+                }
+            }
+            
+            output_data[out_idx] = sum / count as f32;
+        }
+        
+        let result = Tensor::from_vec(output_data, Shape::from_dims(&output_shape), self.device.clone())?;
         
         if keepdim {
             Ok(result)
         } else {
-            // Remove dimensions
-            let mut new_shape = self.shape.dims().to_vec();
-            for &dim in dims.iter().rev() {
-                new_shape.remove(dim);
+            // Remove dimensions with size 1
+            let mut new_shape = Vec::new();
+            for (i, &size) in output_shape.iter().enumerate() {
+                if !dims.contains(&i) {
+                    new_shape.push(size);
+                }
             }
             result.reshape(&new_shape)
         }

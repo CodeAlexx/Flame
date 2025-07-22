@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Create LayerNorm for the last two dimensions [height=8, width=8]
     let normalized_shape = vec![8, 8];
-    let ln = LayerNorm::new(
+    let ln = LayerNorm::new_with_affine(
         normalized_shape.clone(),
         1e-5,      // eps
         true,      // elementwise_affine
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device.clone()
     )?;
     
-    let ln_3d = LayerNorm::new(
+    let ln_3d = LayerNorm::new_with_affine(
         vec![64],  // Normalize over feature dimension
         1e-5,
         true,

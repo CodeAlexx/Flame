@@ -425,32 +425,28 @@ fn compute_gradients(
         
         Op::ReLU { input } => {
             // d/dx ReLU(x) = 1 if x > 0, else 0
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let grad = relu_backward(output_grad, input_tensor)?;
             Ok(vec![(*input, grad)])
         }
         
         Op::GELU { input } => {
             // Use the complete GELU backward implementation
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let grad = crate::autograd_ops_complete::gelu_backward(output_grad, input_tensor)?;
             Ok(vec![(*input, grad)])
         }
         
         Op::SiLU { input } => {
             // Use the complete SiLU backward implementation
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let grad = crate::autograd_ops_complete::silu_backward(output_grad, input_tensor)?;
             Ok(vec![(*input, grad)])
         }
         
         Op::Tanh { input } => {
             // Use the complete Tanh backward implementation
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let output_tensor = input_tensor.tanh()?;
             let grad = crate::autograd_ops_complete::tanh_backward(output_grad, &output_tensor)?;
             Ok(vec![(*input, grad)])
@@ -458,8 +454,7 @@ fn compute_gradients(
         
         Op::Sigmoid { input } => {
             // Use the complete Sigmoid backward implementation
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let output_tensor = input_tensor.sigmoid()?;
             let grad = crate::autograd_ops_complete::sigmoid_backward(output_grad, &output_tensor)?;
             Ok(vec![(*input, grad)])
@@ -467,8 +462,7 @@ fn compute_gradients(
         
         Op::Square { input } => {
             // d/dx(x^2) = 2x
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let two_x = GpuOps::mul_scalar(input_tensor, 2.0)?;
             let grad = GpuOps::mul(output_grad, &two_x)?;
             Ok(vec![(*input, grad)])
@@ -496,10 +490,8 @@ fn compute_gradients(
         
         Op::Conv2d { input, weight, stride, padding } => {
             // Use CUDA Conv2D backward
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
-            let weight_tensor = entry.saved_tensors.get(weight)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for weight".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
+            let weight_tensor = &entry.saved_tensors[weight];
             
             let (grad_input, grad_weight, grad_bias) = crate::cuda_conv2d::CudaConv2d::conv2d_backward(
                 output_grad,
@@ -535,8 +527,7 @@ fn compute_gradients(
         
         Op::LayerNorm { input, normalized_shape } => {
             // Use the complete LayerNorm backward implementation
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             
             // Support for affine LayerNorm with weight and bias
             let mean = input_tensor.mean_dims(&normalized_shape, true)?;
@@ -585,8 +576,7 @@ fn compute_gradients(
         
         Op::GroupNorm { input, num_groups, weight, bias } => {
             // GroupNorm backward pass
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let shape = input_tensor.shape().dims();
             let channels = shape[1];
             let batch_size = shape[0];
@@ -643,8 +633,7 @@ fn compute_gradients(
         
         Op::RMSNorm { input, weight, eps } => {
             // RMSNorm backward pass
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             
             // Calculate RMS
             let square = input_tensor.square()?;
@@ -688,10 +677,8 @@ fn compute_gradients(
             // d/dx(Wx + b) = W^T @ grad
             // d/dW(Wx + b) = grad @ x^T
             // d/db(Wx + b) = grad
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
-            let weight_tensor = entry.saved_tensors.get(weight)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for weight".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
+            let weight_tensor = &entry.saved_tensors[weight];
             
             // Gradient w.r.t. input: W^T @ grad
             let weight_t = weight_tensor.transpose()?;
@@ -718,10 +705,8 @@ fn compute_gradients(
         
         Op::BatchMatMul { lhs, rhs } => {
             // Similar to MatMul but preserves batch dimension
-            let lhs_tensor = entry.saved_tensors.get(lhs)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for lhs in BatchMatMul".into()))?;
-            let rhs_tensor = entry.saved_tensors.get(rhs)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for rhs in BatchMatMul".into()))?;
+            let lhs_tensor = &entry.saved_tensors[lhs];
+            let rhs_tensor = &entry.saved_tensors[rhs];
             
             // Gradient w.r.t. lhs: grad @ rhs^T (batched)
             let rhs_t = rhs_tensor.transpose_batch()?;
@@ -739,8 +724,7 @@ fn compute_gradients(
         
         Op::Reshape { input, .. } => {
             // Gradient of reshape is reshape of gradient back to original shape
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let grad = output_grad.reshape(input_tensor.shape().dims())?;
             Ok(vec![(*input, grad)])
         }
@@ -774,8 +758,7 @@ fn compute_gradients(
         
         Op::SumDim { input, dim } => {
             // Gradient of sum is broadcast back to original shape
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let mut grad_shape = input_tensor.shape().dims().to_vec();
             grad_shape[*dim] = 1;
             let grad_reshaped = output_grad.reshape(&grad_shape)?;
@@ -785,8 +768,7 @@ fn compute_gradients(
         
         Op::Clamp { input, min, max } => {
             // Use the clamp backward implementation
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let grad = crate::autograd_ops_complete::clamp_backward(
                 output_grad, 
                 input_tensor, 
@@ -799,10 +781,8 @@ fn compute_gradients(
         Op::Div { lhs, rhs } => {
             // d/dx (x/y) = 1/y
             // d/dy (x/y) = -x/y^2
-            let lhs_tensor = entry.saved_tensors.get(lhs)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for lhs in Div".into()))?;
-            let rhs_tensor = entry.saved_tensors.get(rhs)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for rhs in Div".into()))?;
+            let lhs_tensor = &entry.saved_tensors[lhs];
+            let rhs_tensor = &entry.saved_tensors[rhs];
             
             // Gradient w.r.t. lhs: grad * (1/rhs)
             let grad_lhs = GpuOps::div(output_grad, rhs_tensor)?;
@@ -818,8 +798,7 @@ fn compute_gradients(
         
         Op::MaxDim { input, dim, keepdim } => {
             // For max reduction, gradient flows only through the max elements
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             
             // Get the max values and indices
             let max_vals = input_tensor.max_dim(*dim, *keepdim)?;
@@ -849,8 +828,7 @@ fn compute_gradients(
         
         Op::SumDimKeepdim { input, dim } => {
             // For sum with keepdim, gradient is broadcast back
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let input_shape = input_tensor.shape();
             
             // Broadcast gradient back to input shape
@@ -862,10 +840,8 @@ fn compute_gradients(
         Op::Embedding { weight, indices } => {
             // For embedding, gradient flows back to weight matrix
             // Gradient w.r.t weight: scatter_add gradients to corresponding rows
-            let indices_tensor = entry.saved_tensors.get(indices)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for indices".into()))?;
-            let weight_tensor = entry.saved_tensors.get(weight)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for weight".into()))?;
+            let indices_tensor = &entry.saved_tensors[indices];
+            let weight_tensor = &entry.saved_tensors[weight];
             
             // Create zero gradient for weight
             let mut weight_grad = Tensor::zeros(weight_tensor.shape().clone(), weight_tensor.device().clone())?;
@@ -884,10 +860,8 @@ fn compute_gradients(
         
         Op::IndexSelect { input, indices, dim } => {
             // Gradient flows back to selected indices
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
-            let indices_tensor = entry.saved_tensors.get(indices)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for indices".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
+            let indices_tensor = &entry.saved_tensors[indices];
             
             // Create zero gradient for input
             // FLAME is GPU-only, always use CUDA scatter_add kernel
@@ -908,8 +882,7 @@ fn compute_gradients(
             let mut offset = 0;
             
             for &input_id in inputs {
-                let input_tensor = entry.saved_tensors.get(&input_id)
-                    .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input in Cat".into()))?;
+                let input_tensor = &entry.saved_tensors[&input_id];
                 let size = input_tensor.shape().dims()[*dim];
                 
                 // Slice gradient for this input
@@ -933,8 +906,7 @@ fn compute_gradients(
         Op::Split { input, sizes, dim } => {
             // Concatenate gradients back to original tensor
             // We need to collect gradients for all split outputs
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let input_size = input_tensor.shape().dims()[*dim];
             
             // Create gradient tensor filled with zeros
@@ -954,8 +926,7 @@ fn compute_gradients(
         
         Op::Abs { input } => {
             // d/dx |x| = sign(x) 
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let sign = input_tensor.sign()?;
             let grad = output_grad.mul(&sign)?;
             Ok(vec![(*input, grad)])
@@ -963,8 +934,7 @@ fn compute_gradients(
         
         Op::Log { input } => {
             // d/dx log(x) = 1/x
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let reciprocal = Tensor::ones(input_tensor.shape().clone(), input_tensor.device().clone())?
                 .div(input_tensor)?;
             let grad = output_grad.mul(&reciprocal)?;
@@ -973,8 +943,7 @@ fn compute_gradients(
         
         Op::Softmax { input, dim } => {
             // Use the complete softmax backward implementation
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let output = input_tensor.softmax(*dim)?;
             let grad = crate::autograd_ops_complete::softmax_backward(output_grad, &output, *dim)?;
             Ok(vec![(*input, grad)])
@@ -982,8 +951,7 @@ fn compute_gradients(
         
         Op::LogSoftmax { input, dim } => {
             // Use the complete log_softmax backward implementation
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &entry.saved_tensors[input];
             let output = input_tensor.log_softmax(*dim)?;
             let grad = crate::autograd_ops_complete::log_softmax_backward(output_grad, &output, *dim)?;
             Ok(vec![(*input, grad)])
@@ -991,10 +959,8 @@ fn compute_gradients(
         
         Op::MSELoss { predictions, targets, num_elements } => {
             // For MSE: d/dx[(x-y)^2] = 2(x-y)/n
-            let predictions_tensor = entry.saved_tensors.get(predictions)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for predictions".into()))?;
-            let targets_tensor = entry.saved_tensors.get(targets)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for targets".into()))?;
+            let predictions_tensor = &entry.saved_tensors[predictions];
+            let targets_tensor = &entry.saved_tensors[targets];
             
             // Gradient is 2 * (predictions - targets) / num_elements
             let diff = predictions_tensor.sub(targets_tensor)?;
@@ -1010,10 +976,8 @@ fn compute_gradients(
         
         Op::L1Loss { predictions, targets, num_elements } => {
             // For L1: d/dx|x-y| = sign(x-y)/n
-            let predictions_tensor = entry.saved_tensors.get(predictions)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for predictions".into()))?;
-            let targets_tensor = entry.saved_tensors.get(targets)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for targets".into()))?;
+            let predictions_tensor = &entry.saved_tensors[predictions];
+            let targets_tensor = &entry.saved_tensors[targets];
             
             let diff = predictions_tensor.sub(targets_tensor)?;
             let sign = diff.sign()?;
@@ -1031,10 +995,8 @@ fn compute_gradients(
             // Huber gradient: 
             // if |x-y| <= delta: (x-y)/n
             // if |x-y| > delta: delta*sign(x-y)/n
-            let predictions_tensor = entry.saved_tensors.get(predictions)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for predictions".into()))?;
-            let targets_tensor = entry.saved_tensors.get(targets)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for targets".into()))?;
+            let predictions_tensor = &entry.saved_tensors[predictions];
+            let targets_tensor = &entry.saved_tensors[targets];
             
             let diff = predictions_tensor.sub(targets_tensor)?;
             let abs_diff = diff.abs()?;
@@ -1065,10 +1027,8 @@ fn compute_gradients(
         
         Op::BCELoss { predictions, targets, num_elements } => {
             // BCE gradient: d/dp[-y*log(p) - (1-y)*log(1-p)] = (p-y)/(p(1-p))/n
-            let predictions_tensor = entry.saved_tensors.get(predictions)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for predictions".into()))?;
-            let targets_tensor = entry.saved_tensors.get(targets)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for targets".into()))?;
+            let predictions_tensor = &entry.saved_tensors[predictions];
+            let targets_tensor = &entry.saved_tensors[targets];
             
             // Clamp predictions to avoid division by zero
             let eps = 1e-7;
@@ -1089,10 +1049,8 @@ fn compute_gradients(
         
         Op::NLLLoss { log_probs, targets, batch_size } => {
             // NLL gradient: sparse gradient, -1/batch_size at target indices
-            let log_probs_tensor = entry.saved_tensors.get(log_probs)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for log_probs".into()))?;
-            let targets_tensor = entry.saved_tensors.get(targets)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for targets".into()))?;
+            let log_probs_tensor = &entry.saved_tensors[log_probs];
+            let targets_tensor = &entry.saved_tensors[targets];
             
             // Create zero gradient tensor
             let mut grad_log_probs = Tensor::zeros(log_probs_tensor.shape().clone(), log_probs_tensor.device().clone())?;

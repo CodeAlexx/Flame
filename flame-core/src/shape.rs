@@ -38,6 +38,11 @@ impl Shape {
         }
         stride
     }
+    
+    /// Get strides for this shape (alias for stride_contiguous)
+    pub fn strides(&self) -> Vec<usize> {
+        self.stride_contiguous()
+    }
 
     // COPIED FROM CANDLE - Critical broadcasting logic
     pub fn broadcast_shape_binary_op(&self, rhs: &Self) -> Result<Shape> {

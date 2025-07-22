@@ -56,7 +56,7 @@ fn test_basic_gradient_flow() -> Result<()> {
     
     // Compute gradients
     println!("Computing backward pass...");
-    let grads = AutogradContext::backward(&loss)?;
+    let grads = AutogradContext::backward_debug(&loss)?;
     println!("Backward pass complete. Number of gradients: {}", grads.len());
     
     // Print all gradient IDs

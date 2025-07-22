@@ -793,42 +793,52 @@ impl CudaKernels {
     
     /// Broadcast tensor to a new shape
     pub fn broadcast(input: &Tensor, target_shape: &Shape) -> Result<Tensor> {
-        // For now, simplified broadcast that requires compatible shapes
-        // Full broadcasting with PTX would be complex
         if input.shape == *target_shape {
             return Ok(input.clone()?);
         }
         
-        // Check if it's a simple broadcast case (e.g., [1, C] -> [B, C])
         let input_dims = input.shape.dims();
         let target_dims = target_shape.dims();
         
-        // Simple case: adding dimensions at the beginning
-        if input_dims.len() < target_dims.len() {
-            let diff = target_dims.len() - input_dims.len();
-            let mut compatible = true;
+        // CPU implementation for now until we have a proper CUDA kernel
+        let input_data = input.to_vec()?;
+        let mut output_data = vec![0.0f32; target_shape.elem_count()];
+        
+        // Calculate strides for both shapes
+        let input_strides = input.shape.strides();
+        let target_strides = target_shape.strides();
+        
+        // Align dimensions from the right
+        let ndim = target_dims.len();
+        let offset = ndim - input_dims.len();
+        
+        // For each element in the output
+        for i in 0..target_shape.elem_count() {
+            // Calculate indices for each dimension
+            let mut target_idx = i;
+            let mut input_idx = 0;
             
-            for i in 0..input_dims.len() {
-                if input_dims[i] != target_dims[i + diff] && input_dims[i] != 1 {
-                    compatible = false;
-                    break;
+            for d in 0..ndim {
+                let dim_idx = target_idx / target_strides[d];
+                target_idx %= target_strides[d];
+                
+                // Map to input dimension
+                if d >= offset {
+                    let input_d = d - offset;
+                    let input_dim_size = input_dims[input_d];
+                    if input_dim_size > 1 {
+                        input_idx += dim_idx * input_strides[input_d];
+                    }
+                    // If input_dim_size == 1, we broadcast (don't add to index)
                 }
             }
             
-            if compatible {
-                // For now, just return a tensor with the right shape
-                // Real implementation would use a proper broadcast kernel
-                let output = Tensor::zeros(target_shape.clone(), input.device.clone())?;
-                
-                // This is a placeholder - real implementation needs a proper PTX kernel
-                return Ok(output);
-            }
+            output_data[i] = input_data[input_idx];
         }
         
-        Err(FlameError::InvalidOperation(format!(
-            "Broadcast from {:?} to {:?} not yet implemented",
-            input.shape, target_shape
-        )))
+        // Create output tensor
+        let output = Tensor::from_vec(output_data, target_shape.clone(), input.device.clone())?;
+        Ok(output)
     }
     
     // Stub for ensure_kernel - not needed with pre-compiled kernels

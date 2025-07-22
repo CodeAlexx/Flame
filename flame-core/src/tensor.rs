@@ -310,180 +310,114 @@ impl Tensor {
             ));
         }
         
-        // Extract batch dimensions and matrix dimensions
-        let self_batch = &self_shape[..self_shape.len() - 2];
-        let other_batch = &other_shape[..other_shape.len() - 2];
-        
-        let (m, k1) = (self_shape[self_shape.len() - 2], self_shape[self_shape.len() - 1]);
-        let (k2, n) = (other_shape[other_shape.len() - 2], other_shape[other_shape.len() - 1]);
-        
-        if k1 != k2 {
+        // Support 3D and 4D tensors
+        if self_shape.len() == 3 && other_shape.len() == 3 {
+            let (batch, m, k1) = (self_shape[0], self_shape[1], self_shape[2]);
+            let (batch2, k2, n) = (other_shape[0], other_shape[1], other_shape[2]);
+            
+            if batch != batch2 {
+                return Err(FlameError::InvalidOperation(
+                    format!("bmm: batch size mismatch {} vs {}", batch, batch2)
+                ));
+            }
+            
+            if k1 != k2 {
+                return Err(FlameError::InvalidOperation(
+                    format!("bmm: incompatible matrix dimensions {} vs {}", k1, k2)
+                ));
+            }
+            
+            return self.bmm_3d(batch, m, k1, n, other);
+        } else if self_shape.len() == 4 && other_shape.len() == 4 {
+            // 4D case: [batch, heads, seq, dim] @ [batch, heads, dim, seq2]
+            let (batch, heads, m, k1) = (self_shape[0], self_shape[1], self_shape[2], self_shape[3]);
+            let (batch2, heads2, k2, n) = (other_shape[0], other_shape[1], other_shape[2], other_shape[3]);
+            
+            if batch != batch2 || heads != heads2 {
+                return Err(FlameError::InvalidOperation(
+                    format!("bmm: batch/heads mismatch: [{}, {}] vs [{}, {}]", batch, heads, batch2, heads2)
+                ));
+            }
+            
+            if k1 != k2 {
+                return Err(FlameError::InvalidOperation(
+                    format!("bmm: incompatible matrix dimensions {} vs {}", k1, k2)
+                ));
+            }
+            
+            // Reshape to 3D for computation
+            let total_batch = batch * heads;
+            let self_3d = self.reshape(&[total_batch, m, k1])?;
+            let other_3d = other.reshape(&[total_batch, k2, n])?;
+            
+            // Do 3D BMM
+            let result_3d = self_3d.bmm_3d(total_batch, m, k1, n, &other_3d)?;
+            
+            // Reshape back to 4D
+            return result_3d.reshape(&[batch, heads, m, n]);
+        } else {
             return Err(FlameError::InvalidOperation(
-                format!("bmm: incompatible matrix dimensions {} vs {}", k1, k2)
+                format!("bmm: unsupported tensor shapes {:?} @ {:?}", self_shape, other_shape)
             ));
         }
         
-        // Broadcast batch dimensions
-        let broadcast_batch = broadcast_shapes(self_batch, other_batch)?;
-        
-        // Calculate total batch size
-        let batch_size: usize = broadcast_batch.iter().product();
-        
-        // Reshape to 3D: [batch_size, m, k] and [batch_size, k, n]
-        let self_3d = self.reshape_for_bmm(&broadcast_batch, m, k1)?;
-        let other_3d = other.reshape_for_bmm(&broadcast_batch, k1, n)?;
-        
-        // Prepare output shape
-        let mut output_shape = broadcast_batch.to_vec();
-        output_shape.push(m);
-        output_shape.push(n);
-        
+    }
+    
+    /// Helper for 3D batch matrix multiplication
+    fn bmm_3d(&self, batch: usize, m: usize, k: usize, n: usize, other: &Tensor) -> Result<Tensor> {
+        // Prepare output shape [batch, m, n]
+        let output_shape = vec![batch, m, n];
         let mut output = Tensor::zeros(Shape::from_dims(&output_shape), self.device.clone())?;
         
         // Use cuBLAS
         let blas = CudaBlas::new(self.device.clone())
             .map_err(|_| FlameError::CuBlas)?;
         
-        // Use cuBLAS batched GEMM for efficient batch matrix multiplication
-        if batch_size > 1 {  // Always use batched GEMM when available
-            // Prepare arrays of pointers for batched GEMM
-            let mut a_ptrs = Vec::with_capacity(batch_size);
-            let mut b_ptrs = Vec::with_capacity(batch_size);
-            let mut c_ptrs = Vec::with_capacity(batch_size);
-            
-            for b in 0..batch_size {
-                let self_offset = b * m * k1;
-                let other_offset = b * k1 * n;
-                let output_offset = b * m * n;
-                
-                let self_ptr = *(*self_3d.data).device_ptr() as *const f32;
-                let other_ptr = *(*other_3d.data).device_ptr() as *const f32;
-                let output_ptr = *(*output.data).device_ptr() as *mut f32;
-                
-                a_ptrs.push(unsafe { self_ptr.add(self_offset) });
-                b_ptrs.push(unsafe { other_ptr.add(other_offset) });
-                c_ptrs.push(unsafe { output_ptr.add(output_offset) });
-            }
-            
-            // Call individual GEMM for each batch
-            use cudarc::cublas::{GemmConfig, Gemm};
-            
-            for b in 0..batch_size {
-                let self_offset = b * m * k1;
-                let other_offset = b * k1 * n;
-                let output_offset = b * m * n;
-                
-                let cfg = GemmConfig {
-                    m: m as i32,
-                    n: n as i32,
-                    k: k1 as i32,
-                    transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-                    transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-                    lda: m as i32,
-                    ldb: k1 as i32,
-                    ldc: m as i32,
-                    alpha: 1.0,
-                    beta: 0.0,
-                };
-                
-                // Perform GEMM for this batch
-                // We'll need to create temporary tensors for the slices
-                let self_slice = Tensor {
-                    data: self_3d.data.clone(),
-                    shape: Shape::from_dims(&[m, k1]),
-                    device: self.device.clone(),
-                    id: TensorId::new(),
-                    requires_grad: false,
-                };
-                
-                let other_slice = Tensor {
-                    data: other_3d.data.clone(),
-                    shape: Shape::from_dims(&[k1, n]),
-                    device: self.device.clone(),
-                    id: TensorId::new(),
-                    requires_grad: false,
-                };
-                
-                // Use existing matmul which handles the GEMM internally
-                let batch_result = self_slice.matmul(&other_slice)?;
-                
-                // Copy result to the right position in output
-                let batch_data = batch_result.to_vec()?;
-                let output_data = output.to_vec()?;
-                let mut updated_output = output_data;
-                
-                for i in 0..(m * n) {
-                    updated_output[output_offset + i] = batch_data[i];
-                }
-                
-                output = Tensor::from_vec(updated_output, output.shape.clone(), output.device.clone())?;
-            }
-            
-            return Ok(output);
-        }
-        
-        // Fallback to loop implementation for single batch or CPU
-        for b in 0..batch_size {
-            let self_offset = b * m * k1;
-            let other_offset = b * k1 * n;
+        // Simple loop-based implementation for now
+        for b in 0..batch {
+            let self_offset = b * m * k;
+            let other_offset = b * k * n;
             let output_offset = b * m * n;
             
-            // Create views for this batch
-            let self_batch = self_3d.slice_internal(self_offset, m * k1)?;
-            let other_batch = other_3d.slice_internal(other_offset, k1 * n)?;
+            // Create temporary tensors for this batch's slice
+            // This is inefficient but works for now
+            let self_data = self.to_vec()?;
+            let other_data = other.to_vec()?;
             
-            // Perform matrix multiplication for this batch
-            use cudarc::cublas::{GemmConfig, Gemm};
-            let cfg = GemmConfig {
-                transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-                transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-                m: n as i32,
-                n: m as i32,
-                k: k1 as i32,
-                alpha: 1.0,
-                lda: n as i32,
-                ldb: k1 as i32,
-                beta: 0.0,
-                ldc: n as i32,
-            };
+            let mut self_batch_data = vec![0.0f32; m * k];
+            let mut other_batch_data = vec![0.0f32; k * n];
             
-            unsafe {
-                // Create a temporary buffer for this batch
-                let mut batch_output = self.device.alloc_zeros::<f32>(m * n)
-                    .map_err(|_| FlameError::CudaDriver)?;
-                    
-                blas.gemm(cfg, &*other_batch.data, &*self_batch.data, &mut batch_output)
-                    .map_err(|_| FlameError::CuBlas)?;
-                    
-                // Now actually tries GPU-to-GPU memory copy
-                let kernel_code = r#"
-extern "C" __global__ void copy_at_offset(
-    float* output,
-    const float* input,
-    int offset,
-    int count
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < count) {
-        output[offset + idx] = input[idx];
-    }
-}
-"#;
-                
-                CudaKernels::ensure_kernel(&self.device, "copy_at_offset", kernel_code)?;
-                
-                let f = self.device.get_func("copy_at_offset", "copy_at_offset")
-                    .ok_or_else(|| FlameError::Cuda("Failed to get copy_at_offset kernel".into()))?;
-                
-                let cfg = cudarc::driver::LaunchConfig::for_num_elems((m * n) as u32);
-                
-                launch_kernel!(f, cfg,
-                    &*output.data,
-                    &batch_output,
-                    output_offset as i32,
-                    (m * n) as i32
-                )?;
+            for i in 0..(m * k) {
+                self_batch_data[i] = self_data[self_offset + i];
             }
+            for i in 0..(k * n) {
+                other_batch_data[i] = other_data[other_offset + i];
+            }
+            
+            let self_batch = Tensor::from_vec(
+                self_batch_data,
+                Shape::from_dims(&[m, k]),
+                self.device.clone()
+            )?;
+            
+            let other_batch = Tensor::from_vec(
+                other_batch_data,
+                Shape::from_dims(&[k, n]),
+                self.device.clone()
+            )?;
+            
+            // Use regular matmul for this batch
+            let batch_result = self_batch.matmul(&other_batch)?;
+            
+            // Copy result back to output
+            let batch_result_data = batch_result.to_vec()?;
+            let mut output_data = output.to_vec()?;
+            
+            for i in 0..(m * n) {
+                output_data[output_offset + i] = batch_result_data[i];
+            }
+            
+            output = Tensor::from_vec(output_data, output.shape.clone(), output.device.clone())?;
         }
         
         // AUTOGRAD: Record operation if needed
@@ -627,14 +561,8 @@ extern "C" __global__ void slice_kernel(
 
     /// Subtract another tensor
     pub fn sub(&self, other: &Tensor) -> Result<Tensor> {
-        if self.shape != other.shape {
-            return Err(FlameError::ShapeMismatch {
-                expected: self.shape.clone(),
-                got: other.shape.clone(),
-            });
-        }
-        
         // Implement as self + (-1 * other)
+        // This automatically handles broadcasting through the add operation
         let neg_other = other.mul_scalar(-1.0)?;
         let mut output = self.add(&neg_other)?;
         
@@ -1371,14 +1299,14 @@ extern "C" __global__ void slice_kernel(
         }
         
         // Compute max along dimension for numerical stability
-        let max_vals = self.max_dim(dim, true)?;
+        let max_vals = GpuOps::max_dim(self, dim, true)?;
         let shifted = self.sub(&max_vals)?;
         
         // Compute exp
         let exp_vals = shifted.exp()?;
         
         // Sum along dimension
-        let sum_exp = exp_vals.sum_dim_keepdim(dim)?;
+        let sum_exp = GpuOps::sum_dim_keepdim(&exp_vals, dim)?;
         
         // Divide by sum
         let mut output = exp_vals.div(&sum_exp)?;

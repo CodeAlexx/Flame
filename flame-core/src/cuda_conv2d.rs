@@ -22,17 +22,21 @@ pub struct CudaConv2d;
 impl CudaConv2d {
     /// Ensure kernels are loaded
     fn ensure_kernels(device: &Arc<CudaDevice>) -> Result<()> {
+        // Compile CUDA kernels first
+        let ptx = cudarc::nvrtc::compile_ptx(CONV2D_KERNELS)
+            .map_err(|e| FlameError::Cuda(format!("Failed to compile Conv2D kernels: {:?}", e)))?;
+        
         device
-            .load_ptx(CONV2D_KERNELS.into(), "conv2d_ops", &[
+            .load_ptx(ptx, "conv2d_ops", &[
                 "im2col_kernel_simple",
                 "im2col_kernel",
+                "im2col_kernel_v2",
                 "col2im_kernel_simple",
                 "col2im_kernel",
+                "col2im_kernel_v2",
                 "add_bias_nhwc_kernel",
                 "add_bias_nchw_kernel",
                 "bias_grad_kernel",
-                "im2col_optimized_kernel",
-                "check_conv_dimensions_kernel",
             ])
             .map_err(|e| FlameError::Cuda(format!("Failed to load Conv2D kernels: {}", e)))?;
         Ok(())
@@ -310,8 +314,8 @@ impl CudaConv2d {
             let dims_gpu = device.htod_sync_copy(&dims)?;
             let params_gpu = device.htod_sync_copy(&conv_params)?;
             
-            let f_im2col = device.get_func("conv2d_ops", "im2col_kernel")
-                .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel".into()))?;
+            let f_im2col = device.get_func("conv2d_ops", "im2col_kernel_v2")
+                .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel v2".into()))?;
             
             launch_kernel!(f_im2col, cfg,
                 input.data.as_ref(),
@@ -368,8 +372,8 @@ impl CudaConv2d {
             let dims_gpu = device.htod_sync_copy(&dims)?;
             let params_gpu = device.htod_sync_copy(&conv_params)?;
             
-            let f_col2im = device.get_func("conv2d_ops", "col2im_kernel")
-                .ok_or_else(|| FlameError::Cuda("Failed to get col2im kernel".into()))?;
+            let f_col2im = device.get_func("conv2d_ops", "col2im_kernel_v2")
+                .ok_or_else(|| FlameError::Cuda("Failed to get col2im kernel v2".into()))?;
             
             launch_kernel!(f_col2im, cfg,
                 grad_input_col.data.as_ref(),
