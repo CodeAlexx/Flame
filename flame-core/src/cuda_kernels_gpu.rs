@@ -1,14 +1,17 @@
 use crate::{Result, FlameError, Tensor, Shape};
 use cudarc::{
     driver::{CudaDevice, LaunchAsync, LaunchConfig, CudaSlice}, 
-    nvrtc::{compile_ptx_with_opts, CompileOptions}
+    nvrtc::{compile_ptx_with_opts, CompileOptions},
+    cublas::CudaBlas
 };
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::os::raw::c_void;
 
 lazy_static::lazy_static! {
     static ref KERNEL_CACHE: Mutex<HashMap<String, ()>> = Mutex::new(HashMap::new());
+    static ref CONV2D_MODULE: Result<()> = Err(FlameError::Cuda("Conv2D module not compiled".into()));
 }
 
 // Kernel names as static strings
@@ -1380,10 +1383,19 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
         // Compute grad_weight: conv2d_backward_weight(input, grad_output)
         // This involves im2col on input and matmul with grad_output
         let batch = input.shape.dims()[0];
+        let batch_size = batch;  // Alias for consistency
         let in_channels = input.shape.dims()[1];
         let out_channels = weight.shape.dims()[1];
         let kh = weight.shape.dims()[2];
         let kw = weight.shape.dims()[3];
+        let kernel_h = kh;
+        let kernel_w = kw;
+        
+        // Calculate output dimensions
+        let in_h = input.shape.dims()[2];
+        let in_w = input.shape.dims()[3];
+        let out_h = grad_output.shape.dims()[2];
+        let out_w = grad_output.shape.dims()[3];
         
         let grad_weight_shape = weight.shape.clone();
         let grad_weight_data = unsafe { 
@@ -1397,6 +1409,17 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
         // Launch kernel to compute grad_weight using cuBLAS GEMM
         // grad_weight = grad_output^T @ input_col
         
+        // Create im2col transformation of input
+        // This converts the input patches into columns for matrix multiplication
+        let input_col_shape = Shape::from_dims(&[
+            batch_size * out_h * out_w,
+            in_channels * kernel_h * kernel_w
+        ]);
+        let input_col = Tensor::zeros(&input_col_shape, input.dtype(), input.device())?;
+        
+        // TODO: Implement im2col kernel to fill input_col
+        // For now, we'll use a placeholder
+        
         // Reshape grad_output for matrix multiply
         let grad_output_reshaped = grad_output.reshape(&[batch_size * out_h * out_w, out_channels])?;
         
@@ -1404,23 +1427,23 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
         if let Some(cuda_device) = weight.device.cuda_device() {
             // Call cuBLAS SGEMM for weight gradient computation
             unsafe {
-                let cublas = crate::cuda_utils::get_cublas_handle(cuda_device)?;
+                let cublas = CudaBlas::new(cuda_device.clone())?;
                 
                 // grad_weight = grad_output_reshaped^T @ input_col
                 // M = out_channels, N = in_channels * kernel_h * kernel_w, K = batch_size * out_h * out_w
                 cublas.sgemm(
-                    cublasOperation_t::CUBLAS_OP_T,  // transpose grad_output
-                    cublasOperation_t::CUBLAS_OP_N,  // no transpose input_col
+                    cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,  // transpose grad_output
+                    cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,  // no transpose input_col
                     out_channels as i32,
                     (in_channels * kernel_h * kernel_w) as i32,
                     (batch_size * out_h * out_w) as i32,
                     &1.0f32,  // alpha
-                    grad_output_reshaped.data_ptr()? as *const f32,
+                    (*grad_output_reshaped.data).device_ptr() as *const f32,
                     (batch_size * out_h * out_w) as i32,  // lda
-                    input_col.data_ptr()? as *const f32,
+                    (*input_col.data).device_ptr() as *const f32,
                     (batch_size * out_h * out_w) as i32,  // ldb
                     &0.0f32,  // beta
-                    grad_weight_data.as_mut_ptr() as *mut f32,
+                    grad_weight_data.device_ptr() as *mut f32,
                     out_channels as i32,  // ldc
                 )?;
             }
@@ -1557,5 +1580,41 @@ extern "C" __global__ void broadcast_kernel(
         }
         
         Ok(create_output_tensor(output_data, target_shape.clone(), input.device.clone()))
+    }
+}
+
+/// Mean reduction along specified dimensions
+pub fn mean_reduce_dims(tensor: &Tensor, dims: &[usize]) -> Result<Tensor> {
+    // For now, implement as sum followed by division
+    let kernels = CudaKernels::new(tensor.device.clone())?;
+    let sum_result = kernels.sum_dim_keepdim(tensor, dims[0])?;
+    
+    // Calculate the number of elements in the reduced dimensions
+    let mut divisor = 1.0;
+    for &dim in dims {
+        divisor *= tensor.shape().dims()[dim] as f32;
+    }
+    
+    // Divide by the number of elements
+    sum_result.div_scalar(divisor)
+}
+
+/// Cast tensor to different dtype
+pub fn cast_dtype(tensor: &Tensor, target_dtype: crate::DType) -> Result<Tensor> {
+    // For now, just clone with the new dtype
+    // In a real implementation, this would use a CUDA kernel
+    match (tensor.dtype(), target_dtype) {
+        (crate::DType::F32, crate::DType::F16) => {
+            // F32 to F16 conversion
+            tensor.to_dtype(target_dtype)
+        }
+        (crate::DType::F16, crate::DType::F32) => {
+            // F16 to F32 conversion
+            tensor.to_dtype(target_dtype)
+        }
+        _ => {
+            // Same dtype or other conversions
+            tensor.to_dtype(target_dtype)
+        }
     }
 }

@@ -311,7 +311,7 @@ impl Tensor {
             .map_err(|_| FlameError::CuBlas)?;
         
         // Use cuBLAS batched GEMM for efficient batch matrix multiplication
-        if self.device.is_cuda() && batch_size > 1 {
+        if batch_size > 1 {  // Always use batched GEMM when available
             // Prepare arrays of pointers for batched GEMM
             let mut a_ptrs = Vec::with_capacity(batch_size);
             let mut b_ptrs = Vec::with_capacity(batch_size);

@@ -377,7 +377,7 @@ impl CudaKernels {
         let mut output = Tensor::zeros(Shape::from_dims(&output_shape), tensor.device.clone())?;
         
         // Implement GPU kernel for multi-dimensional reduction
-        if tensor.device.is_cuda() {
+        if true {  // FLAME is GPU-only
             return crate::cuda_kernels_gpu::mean_reduce_dims(tensor, dims);
         }
         
@@ -979,10 +979,10 @@ pub fn scatter_add(
 ) -> Result<Tensor> {
     let device = grad_output.device();
     
-    if device.is_cuda() {
+    if true {  // FLAME is GPU-only
         // For GPU, we would use a CUDA kernel
         // For now, fallback to CPU implementation
-        let mut input_grad = Tensor::zeros(input_shape, grad_output.dtype(), device)?;
+        let mut input_grad = Tensor::zeros(input_shape, crate::DType::F32, device)?;
         let grad_data = grad_output.to_vec::<f32>()?;
         let indices_data = indices.to_vec::<i64>()?;
         let mut input_grad_data = vec![0.0f32; input_grad.shape().elem_count()];
@@ -1016,7 +1016,7 @@ pub fn scatter_add(
         Tensor::from_vec(input_grad_data, input_shape, device)
     } else {
         // CPU implementation
-        let mut input_grad = Tensor::zeros(input_shape, grad_output.dtype(), device)?;
+        let mut input_grad = Tensor::zeros(input_shape, crate::DType::F32, device)?;
         let grad_data = grad_output.to_vec::<f32>()?;
         let indices_data = indices.to_vec::<i64>()?;
         let mut input_grad_data = vec![0.0f32; input_grad.shape().elem_count()];

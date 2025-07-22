@@ -136,6 +136,22 @@ impl Conv3d {
     
     /// CPU implementation of 3D convolution
     fn conv3d_cpu(&self, input: &Tensor, output_shape: &Shape) -> Result<Tensor> {
+        // Extract dimensions from shapes
+        let input_shape = input.shape().dims();
+        let batch = input_shape[0];
+        let d_in = input_shape[2];
+        let h_in = input_shape[3];
+        let w_in = input_shape[4];
+        
+        let output_dims = output_shape.dims();
+        let d_out = output_dims[2];
+        let h_out = output_dims[3];
+        let w_out = output_dims[4];
+        
+        let (kd, kh, kw) = self.kernel_size;
+        let (sd, sh, sw) = self.stride;
+        let (pd, ph, pw) = self.padding;
+        
         // Simple CPU implementation
         // Now actually tries to perform 3D convolution
         let kernel_code = r#"
@@ -200,7 +216,7 @@ extern "C" __global__ void conv3d_forward(
         
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(output_numel as u32);
         unsafe {
-            f.launch(cfg, (
+            f.launch_async(cfg, &self.device.stream(), (
                 &mut output_data,
                 &*input.data(),
                 &*self.weight.data(),
@@ -398,7 +414,7 @@ extern "C" __global__ void batchnorm3d_forward(
         
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
         unsafe {
-            f.launch(cfg, (
+            f.launch_async(cfg, &self.device.stream(), (
                 &mut output_data,
                 &*input.data(),
                 &*mean,

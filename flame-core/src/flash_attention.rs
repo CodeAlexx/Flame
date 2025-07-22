@@ -269,10 +269,10 @@ pub fn flash_attn_varlen(
             continue;
         }
         
-        // Extract subsequences
-        let q_seq = q.narrow(0, q_start, seq_len_q)?;
-        let k_seq = k.narrow(0, k_start, seq_len_k)?;
-        let v_seq = v.narrow(0, k_start, seq_len_k)?;
+        // Extract subsequences using slice
+        let q_seq = q.slice(0, q_start, q_start + seq_len_q)?;
+        let k_seq = k.slice(0, k_start, k_start + seq_len_k)?;
+        let v_seq = v.slice(0, k_start, k_start + seq_len_k)?;
         
         // Reshape to [1, num_heads, seq_len, head_dim]
         let q_seq = q_seq.unsqueeze(0)?.transpose(1, 2)?;

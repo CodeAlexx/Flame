@@ -1,5 +1,5 @@
 use crate::{Shape, Result, FlameError};
-use crate::cuda::CudaKernels;
+use crate::cuda_kernels::CudaKernels;
 use cudarc::driver::{CudaDevice, CudaSlice};
 use cudarc::cublas::CudaBlas;
 use std::sync::Arc;
@@ -186,44 +186,12 @@ impl CudaTensor {
             self.device.alloc::<f32>(1)?
         };
         
-        // Get temporary storage size for CUB reduction
-        let mut temp_storage_bytes = 0usize;
-        unsafe {
-            cub::DeviceReduce::Sum(
-                std::ptr::null_mut(),  // null temp storage to get size
-                &mut temp_storage_bytes,
-                self.data.as_ptr() as *const f32,
-                sum_buf.as_mut_ptr() as *mut f32,
-                total_elements as i32,
-                self.device.stream(),
-            )?;
-        }
+        // Launch custom reduction kernel
+        let kernels = CudaKernels::new(self.device.clone())?;
+        let sum_result = kernels.sum_kernel(&self)?;
         
-        // Allocate temporary storage
-        let temp_storage = unsafe {
-            self.device.alloc_bytes(temp_storage_bytes)?
-        };
-        
-        // Perform reduction
-        unsafe {
-            cub::DeviceReduce::Sum(
-                temp_storage.as_mut_ptr(),
-                &mut temp_storage_bytes,
-                self.data.as_ptr() as *const f32,
-                sum_buf.as_mut_ptr() as *mut f32,
-                total_elements as i32,
-                self.device.stream(),
-            )?;
-        }
-        
-        // Synchronize to ensure reduction is complete
-        self.device.synchronize()?;
-        
-        Ok(CudaTensor {
-            data: sum_buf,
-            shape: Shape::from_dims(&[1]),
-            device: self.device.clone(),
-        })
+        // Return the result tensor
+        Ok(sum_result)
     }
 
     /// Get shape
