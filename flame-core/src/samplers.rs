@@ -466,7 +466,7 @@ impl DDPMScheduler {
         noise_schedule: String,
         prediction_type: String,
     ) -> Self {
-        let betas = match noise_schedule.as_str() {
+        let betas: Vec<f32> = match noise_schedule.as_str() {
             "linear" => {
                 let beta_start = 0.0001;
                 let beta_end = 0.02;

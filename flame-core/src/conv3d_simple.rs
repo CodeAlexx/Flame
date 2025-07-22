@@ -6,6 +6,14 @@
 
 use crate::{Tensor, Shape, Result, FlameError, CudaDevice};
 use std::sync::Arc;
+use cudarc::driver::{LaunchAsync, LaunchConfig};
+
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
+}
 
 /// 3D Convolution layer
 pub struct Conv3d {
@@ -159,13 +167,34 @@ extern "C" __global__ void conv3d_forward(
     float *output,
     const float *input,
     const float *weight,
-    int batch, int in_channels, int out_channels,
-    int d_in, int h_in, int w_in,
-    int d_out, int h_out, int w_out,
-    int kernel_d, int kernel_h, int kernel_w,
-    int stride_d, int stride_h, int stride_w,
-    int pad_d, int pad_h, int pad_w
+    const int *input_dims,    // [batch, in_channels, d_in, h_in, w_in]
+    const int *output_dims,   // [out_channels, d_out, h_out, w_out]
+    const int *kernel_dims,   // [kernel_d, kernel_h, kernel_w]
+    const int *conv_params    // [stride_d, stride_h, stride_w, pad_d, pad_h, pad_w]
 ) {
+    // Unpack dimensions from arrays
+    int batch = input_dims[0];
+    int in_channels = input_dims[1];
+    int d_in = input_dims[2];
+    int h_in = input_dims[3];
+    int w_in = input_dims[4];
+    
+    int out_channels = output_dims[0];
+    int d_out = output_dims[1];
+    int h_out = output_dims[2];
+    int w_out = output_dims[3];
+    
+    int kernel_d = kernel_dims[0];
+    int kernel_h = kernel_dims[1];
+    int kernel_w = kernel_dims[2];
+    
+    int stride_d = conv_params[0];
+    int stride_h = conv_params[1];
+    int stride_w = conv_params[2];
+    int pad_d = conv_params[3];
+    int pad_h = conv_params[4];
+    int pad_w = conv_params[5];
+    
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch * out_channels * d_out * h_out * w_out;
     
@@ -205,7 +234,7 @@ extern "C" __global__ void conv3d_forward(
 }"#;
         
         // Launch the kernel
-        crate::cuda_kernels::CudaKernels::ensure_kernel(&self.device, "conv3d_forward", kernel_code)?;
+        crate::cuda_kernels_gpu::CudaKernels::ensure_kernel(&self.device, "conv3d_forward", kernel_code)?;
         
         let f = self.device.get_func("conv3d_forward", "conv3d_forward")
             .ok_or_else(|| crate::FlameError::Cuda("Failed to get conv3d kernel".into()))?;
@@ -215,54 +244,44 @@ extern "C" __global__ void conv3d_forward(
             .map_err(|_| crate::FlameError::CudaDriver)?;
         
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(output_numel as u32);
-        unsafe {
-            f.launch_async(cfg, &self.device.stream(), (
-                &mut output_data,
-                &*input.data(),
-                &*self.weight.data(),
-                batch as i32, self.in_channels as i32, self.out_channels as i32,
-                d_in as i32, h_in as i32, w_in as i32,
-                d_out as i32, h_out as i32, w_out as i32,
-                kd as i32, kh as i32, kw as i32,
-                sd as i32, sh as i32, sw as i32,
-                pd as i32, ph as i32, pw as i32,
-            )).map_err(|_| crate::FlameError::Cuda("Failed to launch conv3d kernel".into()))?;
-        }
+        // Pack dimensions into arrays to reduce parameter count
+        let input_dims = vec![batch as i32, self.in_channels as i32, d_in as i32, h_in as i32, w_in as i32];
+        let output_dims = vec![self.out_channels as i32, d_out as i32, h_out as i32, w_out as i32];
+        let kernel_dims = vec![kd as i32, kh as i32, kw as i32];
+        let conv_params = vec![sd as i32, sh as i32, sw as i32, pd as i32, ph as i32, pw as i32];
         
-        crate::cuda_kernels::create_output_tensor(output_data, output_shape, self.device.clone())
+        let input_dims_gpu = self.device.htod_sync_copy(&input_dims)?;
+        let output_dims_gpu = self.device.htod_sync_copy(&output_dims)?;
+        let kernel_dims_gpu = self.device.htod_sync_copy(&kernel_dims)?;
+        let conv_params_gpu = self.device.htod_sync_copy(&conv_params)?;
+        
+        launch_kernel!(f, cfg,
+            &output_data,
+            &*input.data,
+            &*self.weight.data,
+            &input_dims_gpu,
+            &output_dims_gpu,
+            &kernel_dims_gpu,
+            &conv_params_gpu
+        )?;
+        
+        Ok(crate::cuda_kernels::create_output_tensor(output_data, output_shape.clone(), self.device.clone()))
     }
     
     /// Add bias to output tensor
     fn add_bias_3d(&self, output: &mut Tensor, bias: &Tensor) -> Result<()> {
-        if output.device.is_cuda() {
-            // Use CUDA kernel for efficient bias addition
-            let dims = output.shape().dims();
-            let out_channels = dims[1];
-            
-            // Reshape bias for broadcasting and add
-            let bias_shape = Shape::from_dims(&[1, out_channels, 1, 1, 1]);
-            let bias_reshaped = bias.reshape(&bias_shape)?;
-            
-            // Broadcast and add using CUDA operations
-            *output = output.add(&bias_reshaped)?;
-            Ok(())
-        } else {
-            // CPU implementation
-            let output_data = output.to_vec()?;
-            let bias_data = bias.to_vec()?;
-            let mut result = output_data;
-            
-            let dims = output.shape().dims();
-            let spatial_size = dims[2] * dims[3] * dims[4];
-            
-            for idx in 0..result.len() {
-                let channel = (idx / spatial_size) % self.out_channels;
-                result[idx] += bias_data[channel];
-            }
-            
-            *output = Tensor::from_vec(result, output.shape().clone(), output.device.clone())?;
-            Ok(())
-        }
+        // Always use CUDA since we're in a CUDA-only context
+        // Use CUDA kernel for efficient bias addition
+        let dims = output.shape().dims();
+        let out_channels = dims[1];
+        
+        // Reshape bias for broadcasting and add
+        let bias_shape = Shape::from_dims(&[1, out_channels, 1, 1, 1]);
+        let bias_reshaped = bias.reshape(bias_shape.dims())?;
+        
+        // Broadcast and add using CUDA operations
+        *output = output.add(&bias_reshaped)?;
+        Ok(())
     }
 }
 
@@ -392,7 +411,7 @@ extern "C" __global__ void batchnorm3d_forward(
     }
 }"#;
         
-        crate::cuda_kernels::CudaKernels::ensure_kernel(&self.device, "batchnorm3d_forward", kernel_code)?;
+        crate::cuda_kernels_gpu::CudaKernels::ensure_kernel(&self.device, "batchnorm3d_forward", kernel_code)?;
         
         let f = self.device.get_func("batchnorm3d_forward", "batchnorm3d_forward")
             .ok_or_else(|| FlameError::Cuda("Failed to get batchnorm3d kernel".into()))?;
@@ -403,30 +422,29 @@ extern "C" __global__ void batchnorm3d_forward(
             .map_err(|_| FlameError::CudaDriver)?;
         
         // Use running stats if available, otherwise compute batch stats
+        let (batch_mean, batch_var);
         let (mean, var) = if let (Some(rm), Some(rv)) = (&self.running_mean, &self.running_var) {
-            (rm.data(), rv.data())
+            (rm.data.as_ref(), rv.data.as_ref())
         } else {
             // Compute batch statistics
-            let batch_mean = self.compute_batch_mean(input)?;
-            let batch_var = self.compute_batch_var(input, &batch_mean)?;
-            (batch_mean.data(), batch_var.data())
+            batch_mean = self.compute_batch_mean(input)?;
+            batch_var = self.compute_batch_var(input, &batch_mean)?;
+            (batch_mean.data.as_ref(), batch_var.data.as_ref())
         };
         
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch_async(cfg, &self.device.stream(), (
-                &mut output_data,
-                &*input.data(),
-                &*mean,
-                &*var,
-                self.weight.as_ref().map(|w| &**w.data()).unwrap_or(&cudarc::driver::CudaSlice::from_raw_parts(std::ptr::null_mut(), 0)),
-                self.bias.as_ref().map(|b| &**b.data()).unwrap_or(&cudarc::driver::CudaSlice::from_raw_parts(std::ptr::null_mut(), 0)),
-                self.eps,
-                dims[0] as i32,
-                self.num_features as i32,
-                spatial_size as i32,
-            )).map_err(|_| FlameError::Cuda("Failed to launch batchnorm3d kernel".into()))?;
-        }
+        launch_kernel!(f, cfg,
+            &output_data,
+            &*input.data,
+            mean,
+            var,
+            self.weight.as_ref().map(|w| &*w.data).unwrap_or(mean), // Use mean as dummy for null pointer
+            self.bias.as_ref().map(|b| &*b.data).unwrap_or(mean),   // Use mean as dummy for null pointer
+            self.eps,
+            dims[0] as i32,
+            self.num_features as i32,
+            spatial_size as i32
+        )?;
         
         Ok(Tensor::from_raw(
             Arc::new(output_data),

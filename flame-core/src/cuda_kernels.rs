@@ -7,6 +7,13 @@ use std::collections::HashMap;
 // Import CUDA C kernel sources
 use crate::cuda_kernel_sources::*;
 
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
+}
+
 /// Helper to create output tensor from allocated data
 pub fn create_output_tensor(data: CudaSlice<f32>, shape: Shape, device: Arc<CudaDevice>) -> Tensor {
     Tensor {
@@ -92,9 +99,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (a.data.as_ref(), b.data.as_ref(), &*output.data, n as u32))?;
-        }
+        launch_kernel!(kernel, config, a.data.as_ref(), b.data.as_ref(), &*output.data, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -125,9 +130,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (a.data.as_ref(), b.data.as_ref(), &*output.data, n as u32))?;
-        }
+        launch_kernel!(kernel, config, a.data.as_ref(), b.data.as_ref(), &*output.data, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -151,9 +154,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), scalar, &*output.data, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), scalar, &*output.data, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -177,9 +178,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), scalar, &*output.data, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), scalar, &*output.data, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -203,9 +202,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), &*output.data, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -229,9 +226,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), &*output.data, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -255,9 +250,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), &*output.data, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -281,9 +274,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), &*output.data, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -307,9 +298,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), &*output.data, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -335,9 +324,7 @@ impl CudaKernels {
             shared_mem_bytes: (block_size * 4) as u32,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), &output_data, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), &output_data, n as u32)?;
         
         self.device.synchronize()?;
         
@@ -467,9 +454,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), &*output.data, rows as u32, cols as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, rows as u32, cols as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -500,9 +485,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (output.data.as_ref(), gradients.data.as_ref(), lr, n as u32))?;
-        }
+        launch_kernel!(kernel, config, output.data.as_ref(), gradients.data.as_ref(), lr, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -526,9 +509,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), &*output.data, negative_slope, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, negative_slope, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -551,9 +532,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), &*output.data, alpha, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, alpha, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -581,9 +560,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), &*output.data, exponent, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, exponent, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -606,9 +583,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), &*output.data, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -631,9 +606,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), &*output.data, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -656,9 +629,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        unsafe {
-            kernel.launch(config, (tensor.data.as_ref(), &*output.data, n as u32))?;
-        }
+        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -967,6 +938,14 @@ impl CudaKernels {
         
         Tensor::from_vec(result, Shape::from_dims(&output_shape), tensor.device.clone())
     }
+    
+    /// Sum all elements in a tensor
+    pub fn sum_kernel(&self, tensor: &Tensor) -> Result<Tensor> {
+        // Simple implementation - sum to scalar
+        let data = tensor.to_vec()?;
+        let sum: f32 = data.iter().sum();
+        Tensor::from_vec(vec![sum], Shape::from_dims(&[1]), tensor.device.clone())
+    }
 }
 
 /// Scatter add operation for efficient gradient accumulation
@@ -982,9 +961,9 @@ pub fn scatter_add(
     if true {  // FLAME is GPU-only
         // For GPU, we would use a CUDA kernel
         // For now, fallback to CPU implementation
-        let mut input_grad = Tensor::zeros(input_shape, crate::DType::F32, device)?;
-        let grad_data = grad_output.to_vec::<f32>()?;
-        let indices_data = indices.to_vec::<i64>()?;
+        let mut input_grad = Tensor::zeros(Shape::from_dims(input_shape), device.clone())?;
+        let grad_data = grad_output.to_vec()?;
+        let indices_data = indices.to_vec()?;
         let mut input_grad_data = vec![0.0f32; input_grad.shape().elem_count()];
         
         let grad_shape = grad_output.shape().dims();
@@ -1000,7 +979,7 @@ pub fn scatter_add(
                 grad_idx /= grad_shape[d];
             }
             
-            let idx = indices_data[pos[dim]] as usize;
+            let idx = indices_data[pos[dim]] as i64 as usize;
             pos[dim] = idx;
             
             let mut in_idx = 0;
@@ -1013,12 +992,12 @@ pub fn scatter_add(
             input_grad_data[in_idx] += grad_data[i];
         }
         
-        Tensor::from_vec(input_grad_data, input_shape, device)
+        Tensor::from_vec(input_grad_data, Shape::from_dims(input_shape), device.clone())
     } else {
         // CPU implementation
-        let mut input_grad = Tensor::zeros(input_shape, crate::DType::F32, device)?;
-        let grad_data = grad_output.to_vec::<f32>()?;
-        let indices_data = indices.to_vec::<i64>()?;
+        let mut input_grad = Tensor::zeros(Shape::from_dims(input_shape), device.clone())?;
+        let grad_data = grad_output.to_vec()?;
+        let indices_data = indices.to_vec()?;
         let mut input_grad_data = vec![0.0f32; input_grad.shape().elem_count()];
         
         let grad_shape = grad_output.shape().dims();
@@ -1034,7 +1013,7 @@ pub fn scatter_add(
                 grad_idx /= grad_shape[d];
             }
             
-            let idx = indices_data[pos[dim]] as usize;
+            let idx = indices_data[pos[dim]] as i64 as usize;
             pos[dim] = idx;
             
             let mut in_idx = 0;
@@ -1047,7 +1026,7 @@ pub fn scatter_add(
             input_grad_data[in_idx] += grad_data[i];
         }
         
-        Tensor::from_vec(input_grad_data, input_shape, device)
+        Tensor::from_vec(input_grad_data, Shape::from_dims(input_shape), device.clone())
     }
 }
 

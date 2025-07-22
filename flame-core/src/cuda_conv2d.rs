@@ -9,6 +9,13 @@ use std::sync::Arc;
 // Import kernel source from dedicated module
 use crate::cuda_conv2d_kernels::CONV2D_KERNELS;
 
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
+}
+
 /// GPU-accelerated 2D convolution
 pub struct CudaConv2d;
 
@@ -78,22 +85,20 @@ impl CudaConv2d {
         let check_f = device.get_func("conv2d_ops", "check_conv_dimensions_kernel")
             .ok_or_else(|| FlameError::Cuda("Failed to get check_conv_dimensions kernel".into()))?;
         
-        unsafe {
-            check_f.launch(LaunchConfig::for_num_elems(1), (
-                batch_size as i32,
-                in_channels as i32,
-                out_channels as i32,
-                in_height as i32,
-                in_width as i32,
-                kernel_h as i32,
-                kernel_w as i32,
-                stride_h as i32,
-                stride_w as i32,
-                pad_h as i32,
-                pad_w as i32,
-                &error_flag,
-            ))?;
-        }
+        launch_kernel!(check_f, LaunchConfig::for_num_elems(1),
+            batch_size as i32,
+            in_channels as i32,
+            out_channels as i32,
+            in_height as i32,
+            in_width as i32,
+            kernel_h as i32,
+            kernel_w as i32,
+            stride_h as i32,
+            stride_w as i32,
+            pad_h as i32,
+            pad_w as i32,
+            &error_flag
+        )?;
         
         // Check error flag
         device.synchronize()?;
@@ -105,29 +110,10 @@ impl CudaConv2d {
             _ => {}
         }
         
-        // Perform im2col - use simple kernel if possible
+        // Perform im2col using full kernel
         let cfg = LaunchConfig::for_num_elems(col_size as u32);
         
-        if stride_h == 1 && stride_w == 1 && pad_h == 1 && pad_w == 1 {
-            // Use simplified kernel with fewer parameters
-            let f = device.get_func("conv2d_ops", "im2col_kernel_simple")
-                .ok_or_else(|| FlameError::Cuda("Failed to get im2col_kernel_simple".into()))?;
-            
-            unsafe {
-                f.launch(cfg, (
-                    input.data.as_ref(),
-                    &col_buffer,
-                    batch_size as i32,
-                    in_channels as i32,
-                    in_height as i32,
-                    in_width as i32,
-                    kernel_h as i32,
-                    kernel_w as i32,
-                    out_height as i32,
-                    out_width as i32,
-                ))?;
-            }
-        } else {
+        {
             // Use full kernel with dimension arrays
             let dims = vec![
                 batch_size as i32,
@@ -152,14 +138,12 @@ impl CudaConv2d {
             let f = device.get_func("conv2d_ops", "im2col_kernel")
                 .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel".into()))?;
             
-            unsafe {
-                f.launch(cfg, (
-                    input.data.as_ref(),
-                    &col_buffer,
-                    &dims_gpu,
-                    &params_gpu,
-                ))?;
-            }
+            launch_kernel!(f, cfg,
+                input.data.as_ref(),
+                &col_buffer,
+                &dims_gpu,
+                &params_gpu
+            )?;
         }
         
         // Reshape for matrix multiplication
@@ -234,15 +218,13 @@ impl CudaConv2d {
         
         let cfg = LaunchConfig::for_num_elems((batch_size * channels * spatial_size) as u32);
         
-        unsafe {
-            f.launch(cfg, (
-                result.data.as_ref(),
-                bias.data.as_ref(),
-                batch_size as i32,
-                channels as i32,
-                spatial_size as i32,
-            ))?;
-        }
+        launch_kernel!(f, cfg,
+            result.data.as_ref(),
+            bias.data.as_ref(),
+            batch_size as i32,
+            channels as i32,
+            spatial_size as i32
+        )?;
         
         device.synchronize()?;
         Ok(result)
@@ -295,20 +277,18 @@ impl CudaConv2d {
             let f_im2col = device.get_func("conv2d_ops", "im2col_kernel_simple")
                 .ok_or_else(|| FlameError::Cuda("Failed to get im2col_kernel_simple".into()))?;
             
-            unsafe {
-                f_im2col.launch(cfg, (
-                    input.data.as_ref(),
-                    &input_col_buffer,
-                    batch_size as i32,
-                    in_channels as i32,
-                    in_height as i32,
-                    in_width as i32,
-                    kernel_h as i32,
-                    kernel_w as i32,
-                    out_height as i32,
-                    out_width as i32,
-                ))?;
-            }
+            launch_kernel!(f_im2col, cfg,
+                input.data.as_ref(),
+                &input_col_buffer,
+                batch_size as i32,
+                in_channels as i32,
+                in_height as i32,
+                in_width as i32,
+                kernel_h as i32,
+                kernel_w as i32,
+                out_height as i32,
+                out_width as i32
+            )?;
         } else {
             let dims = vec![
                 batch_size as i32,
@@ -333,14 +313,12 @@ impl CudaConv2d {
             let f_im2col = device.get_func("conv2d_ops", "im2col_kernel")
                 .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel".into()))?;
             
-            unsafe {
-                f_im2col.launch(cfg, (
-                    input.data.as_ref(),
-                    &input_col_buffer,
-                    &dims_gpu,
-                    &params_gpu,
-                ))?;
-            }
+            launch_kernel!(f_im2col, cfg,
+                input.data.as_ref(),
+                &input_col_buffer,
+                &dims_gpu,
+                &params_gpu
+            )?;
         }
         
         device.synchronize()?;
@@ -369,25 +347,7 @@ impl CudaConv2d {
         
         let cfg = LaunchConfig::for_num_elems(input.shape().elem_count() as u32);
         
-        if stride_h == 1 && stride_w == 1 && pad_h == 1 && pad_w == 1 {
-            let f_col2im = device.get_func("conv2d_ops", "col2im_kernel_simple")
-                .ok_or_else(|| FlameError::Cuda("Failed to get col2im_kernel_simple".into()))?;
-            
-            unsafe {
-                f_col2im.launch(cfg, (
-                    grad_input_col.data.as_ref(),
-                    &grad_input_data,
-                    batch_size as i32,
-                    in_channels as i32,
-                    in_height as i32,
-                    in_width as i32,
-                    kernel_h as i32,
-                    kernel_w as i32,
-                    out_height as i32,
-                    out_width as i32,
-                ))?;
-            }
-        } else {
+        {
             let dims = vec![
                 batch_size as i32,
                 in_channels as i32,
@@ -411,14 +371,12 @@ impl CudaConv2d {
             let f_col2im = device.get_func("conv2d_ops", "col2im_kernel")
                 .ok_or_else(|| FlameError::Cuda("Failed to get col2im kernel".into()))?;
             
-            unsafe {
-                f_col2im.launch(cfg, (
-                    grad_input_col.data.as_ref(),
-                    &grad_input_data,
-                    &dims_gpu,
-                    &params_gpu,
-                ))?;
-            }
+            launch_kernel!(f_col2im, cfg,
+                grad_input_col.data.as_ref(),
+                &grad_input_data,
+                &dims_gpu,
+                &params_gpu
+            )?;
         }
         
         device.synchronize()?;
@@ -439,15 +397,13 @@ impl CudaConv2d {
                 .ok_or_else(|| FlameError::Cuda("Failed to get bias_grad kernel".into()))?;
             
             let cfg = LaunchConfig::for_num_elems(out_channels as u32);
-            unsafe {
-                f_bias_grad.launch(cfg, (
-                    grad_output.data.as_ref(),
-                    &grad_bias_data,
-                    batch_size as i32,
-                    out_channels as i32,
-                    (out_height * out_width) as i32,
-                ))?;
-            }
+            launch_kernel!(f_bias_grad, cfg,
+                grad_output.data.as_ref(),
+                &grad_bias_data,
+                batch_size as i32,
+                out_channels as i32,
+                (out_height * out_width) as i32
+            )?;
             
             device.synchronize()?;
             

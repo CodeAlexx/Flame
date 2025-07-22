@@ -1,8 +1,15 @@
 use crate::{Shape, Result, FlameError};
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync};
 use cudarc::cublas::CudaBlas;
 use std::sync::Arc;
 use crate::cuda_kernels::CudaKernels;
+
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
+}
 
 /// Helper function to broadcast two shape arrays
 fn broadcast_shapes(shape1: &[usize], shape2: &[usize]) -> Result<Vec<usize>> {
@@ -303,15 +310,12 @@ extern "C" __global__ void copy_at_offset(
                 
                 let cfg = cudarc::driver::LaunchConfig::for_num_elems((m * n) as u32);
                 
-                unsafe {
-                    use cudarc::driver::LaunchAsync;
-                    f.launch(cfg, (
-                        &output.data,
-                        &batch_output,
-                        output_offset as i32,
-                        (m * n) as i32,
-                    ))?;
-                }
+                launch_kernel!(f, cfg,
+                    &output.data,
+                    &batch_output,
+                    output_offset as i32,
+                    (m * n) as i32
+                )?;
             }
         }
         
@@ -370,15 +374,12 @@ extern "C" __global__ void slice_kernel(
         
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(len as u32);
         
-        unsafe {
-            use cudarc::driver::LaunchAsync;
-            f.launch(cfg, (
-                &slice_data,
-                &self.data,
-                start as i32,
-                len as i32,
-            ))?;
-        }
+        launch_kernel!(f, cfg,
+            &slice_data,
+            &self.data,
+            start as i32,
+            len as i32
+        )?;
         
         Ok(Tensor {
             data: slice_data,

@@ -64,7 +64,7 @@ pub use error::{FlameError, Result};
 pub use shape::Shape;
 pub use tensor::{Tensor, TensorId};
 pub use autograd::{AutogradContext, Op};
-pub use gradient::GradientMap;
+pub use gradient::{GradientMap, TensorGradExt};
 
 // Re-export cudarc types we use
 pub use cudarc::driver::CudaDevice;

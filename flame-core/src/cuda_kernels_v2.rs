@@ -11,6 +11,13 @@ use std::sync::Arc;
 // Import the kernel_params macro
 use crate::kernel_params;
 
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
+}
+
 /// Create a tensor from allocated CUDA memory
 pub fn create_output_tensor(data: CudaSlice<f32>, shape: Shape, device: Arc<CudaDevice>) -> Tensor {
     Tensor {
@@ -56,14 +63,12 @@ impl CudaKernelsV2 {
             .ok_or_else(|| FlameError::Cuda("Failed to get add_kernel".into()))?;
         
         let config = launch_configs::elementwise(numel);
-        unsafe {
-            f.launch(config, (
-                &mut output,
-                &*a.data,
-                &*b.data,
-                numel as i32,
-            ))?;
-        }
+        launch_kernel!(f, config,
+            &output,
+            &*a.data,
+            &*b.data,
+            numel as i32
+        )?;
         
         Ok(create_output_tensor(output, a.shape.clone(), a.device.clone()))
     }
@@ -88,14 +93,12 @@ impl CudaKernelsV2 {
             .ok_or_else(|| FlameError::Cuda("Failed to get mul_kernel".into()))?;
         
         let config = launch_configs::elementwise(numel);
-        unsafe {
-            f.launch(config, (
-                &mut output,
-                &*a.data,
-                &*b.data,
-                numel as i32,
-            ))?;
-        }
+        launch_kernel!(f, config,
+            &output,
+            &*a.data,
+            &*b.data,
+            numel as i32
+        )?;
         
         Ok(create_output_tensor(output, a.shape.clone(), a.device.clone()))
     }
@@ -113,13 +116,11 @@ impl CudaKernelsV2 {
             .ok_or_else(|| FlameError::Cuda("Failed to get relu_kernel".into()))?;
         
         let config = launch_configs::elementwise(numel);
-        unsafe {
-            f.launch(config, (
-                &mut output,
-                &*input.data,
-                numel as i32,
-            ))?;
-        }
+        launch_kernel!(f, config,
+            &output,
+            &*input.data,
+            numel as i32
+        )?;
         
         Ok(create_output_tensor(output, input.shape.clone(), input.device.clone()))
     }
@@ -140,13 +141,11 @@ impl CudaKernelsV2 {
             .ok_or_else(|| FlameError::Cuda("Failed to get gelu_kernel".into()))?;
         
         let config = launch_configs::elementwise(numel);
-        unsafe {
-            f.launch(config, (
-                &mut output,
-                &*input.data,
-                numel as i32,
-            ))?;
-        }
+        launch_kernel!(f, config,
+            &output,
+            &*input.data,
+            numel as i32
+        )?;
         
         Ok(create_output_tensor(output, input.shape.clone(), input.device.clone()))
     }
@@ -219,16 +218,14 @@ extern "C" __global__ void matmul_kernel(
         };
         
         let config = launch_configs::grid_2d(m, n, 16);
-        unsafe {
-            f.launch(config, (
-                &mut output,
-                &*a.data,
-                &*b.data,
-                params.m,
-                params.n,
-                params.k,
-            ))?;
-        }
+        launch_kernel!(f, config,
+            &output,
+            &*a.data,
+            &*b.data,
+            params.m,
+            params.n,
+            params.k
+        )?;
         
         Ok(create_output_tensor(output, output_shape, a.device.clone()))
     }
@@ -245,13 +242,11 @@ extern "C" __global__ void matmul_kernel(
             .ok_or_else(|| FlameError::Cuda("Failed to get reduction_sum".into()))?;
         
         let config = launch_configs::reduction(input.shape.elem_count());
-        unsafe {
-            f.launch(config, (
-                &mut output,
-                &*input.data,
-                input.shape.elem_count() as i32,
-            ))?;
-        }
+        launch_kernel!(f, config,
+            &output,
+            &*input.data,
+            input.shape.elem_count() as i32
+        )?;
         
         Ok(create_output_tensor(output, Shape::from_dims(&[1]), input.device.clone()))
     }

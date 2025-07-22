@@ -3,7 +3,14 @@
 use crate::{Tensor, Shape, Result, FlameError};
 use crate::autograd::{AutogradContext, Op};
 use std::sync::Arc;
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaDevice, CudaSlice, LaunchConfig, LaunchAsync};
+
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
+}
 
 /// Layer normalization configuration
 pub struct LayerNormConfig {
@@ -245,7 +252,7 @@ pub fn layer_norm(
         
         // Create launch parameters based on whether weight/bias exist
         if has_weight && has_bias {
-            f.launch(cfg, (
+            launch_kernel!(f, cfg,
                 input.data(),
                 weight.unwrap().data(),
                 bias.unwrap().data(),
@@ -254,10 +261,10 @@ pub fn layer_norm(
                 &rstd_data,
                 batch_size as i32,
                 norm_size as i32,
-                eps,
-            ))?;
+                eps
+            )?;
         } else if has_weight {
-            f.launch(cfg, (
+            launch_kernel!(f, cfg,
                 input.data(),
                 weight.unwrap().data(),
                 0usize, // null pointer for bias
@@ -266,10 +273,10 @@ pub fn layer_norm(
                 &rstd_data,
                 batch_size as i32,
                 norm_size as i32,
-                eps,
-            ))?;
+                eps
+            )?;
         } else if has_bias {
-            f.launch(cfg, (
+            launch_kernel!(f, cfg,
                 input.data(),
                 0usize, // null pointer for weight
                 bias.unwrap().data(),
@@ -278,10 +285,10 @@ pub fn layer_norm(
                 &rstd_data,
                 batch_size as i32,
                 norm_size as i32,
-                eps,
-            ))?;
+                eps
+            )?;
         } else {
-            f.launch(cfg, (
+            launch_kernel!(f, cfg,
                 input.data(),
                 0usize, // null pointer for weight
                 0usize, // null pointer for bias
@@ -290,8 +297,8 @@ pub fn layer_norm(
                 &rstd_data,
                 batch_size as i32,
                 norm_size as i32,
-                eps,
-            ))?;
+                eps
+            )?;
         }
     }
     

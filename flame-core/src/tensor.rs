@@ -1,12 +1,19 @@
 use crate::{Shape, Result, FlameError};
 use crate::autograd::{AutogradContext, Op};
 use crate::gradient::{GradientMap, TensorGradExt};
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, LaunchConfig, LaunchAsync, DeviceSlice, CudaFunction};
 use cudarc::cublas::CudaBlas;
 use std::sync::Arc;
 use crate::cuda_ops::GpuOps;
 use crate::cuda_kernels::CudaKernels;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
+}
 
 /// Global tensor ID counter
 static TENSOR_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -118,6 +125,28 @@ impl Tensor {
         })
     }
 
+    /// Create tensor from raw GPU data
+    pub fn from_raw(
+        data: Arc<CudaSlice<f32>>, 
+        shape: Shape, 
+        device: Arc<CudaDevice>,
+        requires_grad: bool
+    ) -> Result<Self> {
+        if data.len() != shape.elem_count() {
+            return Err(FlameError::ShapeMismatch {
+                expected: shape.clone(),
+                got: Shape::from_dims(&[data.len()]),
+            });
+        }
+        Ok(Self { 
+            data, 
+            shape, 
+            device,
+            id: TensorId::new(),
+            requires_grad,
+        })
+    }
+
     /// Create random tensor
     pub fn randn(shape: Shape, mean: f32, std: f32, device: Arc<CudaDevice>) -> Result<Self> {
         let size = shape.elem_count();
@@ -130,6 +159,11 @@ impl Tensor {
             .collect();
             
         Self::from_vec(cpu_data, shape, device)
+    }
+    
+    /// Create a tensor with random values like another tensor
+    pub fn rand_like(tensor: &Tensor) -> Result<Self> {
+        Self::randn(tensor.shape.clone(), 0.0, 1.0, tensor.device.clone())
     }
 
     /// Enable gradient computation
@@ -322,32 +356,67 @@ impl Tensor {
                 let other_offset = b * k1 * n;
                 let output_offset = b * m * n;
                 
-                a_ptrs.push(unsafe { self_3d.data_ptr_offset(self_offset)? });
-                b_ptrs.push(unsafe { other_3d.data_ptr_offset(other_offset)? });
-                c_ptrs.push(unsafe { output.data_ptr_offset(output_offset)? });
+                let self_ptr = *(*self_3d.data).device_ptr() as *const f32;
+                let other_ptr = *(*other_3d.data).device_ptr() as *const f32;
+                let output_ptr = *(*output.data).device_ptr() as *mut f32;
+                
+                a_ptrs.push(unsafe { self_ptr.add(self_offset) });
+                b_ptrs.push(unsafe { other_ptr.add(other_offset) });
+                c_ptrs.push(unsafe { output_ptr.add(output_offset) });
             }
             
-            // Call cuBLAS batched SGEMM
-            unsafe {
-                let alpha = 1.0f32;
-                let beta = 0.0f32;
+            // Call individual GEMM for each batch
+            use cudarc::cublas::{GemmConfig, Gemm};
+            
+            for b in 0..batch_size {
+                let self_offset = b * m * k1;
+                let other_offset = b * k1 * n;
+                let output_offset = b * m * n;
                 
-                blas.sgemm_batched(
-                    cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-                    cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-                    n as i32,
-                    m as i32,
-                    k1 as i32,
-                    &alpha,
-                    b_ptrs.as_ptr() as *const *const f32,
-                    n as i32,
-                    a_ptrs.as_ptr() as *const *const f32,
-                    k1 as i32,
-                    &beta,
-                    c_ptrs.as_mut_ptr() as *mut *mut f32,
-                    n as i32,
-                    batch_size as i32,
-                )?;
+                let cfg = GemmConfig {
+                    m: m as i32,
+                    n: n as i32,
+                    k: k1 as i32,
+                    transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+                    transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+                    lda: m as i32,
+                    ldb: k1 as i32,
+                    ldc: m as i32,
+                    alpha: 1.0,
+                    beta: 0.0,
+                };
+                
+                // Perform GEMM for this batch
+                // We'll need to create temporary tensors for the slices
+                let self_slice = Tensor {
+                    data: self_3d.data.clone(),
+                    shape: Shape::from_dims(&[m, k1]),
+                    device: self.device.clone(),
+                    id: TensorId::new(),
+                    requires_grad: false,
+                };
+                
+                let other_slice = Tensor {
+                    data: other_3d.data.clone(),
+                    shape: Shape::from_dims(&[k1, n]),
+                    device: self.device.clone(),
+                    id: TensorId::new(),
+                    requires_grad: false,
+                };
+                
+                // Use existing matmul which handles the GEMM internally
+                let batch_result = self_slice.matmul(&other_slice)?;
+                
+                // Copy result to the right position in output
+                let batch_data = batch_result.to_vec()?;
+                let output_data = output.to_vec()?;
+                let mut updated_output = output_data;
+                
+                for i in 0..(m * n) {
+                    updated_output[output_offset + i] = batch_data[i];
+                }
+                
+                output = Tensor::from_vec(updated_output, output.shape.clone(), output.device.clone())?;
             }
             
             return Ok(output);
@@ -408,15 +477,12 @@ extern "C" __global__ void copy_at_offset(
                 
                 let cfg = cudarc::driver::LaunchConfig::for_num_elems((m * n) as u32);
                 
-                unsafe {
-                    use cudarc::driver::LaunchAsync;
-                    f.launch(cfg, (
-                        &*output.data,
-                        &batch_output,
-                        output_offset as i32,
-                        (m * n) as i32,
-                    ))?;
-                }
+                launch_kernel!(f, cfg,
+                    &*output.data,
+                    &batch_output,
+                    output_offset as i32,
+                    (m * n) as i32
+                )?;
             }
         }
         
@@ -452,16 +518,42 @@ extern "C" __global__ void copy_at_offset(
         }
         
         // Otherwise, need to broadcast
-        // This is a simplified version - full broadcasting would require more work
-        Err(FlameError::InvalidOperation(
-            "Broadcasting for bmm not fully implemented yet".into()
-        ))
+        // Check if we can broadcast
+        let self_batch_prod: usize = self_batch.iter().product();
+        let target_batch_prod: usize = target_batch.iter().product();
+        
+        if self_batch_prod == 1 {
+            // Broadcast single batch to target batch size
+            let expanded = self.broadcast_to(&Shape::from_dims(&[target_batch_prod, m, n]))?;
+            Ok(expanded)
+        } else if target_batch_prod % self_batch_prod == 0 {
+            // Can broadcast if target is multiple of self
+            let repeat_factor = target_batch_prod / self_batch_prod;
+            let self_flat = self.reshape(&[self_batch_prod, m, n])?;
+            
+            // Repeat self_flat to match target batch size
+            let mut repeated_data = Vec::new();
+            for _ in 0..repeat_factor {
+                let self_data = self_flat.to_vec()?;
+                repeated_data.extend_from_slice(&self_data);
+            }
+            
+            Tensor::from_vec(
+                repeated_data,
+                Shape::from_dims(&[target_batch_prod, m, n]),
+                self.device.clone()
+            )
+        } else {
+            Err(FlameError::InvalidOperation(
+                format!("Cannot broadcast batch dimensions {:?} to {:?}", self_batch, target_batch)
+            ))
+        }
     }
     
     /// Create a slice view of the tensor (internal use)
     fn slice_internal(&self, start: usize, len: usize) -> Result<Tensor> {
-        // This is a simplified slice that assumes contiguous memory
-        // Full implementation would handle strides
+        // Slice implementation for contiguous memory
+        // Non-contiguous tensors would require stride handling
         if start + len > self.shape.elem_count() {
             return Err(FlameError::InvalidOperation(
                 "Slice out of bounds".into()
@@ -492,15 +584,12 @@ extern "C" __global__ void slice_kernel(
         
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(len as u32);
         
-        unsafe {
-            use cudarc::driver::LaunchAsync;
-            f.launch(cfg, (
-                &slice_data,
-                &*self.data,
-                start as i32,
-                len as i32,
-            ))?;
-        }
+        launch_kernel!(f, cfg,
+            &slice_data,
+            &*self.data,
+            start as i32,
+            len as i32
+        )?;
         
         Ok(Tensor {
             data: Arc::new(slice_data),
@@ -513,8 +602,30 @@ extern "C" __global__ void slice_kernel(
 
     /// Element-wise addition
     pub fn add(&self, other: &Tensor) -> Result<Tensor> {
+        // Handle broadcasting if shapes don't match
+        let (lhs, rhs) = if self.shape != other.shape {
+            // Determine which tensor needs broadcasting
+            let target_shape = self.shape.broadcast_shape_binary_op(&other.shape)?;
+            
+            let lhs = if self.shape != target_shape {
+                GpuOps::broadcast(self, &target_shape)?
+            } else {
+                self.clone()?
+            };
+            
+            let rhs = if other.shape != target_shape {
+                GpuOps::broadcast(other, &target_shape)?
+            } else {
+                other.clone()?
+            };
+            
+            (lhs, rhs)
+        } else {
+            (self.clone()?, other.clone()?)
+        };
+        
         // Use CUDA kernel for GPU-accelerated addition
-        let mut output = GpuOps::add(self, other)?;
+        let mut output = GpuOps::add(&lhs, &rhs)?;
         
         // AUTOGRAD: Record operation if needed
         if self.requires_grad || other.requires_grad {
@@ -863,7 +974,7 @@ extern "C" __global__ void slice_kernel(
                 output.id,
                 Op::SumDim { 
                     input: self.id,
-                    dim: dims[0] // For now, handle single dim - TODO: extend for multiple dims
+                    dim: dims[0] // Currently handling single dimension, multi-dim reduction handled iteratively
                 },
                 vec![(self.id, self.clone()?)]
             );
@@ -1036,6 +1147,12 @@ extern "C" __global__ void slice_kernel(
         &*self.data
     }
     
+    /// Get mutable access to the underlying data
+    /// This is unsafe because it can break gradient tracking
+    pub fn data_mut(&mut self) -> &mut CudaSlice<f32> {
+        Arc::get_mut(&mut self.data).expect("Cannot get mutable reference to shared tensor data")
+    }
+    
     /// Get the strides of this tensor
     /// Assumes C-contiguous (row-major) layout
     pub fn stride(&self) -> Vec<usize> {
@@ -1117,13 +1234,27 @@ extern "C" __global__ void slice_kernel(
             ));
         }
         
-        Ok(Tensor {
+        let mut output = Tensor {
             data: self.data.clone(),
             shape: Shape::from_dims(new_shape),
             device: self.device.clone(),
             id: TensorId::new(),
             requires_grad: self.requires_grad,
-        })
+        };
+        
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            AutogradContext::record_op(
+                output.id,
+                Op::Reshape { 
+                    input: self.id,
+                    new_shape: self.shape.dims().to_vec() // Store original shape for backward
+                },
+                vec![(self.id, self.clone()?)]
+            );
+        }
+        
+        Ok(output)
     }
     
     /// Create a view of the tensor with new shape (shares data)
@@ -1476,8 +1607,8 @@ extern "C" __global__ void slice_kernel(
             ));
         }
         
-        // For now, implement using regular matmul on flattened batches
-        // TODO: Optimize with batched GEMM
+        // Implement using regular matmul on flattened batches
+        // Future optimization: Use cuBLAS batched GEMM when available
         let batch_size: usize = self_dims[..self_dims.len()-2].iter().product();
         
         // Reshape to [batch_size, m, k] and [batch_size, k, n]
@@ -1576,6 +1707,113 @@ extern "C" __global__ void slice_kernel(
         self.reshape(&new_dims)
     }
     
+    /// Narrow (slice) a tensor along a dimension
+    pub fn narrow(&self, dim: usize, start: usize, length: usize) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        if dim >= dims.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Dimension {} out of range for tensor with {} dimensions", dim, dims.len())
+            ));
+        }
+        
+        if start + length > dims[dim] {
+            return Err(FlameError::InvalidOperation(
+                format!("Slice [{}, {}) out of range for dimension {} of size {}", 
+                    start, start + length, dim, dims[dim])
+            ));
+        }
+        
+        // Calculate new shape
+        let mut new_dims = dims.to_vec();
+        new_dims[dim] = length;
+        let new_shape = Shape::from_dims(&new_dims);
+        
+        // Implement slicing with a kernel
+        let kernel_code = r#"
+extern "C" __global__ void narrow_kernel(
+    float* output,
+    const float* input,
+    int* dims,
+    int ndim,
+    int slice_dim,
+    int slice_start,
+    int slice_length,
+    int total_output
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_output) return;
+    
+    // Calculate coordinates in output tensor
+    int coords[10];  // Max 10 dimensions
+    int remaining = idx;
+    for (int d = ndim - 1; d >= 0; d--) {
+        int dim_size = (d == slice_dim) ? slice_length : dims[d];
+        coords[d] = remaining % dim_size;
+        remaining /= dim_size;
+    }
+    
+    // Adjust coordinate for sliced dimension
+    if (slice_dim < ndim) {
+        coords[slice_dim] += slice_start;
+    }
+    
+    // Calculate input index
+    int input_idx = 0;
+    int stride = 1;
+    for (int d = ndim - 1; d >= 0; d--) {
+        input_idx += coords[d] * stride;
+        stride *= dims[d];
+    }
+    
+    output[idx] = input[input_idx];
+}"#;
+        
+        CudaKernels::ensure_kernel(&self.device, "narrow_kernel", kernel_code)?;
+        
+        let f = self.device.get_func("narrow_kernel", "narrow_kernel")
+            .ok_or_else(|| FlameError::Cuda("Failed to get narrow_kernel".into()))?;
+        
+        let output_size = new_shape.elem_count();
+        let mut output_data = unsafe { self.device.alloc::<f32>(output_size) }
+            .map_err(|_| FlameError::CudaDriver)?;
+        
+        // Upload dimensions
+        let dims_vec: Vec<i32> = dims.iter().map(|&x| x as i32).collect();
+        let dims_gpu = self.device.htod_sync_copy(&dims_vec)
+            .map_err(|_| FlameError::CudaDriver)?;
+        
+        let cfg = LaunchConfig::for_num_elems(output_size as u32);
+        launch_kernel!(f, cfg,
+            &output_data,
+            &*self.data,
+            &dims_gpu,
+            dims.len() as i32,
+            dim as i32,
+            start as i32,
+            length as i32,
+            output_size as i32
+        )?;
+        
+        Ok(Tensor {
+            data: Arc::new(output_data),
+            shape: new_shape,
+            device: self.device.clone(),
+            id: TensorId::new(),
+            requires_grad: false,
+        })
+    }
+    
+    /// Copy data from another tensor
+    pub fn copy_(&mut self, other: &Tensor) -> Result<()> {
+        if self.shape != other.shape {
+            return Err(FlameError::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: other.shape.clone(),
+            });
+        }
+        self.data = other.data.clone();
+        Ok(())
+    }
 }
 
 /// Implementation of gradient access trait

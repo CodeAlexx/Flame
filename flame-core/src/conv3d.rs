@@ -8,6 +8,13 @@ use std::sync::Arc;
 use cudarc::driver::{LaunchAsync, LaunchConfig, DeviceRepr};
 use cudarc::nvrtc::compile_ptx;
 
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
+}
+
 /// 3D Convolution layer
 pub struct Conv3d {
     pub in_channels: usize,
@@ -179,14 +186,12 @@ impl Conv3d {
             groups: self.groups as i32,
         };
         
-        unsafe {
-            f.launch(cfg, (
-                &*input.data,
-                &*self.weight.data,
-                &mut output_data,
-                params,
-            ))?;
-        }
+        launch_kernel!(f, cfg,
+            &*input.data,
+            &*self.weight.data,
+            &mut output_data,
+            params
+        )?;
         
         // Create the output tensor
         let mut output = crate::cuda_kernels::create_output_tensor(
@@ -225,16 +230,14 @@ impl Conv3d {
         
         let cfg = LaunchConfig::for_num_elems(total_elems as u32);
         
-        unsafe {
-            kernel.launch(cfg, (
-                &mut output_data,
-                &*output.data,
-                &*bias.data,
-                total_elems as i32,
-                self.out_channels as i32,
-                elems_per_channel,
-            ))?;
-        }
+        launch_kernel!(kernel, cfg,
+            &mut output_data,
+            &*output.data,
+            &*bias.data,
+            total_elems as i32,
+            self.out_channels as i32,
+            elems_per_channel
+        )?;
         
         Ok(crate::cuda_kernels::create_output_tensor(
             output_data,
@@ -471,19 +474,17 @@ impl BatchNorm3d {
         
         // For now, use a simplified kernel without optional weight/bias
         // In production, you'd handle all cases properly
-        unsafe {
-            kernel.launch(cfg, (
-                &*input.data,
-                &*mean.data,
-                &*var.data,
-                &mut output_data,
-                total_elems as i32,
-                self.num_features as i32,
-                spatial_size,
-                self.eps,
-                self.affine as i32,
-            ))?;
-        }
+        launch_kernel!(kernel, cfg,
+            &*input.data,
+            &*mean.data,
+            &*var.data,
+            &mut output_data,
+            total_elems as i32,
+            self.num_features as i32,
+            spatial_size,
+            self.eps,
+            self.affine as i32
+        )?;
         
         Ok(crate::cuda_kernels::create_output_tensor(
             output_data,

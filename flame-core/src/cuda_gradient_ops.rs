@@ -1,9 +1,16 @@
 //! GPU-based gradient operations for efficient gradient modifications
 //! Avoids CPU-GPU transfers by performing all operations on GPU
 
-use crate::{Tensor, Result, FlameError, Shape};
+use crate::{Tensor, Result, FlameError, Shape, cuda_kernel_compiler::compile_cuda_kernel};
 use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
+
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
+}
 
 /// GPU kernels for gradient operations
 pub const GRADIENT_KERNELS: &str = r#"
@@ -190,8 +197,12 @@ impl CudaGradientOps {
     /// Ensure kernels are loaded
     fn ensure_kernels(&mut self) -> Result<()> {
         if !self.kernels_loaded {
+            // Compile CUDA C source to PTX
+            let ptx = compile_cuda_kernel(GRADIENT_KERNELS, "gradient_ops")?;
+            
+            // Load the compiled PTX
             self.device
-                .load_ptx(GRADIENT_KERNELS.into(), "gradient_ops", &[
+                .load_ptx(ptx, "gradient_ops", &[
                     "clip_gradient_kernel",
                     "normalize_gradient_kernel",
                     "compute_l2_norm_kernel",
@@ -215,13 +226,11 @@ impl CudaGradientOps {
             .ok_or_else(|| FlameError::Cuda("Failed to get clip_gradient kernel".into()))?;
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
-        unsafe {
-            f.launch(cfg, (
-                grad.data.as_ref(),
-                clip_value,
-                n as i32,
-            ))?;
-        }
+        launch_kernel!(f, cfg,
+            grad.data.as_ref(),
+            clip_value,
+            n as i32
+        )?;
         
         self.device.synchronize()?;
         Ok(())
@@ -263,13 +272,11 @@ impl CudaGradientOps {
             shared_mem_bytes: (block_size * std::mem::size_of::<f32>()) as u32,
         };
         
-        unsafe {
-            f1.launch(cfg1, (
-                tensor.data.as_ref(),
-                &partial_sums,
-                n as i32,
-            ))?;
-        }
+        launch_kernel!(f1, cfg1,
+            tensor.data.as_ref(),
+            &partial_sums,
+            n as i32
+        )?;
         
         // Final reduction
         let norm_result = self.device.alloc_zeros::<f32>(1)?;
@@ -283,13 +290,11 @@ impl CudaGradientOps {
             shared_mem_bytes: (256 * std::mem::size_of::<f32>()) as u32,
         };
         
-        unsafe {
-            f2.launch(cfg2, (
-                &partial_sums,
-                &norm_result,
-                num_blocks as i32,
-            ))?;
-        }
+        launch_kernel!(f2, cfg2,
+            &partial_sums,
+            &norm_result,
+            num_blocks as i32
+        )?;
         
         self.device.synchronize()?;
         
@@ -311,14 +316,12 @@ impl CudaGradientOps {
             .ok_or_else(|| FlameError::Cuda("Failed to get add_gradient_noise kernel".into()))?;
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
-        unsafe {
-            f.launch(cfg, (
-                grad.data.as_ref(),
-                noise.data.as_ref(),
-                noise_scale,
-                n as i32,
-            ))?;
-        }
+        launch_kernel!(f, cfg,
+            grad.data.as_ref(),
+            noise.data.as_ref(),
+            noise_scale,
+            n as i32
+        )?;
         
         self.device.synchronize()?;
         Ok(())
@@ -332,13 +335,11 @@ impl CudaGradientOps {
             .ok_or_else(|| FlameError::Cuda("Failed to get scale_gradient kernel".into()))?;
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
-        unsafe {
-            f.launch(cfg, (
-                grad.data.as_ref(),
-                scale,
-                n as i32,
-            ))?;
-        }
+        launch_kernel!(f, cfg,
+            grad.data.as_ref(),
+            scale,
+            n as i32
+        )?;
         
         self.device.synchronize()?;
         Ok(())
@@ -352,14 +353,12 @@ impl CudaGradientOps {
             .ok_or_else(|| FlameError::Cuda("Failed to get clamp_tensor kernel".into()))?;
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
-        unsafe {
-            f.launch(cfg, (
-                tensor.data.as_ref(),
-                min_val,
-                max_val,
-                n as i32,
-            ))?;
-        }
+        launch_kernel!(f, cfg,
+            tensor.data.as_ref(),
+            min_val,
+            max_val,
+            n as i32
+        )?;
         
         self.device.synchronize()?;
         Ok(())
@@ -389,21 +388,19 @@ impl CudaGradientOps {
             .ok_or_else(|| FlameError::Cuda("Failed to get adam_update kernel".into()))?;
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
-        unsafe {
-            f.launch(cfg, (
-                param.data.as_ref(),
-                m.data.as_ref(),
-                v.data.as_ref(),
-                grad.data.as_ref(),
-                lr,
-                beta1,
-                beta2,
-                eps,
-                bias_correction1,
-                bias_correction2,
-                n as i32,
-            ))?;
-        }
+        launch_kernel!(f, cfg,
+            param.data.as_ref(),
+            m.data.as_ref(),
+            v.data.as_ref(),
+            grad.data.as_ref(),
+            lr,
+            beta1,
+            beta2,
+            eps,
+            bias_correction1,
+            bias_correction2,
+            n as i32
+        )?;
         
         self.device.synchronize()?;
         Ok(())

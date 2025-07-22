@@ -2,8 +2,8 @@
 //! Implements im2col/col2im for efficient convolution
 
 pub const CONV2D_KERNELS: &str = r#"
-// Simplified im2col for common case (stride=1, padding=1)
-extern "C" __global__ void im2col_kernel_simple(
+// Full im2col implementation with configurable stride and padding
+extern "C" __global__ void im2col_kernel(
     const float* data_im,
     float* data_col,
     const int batch_size,
@@ -12,13 +12,13 @@ extern "C" __global__ void im2col_kernel_simple(
     const int width,
     const int kernel_h,
     const int kernel_w,
+    const int pad_h,
+    const int pad_w,
+    const int stride_h,
+    const int stride_w,
     const int out_h,
     const int out_w
 ) {
-    const int pad_h = 1;
-    const int pad_w = 1;
-    const int stride_h = 1;
-    const int stride_w = 1;
     
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     const int total_size = batch_size * channels * out_h * out_w * kernel_h * kernel_w;
@@ -106,8 +106,8 @@ extern "C" __global__ void im2col_kernel(
     }
 }
 
-// Simplified col2im for common case (stride=1, padding=1)
-extern "C" __global__ void col2im_kernel_simple(
+// Full col2im implementation with configurable stride and padding
+extern "C" __global__ void col2im_kernel(
     const float* data_col,
     float* data_im,
     const int batch_size,
@@ -116,13 +116,13 @@ extern "C" __global__ void col2im_kernel_simple(
     const int width,
     const int kernel_h,
     const int kernel_w,
+    const int pad_h,
+    const int pad_w,
+    const int stride_h,
+    const int stride_w,
     const int out_h,
     const int out_w
 ) {
-    const int pad_h = 1;
-    const int pad_w = 1;
-    const int stride_h = 1;
-    const int stride_w = 1;
     
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     const int total_size = batch_size * channels * height * width;

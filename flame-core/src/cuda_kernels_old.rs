@@ -1,6 +1,6 @@
 use crate::{Result, FlameError, Tensor, Shape};
 use cudarc::{
-    driver::{CudaDevice, LaunchAsync, LaunchConfig}, 
+    driver::{CudaDevice, LaunchAsync, LaunchConfig, CudaFunction}, 
     nvrtc::{compile_ptx_with_opts, CompileOptions}
 };
 use std::sync::Arc;
@@ -9,6 +9,13 @@ use std::sync::Mutex;
 
 lazy_static::lazy_static! {
     static ref KERNEL_CACHE: Mutex<HashMap<String, ()>> = Mutex::new(HashMap::new());
+}
+
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
 }
 
 // Kernel names as static strings
@@ -79,9 +86,7 @@ extern "C" __global__ void add_kernel(float *out, const float *a, const float *b
         let numel = a.shape.elem_count() as i32;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (output.data_mut(), a.data(), b.data(), numel))?;
-        }
+        launch_kernel!(f, cfg, output.data_mut(), a.data(), b.data(), numel)?;
         
         Ok(output)
     }
@@ -112,9 +117,7 @@ extern "C" __global__ void mul_kernel(float *out, const float *a, const float *b
         let numel = a.shape.elem_count() as i32;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (output.data_mut(), a.data(), b.data(), numel))?;
-        }
+        launch_kernel!(f, cfg, output.data_mut(), a.data(), b.data(), numel)?;
         
         Ok(output)
     }
@@ -138,9 +141,7 @@ extern "C" __global__ void mul_scalar_kernel(float *out, const float *input, flo
         let numel = tensor.shape.elem_count() as i32;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (output.data_mut(), tensor.data(), scalar, numel))?;
-        }
+        launch_kernel!(f, cfg, output.data_mut(), tensor.data(), scalar, numel)?;
         
         Ok(output)
     }
@@ -164,9 +165,7 @@ extern "C" __global__ void relu_kernel(float *out, const float *input, int numel
         let numel = tensor.shape.elem_count() as i32;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (output.data_mut(), tensor.data(), numel))?;
-        }
+        launch_kernel!(f, cfg, output.data_mut(), tensor.data(), numel)?;
         
         Ok(output)
     }
@@ -196,9 +195,7 @@ extern "C" __global__ void update_weights_kernel(float *weights, const float *gr
         let numel = weights.shape.elem_count() as i32;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (weights.data_mut(), gradients.data(), lr, numel))?;
-        }
+        launch_kernel!(f, cfg, weights.data_mut(), gradients.data(), lr, numel)?;
         
         Ok(())
     }
@@ -250,9 +247,7 @@ extern "C" __global__ void sum_kernel(float *out, const float *input, int numel)
             shared_mem_bytes: block_size * 4, // 4 bytes per float
         };
         
-        unsafe {
-            f.launch(cfg, (output.data_mut(), tensor.data(), numel))?;
-        }
+        launch_kernel!(f, cfg, output.data_mut(), tensor.data(), numel)?;
         
         Ok(output)
     }
@@ -316,9 +311,7 @@ extern "C" __global__ void transpose_kernel(
             shared_mem_bytes: (tile_size * (tile_size + 1) * 4) as u32, // Extra column to avoid bank conflicts
         };
         
-        unsafe {
-            f.launch(cfg, (output.data_mut(), tensor.data(), rows as i32, cols as i32))?;
-        }
+        launch_kernel!(f, cfg, output.data_mut(), tensor.data(), rows as i32, cols as i32)?;
         
         Ok(output)
     }
@@ -429,7 +422,7 @@ extern "C" __global__ void im2col_kernel(
                 let input_slice = input.data().slice(batch_offset..);
                 let output_slice = output.data_mut().slice_mut(col_offset..);
                 
-                f.launch(cfg, (
+                launch_kernel!(f, cfg,
                     &input_slice,
                     channels as i32,
                     height as i32,
@@ -444,8 +437,8 @@ extern "C" __global__ void im2col_kernel(
                     dilation_w as i32,
                     out_h as i32,
                     out_w as i32,
-                    &output_slice,
-                ))?;
+                    &output_slice
+                )?;
             }
         }
         

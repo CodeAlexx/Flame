@@ -10,6 +10,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use cudarc::driver::LaunchAsync;
 
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
+}
+
 /// Operation types for autograd
 #[derive(Debug, Clone)]
 pub enum Op {
@@ -383,12 +390,9 @@ extern "C" __global__ void relu_backward_kernel(
             .map_err(|_| crate::FlameError::CudaDriver)?;
         
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(
-                cfg,
-                (&mut grad_in, &*grad_out.data, &*input.data, numel as i32),
-            ).map_err(|_| crate::FlameError::Cuda("Failed to launch relu_backward kernel".into()))?;
-        }
+        launch_kernel!(f, cfg,
+            &grad_in, &*grad_out.data, &*input.data, numel as i32
+        )?;
         
         Ok(crate::cuda_kernels::create_output_tensor(
             grad_in,

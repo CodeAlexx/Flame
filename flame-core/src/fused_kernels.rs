@@ -6,6 +6,14 @@
 use crate::{Tensor, Shape, Result, FlameError, CudaDevice};
 use crate::cuda_kernels::CudaKernels;
 use std::sync::Arc;
+use cudarc::driver::{LaunchAsync, CudaFunction};
+
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
+}
 
 /// Fused operations for common patterns
 pub struct FusedKernels;
@@ -54,16 +62,14 @@ extern "C" __global__ void bias_gelu_kernel(
         let total_elems = (batch_size * seq_len * hidden_size) as u32;
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(total_elems);
         
-        unsafe {
-            f.launch(cfg, (
-                output.data_mut(),
-                x.data(),
-                bias.data(),
-                batch_size,
-                seq_len,
-                hidden_size,
-            ))?;
-        }
+        launch_kernel!(f, cfg,
+            output.data_mut(),
+            x.data(),
+            bias.data(),
+            batch_size,
+            seq_len,
+            hidden_size
+        )?;
         
         Ok(output)
     }
@@ -177,39 +183,30 @@ extern "C" __global__ void layernorm_linear_kernel(
             shared_mem_bytes: ((hidden_size + 2) * 4) as u32, // For input + stats
         };
         
-        unsafe {
-            if let Some(b) = bias {
-                f.launch(grid, (
-                    output.data_mut(),
-                    x.data(),
-                    gamma.data(),
-                    beta.data(),
-                    weight.data(),
-                    b.data(),
-                    batch_size,
-                    seq_len,
-                    hidden_size,
-                    out_features,
-                    eps,
-                    true,
-                ))?;
-            } else {
-                f.launch(grid, (
-                    output.data_mut(),
-                    x.data(),
-                    gamma.data(),
-                    beta.data(),
-                    weight.data(),
-                    std::ptr::null::<f32>(),
-                    batch_size,
-                    seq_len,
-                    hidden_size,
-                    out_features,
-                    eps,
-                    false,
-                ))?;
-            }
-        }
+        // For now, always require a bias tensor
+        let dummy_bias;
+        let bias_to_use = if let Some(b) = bias {
+            b
+        } else {
+            // Create a dummy zero tensor for bias
+            dummy_bias = Tensor::zeros(Shape::from_dims(&[out_features as usize]), x.device.clone())?;
+            &dummy_bias
+        };
+        
+        launch_kernel!(f, grid,
+            output.data_mut(),
+            x.data(),
+            gamma.data(),
+            beta.data(),
+            weight.data(),
+            bias_to_use.data(),
+            batch_size,
+            seq_len,
+            hidden_size,
+            out_features,
+            eps,
+            bias.is_some()
+        )?;
         
         Ok(output)
     }
@@ -336,7 +333,7 @@ extern "C" __global__ void fused_attention_kernel(
                 ..Default::default()
             },
             q.device.clone()
-        ).forward(q, k, v)
+        ).forward(q, k, v, false)  // Assume inference mode for fused kernel
     }
     
     /// Fused residual + LayerNorm
@@ -415,7 +412,15 @@ extern "C" __global__ void residual_layernorm_kernel(
         
         // For now, implement as separate operations
         let residual_sum = x.add(residual)?;
-        crate::norm::LayerNorm::forward_internal(&residual_sum, gamma, beta, eps)
+        // Create a LayerNorm instance and use it
+        let layer_norm = crate::norm::LayerNorm {
+            normalized_shape: vec![residual_sum.shape().dims().last().copied().unwrap_or(1)],
+            eps,
+            elementwise_affine: true,
+            weight: Some(gamma.clone()?),
+            bias: Some(beta.clone()?),
+        };
+        layer_norm.forward(&residual_sum)
     }
     
     /// Fused GELU backward
@@ -459,14 +464,12 @@ extern "C" __global__ void gelu_backward_kernel(
         
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
         
-        unsafe {
-            f.launch(cfg, (
-                grad_input.data_mut(),
-                grad_output.data(),
-                input.data(),
-                numel,
-            ))?;
-        }
+        launch_kernel!(f, cfg,
+            grad_input.data_mut(),
+            grad_output.data(),
+            input.data(),
+            numel
+        )?;
         
         Ok(grad_input)
     }
@@ -522,20 +525,18 @@ extern "C" __global__ void adam_step_kernel(
         let numel = param.shape().elem_count() as i32;
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
         
-        unsafe {
-            f.launch(cfg, (
-                param.data_mut(),
-                m.data_mut(),
-                v.data_mut(),
-                grad.data(),
-                lr,
-                beta1,
-                beta2,
-                eps,
-                step,
-                numel,
-            ))?;
-        }
+        launch_kernel!(f, cfg,
+            param.data_mut(),
+            m.data_mut(),
+            v.data_mut(),
+            grad.data(),
+            lr,
+            beta1,
+            beta2,
+            eps,
+            step,
+            numel
+        )?;
         
         Ok(())
     }

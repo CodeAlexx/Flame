@@ -1,4 +1,4 @@
-use crate::{Shape, Result, FlameError};
+use crate::{Shape, Result, FlameError, Tensor};
 use crate::cuda_kernels::CudaKernels;
 use cudarc::driver::{CudaDevice, CudaSlice};
 use cudarc::cublas::CudaBlas;
@@ -23,9 +23,10 @@ impl CudaTensor {
     /// Create a new tensor filled with ones
     pub fn ones(shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
         let size = shape.elem_count();
-        let mut data = device.alloc::<f32>(size)
+        // For now, use device method to fill with ones
+        let ones = vec![1.0f32; size];
+        let data = device.htod_sync_copy(&ones[..])
             .map_err(|_| FlameError::CudaDriver)?;
-        CudaKernels::fill(&device, &mut data, 1.0)?;
         Ok(Self { data, shape, device })
     }
 
@@ -65,7 +66,25 @@ impl CudaTensor {
             });
         }
 
-        CudaKernels::update_weights(&self.device, &mut self.data, &gradient.data, lr)?;
+        // Use the kernel that updates weights and returns new tensor
+        let kernels = CudaKernels::new(self.device.clone())?;
+        let gradient_tensor = Tensor {
+            data: Arc::new(gradient.data.clone()),
+            shape: gradient.shape.clone(),
+            device: gradient.device.clone(),
+            id: crate::tensor::TensorId::new(),
+            requires_grad: false,
+        };
+        let self_tensor = Tensor {
+            data: Arc::new(self.data.clone()),
+            shape: self.shape.clone(),
+            device: self.device.clone(),
+            id: crate::tensor::TensorId::new(),
+            requires_grad: false,
+        };
+        let updated = kernels.update_weights(&self_tensor, &gradient_tensor, lr)?;
+        // Extract the data from the Arc - we need to clone it
+        self.data = (*updated.data).clone();
         Ok(())
     }
 
@@ -96,21 +115,21 @@ impl CudaTensor {
             .map_err(|_| FlameError::CuBlas)?;
             
         unsafe {
-            blas.gemm(
-                cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-                cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-                n as i32,
-                m as i32,
-                k as i32,
-                &1.0f32,
-                other.data.as_ptr(),
-                n as i32,
-                self.data.as_ptr(),
-                k as i32,
-                &0.0f32,
-                output.data.as_mut_ptr(),
-                n as i32,
-            ).map_err(|_| FlameError::CuBlas)?;
+            use cudarc::cublas::{GemmConfig, Gemm};
+            let cfg = GemmConfig {
+                transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+                transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+                m: n as i32,
+                n: m as i32,
+                k: k as i32,
+                alpha: 1.0f32,
+                lda: n as i32,
+                ldb: k as i32,
+                beta: 0.0f32,
+                ldc: n as i32,
+            };
+            blas.gemm(cfg, &other.data, &self.data, &mut output.data)
+                .map_err(|_| FlameError::CuBlas)?;
         }
         
         Ok(output)
@@ -123,7 +142,23 @@ impl CudaTensor {
         
         // For now, simple element-wise add (no broadcasting yet)
         if self.shape == other.shape {
-            CudaKernels::add(&self.device, &self.data, &other.data, &mut output.data)?;
+            let kernels = CudaKernels::new(self.device.clone())?;
+            let self_tensor = Tensor {
+                data: Arc::new(self.data.clone()),
+                shape: self.shape.clone(),
+                device: self.device.clone(),
+                id: crate::tensor::TensorId::new(),
+                requires_grad: false,
+            };
+            let other_tensor = Tensor {
+                data: Arc::new(other.data.clone()),
+                shape: other.shape.clone(),
+                device: other.device.clone(),
+                id: crate::tensor::TensorId::new(),
+                requires_grad: false,
+            };
+            let result = kernels.add(&self_tensor, &other_tensor)?;
+            output.data = (*result.data).clone();
         } else {
             return Err(FlameError::InvalidOperation("Broadcasting not implemented yet".into()));
         }
@@ -138,21 +173,55 @@ impl CudaTensor {
         }
         
         let mut output = CudaTensor::zeros(self.shape.clone(), self.device.clone())?;
-        CudaKernels::mul(&self.device, &self.data, &other.data, &mut output.data)?;
+        let kernels = CudaKernels::new(self.device.clone())?;
+        let self_tensor = Tensor {
+            data: Arc::new(self.data.clone()),
+            shape: self.shape.clone(),
+            device: self.device.clone(),
+            id: crate::tensor::TensorId::new(),
+            requires_grad: false,
+        };
+        let other_tensor = Tensor {
+            data: Arc::new(other.data.clone()),
+            shape: other.shape.clone(),
+            device: other.device.clone(),
+            id: crate::tensor::TensorId::new(),
+            requires_grad: false,
+        };
+        let result = kernels.mul(&self_tensor, &other_tensor)?;
+        output.data = (*result.data).clone();
         Ok(output)
     }
 
     /// Scalar multiplication
     pub fn mul_scalar(&self, scalar: f32) -> Result<CudaTensor> {
         let mut output = CudaTensor::zeros(self.shape.clone(), self.device.clone())?;
-        CudaKernels::mul_scalar(&self.device, &self.data, scalar, &mut output.data)?;
+        let kernels = CudaKernels::new(self.device.clone())?;
+        let self_tensor = Tensor {
+            data: Arc::new(self.data.clone()),
+            shape: self.shape.clone(),
+            device: self.device.clone(),
+            id: crate::tensor::TensorId::new(),
+            requires_grad: false,
+        };
+        let result = kernels.mul_scalar(&self_tensor, scalar)?;
+        output.data = (*result.data).clone();
         Ok(output)
     }
 
     /// ReLU activation
     pub fn relu(&self) -> Result<CudaTensor> {
         let mut output = CudaTensor::zeros(self.shape.clone(), self.device.clone())?;
-        CudaKernels::relu(&self.device, &self.data, &mut output.data)?;
+        let kernels = CudaKernels::new(self.device.clone())?;
+        let self_tensor = Tensor {
+            data: Arc::new(self.data.clone()),
+            shape: self.shape.clone(),
+            device: self.device.clone(),
+            id: crate::tensor::TensorId::new(),
+            requires_grad: false,
+        };
+        let result = kernels.relu(&self_tensor)?;
+        output.data = (*result.data).clone();
         Ok(output)
     }
 
@@ -188,10 +257,21 @@ impl CudaTensor {
         
         // Launch custom reduction kernel
         let kernels = CudaKernels::new(self.device.clone())?;
-        let sum_result = kernels.sum_kernel(&self)?;
+        let self_tensor = Tensor {
+            data: Arc::new(self.data.clone()),
+            shape: self.shape.clone(),
+            device: self.device.clone(),
+            id: crate::tensor::TensorId::new(),
+            requires_grad: false,
+        };
+        let sum_result = kernels.sum_kernel(&self_tensor)?;
         
-        // Return the result tensor
-        Ok(sum_result)
+        // Convert back to CudaTensor
+        Ok(CudaTensor {
+            data: (*sum_result.data).clone(),
+            shape: sum_result.shape.clone(),
+            device: sum_result.device.clone(),
+        })
     }
 
     /// Get shape

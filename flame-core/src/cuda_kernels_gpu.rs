@@ -1,6 +1,6 @@
 use crate::{Result, FlameError, Tensor, Shape};
 use cudarc::{
-    driver::{CudaDevice, LaunchAsync, LaunchConfig, CudaSlice}, 
+    driver::{CudaDevice, LaunchAsync, LaunchConfig, CudaSlice, DevicePtr, CudaFunction}, 
     nvrtc::{compile_ptx_with_opts, CompileOptions},
     cublas::CudaBlas
 };
@@ -12,6 +12,13 @@ use std::os::raw::c_void;
 lazy_static::lazy_static! {
     static ref KERNEL_CACHE: Mutex<HashMap<String, ()>> = Mutex::new(HashMap::new());
     static ref CONV2D_MODULE: Result<()> = Err(FlameError::Cuda("Conv2D module not compiled".into()));
+}
+
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
 }
 
 // Kernel names as static strings
@@ -66,28 +73,169 @@ pub fn compile_kernel(name: &str, code: &str) -> Result<cudarc::nvrtc::Ptx> {
 }
 
 impl CudaKernels {
-    /// Ensure kernel is loaded
-    pub(crate) fn ensure_kernel(device: &CudaDevice, kernel_name: &str, kernel_code: &str) -> Result<()> {
-        // Check if kernel is already loaded in cache
-        {
-            let cache = KERNEL_CACHE.lock().unwrap();
-            if cache.contains_key(kernel_name) {
-                return Ok(());
+    /// Create a new CudaKernels instance
+    pub fn new(device: Arc<CudaDevice>) -> Result<Self> {
+        Ok(CudaKernels)
+    }
+    
+    /// Sum along a dimension keeping the dimension
+    pub fn sum_dim_keepdim(&self, tensor: &Tensor, dim: usize) -> Result<Tensor> {
+        let kernel_code = r#"
+extern "C" __global__ void sum_dim_keepdim_kernel(
+    const float* input,
+    float* output,
+    int* dims,
+    int ndim,
+    int reduce_dim,
+    int total_elements
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total_elements) return;
+    
+    // Calculate position in output tensor
+    int out_idx = tid;
+    int in_idx_base = 0;
+    int stride = 1;
+    
+    // Calculate base index for input
+    for (int d = ndim - 1; d >= 0; d--) {
+        if (d != reduce_dim) {
+            int coord = (out_idx / stride) % dims[d];
+            in_idx_base = in_idx_base * dims[d] + coord;
+            stride *= dims[d];
+        }
+    }
+    
+    // Sum along the reduction dimension
+    float sum = 0.0f;
+    int reduce_size = dims[reduce_dim];
+    for (int i = 0; i < reduce_size; i++) {
+        int idx = in_idx_base;
+        int multiplier = 1;
+        for (int d = ndim - 1; d >= 0; d--) {
+            if (d == reduce_dim) {
+                idx += i * multiplier;
             }
+            multiplier *= dims[d];
+        }
+        sum += input[idx];
+    }
+    
+    output[tid] = sum;
+}"#;
+        
+        Self::ensure_kernel(&tensor.device, "sum_dim_keepdim_kernel", kernel_code)?;
+        
+        let f = tensor.device.get_func("sum_dim_keepdim_kernel", "sum_dim_keepdim_kernel")
+            .ok_or_else(|| FlameError::Cuda("Failed to get sum_dim_keepdim_kernel".into()))?;
+        
+        // Calculate output shape (same as input but with dim size = 1)
+        let mut out_shape = tensor.shape().dims().to_vec();
+        out_shape[dim] = 1;
+        let out_elements = out_shape.iter().product();
+        
+        // Upload dimensions
+        let dims_vec: Vec<i32> = tensor.shape().dims().iter().map(|&x| x as i32).collect();
+        let dims_gpu = tensor.device.htod_sync_copy(&dims_vec)
+            .map_err(|_| FlameError::CudaDriver)?;
+        
+        let mut output_data = unsafe { tensor.device.alloc::<f32>(out_elements) }
+            .map_err(|_| FlameError::CudaDriver)?;
+        
+        let cfg = LaunchConfig::for_num_elems(out_elements as u32);
+        launch_kernel!(f, cfg,
+            &*tensor.data,
+            &output_data,
+            &dims_gpu,
+            dims_vec.len() as i32,
+            dim as i32,
+            out_elements as i32
+        )?;
+        
+        Ok(create_output_tensor(output_data, Shape::from_dims(&out_shape), tensor.device.clone()))
+    }
+    
+    /// Sum all elements in a tensor
+    pub fn sum_kernel(&self, tensor: &Tensor) -> Result<Tensor> {
+        let kernel_code = r#"
+extern "C" __global__ void sum_all_kernel(
+    const float* input,
+    float* output,
+    int n
+) {
+    extern __shared__ float sdata[];
+    
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    float sum = 0.0f;
+    while (i < n) {
+        sum += input[i];
+        i += blockDim.x * gridDim.x;
+    }
+    
+    sdata[tid] = sum;
+    __syncthreads();
+    
+    // Reduce within block
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        atomicAdd(output, sdata[0]);
+    }
+}"#;
+        
+        Self::ensure_kernel(&tensor.device, "sum_all_kernel", kernel_code)?;
+        
+        let f = tensor.device.get_func("sum_all_kernel", "sum_all_kernel")
+            .ok_or_else(|| FlameError::Cuda("Failed to get sum_all_kernel".into()))?;
+        
+        let mut output_data = unsafe { tensor.device.alloc_zeros::<f32>(1) }
+            .map_err(|_| FlameError::CudaDriver)?;
+        
+        let n = tensor.shape().elem_count();
+        let block_size = 256;
+        let grid_size = ((n + block_size - 1) / block_size).min(1024) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: (block_size * std::mem::size_of::<f32>()) as u32,
+        };
+        
+        launch_kernel!(f, cfg,
+            &*tensor.data,
+            &output_data,
+            n as i32
+        )?;
+        
+        Ok(create_output_tensor(output_data, Shape::from_dims(&[1]), tensor.device.clone()))
+    }
+    /// Ensure kernel is loaded - compiles and loads CUDA kernel on first use
+    pub(crate) fn ensure_kernel(device: &Arc<CudaDevice>, kernel_name: &str, kernel_code: &str) -> Result<()> {
+        use crate::cuda_kernel_compiler::compile_cuda_kernel;
+        
+        // Check if kernel is already loaded
+        let module_name = kernel_name;
+        if device.get_func(module_name, kernel_name).is_some() {
+            return Ok(());
         }
         
-        // Compile kernel to PTX
-        let ptx = compile_kernel(kernel_name, kernel_code)?;
+        // Compile the CUDA kernel to PTX
+        let ptx = compile_cuda_kernel(kernel_code, kernel_name)?;
         
-        // Load module into device
-        device.load_ptx(ptx, kernel_name, &[kernel_name])
-            .map_err(|e| FlameError::Cuda(format!("Failed to load PTX module: {:?}", e)))?;
+        // Create leaked strings for static lifetime (kernels are loaded once per process)
+        let module_name_static = Box::leak(kernel_name.to_string().into_boxed_str());
+        let kernel_name_static = Box::leak(kernel_name.to_string().into_boxed_str());
         
-        // Mark as loaded in cache
-        {
-            let mut cache = KERNEL_CACHE.lock().unwrap();
-            cache.insert(kernel_name.to_string(), ());
-        }
+        // Load the compiled PTX
+        device
+            .load_ptx(ptx, module_name_static, &[kernel_name_static])
+            .map_err(|e| FlameError::Cuda(format!("Failed to load kernel '{}': {}", kernel_name, e)))?;
         
         Ok(())
     }
@@ -121,9 +269,7 @@ extern "C" __global__ void add_kernel(float *out, const float *a, const float *b
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (&mut output_data, &*a.data, &*b.data, numel as i32))?;
-        }
+        launch_kernel!(f, cfg, &output_data, &*a.data, &*b.data, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, a.shape.clone(), a.device.clone()))
@@ -158,9 +304,7 @@ extern "C" __global__ void mul_kernel(float *out, const float *a, const float *b
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (&mut output_data, &*a.data, &*b.data, numel as i32))?;
-        }
+        launch_kernel!(f, cfg, &output_data, &*a.data, &*b.data, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, a.shape.clone(), a.device.clone()))
@@ -188,9 +332,7 @@ extern "C" __global__ void mul_scalar_kernel(float *out, const float *input, flo
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (&mut output_data, &*tensor.data, scalar, numel as i32))?;
-        }
+        launch_kernel!(f, cfg, &output_data, &*tensor.data, scalar, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -218,9 +360,7 @@ extern "C" __global__ void add_scalar_kernel(float *out, const float *input, flo
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (&mut output_data, &*tensor.data, scalar, numel as i32))?;
-        }
+        launch_kernel!(f, cfg, &output_data, &*tensor.data, scalar, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -249,9 +389,7 @@ extern "C" __global__ void relu_kernel(float *out, const float *input, int numel
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (&mut output_data, &*tensor.data, numel as i32))?;
-        }
+        launch_kernel!(f, cfg, &output_data, &*tensor.data, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -284,9 +422,7 @@ extern "C" __global__ void gelu_kernel(float *out, const float *input, int numel
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (&mut output_data, &*tensor.data, numel as i32))?;
-        }
+        launch_kernel!(f, cfg, &output_data, &*tensor.data, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -315,9 +451,7 @@ extern "C" __global__ void silu_kernel(float *out, const float *input, int numel
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (&mut output_data, &*tensor.data, numel as i32))?;
-        }
+        launch_kernel!(f, cfg, &output_data, &*tensor.data, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -345,9 +479,7 @@ extern "C" __global__ void tanh_kernel(float *out, const float *input, int numel
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (&mut output_data, &*tensor.data, numel as i32))?;
-        }
+        launch_kernel!(f, cfg, &output_data, &*tensor.data, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -375,9 +507,7 @@ extern "C" __global__ void sigmoid_kernel(float *out, const float *input, int nu
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (&mut output_data, &*tensor.data, numel as i32))?;
-        }
+        launch_kernel!(f, cfg, &output_data, &*tensor.data, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -429,9 +559,7 @@ extern "C" __global__ void sum_kernel(float *out, const float *input, int numel)
             shared_mem_bytes: block_size * 4, // 4 bytes per float
         };
         
-        unsafe {
-            f.launch(cfg, (&mut output_data, &*tensor.data, numel))?;
-        }
+        launch_kernel!(f, cfg, &output_data, &*tensor.data, numel)?;
         
         // Create scalar output tensor
         Ok(create_output_tensor(output_data, Shape::from_dims(&[]), tensor.device.clone()))
@@ -497,9 +625,7 @@ extern "C" __global__ void transpose_kernel(
             shared_mem_bytes: (tile_size * (tile_size + 1) * 4) as u32,
         };
         
-        unsafe {
-            f.launch(cfg, (&mut output_data, &*tensor.data, rows as i32, cols as i32))?;
-        }
+        launch_kernel!(f, cfg, &output_data, &*tensor.data, rows as i32, cols as i32)?;
         
         // Create transposed tensor
         Ok(create_output_tensor(output_data, Shape::from_dims(&[cols, rows]), tensor.device.clone()))
@@ -526,9 +652,7 @@ extern "C" __global__ void leaky_relu_kernel(float *out, const float *input, flo
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (&mut output_data, &*tensor.data, negative_slope, numel as i32))?;
-        }
+        launch_kernel!(f, cfg, &output_data, &*tensor.data, negative_slope, numel as i32)?;
         
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
     }
@@ -554,9 +678,7 @@ extern "C" __global__ void elu_kernel(float *out, const float *input, float alph
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(cfg, (&mut output_data, &*tensor.data, alpha, numel as i32))?;
-        }
+        launch_kernel!(f, cfg, &output_data, &*tensor.data, alpha, numel as i32)?;
         
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
     }
@@ -596,14 +718,14 @@ extern "C" __global__ void prelu_kernel(
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         unsafe {
-            f.launch(cfg, (
-                &mut output_data,
+            launch_kernel!(f, cfg,
+                &output_data,
                 &*tensor.data,
                 &*weight.data,
                 numel as i32,
                 num_channels as i32,
                 channel_size as i32
-            ))?;
+            )?;
         }
         
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -703,17 +825,17 @@ extern "C" __global__ void maxpool2d_with_indices_kernel(
             let stride_hw = ((stride.0 as i32) << 16) | (stride.1 as i32);
             let padding_hw = ((padding.0 as i32) << 16) | (padding.1 as i32);
             
-            f.launch(cfg, (
-                &mut output_data,
-                &mut indices_data,
+            launch_kernel!(f, cfg,
+                &output_data,
+                &indices_data,
                 &*input.data,
                 input_dims,
                 input_hw,
                 output_hw,
                 kernel_hw,
                 stride_hw,
-                padding_hw,
-            )).map_err(|_| FlameError::Cuda("Failed to launch maxpool2d kernel".into()))?;
+                padding_hw
+            )?;
         }
         
         let output = create_output_tensor(output_data, output_shape.clone(), input.device.clone());
@@ -775,15 +897,13 @@ extern "C" __global__ void maxpool2d_backward_with_indices_kernel(
         
         // Launch kernel with output elements (we scatter gradients from output to input)
         let cfg = LaunchConfig::for_num_elems(output_numel as u32);
-        unsafe {
-            f.launch(cfg, (
-                &mut grad_input,
-                &*grad_output.data,
-                &*indices.data,
-                input_numel as i32,
-                output_numel as i32,
-            ))?;
-        }
+        launch_kernel!(f, cfg,
+            &grad_input,
+            &*grad_output.data,
+            &*indices.data,
+            input_numel as i32,
+            output_numel as i32
+        )?;
         
         Ok(create_output_tensor(grad_input, input.shape.clone(), input.device.clone()))
     }
@@ -880,8 +1000,8 @@ extern "C" __global__ void avgpool2d_kernel(
             let stride_hw = ((stride.0 as i32) << 16) | (stride.1 as i32);
             let padding_hw = ((padding.0 as i32) << 16) | (padding.1 as i32);
             
-            f.launch(cfg, (
-                &mut output_data,
+            launch_kernel!(f, cfg,
+                &output_data,
                 &*input.data,
                 input_dims,
                 input_hw,
@@ -889,8 +1009,8 @@ extern "C" __global__ void avgpool2d_kernel(
                 kernel_hw,
                 stride_hw,
                 padding_hw,
-                count_include_pad as i32,
-            )).map_err(|_| FlameError::Cuda("Failed to launch avgpool2d kernel".into()))?;
+                count_include_pad as i32
+            )?;
         }
         
         Ok(create_output_tensor(output_data, output_shape, input.device.clone()))
@@ -1010,8 +1130,8 @@ extern "C" __global__ void avgpool2d_backward_kernel(
             let stride_hw = ((stride.0 as i32) << 16) | (stride.1 as i32);
             let padding_hw = ((padding.0 as i32) << 16) | (padding.1 as i32);
             
-            f.launch(cfg, (
-                &mut grad_input,
+            launch_kernel!(f, cfg,
+                &grad_input,
                 &*grad_output.data,
                 input_dims,
                 input_hw,
@@ -1019,8 +1139,8 @@ extern "C" __global__ void avgpool2d_backward_kernel(
                 kernel_hw,
                 stride_hw,
                 padding_hw,
-                count_include_pad as i32,
-            ))?;
+                count_include_pad as i32
+            )?;
         }
         
         Ok(create_output_tensor(grad_input, input.shape.clone(), input.device.clone()))
@@ -1028,40 +1148,149 @@ extern "C" __global__ void avgpool2d_backward_kernel(
     
     /// Adaptive MaxPool2d forward
     pub fn adaptive_maxpool2d_forward(input: &Tensor, output_size: (usize, usize)) -> Result<Tensor> {
+        let kernel_code = r#"
+extern "C" __global__ void adaptive_maxpool2d_kernel(
+    float *output,
+    const float *input,
+    int batch_channels,
+    int h_in,
+    int w_in,
+    int h_out,
+    int w_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_output = batch_channels * h_out * w_out;
+    
+    if (idx < total_output) {
+        int w = idx % w_out;
+        int h = (idx / w_out) % h_out;
+        int bc = idx / (h_out * w_out);
+        
+        // Calculate adaptive pooling region
+        int h_start = h * h_in / h_out;
+        int h_end = (h + 1) * h_in / h_out;
+        int w_start = w * w_in / w_out;
+        int w_end = (w + 1) * w_in / w_out;
+        
+        float max_val = -1e20f;
+        
+        for (int hi = h_start; hi < h_end; hi++) {
+            for (int wi = w_start; wi < w_end; wi++) {
+                int input_idx = bc * h_in * w_in + hi * w_in + wi;
+                float val = input[input_idx];
+                if (val > max_val) {
+                    max_val = val;
+                }
+            }
+        }
+        
+        output[idx] = max_val;
+    }
+}"#;
+        
         let dims = input.shape.dims();
         let (batch, channels, h_in, w_in) = match dims {
             [b, c, h, w] => (*b, *c, *h, *w),
             _ => return Err(FlameError::InvalidOperation("AdaptiveMaxPool2d requires 4D input".into())),
         };
         
+        Self::ensure_kernel(&input.device, "adaptive_maxpool2d_kernel", kernel_code)?;
+        
+        let f = input.device.get_func("adaptive_maxpool2d_kernel", "adaptive_maxpool2d_kernel")
+            .ok_or_else(|| FlameError::Cuda("Failed to get adaptive_maxpool2d_kernel".into()))?;
+        
         let output_shape = Shape::from_dims(&[batch, channels, output_size.0, output_size.1]);
         let output_numel = output_shape.elem_count();
         
-        let mut output_data = unsafe { input.device.alloc_zeros::<f32>(output_numel) }
+        let mut output_data = unsafe { input.device.alloc::<f32>(output_numel) }
             .map_err(|_| FlameError::CudaDriver)?;
         
-        // Simplified: just copy corners for now
-        // Real implementation would compute stride and kernel size adaptively
+        let cfg = LaunchConfig::for_num_elems(output_numel as u32);
+        unsafe {
+            launch_kernel!(f, cfg,
+                &output_data,
+                &*input.data,
+                (batch * channels) as i32,
+                h_in as i32,
+                w_in as i32,
+                output_size.0 as i32,
+                output_size.1 as i32
+            )?;
+        }
         
         Ok(create_output_tensor(output_data, output_shape, input.device.clone()))
     }
     
     /// Adaptive AvgPool2d forward
     pub fn adaptive_avgpool2d_forward(input: &Tensor, output_size: (usize, usize)) -> Result<Tensor> {
+        let kernel_code = r#"
+extern "C" __global__ void adaptive_avgpool2d_kernel(
+    float *output,
+    const float *input,
+    int batch_channels,
+    int h_in,
+    int w_in,
+    int h_out,
+    int w_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_output = batch_channels * h_out * w_out;
+    
+    if (idx < total_output) {
+        int w = idx % w_out;
+        int h = (idx / w_out) % h_out;
+        int bc = idx / (h_out * w_out);
+        
+        // Calculate adaptive pooling region
+        int h_start = h * h_in / h_out;
+        int h_end = (h + 1) * h_in / h_out;
+        int w_start = w * w_in / w_out;
+        int w_end = (w + 1) * w_in / w_out;
+        
+        float sum = 0.0f;
+        int count = 0;
+        
+        for (int hi = h_start; hi < h_end; hi++) {
+            for (int wi = w_start; wi < w_end; wi++) {
+                int input_idx = bc * h_in * w_in + hi * w_in + wi;
+                sum += input[input_idx];
+                count++;
+            }
+        }
+        
+        output[idx] = count > 0 ? sum / count : 0.0f;
+    }
+}"#;
+        
         let dims = input.shape.dims();
-        let (batch, channels, _, _) = match dims {
+        let (batch, channels, h_in, w_in) = match dims {
             [b, c, h, w] => (*b, *c, *h, *w),
             _ => return Err(FlameError::InvalidOperation("AdaptiveAvgPool2d requires 4D input".into())),
         };
         
+        Self::ensure_kernel(&input.device, "adaptive_avgpool2d_kernel", kernel_code)?;
+        
+        let f = input.device.get_func("adaptive_avgpool2d_kernel", "adaptive_avgpool2d_kernel")
+            .ok_or_else(|| FlameError::Cuda("Failed to get adaptive_avgpool2d_kernel".into()))?;
+        
         let output_shape = Shape::from_dims(&[batch, channels, output_size.0, output_size.1]);
         let output_numel = output_shape.elem_count();
         
-        let mut output_data = unsafe { input.device.alloc_zeros::<f32>(output_numel) }
+        let mut output_data = unsafe { input.device.alloc::<f32>(output_numel) }
             .map_err(|_| FlameError::CudaDriver)?;
         
-        // Simplified: just average all input for now
-        // Real implementation would compute adaptive regions
+        let cfg = LaunchConfig::for_num_elems(output_numel as u32);
+        unsafe {
+            launch_kernel!(f, cfg,
+                &output_data,
+                &*input.data,
+                (batch * channels) as i32,
+                h_in as i32,
+                w_in as i32,
+                output_size.0 as i32,
+                output_size.1 as i32
+            )?;
+        }
         
         Ok(create_output_tensor(output_data, output_shape, input.device.clone()))
     }
@@ -1117,15 +1346,15 @@ extern "C" __global__ void upsample2d_nearest_kernel(
         
         let cfg = LaunchConfig::for_num_elems(output_numel as u32);
         unsafe {
-            f.launch(cfg, (
-                &mut output_data,
+            launch_kernel!(f, cfg,
+                &output_data,
                 &*input.data,
                 (batch * channels) as i32,
                 h_in as i32,
                 w_in as i32,
                 output_size.0 as i32,
-                output_size.1 as i32,
-            ))?;
+                output_size.1 as i32
+            )?;
         }
         
         Ok(create_output_tensor(output_data, output_shape, input.device.clone()))
@@ -1211,16 +1440,16 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
         
         let cfg = LaunchConfig::for_num_elems(output_numel as u32);
         unsafe {
-            f.launch(cfg, (
-                &mut output_data,
+            launch_kernel!(f, cfg,
+                &output_data,
                 &*input.data,
                 (batch * channels) as i32,
                 h_in as i32,
                 w_in as i32,
                 output_size.0 as i32,
                 output_size.1 as i32,
-                align_corners as i32,
-            ))?;
+                align_corners as i32
+            )?;
         }
         
         Ok(create_output_tensor(output_data, output_shape, input.device.clone()))
@@ -1305,42 +1534,14 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
             );
             let block_dim = (16, 16, 4);
             
-            unsafe {
-                // Custom kernel for transposed convolution
-                let kernel_name = "conv_transpose2d_kernel";
-                if let Ok(module) = &*CONV2D_MODULE {
-                    if let Ok(kernel) = module.get_function(kernel_name) {
-                        let _ = kernel.launch(
-                            grid_dim,
-                            block_dim,
-                            &[
-                                &(input.data.as_ptr() as usize + input_offset * std::mem::size_of::<f32>()),
-                                &weight.data.as_ptr(),
-                                &output.as_ptr(),
-                                &batch,
-                                &in_channels,
-                                &out_channels,
-                                &h_in,
-                                &w_in,
-                                &h_out,
-                                &w_out,
-                                &kh,
-                                &kw,
-                                &stride.0,
-                                &stride.1,
-                                &padding.0,
-                                &padding.1,
-                            ],
-                        );
-                    }
-                }
-            }
+            // For now, return error as transposed conv2d kernel is not implemented
+            return Err(FlameError::Cuda("Transposed convolution GPU kernel not yet implemented".into()));
         }
         
         // Apply bias if provided
         if let Some(bias) = bias {
             // Add bias to each output channel
-            let bias_data = bias.data.as_ptr() as *const f32;
+            let bias_data = *(*bias.data).device_ptr() as *const f32;
             unsafe {
                 for b in 0..batch {
                     for c in 0..out_channels {
@@ -1348,7 +1549,7 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
                         let offset = (b * out_channels + c) * h_out * w_out;
                         for i in 0..(h_out * w_out) {
                             let idx = offset + i;
-                            let ptr = output.as_ptr() as *mut f32;
+                            let ptr = *output.device_ptr() as *mut f32;
                             *ptr.add(idx) += bias_val;
                         }
                     }
@@ -1372,12 +1573,12 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
         // and regular convolution backward for weight gradient
         
         // Compute grad_input: conv2d(grad_output, weight, stride, padding)
-        let grad_input = Conv2dOps::conv2d_forward(
+        let grad_input = crate::cuda_conv2d::conv2d(
             grad_output,
             weight,
             None,
-            stride,
-            padding,
+            stride.0, // Assume square stride
+            padding.0, // Assume square padding
         )?;
         
         // Compute grad_weight: conv2d_backward_weight(input, grad_output)
@@ -1398,7 +1599,7 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
         let out_w = grad_output.shape.dims()[3];
         
         let grad_weight_shape = weight.shape.clone();
-        let grad_weight_data = unsafe { 
+        let mut grad_weight_data = unsafe { 
             input.device.alloc_zeros::<f32>(grad_weight_shape.elem_count()) 
         }.map_err(|_| FlameError::CudaDriver)?;
         
@@ -1415,7 +1616,7 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
             batch_size * out_h * out_w,
             in_channels * kernel_h * kernel_w
         ]);
-        let input_col = Tensor::zeros(&input_col_shape, input.dtype(), input.device())?;
+        let input_col = Tensor::zeros(input_col_shape, input.device.clone())?;
         
         // TODO: Implement im2col kernel to fill input_col
         // For now, we'll use a placeholder
@@ -1424,28 +1625,31 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
         let grad_output_reshaped = grad_output.reshape(&[batch_size * out_h * out_w, out_channels])?;
         
         // Perform matrix multiplication using cuBLAS
-        if let Some(cuda_device) = weight.device.cuda_device() {
+        {
+            let cuda_device = &weight.device;
             // Call cuBLAS SGEMM for weight gradient computation
             unsafe {
                 let cublas = CudaBlas::new(cuda_device.clone())?;
                 
                 // grad_weight = grad_output_reshaped^T @ input_col
                 // M = out_channels, N = in_channels * kernel_h * kernel_w, K = batch_size * out_h * out_w
-                cublas.sgemm(
-                    cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,  // transpose grad_output
-                    cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,  // no transpose input_col
-                    out_channels as i32,
-                    (in_channels * kernel_h * kernel_w) as i32,
-                    (batch_size * out_h * out_w) as i32,
-                    &1.0f32,  // alpha
-                    (*grad_output_reshaped.data).device_ptr() as *const f32,
-                    (batch_size * out_h * out_w) as i32,  // lda
-                    (*input_col.data).device_ptr() as *const f32,
-                    (batch_size * out_h * out_w) as i32,  // ldb
-                    &0.0f32,  // beta
-                    grad_weight_data.device_ptr() as *mut f32,
-                    out_channels as i32,  // ldc
-                )?;
+                use cudarc::cublas::{GemmConfig, Gemm};
+                let cfg = GemmConfig {
+                    transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,  // transpose grad_output
+                    transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,  // no transpose input_col
+                    m: out_channels as i32,
+                    n: (in_channels * kernel_h * kernel_w) as i32,
+                    k: (batch_size * out_h * out_w) as i32,
+                    alpha: 1.0f32,
+                    lda: (batch_size * out_h * out_w) as i32,
+                    ldb: (batch_size * out_h * out_w) as i32,
+                    beta: 0.0f32,
+                    ldc: out_channels as i32,
+                };
+                
+                // Perform GEMM
+                cublas.gemm(cfg, &*grad_output_reshaped.data, &*input_col.data, &mut grad_weight_data)
+                    .map_err(|_| FlameError::Cuda("GEMM failed".into()))?;
             }
         }
         
@@ -1461,29 +1665,80 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
             
             // Sum over batch, height, width dimensions
             // Launch kernel to compute bias gradient
-            if let Some(cuda_device) = grad_output.device.cuda_device() {
+            {
+                let cuda_device = &grad_output.device;
                 // Use reduction kernel to sum grad_output over spatial dimensions
                 let block_size = 256;
                 let grid_size = (out_channels + block_size - 1) / block_size;
                 
                 unsafe {
                     // Launch custom reduction kernel
-                    let kernel_fn = cuda_device.get_func("reduce_sum_channels", "conv_kernels")?;
-                    let grad_output_ptr = grad_output.data_ptr()? as *const f32;
-                    let grad_bias_ptr = grad_bias_data.as_mut_ptr() as *mut f32;
+                    let kernel_fn = cuda_device.get_func("reduce_sum_channels", "conv_kernels")
+                        .ok_or_else(|| FlameError::Cuda("Failed to get reduce_sum_channels kernel".into()))?;
+                    let grad_output_ptr = *(*grad_output.data).device_ptr() as *const f32;
+                    let grad_bias_ptr = *grad_bias_data.device_ptr() as *mut f32;
                     let spatial_size = batch_size * out_h * out_w;
                     
-                    kernel_fn.launch(
-                        grid_size as u32, 1, 1,  // grid
-                        block_size as u32, 1, 1, // block
-                        0,  // shared mem
-                        cuda_device.stream(),
-                        &[
-                            &grad_output_ptr as *const _ as *const c_void,
-                            &grad_bias_ptr as *const _ as *const c_void,
-                            &out_channels as *const _ as *const c_void,
-                            &spatial_size as *const _ as *const c_void,
-                        ],
+                    let kernel_code = r#"
+extern "C" __global__ void bias_grad_reduction_kernel(
+    float* grad_bias,
+    const float* grad_output,
+    int batch_size,
+    int channels,
+    int spatial_size
+) {
+    extern __shared__ float sdata[];
+    
+    int c = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    if (c >= channels) return;
+    
+    float sum = 0.0f;
+    
+    // Each thread sums over a portion of the spatial dimensions
+    for (int i = tid; i < batch_size * spatial_size; i += blockDim.x) {
+        int batch = i / spatial_size;
+        int spatial = i % spatial_size;
+        int idx = batch * channels * spatial_size + c * spatial_size + spatial;
+        sum += grad_output[idx];
+    }
+    
+    // Store in shared memory
+    sdata[tid] = sum;
+    __syncthreads();
+    
+    // Reduce within block
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    // Write result
+    if (tid == 0) {
+        grad_bias[c] = sdata[0];
+    }
+}"#;
+                    
+                    Self::ensure_kernel(&grad_output.device, "bias_grad_reduction_kernel", kernel_code)?;
+                    
+                    let kernel_fn = cuda_device.get_func("bias_grad_reduction_kernel", "bias_grad_reduction_kernel")
+                        .ok_or_else(|| FlameError::Cuda("Failed to get bias_grad_reduction_kernel".into()))?;
+                    
+                    let cfg = LaunchConfig {
+                        grid_dim: (out_channels as u32, 1, 1),
+                        block_dim: (block_size as u32, 1, 1),
+                        shared_mem_bytes: (block_size * std::mem::size_of::<f32>()) as u32,
+                    };
+                    
+                    launch_kernel!(kernel_fn, cfg,
+                        &grad_bias_data,
+                        &*grad_output.data,
+                        batch_size as i32,
+                        out_channels as i32,
+                        (out_h * out_w) as i32
                     )?;
                 }
             }
@@ -1568,18 +1823,78 @@ extern "C" __global__ void broadcast_kernel(
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        unsafe {
-            f.launch(
-                cfg,
-                (&mut output_data, &*input.data,
-                 &src_shape_gpu, &dst_shape_gpu,
-                 &src_strides_gpu, &dst_strides_gpu,
-                 src_ndim as i32, dst_ndim as i32,
-                 numel as i32),
-            ).map_err(|_| FlameError::Cuda("Failed to launch broadcast kernel".into()))?;
-        }
+        launch_kernel!(f, cfg,
+            &output_data, &*input.data,
+            &src_shape_gpu, &dst_shape_gpu,
+            &src_strides_gpu, &dst_strides_gpu,
+            src_ndim as i32, dst_ndim as i32,
+            numel as i32
+        )?;
         
         Ok(create_output_tensor(output_data, target_shape.clone(), input.device.clone()))
+    }
+    
+    /// Scatter add operation - adds values from src to dst at indices
+    pub fn scatter_add(
+        dst: &Tensor,
+        indices: &Tensor,
+        src: &Tensor,
+        dim: usize,
+    ) -> Result<Tensor> {
+        let kernel_code = r#"
+extern "C" __global__ void scatter_add_kernel(
+    float* dst,
+    const int* indices,
+    const float* src,
+    int batch_size,
+    int embedding_dim,
+    int num_indices
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_indices * embedding_dim) return;
+    
+    int i = idx / embedding_dim;  // which index
+    int j = idx % embedding_dim;  // which dimension
+    
+    int index = indices[i];
+    if (index >= 0 && index < batch_size) {
+        atomicAdd(&dst[index * embedding_dim + j], src[i * embedding_dim + j]);
+    }
+}"#;
+        
+        CudaKernels::ensure_kernel(&dst.device, "scatter_add_kernel", kernel_code)?;
+        
+        let f = dst.device.get_func("scatter_add_kernel", "scatter_add_kernel")
+            .ok_or_else(|| FlameError::Cuda("Failed to get scatter_add_kernel".into()))?;
+        
+        // Clone dst data for output
+        let mut output_data = unsafe {
+            let size = dst.shape.elem_count();
+            let mut data = dst.device.alloc::<f32>(size)
+                .map_err(|_| FlameError::CudaDriver)?;
+            dst.device.dtod_copy(&*dst.data, &mut data)
+                .map_err(|_| FlameError::CudaDriver)?;
+            data
+        };
+        
+        let shape = src.shape().dims();
+        let batch_size = dst.shape().dims()[0] as i32;
+        let embedding_dim = if shape.len() > 1 { shape[1] as i32 } else { 1 };
+        let num_indices = shape[0] as i32;
+        
+        let cfg = LaunchConfig::for_num_elems((num_indices * embedding_dim) as u32);
+        unsafe {
+            launch_kernel!(f, cfg,
+                &output_data,
+                &*indices.data,
+                &*src.data,
+                batch_size,
+                embedding_dim,
+                num_indices
+            )?;
+        }
+        
+        Ok(create_output_tensor(output_data, dst.shape().clone(), dst.device.clone()))
     }
 }
 
@@ -1603,7 +1918,8 @@ pub fn mean_reduce_dims(tensor: &Tensor, dims: &[usize]) -> Result<Tensor> {
 pub fn cast_dtype(tensor: &Tensor, target_dtype: crate::DType) -> Result<Tensor> {
     // For now, just clone with the new dtype
     // In a real implementation, this would use a CUDA kernel
-    match (tensor.dtype(), target_dtype) {
+    // Assume tensors are F32 for now
+    match (crate::DType::F32, target_dtype) {
         (crate::DType::F32, crate::DType::F16) => {
             // F32 to F16 conversion
             tensor.to_dtype(target_dtype)

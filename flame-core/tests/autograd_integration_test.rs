@@ -4,7 +4,6 @@
 use flame_core::{
     Tensor, Shape, Result, CudaDevice, 
     autograd::{AutogradContext},
-    gradient::GradientMap,
     linear::Linear,
     conv::Conv2d,
     attention::{MultiHeadAttention, AttentionConfig},
@@ -59,10 +58,10 @@ fn test_conv2d_forward_backward() -> Result<()> {
     let grad_map = AutogradContext::backward(&loss)?;
     
     // Check that gradients exist for input and conv parameters
-    assert!(grad_map.has_gradient(input.id()));
-    assert!(grad_map.has_gradient(conv.weight.id()));
+    assert!(grad_map.contains(input.id()));
+    assert!(grad_map.contains(conv.weight.id()));
     if let Some(bias) = &conv.bias {
-        assert!(grad_map.has_gradient(bias.id()));
+        assert!(grad_map.contains(bias.id()));
     }
     
     // Verify gradient shapes
@@ -87,7 +86,7 @@ fn test_linear_forward_backward() -> Result<()> {
     )?.requires_grad_(true);
     
     // Create Linear layer: 32 input features, 64 output features
-    let linear = Linear::new(32, 64, true, device.clone())?;
+    let linear = Linear::new(32, 64, true, &device)?;
     
     // Forward pass
     let output = linear.forward(&input)?;
@@ -102,10 +101,10 @@ fn test_linear_forward_backward() -> Result<()> {
     let grad_map = AutogradContext::backward(&loss)?;
     
     // Check gradients
-    assert!(grad_map.has_gradient(input.id()));
-    assert!(grad_map.has_gradient(linear.weight.id()));
+    assert!(grad_map.contains(input.id()));
+    assert!(grad_map.contains(linear.weight.id()));
     if let Some(bias) = &linear.bias {
-        assert!(grad_map.has_gradient(bias.id()));
+        assert!(grad_map.contains(bias.id()));
     }
     
     Ok(())
@@ -140,11 +139,11 @@ fn test_attention_forward_backward() -> Result<()> {
     let grad_map = AutogradContext::backward(&loss)?;
     
     // Check gradients for attention parameters
-    assert!(grad_map.has_gradient(query.id()));
-    assert!(grad_map.has_gradient(attention.q_proj.weight.id()));
-    assert!(grad_map.has_gradient(attention.k_proj.weight.id()));
-    assert!(grad_map.has_gradient(attention.v_proj.weight.id()));
-    assert!(grad_map.has_gradient(attention.out_proj.weight.id()));
+    assert!(grad_map.contains(query.id()));
+    assert!(grad_map.contains(attention.q_proj.weight.id()));
+    assert!(grad_map.contains(attention.k_proj.weight.id()));
+    assert!(grad_map.contains(attention.v_proj.weight.id()));
+    assert!(grad_map.contains(attention.out_proj.weight.id()));
     
     Ok(())
 }
@@ -154,7 +153,7 @@ fn test_adam_optimizer() -> Result<()> {
     let device = create_test_device();
     
     // Create a simple linear layer
-    let mut linear = Linear::new(10, 5, true, device.clone())?;
+    let mut linear = Linear::new(10, 5, true, &device)?;
     
     // Create dummy gradients
     let weight_grad = Tensor::ones(linear.weight.shape().clone(), device.clone())?;
@@ -171,10 +170,10 @@ fn test_adam_optimizer() -> Result<()> {
     // Create optimizer
     let mut optimizer = Adam::new(AdamConfig::default());
     
-    // Prepare parameters with gradients
-    let mut params = vec![(linear.weight.id(), &mut linear.weight, &weight_grad)];
+    // Prepare parameters with gradients - optimizer expects usize as ID
+    let mut params = vec![(0usize, &mut linear.weight, &weight_grad)];
     if let (Some(bias), Some(grad)) = (linear.bias.as_mut(), bias_grad.as_ref()) {
-        params.push((bias.id(), bias, grad));
+        params.push((1usize, bias, grad));
     }
     
     // Take optimization step
@@ -219,7 +218,7 @@ fn test_sgd_optimizer_with_momentum() -> Result<()> {
     
     // Take multiple steps to see momentum effect
     for _ in 0..3 {
-        let mut params = vec![(param.id(), &mut param, &grad)];
+        let mut params = vec![(0usize, &mut param, &grad)];
         optimizer.step(&mut params)?;
     }
     
@@ -251,7 +250,7 @@ fn test_complex_gradient_flow() -> Result<()> {
     let flattened = conv_out.reshape(&[1, 8 * 8 * 8])?;
     
     // Linear layer
-    let linear = Linear::new(8 * 8 * 8, 10, true, device.clone())?;
+    let linear = Linear::new(8 * 8 * 8, 10, true, &device)?;
     let output = linear.forward(&flattened)?;
     
     // Create target and loss
@@ -263,9 +262,9 @@ fn test_complex_gradient_flow() -> Result<()> {
     let grad_map = AutogradContext::backward(&loss)?;
     
     // Verify gradients flow through entire network
-    assert!(grad_map.has_gradient(input.id()), "Input should have gradient");
-    assert!(grad_map.has_gradient(conv.weight.id()), "Conv weight should have gradient");
-    assert!(grad_map.has_gradient(linear.weight.id()), "Linear weight should have gradient");
+    assert!(grad_map.contains(input.id()), "Input should have gradient");
+    assert!(grad_map.contains(conv.weight.id()), "Conv weight should have gradient");
+    assert!(grad_map.contains(linear.weight.id()), "Linear weight should have gradient");
     
     // Check gradient shapes
     let input_grad = grad_map.get(input.id()).unwrap();
@@ -341,11 +340,11 @@ fn test_framework_is_generic() -> Result<()> {
     // Conv2d is generic - can be used for any convolutional network
     let device = create_test_device();
     let conv = Conv2d::new_with_bias(3, 64, 7, 2, 3, device.clone(), true)?;
-    assert!(conv.in_channels() == 3);
-    assert!(conv.out_channels() == 64);
+    assert!(conv.config.in_channels == 3);
+    assert!(conv.config.out_channels == 64);
     
     // Linear is generic - can be used for any fully connected layer
-    let linear = Linear::new(768, 3072, true, device.clone())?;
+    let linear = Linear::new(768, 3072, true, &device)?;
     assert!(linear.in_features() == 768);
     assert!(linear.out_features() == 3072);
     
