@@ -3,7 +3,9 @@
 //! This module provides CUDA kernel implementations for tensor operations
 //! using the type-safe kernel launcher.
 
-use crate::{Tensor, Shape, Result, FlameError};
+use crate::{Tensor, Shape, Result, FlameError, DType};
+use crate::tensor::{TensorId};
+use crate::tensor_storage::TensorStorage;
 use crate::kernel_launcher::{KernelLauncher, launch_configs, templates};
 use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync};
 use std::sync::Arc;
@@ -21,7 +23,7 @@ macro_rules! launch_kernel {
 /// Create a tensor from allocated CUDA memory
 pub fn create_output_tensor(data: CudaSlice<f32>, shape: Shape, device: Arc<CudaDevice>) -> Tensor {
     Tensor {
-        data: Arc::new(data),
+        storage: TensorStorage::F32 { data, numel: shape.elem_count() },
         shape,
         device,
         id: crate::tensor::TensorId(0), // Will be set properly when added to graph
@@ -52,7 +54,7 @@ impl CudaKernelsV2 {
         }
         
         let numel = a.shape.elem_count();
-        let mut output = unsafe { a.device.alloc::<f32>(numel) }
+        let mut output = crate::tensor::alloc_from_pool(&a.device, numel)
             .map_err(|_| FlameError::CudaDriver)?;
         
         let kernel_code = templates::elementwise_binary("add_kernel", "+");
@@ -65,8 +67,8 @@ impl CudaKernelsV2 {
         let config = launch_configs::elementwise(numel);
         launch_kernel!(f, config,
             &output,
-            &*a.data,
-            &*b.data,
+            a.storage.as_slice(),
+            b.storage.as_slice(),
             numel as i32
         )?;
         
@@ -83,7 +85,7 @@ impl CudaKernelsV2 {
         }
         
         let numel = a.shape.elem_count();
-        let mut output = unsafe { a.device.alloc::<f32>(numel) }
+        let mut output = crate::tensor::alloc_from_pool(&a.device, numel)
             .map_err(|_| FlameError::CudaDriver)?;
         
         let kernel_code = templates::elementwise_binary("mul_kernel", "*");
@@ -95,8 +97,8 @@ impl CudaKernelsV2 {
         let config = launch_configs::elementwise(numel);
         launch_kernel!(f, config,
             &output,
-            &*a.data,
-            &*b.data,
+            a.storage.as_slice(),
+            b.storage.as_slice(),
             numel as i32
         )?;
         
@@ -106,7 +108,7 @@ impl CudaKernelsV2 {
     /// ReLU activation
     pub fn relu(&self, input: &Tensor) -> Result<Tensor> {
         let numel = input.shape.elem_count();
-        let mut output = unsafe { input.device.alloc::<f32>(numel) }
+        let mut output = crate::tensor::alloc_from_pool(&input.device, numel)
             .map_err(|_| FlameError::CudaDriver)?;
         
         let kernel_code = templates::elementwise_unary("relu_kernel", "fmaxf(0.0f, x)");
@@ -118,7 +120,7 @@ impl CudaKernelsV2 {
         let config = launch_configs::elementwise(numel);
         launch_kernel!(f, config,
             &output,
-            &*input.data,
+            input.storage.as_slice(),
             numel as i32
         )?;
         
@@ -128,7 +130,7 @@ impl CudaKernelsV2 {
     /// GELU activation
     pub fn gelu(&self, input: &Tensor) -> Result<Tensor> {
         let numel = input.shape.elem_count();
-        let mut output = unsafe { input.device.alloc::<f32>(numel) }
+        let mut output = crate::tensor::alloc_from_pool(&input.device, numel)
             .map_err(|_| FlameError::CudaDriver)?;
         
         let kernel_code = templates::elementwise_unary(
@@ -143,7 +145,7 @@ impl CudaKernelsV2 {
         let config = launch_configs::elementwise(numel);
         launch_kernel!(f, config,
             &output,
-            &*input.data,
+            input.storage.as_slice(),
             numel as i32
         )?;
         
@@ -182,7 +184,7 @@ impl CudaKernelsV2 {
         
         let output_shape = Shape::from_dims(&[m, n]);
         let output_numel = output_shape.elem_count();
-        let mut output = unsafe { a.device.alloc::<f32>(output_numel) }
+        let mut output = crate::tensor::alloc_from_pool(&a.device, output_numel)
             .map_err(|_| FlameError::CudaDriver)?;
         
         let kernel_code = r#"
@@ -220,8 +222,8 @@ extern "C" __global__ void matmul_kernel(
         let config = launch_configs::grid_2d(m, n, 16);
         launch_kernel!(f, config,
             &output,
-            &*a.data,
-            &*b.data,
+            a.storage.as_slice(),
+            b.storage.as_slice(),
             params.m,
             params.n,
             params.k
@@ -232,7 +234,7 @@ extern "C" __global__ void matmul_kernel(
     
     /// Sum reduction
     pub fn sum(&self, input: &Tensor) -> Result<Tensor> {
-        let mut output = unsafe { input.device.alloc_zeros::<f32>(1) }
+        let output = crate::tensor::alloc_zeros_from_pool(&input.device, 1)
             .map_err(|_| FlameError::CudaDriver)?;
         
         let kernel_code = templates::reduction_sum();
@@ -244,7 +246,7 @@ extern "C" __global__ void matmul_kernel(
         let config = launch_configs::reduction(input.shape.elem_count());
         launch_kernel!(f, config,
             &output,
-            &*input.data,
+            input.storage.as_slice(),
             input.shape.elem_count() as i32
         )?;
         

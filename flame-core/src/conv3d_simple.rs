@@ -6,7 +6,25 @@
 
 use crate::{Tensor, Shape, Result, FlameError, CudaDevice};
 use std::sync::Arc;
-use cudarc::driver::{LaunchAsync, LaunchConfig};
+use cudarc::driver::{LaunchAsync, LaunchConfig, CudaSlice};
+
+// Helper to allocate from pool and copy data
+fn alloc_from_pool_and_copy(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<f32>> {
+    let f32_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
+    let mut cuda_data = crate::tensor::alloc_from_pool(device, f32_data.len())?;
+    device.htod_copy_into(f32_data, &mut cuda_data).map_err(|_| FlameError::CudaDriver)?;
+    Ok(cuda_data)
+}
+
+
+// Helper function for allocating and copying to GPU via memory pool
+fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(device: &Arc<CudaDevice>, data: T) -> Result<CudaSlice<f32>> {
+    let slice = data.as_ref();
+    let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
+    device.htod_copy_into(slice.to_vec(), &mut cuda_data).map_err(|_| FlameError::CudaDriver)?;
+    Ok(cuda_data)
+}
+
 
 // Helper macro for kernel launches
 macro_rules! launch_kernel {
@@ -240,7 +258,7 @@ extern "C" __global__ void conv3d_forward(
             .ok_or_else(|| crate::FlameError::Cuda("Failed to get conv3d kernel".into()))?;
         
         let output_numel = output_shape.elem_count();
-        let mut output_data = unsafe { self.device.alloc::<f32>(output_numel) }
+        let mut output_data = crate::tensor::alloc_from_pool(&self.device, output_numel)
             .map_err(|_| crate::FlameError::CudaDriver)?;
         
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(output_numel as u32);
@@ -250,15 +268,15 @@ extern "C" __global__ void conv3d_forward(
         let kernel_dims = vec![kd as i32, kh as i32, kw as i32];
         let conv_params = vec![sd as i32, sh as i32, sw as i32, pd as i32, ph as i32, pw as i32];
         
-        let input_dims_gpu = self.device.htod_sync_copy(&input_dims)?;
-        let output_dims_gpu = self.device.htod_sync_copy(&output_dims)?;
-        let kernel_dims_gpu = self.device.htod_sync_copy(&kernel_dims)?;
-        let conv_params_gpu = self.device.htod_sync_copy(&conv_params)?;
+        let input_dims_gpu = alloc_from_pool_and_copy(&self.device, &input_dims)?;
+        let output_dims_gpu = alloc_from_pool_and_copy(&self.device, &output_dims)?;
+        let kernel_dims_gpu = alloc_from_pool_and_copy(&self.device, &kernel_dims)?;
+        let conv_params_gpu = alloc_from_pool_and_copy(&self.device, &conv_params)?;
         
         launch_kernel!(f, cfg,
             &output_data,
-            &*input.data,
-            &*self.weight.data,
+            input.storage.as_slice(),
+            self.weight.storage.as_slice(),
             &input_dims_gpu,
             &output_dims_gpu,
             &kernel_dims_gpu,
@@ -418,28 +436,28 @@ extern "C" __global__ void batchnorm3d_forward(
         
         let spatial_size = dims[2] * dims[3] * dims[4];
         let numel = input.shape().elem_count();
-        let mut output_data = unsafe { self.device.alloc::<f32>(numel) }
+        let mut output_data = crate::tensor::alloc_from_pool(&self.device, numel)
             .map_err(|_| FlameError::CudaDriver)?;
         
         // Use running stats if available, otherwise compute batch stats
         let (batch_mean, batch_var);
         let (mean, var) = if let (Some(rm), Some(rv)) = (&self.running_mean, &self.running_var) {
-            (rm.data.as_ref(), rv.data.as_ref())
+            (rm.storage.as_slice(), rv.storage.as_slice())
         } else {
             // Compute batch statistics
             batch_mean = self.compute_batch_mean(input)?;
             batch_var = self.compute_batch_var(input, &batch_mean)?;
-            (batch_mean.data.as_ref(), batch_var.data.as_ref())
+            (batch_mean.storage.as_slice(), batch_var.storage.as_slice())
         };
         
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(f, cfg,
             &output_data,
-            &*input.data,
+            input.storage.as_slice(),
             mean,
             var,
-            self.weight.as_ref().map(|w| &*w.data).unwrap_or(mean), // Use mean as dummy for null pointer
-            self.bias.as_ref().map(|b| &*b.data).unwrap_or(mean),   // Use mean as dummy for null pointer
+            self.weight.as_ref().map(|w| w.storage.as_slice()).unwrap_or(mean), // Use mean as dummy for null pointer
+            self.bias.as_ref().map(|b| b.storage.as_slice()).unwrap_or(mean),   // Use mean as dummy for null pointer
             self.eps,
             dims[0] as i32,
             self.num_features as i32,

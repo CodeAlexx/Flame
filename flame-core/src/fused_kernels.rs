@@ -63,9 +63,9 @@ extern "C" __global__ void bias_gelu_kernel(
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(total_elems);
         
         launch_kernel!(f, cfg,
-            output.data_mut(),
-            x.data(),
-            bias.data(),
+            output.storage.as_slice(),
+            x.storage.as_slice(),
+            bias.storage.as_slice(),
             batch_size,
             seq_len,
             hidden_size
@@ -194,12 +194,12 @@ extern "C" __global__ void layernorm_linear_kernel(
         };
         
         launch_kernel!(f, grid,
-            output.data_mut(),
-            x.data(),
-            gamma.data(),
-            beta.data(),
-            weight.data(),
-            bias_to_use.data(),
+            output.storage.as_slice(),
+            x.storage.as_slice(),
+            gamma.storage.as_slice(),
+            beta.storage.as_slice(),
+            weight.storage.as_slice(),
+            bias_to_use.storage.as_slice(),
             batch_size,
             seq_len,
             hidden_size,
@@ -327,13 +327,9 @@ extern "C" __global__ void fused_attention_kernel(
 "#;
         
         // Use Flash Attention for fused implementation
-        crate::flash_attention::FlashAttention::new(
-            crate::flash_attention::FlashAttentionConfig {
-                is_causal: mask.is_some(),
-                ..Default::default()
-            },
-            q.device.clone()
-        ).forward(q, k, v, false)  // Assume inference mode for fused kernel
+        let fa = crate::flash_attention::FlashAttention::new()
+            .with_causal(mask.is_some());
+        fa.forward(q, k, v, mask)
     }
     
     /// Fused residual + LayerNorm
@@ -465,9 +461,9 @@ extern "C" __global__ void gelu_backward_kernel(
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
         
         launch_kernel!(f, cfg,
-            grad_input.data_mut(),
-            grad_output.data(),
-            input.data(),
+            grad_input.storage.as_slice(),
+            grad_output.storage.as_slice(),
+            input.storage.as_slice(),
             numel
         )?;
         
@@ -526,10 +522,10 @@ extern "C" __global__ void adam_step_kernel(
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
         
         launch_kernel!(f, cfg,
-            param.data_mut(),
-            m.data_mut(),
-            v.data_mut(),
-            grad.data(),
+            param.storage.as_slice(),
+            m.storage.as_slice(),
+            v.storage.as_slice(),
+            grad.storage.as_slice(),
             lr,
             beta1,
             beta2,

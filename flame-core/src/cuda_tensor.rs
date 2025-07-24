@@ -2,6 +2,24 @@ use crate::{Shape, Result, FlameError};
 use cudarc::driver::{CudaDevice, CudaSlice};
 use std::sync::Arc;
 
+// Helper to allocate from pool and copy data
+fn alloc_from_pool_and_copy(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<f32>> {
+    let f32_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
+    let mut cuda_data = crate::tensor::alloc_from_pool(device, f32_data.len())?;
+    device.htod_copy_into(&f32_data, &mut cuda_data).map_err(|_| FlameError::CudaDriver)?;
+    Ok(cuda_data)
+}
+
+
+// Helper function for allocating and copying to GPU via memory pool
+fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(device: &Arc<CudaDevice>, data: T) -> Result<CudaSlice<f32>> {
+    let slice = data.as_ref();
+    let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
+    device.htod_copy_into(slice, &mut cuda_data).map_err(|_| FlameError::CudaDriver)?;
+    Ok(cuda_data)
+}
+
+
 /// The core tensor type - owns CUDA memory and supports mutable operations
 pub struct CudaTensor {
     pub(crate) data: CudaSlice<f32>,
@@ -13,7 +31,7 @@ impl CudaTensor {
     /// Create a new tensor filled with zeros
     pub fn zeros(shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
         let size = shape.elem_count();
-        let data = device.alloc_zeros::<f32>(size)
+        let data = crate::tensor::alloc_zeros_from_pool(&device, size)
             .map_err(|_| FlameError::CudaDriver)?;
         Ok(Self { data, shape, device })
     }
@@ -26,7 +44,7 @@ impl CudaTensor {
                 got: Shape::from_dims(&[data.len()]),
             });
         }
-        let data = device.htod_sync_copy(&data)
+        let data = alloc_and_copy_to_pool(&device, &data)
             .map_err(|_| FlameError::CudaDriver)?;
         Ok(Self { data, shape, device })
     }
@@ -56,9 +74,9 @@ impl CudaTensor {
         }
 
         // Download to CPU
-        let mut weight_data = self.device.dtoh_sync_copy(&self.data)
+        let mut weight_data = self.device.dtoh_sync_copy(&self.data())
             .map_err(|_| FlameError::CudaDriver)?;
-        let grad_data = gradient.device.dtoh_sync_copy(&gradient.data)
+        let grad_data = gradient.device.dtoh_sync_copy(&gradient.data())
             .map_err(|_| FlameError::CudaDriver)?;
 
         // Update on CPU
@@ -67,7 +85,7 @@ impl CudaTensor {
         }
 
         // Upload back to GPU - create new slice
-        self.data = self.device.htod_sync_copy(&weight_data)
+        self.data = alloc_from_pool_and_copy(&self.device, &weight_data)
             .map_err(|_| FlameError::CudaDriver)?;
 
         Ok(())
@@ -93,9 +111,9 @@ impl CudaTensor {
         }
 
         // Download to CPU for matmul (temporary)
-        let a_data = self.device.dtoh_sync_copy(&self.data)
+        let a_data = self.device.dtoh_sync_copy(&self.data())
             .map_err(|_| FlameError::CudaDriver)?;
-        let b_data = other.device.dtoh_sync_copy(&other.data)
+        let b_data = other.device.dtoh_sync_copy(&other.data())
             .map_err(|_| FlameError::CudaDriver)?;
 
         // CPU matmul
@@ -121,7 +139,7 @@ impl CudaTensor {
 
     /// Copy to CPU for inspection
     pub fn to_vec(&self) -> Result<Vec<f32>> {
-        Ok(self.device.dtoh_sync_copy(&self.data)
+        Ok(self.device.dtoh_sync_copy(&self.data())
             .map_err(|_| FlameError::CudaDriver)?)
     }
 

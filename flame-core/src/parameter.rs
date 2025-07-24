@@ -49,7 +49,7 @@ impl Parameter {
     
     /// Get a clone of the current tensor value
     pub fn tensor(&self) -> Result<Tensor> {
-        Ok(self.data.lock().unwrap().clone()?)
+        self.data.lock().unwrap().clone()
     }
     
     /// Set gradient for this parameter

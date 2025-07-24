@@ -1,5 +1,6 @@
 use crate::{Result, Tensor, FlameError, Shape};
 use crate::tensor::TensorId;
+use crate::tensor_storage::TensorStorage;
 use crate::cuda_kernels::CudaKernels;
 use cudarc::cublas::CudaBlas;
 use std::sync::Arc;
@@ -229,17 +230,17 @@ impl GpuOps {
         };
         
         // Allocate output data
-        let mut output_data = unsafe { a.device.alloc::<f32>(m * n) }
+        let mut output_data = crate::tensor::alloc_from_pool(&a.device, m * n)
             .map_err(|_| FlameError::CudaDriver)?;
         
         unsafe {
-            blas.gemm(cfg, &*b.data, &*a.data, &mut output_data)
+            blas.gemm(cfg, b.storage.as_slice(), a.storage.as_slice(), &mut output_data)
                 .map_err(|_| FlameError::CuBlas)?;
         }
         
         // Create output tensor without autograd recording
         Ok(Tensor {
-            data: Arc::new(output_data),
+            storage: TensorStorage::F32 { data: output_data, numel: out_shape.elem_count() },
             shape: out_shape,
             device: a.device.clone(),
             id: TensorId::new(),

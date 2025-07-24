@@ -2,6 +2,7 @@
 
 use crate::{Tensor, Shape, Result, FlameError};
 use crate::autograd::{AutogradContext, Op};
+use crate::tensor_storage::TensorStorage;
 use std::sync::Arc;
 use cudarc::driver::{CudaDevice, CudaSlice, LaunchConfig, LaunchAsync};
 
@@ -230,9 +231,9 @@ pub fn layer_norm(
     let norm_size: usize = normalized_shape.iter().product();
     
     // Allocate output and intermediate buffers
-    let output_data = device.alloc_zeros::<f32>(input.shape().elem_count())?;
-    let mean_data = device.alloc_zeros::<f32>(batch_size)?;
-    let rstd_data = device.alloc_zeros::<f32>(batch_size)?;
+    let output_data = crate::tensor::alloc_zeros_from_pool(&device, input.shape().elem_count())?;
+    let mean_data = crate::tensor::alloc_zeros_from_pool(&device, batch_size)?;
+    let rstd_data = crate::tensor::alloc_zeros_from_pool(&device, batch_size)?;
     
     // Launch kernel
     let f = device.get_func("layer_norm_forward", "layer_norm_forward")
@@ -253,9 +254,9 @@ pub fn layer_norm(
         // Create launch parameters based on whether weight/bias exist
         if has_weight && has_bias {
             launch_kernel!(f, cfg,
-                input.data(),
-                weight.unwrap().data(),
-                bias.unwrap().data(),
+                input.storage.as_slice(),
+                weight.unwrap().storage.as_slice(),
+                bias.unwrap().storage.as_slice(),
                 &output_data,
                 &mean_data,
                 &rstd_data,
@@ -265,8 +266,8 @@ pub fn layer_norm(
             )?;
         } else if has_weight {
             launch_kernel!(f, cfg,
-                input.data(),
-                weight.unwrap().data(),
+                input.storage.as_slice(),
+                weight.unwrap().storage.as_slice(),
                 0usize, // null pointer for bias
                 &output_data,
                 &mean_data,
@@ -277,9 +278,9 @@ pub fn layer_norm(
             )?;
         } else if has_bias {
             launch_kernel!(f, cfg,
-                input.data(),
+                input.storage.as_slice(),
                 0usize, // null pointer for weight
-                bias.unwrap().data(),
+                bias.unwrap().storage.as_slice(),
                 &output_data,
                 &mean_data,
                 &rstd_data,
@@ -289,7 +290,7 @@ pub fn layer_norm(
             )?;
         } else {
             launch_kernel!(f, cfg,
-                input.data(),
+                input.storage.as_slice(),
                 0usize, // null pointer for weight
                 0usize, // null pointer for bias
                 &output_data,
@@ -303,7 +304,7 @@ pub fn layer_norm(
     }
     
     let mut output = Tensor {
-        data: Arc::new(output_data),
+        storage: TensorStorage::F32 { data: output_data, numel: input.shape().elem_count() },
         shape: input.shape().clone(),
         device: device.clone(),
         id: crate::tensor::TensorId::new(),
@@ -326,14 +327,14 @@ pub fn layer_norm(
         
         // Save mean and rstd for backward pass
         let mean_tensor = Tensor {
-            data: Arc::new(mean_data),
+            storage: TensorStorage::F32 { data: mean_data, numel: batch_size },
             shape: Shape::from_dims(&[batch_size]),
             device: device.clone(),
             id: crate::tensor::TensorId::new(),
             requires_grad: false,
         };
         let rstd_tensor = Tensor {
-            data: Arc::new(rstd_data),
+            storage: TensorStorage::F32 { data: rstd_data, numel: batch_size },
             shape: Shape::from_dims(&[batch_size]),
             device: device.clone(),
             id: crate::tensor::TensorId::new(),

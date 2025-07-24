@@ -227,7 +227,7 @@ impl CudaGradientOps {
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
         launch_kernel!(f, cfg,
-            grad.data.as_ref(),
+            grad.storage.as_slice(),
             clip_value,
             n as i32
         )?;
@@ -259,7 +259,7 @@ impl CudaGradientOps {
         let num_blocks = (n + block_size - 1) / block_size;
         
         // Allocate partial sums
-        let partial_sums = self.device.alloc_zeros::<f32>(num_blocks)?;
+        let partial_sums = crate::tensor::alloc_zeros_from_pool(&self.device, num_blocks)?;
         
         // First reduction pass
         let f1 = self.device
@@ -273,13 +273,13 @@ impl CudaGradientOps {
         };
         
         launch_kernel!(f1, cfg1,
-            tensor.data.as_ref(),
+            tensor.storage.as_slice(),
             &partial_sums,
             n as i32
         )?;
         
         // Final reduction
-        let norm_result = self.device.alloc_zeros::<f32>(1)?;
+        let norm_result = crate::tensor::alloc_zeros_from_pool(&self.device, 1)?;
         let f2 = self.device
             .get_func("gradient_ops", "finalize_l2_norm_kernel")
             .ok_or_else(|| FlameError::Cuda("Failed to get finalize_l2_norm kernel".into()))?;
@@ -317,8 +317,8 @@ impl CudaGradientOps {
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
         launch_kernel!(f, cfg,
-            grad.data.as_ref(),
-            noise.data.as_ref(),
+            grad.storage.as_slice(),
+            noise.storage.as_slice(),
             noise_scale,
             n as i32
         )?;
@@ -336,7 +336,7 @@ impl CudaGradientOps {
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
         launch_kernel!(f, cfg,
-            grad.data.as_ref(),
+            grad.storage.as_slice(),
             scale,
             n as i32
         )?;
@@ -354,7 +354,7 @@ impl CudaGradientOps {
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
         launch_kernel!(f, cfg,
-            tensor.data.as_ref(),
+            tensor.storage.as_slice(),
             min_val,
             max_val,
             n as i32
@@ -389,10 +389,10 @@ impl CudaGradientOps {
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
         launch_kernel!(f, cfg,
-            param.data.as_ref(),
-            m.data.as_ref(),
-            v.data.as_ref(),
-            grad.data.as_ref(),
+            param.storage.as_slice(),
+            m.storage.as_slice(),
+            v.storage.as_slice(),
+            grad.storage.as_slice(),
             lr,
             beta1,
             beta2,

@@ -65,7 +65,7 @@ impl Clone for Tensor {
             .expect("Failed to allocate GPU memory for clone");
         
         // Copy data from source to destination
-        self.device.dtod_copy(&self.data, &mut data)
+        self.device.dtod_copy(&self.data(), &mut data)
             .expect("Failed to copy GPU data");
         
         // Clone the gradient if it exists
@@ -200,7 +200,7 @@ impl Tensor {
         };
         
         unsafe {
-            blas.gemm(cfg, &other.data, &self.data, &mut output.data)
+            blas.gemm(cfg, &other.data(), &self.data(), &mut output.data())
                 .map_err(|_| FlameError::CuBlas)?;
         }
         
@@ -285,7 +285,7 @@ impl Tensor {
                 let mut batch_output = self.device.alloc_zeros::<f32>(m * n)
                     .map_err(|_| FlameError::CudaDriver)?;
                     
-                blas.gemm(cfg, &other_batch.data, &self_batch.data, &mut batch_output)
+                blas.gemm(cfg, &other_batch.data(), &self_batch.data(), &mut batch_output)
                     .map_err(|_| FlameError::CuBlas)?;
                     
                 // Now actually tries GPU-to-GPU memory copy
@@ -311,7 +311,7 @@ extern "C" __global__ void copy_at_offset(
                 let cfg = cudarc::driver::LaunchConfig::for_num_elems((m * n) as u32);
                 
                 launch_kernel!(f, cfg,
-                    &output.data,
+                    &output.data(),
                     &batch_output,
                     output_offset as i32,
                     (m * n) as i32
@@ -376,7 +376,7 @@ extern "C" __global__ void slice_kernel(
         
         launch_kernel!(f, cfg,
             &slice_data,
-            &self.data,
+            &self.data(),
             start as i32,
             len as i32
         )?;
@@ -482,7 +482,7 @@ extern "C" __global__ void slice_kernel(
 
     /// Copy to CPU
     pub fn to_vec(&self) -> Result<Vec<f32>> {
-        Ok(self.device.dtoh_sync_copy(&self.data)
+        Ok(self.device.dtoh_sync_copy(&self.data())
             .map_err(|_| FlameError::CudaDriver)?)
     }
 
@@ -519,12 +519,12 @@ extern "C" __global__ void slice_kernel(
     
     /// Get raw data reference (for internal use by CUDA kernels)
     pub fn data(&self) -> &CudaSlice<f32> {
-        &self.data
+        &self.data()
     }
     
     /// Get mutable raw data reference (for internal use by CUDA kernels)
     pub fn data_mut(&mut self) -> &mut CudaSlice<f32> {
-        &mut self.data
+        &mut self.data()
     }
     
     /// Clone the tensor (creates a new tensor with copied data)
@@ -532,7 +532,7 @@ extern "C" __global__ void slice_kernel(
         let mut data = unsafe { self.device.alloc::<f32>(self.shape.elem_count()) }
             .map_err(|_| FlameError::CudaDriver)?;
         
-        self.device.dtod_copy(&self.data, &mut data)
+        self.device.dtod_copy(&self.data(), &mut data)
             .map_err(|_| FlameError::CudaDriver)?;
         
         Ok(Tensor {
@@ -550,7 +550,7 @@ extern "C" __global__ void slice_kernel(
         let mut data = unsafe { self.device.alloc::<f32>(self.shape.elem_count()) }
             .map_err(|_| FlameError::CudaDriver)?;
         
-        self.device.dtod_copy(&self.data, &mut data)
+        self.device.dtod_copy(&self.data(), &mut data)
             .map_err(|_| FlameError::CudaDriver)?;
             
         Ok(Tensor {
@@ -618,7 +618,7 @@ extern "C" __global__ void slice_kernel(
         }
         
         Ok(Tensor {
-            data: self.data.clone(),
+            data: self.data().clone(),
             shape: Shape::from_dims(new_shape),
             device: self.device.clone(),
             requires_grad: self.requires_grad,
@@ -805,7 +805,7 @@ extern "C" __global__ void slice_kernel(
         let mut result = vec![0.0f32; data.len()];
         
         let features = shape[shape.len() - 1];
-        for i in 0..data.len() {
+        for i in 0..data().len() {
             let feature_idx = i % features;
             result[i] = data[i] + bias_data[feature_idx];
         }
@@ -833,11 +833,11 @@ extern "C" __global__ void slice_kernel(
     
     /// Get a CUDA slice reference to the tensor data
     pub fn to_cuda_slice(&self) -> Result<&CudaSlice<f32>> {
-        Ok(&self.data)
+        Ok(&self.data())
     }
     
     /// Get a mutable CUDA slice reference to the tensor data
     pub fn to_cuda_slice_mut(&mut self) -> Result<&mut CudaSlice<f32>> {
-        Ok(&mut self.data)
+        Ok(&mut self.data())
     }
 }

@@ -139,7 +139,7 @@ impl Conv3d {
     fn conv3d_cuda(&self, input: &Tensor, output_shape: Shape) -> Result<Tensor> {
         // Allocate output data
         let output_numel = output_shape.elem_count();
-        let mut output_data = unsafe { self.device.alloc::<f32>(output_numel) }
+        let mut output_data = crate::tensor::alloc_from_pool(&self.device, output_numel)
             .map_err(|_| FlameError::CudaDriver)?;
         
         // Compile and load kernel
@@ -187,8 +187,8 @@ impl Conv3d {
         };
         
         launch_kernel!(f, cfg,
-            &*input.data,
-            &*self.weight.data,
+            input.storage.as_slice(),
+            self.weight.storage.as_slice(),
             &mut output_data,
             params
         )?;
@@ -225,15 +225,15 @@ impl Conv3d {
         let elems_per_channel = (dims[2] * dims[3] * dims[4]) as i32;
         
         // Allocate new output data
-        let mut output_data = unsafe { self.device.alloc::<f32>(total_elems) }
+        let mut output_data = crate::tensor::alloc_from_pool(&self.device, total_elems)
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(total_elems as u32);
         
         launch_kernel!(kernel, cfg,
             &mut output_data,
-            &*output.data,
-            &*bias.data,
+            output.storage.as_slice(),
+            bias.storage.as_slice(),
             total_elems as i32,
             self.out_channels as i32,
             elems_per_channel
@@ -467,7 +467,7 @@ impl BatchNorm3d {
         let spatial_size = (dims[2] * dims[3] * dims[4]) as i32;
         
         // Allocate output data
-        let mut output_data = unsafe { self.device.alloc::<f32>(total_elems) }
+        let mut output_data = crate::tensor::alloc_from_pool(&self.device, total_elems)
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(total_elems as u32);
@@ -475,9 +475,9 @@ impl BatchNorm3d {
         // For now, use a simplified kernel without optional weight/bias
         // In production, you'd handle all cases properly
         launch_kernel!(kernel, cfg,
-            &*input.data,
-            &*mean.data,
-            &*var.data,
+            input.storage.as_slice(),
+            mean.storage.as_slice(),
+            var.storage.as_slice(),
             &mut output_data,
             total_elems as i32,
             self.num_features as i32,

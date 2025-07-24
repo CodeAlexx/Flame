@@ -86,7 +86,7 @@ extern "C" __global__ void add_kernel(float *out, const float *a, const float *b
         let numel = a.shape.elem_count() as i32;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, output.data_mut(), a.data(), b.data(), numel)?;
+        launch_kernel!(f, cfg, output.data()?, a.storage.as_slice(), b.storage.as_slice(), numel)?;
         
         Ok(output)
     }
@@ -117,7 +117,7 @@ extern "C" __global__ void mul_kernel(float *out, const float *a, const float *b
         let numel = a.shape.elem_count() as i32;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, output.data_mut(), a.data(), b.data(), numel)?;
+        launch_kernel!(f, cfg, output.data()?, a.storage.as_slice(), b.storage.as_slice(), numel)?;
         
         Ok(output)
     }
@@ -141,7 +141,7 @@ extern "C" __global__ void mul_scalar_kernel(float *out, const float *input, flo
         let numel = tensor.shape.elem_count() as i32;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, output.data_mut(), tensor.data(), scalar, numel)?;
+        launch_kernel!(f, cfg, output.data()?, tensor.storage.as_slice(), scalar, numel)?;
         
         Ok(output)
     }
@@ -165,7 +165,7 @@ extern "C" __global__ void relu_kernel(float *out, const float *input, int numel
         let numel = tensor.shape.elem_count() as i32;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, output.data_mut(), tensor.data(), numel)?;
+        launch_kernel!(f, cfg, output.data()?, tensor.storage.as_slice(), numel)?;
         
         Ok(output)
     }
@@ -195,7 +195,7 @@ extern "C" __global__ void update_weights_kernel(float *weights, const float *gr
         let numel = weights.shape.elem_count() as i32;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, weights.data_mut(), gradients.data(), lr, numel)?;
+        launch_kernel!(f, cfg, weights.data()?, gradients.storage.as_slice(), lr, numel)?;
         
         Ok(())
     }
@@ -247,7 +247,7 @@ extern "C" __global__ void sum_kernel(float *out, const float *input, int numel)
             shared_mem_bytes: block_size * 4, // 4 bytes per float
         };
         
-        launch_kernel!(f, cfg, output.data_mut(), tensor.data(), numel)?;
+        launch_kernel!(f, cfg, output.data()?, tensor.storage.as_slice(), numel)?;
         
         Ok(output)
     }
@@ -311,7 +311,7 @@ extern "C" __global__ void transpose_kernel(
             shared_mem_bytes: (tile_size * (tile_size + 1) * 4) as u32, // Extra column to avoid bank conflicts
         };
         
-        launch_kernel!(f, cfg, output.data_mut(), tensor.data(), rows as i32, cols as i32)?;
+        launch_kernel!(f, cfg, output.data()?, tensor.storage.as_slice(), rows as i32, cols as i32)?;
         
         Ok(output)
     }
@@ -419,8 +419,8 @@ extern "C" __global__ void im2col_kernel(
             };
             
             unsafe {
-                let input_slice = input.data().slice(batch_offset..);
-                let output_slice = output.data_mut().slice_mut(col_offset..);
+                let input_slice = input.storage.as_slice().slice(batch_offset..);
+                let output_slice = output.data()?.slice_mut(col_offset..);
                 
                 launch_kernel!(f, cfg,
                     &input_slice,

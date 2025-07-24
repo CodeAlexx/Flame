@@ -386,12 +386,12 @@ extern "C" __global__ void relu_backward_kernel(
             .ok_or_else(|| crate::FlameError::Cuda("Failed to get relu_backward kernel".into()))?;
         
         let numel = input.shape().elem_count();
-        let mut grad_in = unsafe { input.device.alloc::<f32>(numel) }
+        let mut grad_in = crate::tensor::alloc_from_pool(&input.device, numel)
             .map_err(|_| crate::FlameError::CudaDriver)?;
         
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(f, cfg,
-            &grad_in, &*grad_out.data, &*input.data, numel as i32
+            &grad_in, grad_out.storage.as_slice(), input.storage.as_slice(), numel as i32
         )?;
         
         Ok(crate::cuda_kernels::create_output_tensor(

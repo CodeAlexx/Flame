@@ -1,0 +1,109 @@
+use crate::{Result, FlameError, Shape, DType};
+use crate::memory_pool::MEMORY_POOL;
+use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync};
+use half::{f16, bf16};
+use std::sync::Arc;
+
+/// Actual storage backend for tensors with proper dtype support
+#[derive(Clone)]
+pub enum TensorStorage {
+    F32 { data: CudaSlice<f32>, numel: usize },
+    F16 { data: CudaSlice<f32>, numel: usize, scale: f32 },  // Store as F32 but with quantization scale
+    BF16 { data: CudaSlice<f32>, numel: usize }, // Store as F32 but convert on operations
+    I8 { data: CudaSlice<i8>, numel: usize },  // INT8 support for Sage Attention
+}
+
+impl TensorStorage {
+    /// Get the dtype of this storage
+    pub fn dtype(&self) -> DType {
+        match self {
+            TensorStorage::F32 { .. } => DType::F32,
+            TensorStorage::F16 { .. } => DType::F16,
+            TensorStorage::BF16 { .. } => DType::BF16,
+            TensorStorage::I8 { .. } => DType::I8,
+        }
+    }
+    
+    /// Get number of elements
+    pub fn len(&self) -> usize {
+        match self {
+            TensorStorage::F32 { numel, .. } => *numel,
+            TensorStorage::F16 { numel, .. } => *numel,
+            TensorStorage::BF16 { numel, .. } => *numel,
+            TensorStorage::I8 { numel, .. } => *numel,
+        }
+    }
+    
+    /// Allocate new storage using memory pool
+    pub fn zeros(shape: &Shape, dtype: DType, device: &Arc<CudaDevice>) -> Result<Self> {
+        let numel = shape.elem_count();
+        
+        // Get memory pool for this device
+        let pool = MEMORY_POOL.get_pool(device)?;
+        
+        // Allocate from pool - always as F32 for now since cudarc doesn't support f16/bf16 directly
+        let mut data = pool.lock().unwrap().allocate(numel)?;
+        
+        // Zero out the memory
+        device.memset_zeros(&mut data)?;
+        
+        match dtype {
+            DType::F32 => Ok(TensorStorage::F32 { data, numel }),
+            DType::F16 => Ok(TensorStorage::F16 { data, numel, scale: 1.0 }),
+            DType::BF16 => Ok(TensorStorage::BF16 { data, numel }),
+            DType::I8 => {
+                // For I8, we need to allocate i8 storage
+                // Note: This requires proper i8 allocation support in memory pool
+                Err(FlameError::InvalidOperation(
+                    "I8 allocation not yet supported in zeros - use quantization functions".into()
+                ))
+            }
+            DType::F64 | DType::U8 | DType::U32 | DType::I64 => {
+                Err(FlameError::InvalidOperation(
+                    format!("Unsupported dtype in TensorStorage: {:?}", dtype)
+                ))
+            }
+        }
+    }
+    
+    /// Convert to F32 (for operations that don't support F16)
+    pub fn to_f32(&self, device: &Arc<CudaDevice>) -> Result<CudaSlice<f32>> {
+        match self {
+            TensorStorage::F32 { data, numel } | 
+            TensorStorage::F16 { data, numel, .. } | 
+            TensorStorage::BF16 { data, numel } => {
+                // For now, all are stored as F32, so just clone
+                let pool = MEMORY_POOL.get_pool(device)?;
+                let mut out = pool.lock().unwrap().allocate(*numel)?;
+                device.dtod_copy(data, &mut out)?;
+                Ok(out)
+            }
+            TensorStorage::I8 { .. } => {
+                Err(FlameError::InvalidOperation(
+                    "I8 to F32 conversion not yet implemented".into()
+                ))
+            }
+        }
+    }
+    
+    /// Get a reference to the underlying CudaSlice (for f32-backed storage)
+    pub fn as_slice(&self) -> &CudaSlice<f32> {
+        match self {
+            TensorStorage::F32 { data, .. } |
+            TensorStorage::F16 { data, .. } |
+            TensorStorage::BF16 { data, .. } => data,
+            TensorStorage::I8 { .. } => panic!("Cannot get f32 slice from I8 storage"),
+        }
+    }
+    
+    /// Get a reference to the underlying I8 CudaSlice
+    pub fn as_i8_slice(&self) -> Result<&CudaSlice<i8>> {
+        match self {
+            TensorStorage::I8 { data, .. } => Ok(data),
+            _ => Err(FlameError::InvalidOperation("Not an I8 tensor".into())),
+        }
+    }
+}
+
+// TODO: Implement proper F16/BF16 conversion kernels when we have better GPU support
+// For now, we store everything as F32 but track the intended dtype for API compatibility

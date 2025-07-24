@@ -1,14 +1,26 @@
+/// Macro for launching CUDA kernels
+#[macro_export]
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
+}
+
 pub mod dtype;
 pub mod error;
 pub mod shape;
+pub mod tensor_storage;
 pub mod tensor;
 pub mod gradient;
+pub mod memory_pool;
 pub mod device;
 pub mod linear;
 pub mod conv;
 pub mod cuda_conv2d;
 pub mod layer_norm;
 pub mod norm;
+pub mod group_norm;
+pub mod flash_attention;
 pub mod embedding;
 pub mod cuda_kernels;
 pub mod cuda_kernels_gpu;
@@ -44,7 +56,6 @@ pub mod activations;
 // pub mod eridiffusion_adapter;  // Temporarily disable due to candle_interop dependency
 pub mod conv3d;
 pub mod conv3d_simple;
-pub mod flash_attention;
 pub mod fused_kernels;
 pub mod samplers;
 // pub mod tokenizer;  // Removed: model-specific
@@ -58,6 +69,8 @@ pub mod lora;
 // pub mod sdxl_attention;  // Removed: model-specific
 // pub mod sdxl_unet_blocks;  // Removed: model-specific
 pub mod loss;
+pub mod gradient_checkpointing;
+pub mod sage_attention;
 
 pub use dtype::DType;
 pub use error::{FlameError, Result};
@@ -65,6 +78,8 @@ pub use shape::Shape;
 pub use tensor::{Tensor, TensorId};
 pub use autograd::{AutogradContext, Op};
 pub use gradient::{GradientMap, TensorGradExt};
+pub use group_norm::{group_norm, GroupNorm};
+pub use flash_attention::{flash_attention_forward, FlashAttention};
 
 // Re-export cudarc types we use
 pub use cudarc::driver::CudaDevice;

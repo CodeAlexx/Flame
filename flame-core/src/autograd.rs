@@ -3,8 +3,9 @@
 //! This module provides a clean, integrated autograd system that works
 //! seamlessly with the Tensor API.
 
-use crate::{Tensor, Result, FlameError, Shape};
+use crate::{Tensor, Result, FlameError, Shape, DType};
 use crate::tensor::TensorId;
+use crate::tensor_storage::TensorStorage;
 use crate::gradient::GradientMap;
 use crate::cuda_ops::GpuOps;
 use crate::cuda_kernels_gpu::CudaKernels;
@@ -39,7 +40,6 @@ pub enum Op {
     Conv2d { input: TensorId, weight: TensorId, stride: usize, padding: usize },
     Linear { input: TensorId, weight: TensorId, bias: Option<TensorId> },
     LayerNorm { input: TensorId, normalized_shape: Vec<usize> },
-    GroupNorm { input: TensorId, num_groups: usize, weight: Option<TensorId>, bias: Option<TensorId> },
     RMSNorm { input: TensorId, weight: Option<TensorId>, eps: f32 },
     BatchMatMul { lhs: TensorId, rhs: TensorId },
     Reshape { input: TensorId, new_shape: Vec<usize> },
@@ -62,6 +62,16 @@ pub enum Op {
     HuberLoss { predictions: TensorId, targets: TensorId, delta: f32, num_elements: usize },
     BCELoss { predictions: TensorId, targets: TensorId, num_elements: usize },
     NLLLoss { log_probs: TensorId, targets: TensorId, batch_size: usize },
+    GroupNorm { input: TensorId, num_groups: usize, weight: Option<TensorId>, bias: Option<TensorId> },
+    FlashAttention { query: TensorId, key: TensorId, value: TensorId, mask: Option<TensorId>, scale: f32, causal: bool },
+    SageAttention {
+        query_id: TensorId,
+        key_id: TensorId,
+        value_id: TensorId,
+        scale: f32,
+        causal: bool,
+        quantized: bool,
+    },
 }
 
 /// Entry in the computation tape
@@ -583,63 +593,6 @@ fn compute_gradients(
             Ok(gradients)
         }
         
-        Op::GroupNorm { input, num_groups, weight, bias } => {
-            // GroupNorm backward pass
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
-            let shape = input_tensor.shape().dims();
-            let channels = shape[1];
-            let batch_size = shape[0];
-            
-            // Reshape for group norm: [N, G, C/G, H, W]
-            let group_size = channels / num_groups;
-            let mut new_shape = vec![batch_size, *num_groups, group_size];
-            new_shape.extend_from_slice(&shape[2..]);
-            
-            let reshaped = input_tensor.reshape(&new_shape)?;
-            
-            // Calculate mean and variance per group
-            let mut dims_to_reduce = vec![2];
-            for i in 3..new_shape.len() {
-                dims_to_reduce.push(i);
-            }
-            let mean = reshaped.mean_dims(&dims_to_reduce, true)?;
-            let var = reshaped.var_dims(&dims_to_reduce, true, true)?;
-            
-            // Normalize
-            let eps = 1e-5;
-            let std = var.add_scalar(eps)?.sqrt()?;
-            let normalized = reshaped.sub(&mean)?.div(&std)?;
-            
-            // Reshape back
-            let normalized = normalized.reshape(shape)?;
-            
-            // Compute gradients
-            let weight_tensor = weight.as_ref().and_then(|w| entry.saved_tensors.get(w));
-            let bias_tensor = bias.as_ref().and_then(|b| entry.saved_tensors.get(b));
-            
-            let (grad_input, grad_weight, grad_bias) = crate::autograd_ops_complete::layer_norm_backward(
-                output_grad,
-                input_tensor,
-                &normalized,
-                weight_tensor,
-                bias_tensor,
-                &mean.reshape(&[batch_size, *num_groups, 1])?,
-                &var.reshape(&[batch_size, *num_groups, 1])?,
-                &[channels],
-                eps,
-            )?;
-            
-            let mut grads = vec![(*input, grad_input)];
-            if let (Some(w_id), Some(gw)) = (*weight, grad_weight) {
-                grads.push((w_id, gw));
-            }
-            if let (Some(b_id), Some(gb)) = (*bias, grad_bias) {
-                grads.push((b_id, gb));
-            }
-            
-            Ok(grads)
-        }
         
         Op::RMSNorm { input, weight, eps } => {
             // RMSNorm backward pass
@@ -1119,6 +1072,127 @@ fn compute_gradients(
             Ok(vec![(*log_probs, final_grad)])
         }
         
+        Op::GroupNorm { input, num_groups, weight, bias } => {
+            // GroupNorm backward pass
+            let input_tensor = entry.saved_tensors.get(input)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let shape = input_tensor.shape().dims();
+            let num_channels = shape[1];
+            
+            // Saved mean and variance should be in saved_tensors
+            let mean = entry.saved_tensors.values()
+                .find(|t| t.shape().dims() == &[shape[0], *num_groups])
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved mean".into()))?;
+            let var = entry.saved_tensors.values()
+                .skip(1)
+                .find(|t| t.shape().dims() == &[shape[0], *num_groups])
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved variance".into()))?;
+            
+            // Compute gradients
+            let weight_tensor = weight.and_then(|w| entry.saved_tensors.get(&w));
+            let bias_tensor = bias.and_then(|b| entry.saved_tensors.get(&b));
+            
+            let (grad_input, grad_weight, grad_bias) = crate::autograd_ops_complete::group_norm_backward(
+                output_grad,
+                input_tensor,
+                mean,
+                var,
+                weight_tensor,
+                *num_groups,
+                1e-5,
+            )?;
+            
+            let mut grads = vec![(*input, grad_input)];
+            if let (Some(w_id), Some(gw)) = (*weight, grad_weight) {
+                grads.push((w_id, gw));
+            }
+            if let (Some(b_id), Some(gb)) = (*bias, grad_bias) {
+                grads.push((b_id, gb));
+            }
+            
+            Ok(grads)
+        }
+        
+        Op::FlashAttention { query, key, value, mask, scale, causal } => {
+            // FlashAttention backward pass
+            let query_tensor = entry.saved_tensors.get(query)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for query".into()))?;
+            let key_tensor = entry.saved_tensors.get(key)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for key".into()))?;
+            let value_tensor = entry.saved_tensors.get(value)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for value".into()))?;
+            
+            let mask_tensor = if let Some(m_id) = mask {
+                entry.saved_tensors.get(m_id)
+            } else {
+                None
+            };
+            
+            // We need to get the output tensor from saved tensors
+            // The output should have been saved during the forward pass
+            let output_tensor = entry.saved_tensors.values()
+                .find(|t| t.shape().dims() == output_grad.shape().dims() && t.id != query_tensor.id && t.id != key_tensor.id && t.id != value_tensor.id)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved output tensor".into()))?;
+            
+            // Call flash attention backward
+            let (grad_q, grad_k, grad_v) = crate::flash_attention::flash_attention_backward(
+                output_grad,
+                query_tensor,
+                key_tensor,
+                value_tensor,
+                mask_tensor,
+                output_tensor,
+                *scale,
+                *causal,
+            )?;
+            
+            let mut grads = vec![
+                (*query, grad_q),
+                (*key, grad_k),
+                (*value, grad_v),
+            ];
+            
+            Ok(grads)
+        }
+        
+        Op::SageAttention { query_id, key_id, value_id, scale, causal, quantized } => {
+            // SageAttention backward pass
+            let query_tensor = entry.saved_tensors.get(query_id)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for query".into()))?;
+            let key_tensor = entry.saved_tensors.get(key_id)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for key".into()))?;
+            let value_tensor = entry.saved_tensors.get(value_id)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for value".into()))?;
+            
+            // Get attention weights (should be saved with a known ID)
+            // In SageAttention forward, attention_weights.id is saved in saved_tensors
+            let attention_weights = entry.saved_tensors.values()
+                .find(|t| t.shape().dims().len() == 4 && 
+                      t.shape().dims()[0] == query_tensor.shape().dims()[0] &&
+                      t.shape().dims()[1] == query_tensor.shape().dims()[1] &&
+                      t.shape().dims()[2] == query_tensor.shape().dims()[2] && 
+                      t.shape().dims()[3] == key_tensor.shape().dims()[2])
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved attention weights".into()))?;
+            
+            // Call sage attention backward
+            let (grad_q, grad_k, grad_v) = crate::sage_attention::sage_attention_backward(
+                output_grad,
+                query_tensor,
+                key_tensor,
+                value_tensor,
+                attention_weights,
+                *scale,
+                *causal,
+                *quantized,
+            )?;
+            
+            Ok(vec![
+                (*query_id, grad_q),
+                (*key_id, grad_k),
+                (*value_id, grad_v),
+            ])
+        }
+        
         _ => {
             // This should not happen if all operations are implemented
             Err(FlameError::InvalidOperation(
@@ -1177,10 +1251,9 @@ fn relu_backward(grad_output: &Tensor, input: &Tensor) -> Result<Tensor> {
     // We need to create a mask without using tensor operations that record to autograd
     
     // Create zero tensor for comparison
-    let zero_data = unsafe { input.device.alloc_zeros::<f32>(input.shape.elem_count()) }
-        .map_err(|_| FlameError::CudaDriver)?;
+    let zero_data = crate::tensor::alloc_zeros_from_pool(&input.device, input.shape.elem_count())?;
     let zero = Tensor {
-        data: Arc::new(zero_data),
+        storage: TensorStorage::F32 { data: zero_data, numel: input.shape.elem_count() },
         shape: input.shape.clone(),
         device: input.device.clone(),
         id: TensorId::new(),

@@ -99,11 +99,11 @@ impl TensorData {
     }
     
     pub fn tensor(&self) -> Tensor {
-        self.data.borrow().tensor.clone().expect("tensor clone failed")
+        self.data().borrow().tensor.clone().expect("tensor clone failed")
     }
     
     pub fn accumulate_grad(&self, grad: Tensor) -> Result<()> {
-        let mut inner = self.data.borrow_mut();
+        let mut inner = self.data().borrow_mut();
         match &mut inner.grad {
             Some(existing) => {
                 *existing = existing.add(&grad)?;
@@ -116,15 +116,15 @@ impl TensorData {
     }
     
     pub fn grad(&self) -> Option<Tensor> {
-        self.data.borrow().grad.as_ref().and_then(|g| g.clone().ok())
+        self.data().borrow().grad.as_ref().and_then(|g| g.clone().ok())
     }
     
     pub fn zero_grad(&self) {
-        self.data.borrow_mut().grad = None;
+        self.data().borrow_mut().grad = None;
     }
     
     pub fn requires_grad(&self) -> bool {
-        self.data.borrow().requires_grad
+        self.data().borrow().requires_grad
     }
 }
 

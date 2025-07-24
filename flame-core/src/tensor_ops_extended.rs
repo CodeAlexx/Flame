@@ -666,14 +666,6 @@ impl Tensor {
         Tensor::from_slice(&data, Shape::from_dims(&[n]), device)
     }
     
-    /// Convert to different dtype (for now just f32 -> f32)
-    pub fn to_dtype(&self, dtype: crate::DType) -> Result<Tensor> {
-        // For now, we only support f32
-        match dtype {
-            crate::DType::F32 => Ok(self.clone()?),
-            _ => Err(FlameError::InvalidOperation("Only F32 dtype is currently supported".into())),
-        }
-    }
     
     /// Compute sign of elements (-1, 0, or 1)
     pub fn sign(&self) -> Result<Tensor> {

@@ -3,6 +3,15 @@ use cudarc::driver::{CudaDevice, CudaSlice};
 use cudarc::cublas::CudaBlas;
 use std::sync::Arc;
 
+// Helper function for allocating and copying to GPU via memory pool
+fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(device: &Arc<CudaDevice>, data: T) -> Result<CudaSlice<f32>> {
+    let slice = data.as_ref();
+    let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
+    device.htod_copy_into(slice, &mut cuda_data).map_err(|_| FlameError::CudaDriver)?;
+    Ok(cuda_data)
+}
+
+
 /// The core tensor type - owns CUDA memory and supports mutable operations
 pub struct CudaTensor {
     pub(crate) data: CudaSlice<f32>,
@@ -14,7 +23,7 @@ impl CudaTensor {
     /// Create a new tensor filled with zeros
     pub fn zeros(shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
         let size = shape.elem_count();
-        let data = device.alloc_zeros::<f32>(size)
+        let data = crate::tensor::alloc_zeros_from_pool(&device, size)
             .map_err(|_| FlameError::CudaDriver)?;
         Ok(Self { data, shape, device })
     }
@@ -27,7 +36,7 @@ impl CudaTensor {
                 got: Shape::from_dims(&[data.len()]),
             });
         }
-        let data = device.htod_sync_copy(&data)
+        let data = alloc_and_copy_to_pool(&device, &data)
             .map_err(|_| FlameError::CudaDriver)?;
         Ok(Self { data, shape, device })
     }
@@ -61,14 +70,14 @@ impl CudaTensor {
         let blas = CudaBlas::new(self.device.clone())
             .map_err(|_| FlameError::CuBlas)?;
         unsafe {
-            // y = alpha * x + y where y is self.data, x is gradient.data
+            // y = alpha * x + y where y is self.data(), x is gradient.data()
             cudarc::cublas::sys::cublasSaxpy_v2(
                 blas.handle().cast(),
                 self.shape.elem_count() as i32,
                 &(-lr) as *const f32,
-                gradient.data.as_ptr(),
+                gradient.data().as_ptr(),
                 1,
-                self.data.as_mut_ptr(),
+                self.data().as_mut_ptr(),
                 1,
             );
         }
@@ -108,12 +117,12 @@ impl CudaTensor {
                 m as i32,
                 k as i32,
                 &1.0f32,
-                other.data.as_ptr(),
+                other.data().as_ptr(),
                 n as i32,
-                self.data.as_ptr(),
+                self.data().as_ptr(),
                 k as i32,
                 &0.0f32,
-                output.data.as_mut_ptr(),
+                output.data().as_mut_ptr(),
                 n as i32,
             ).map_err(|_| FlameError::CuBlas)?;
         }
@@ -133,7 +142,7 @@ impl CudaTensor {
                 .map_err(|_| FlameError::CuBlas)?;
             
             // Copy self to output
-            self.device.dtod_copy(&self.data, &mut output.data)
+            self.device.dtod_copy(&self.data(), &mut output.data())
                 .map_err(|_| FlameError::CudaDriver)?;
             
             // Add other to output
@@ -142,9 +151,9 @@ impl CudaTensor {
                     blas.handle().cast(),
                     size as i32,
                     &1.0f32 as *const f32,
-                    other.data.as_ptr(),
+                    other.data().as_ptr(),
                     1,
-                    output.data.as_mut_ptr(),
+                    output.data().as_mut_ptr(),
                     1,
                 );
             }
@@ -162,7 +171,7 @@ impl CudaTensor {
 
     /// Copy to CPU for inspection
     pub fn to_vec(&self) -> Result<Vec<f32>> {
-        Ok(self.device.dtoh_sync_copy(&self.data)
+        Ok(self.device.dtoh_sync_copy(&self.data())
             .map_err(|_| FlameError::CudaDriver)?)
     }
 

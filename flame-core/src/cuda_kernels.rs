@@ -1,4 +1,5 @@
 use crate::{Tensor, Shape, Result, FlameError};
+use crate::tensor_storage::TensorStorage;
 use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig, CudaSlice, CudaFunction};
 use cudarc::nvrtc::compile_ptx;
 use std::sync::Arc;
@@ -16,8 +17,9 @@ macro_rules! launch_kernel {
 
 /// Helper to create output tensor from allocated data
 pub fn create_output_tensor(data: CudaSlice<f32>, shape: Shape, device: Arc<CudaDevice>) -> Tensor {
+    let numel = shape.elem_count();
     Tensor {
-        data: Arc::new(data),
+        storage: TensorStorage::F32 { data, numel },
         shape,
         device,
         id: crate::tensor::TensorId::new(),
@@ -99,7 +101,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, a.data.as_ref(), b.data.as_ref(), &*output.data, n as u32)?;
+        launch_kernel!(kernel, config, a.storage.as_slice(), b.storage.as_slice(), output.storage.as_slice(), n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -130,7 +132,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, a.data.as_ref(), b.data.as_ref(), &*output.data, n as u32)?;
+        launch_kernel!(kernel, config, a.storage.as_slice(), b.storage.as_slice(), output.storage.as_slice(), n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -154,7 +156,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), scalar, &*output.data, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), scalar, output.storage.as_slice(), n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -178,7 +180,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), scalar, &*output.data, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), scalar, output.storage.as_slice(), n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -202,7 +204,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -226,7 +228,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -250,7 +252,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -274,7 +276,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -298,7 +300,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -309,7 +311,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         // Allocate output directly as zeros
-        let output_data = self.device.alloc_zeros::<f32>(1)?;
+        let output_data = crate::tensor::alloc_zeros_from_pool(&self.device, 1)?;
         
         let kernel = self.kernels.get("sum_kernel")
             .ok_or_else(|| FlameError::KernelError("sum_kernel not found".into()))?
@@ -324,12 +326,12 @@ impl CudaKernels {
             shared_mem_bytes: (block_size * 4) as u32,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), &output_data, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), &output_data, n as u32)?;
         
         self.device.synchronize()?;
         
         Ok(Tensor {
-            data: Arc::new(output_data),
+            storage: TensorStorage::F32 { data: output_data, numel: 1 },
             shape: Shape::from_dims(&[]),
             device: tensor.device.clone(),
             id: crate::tensor::TensorId::new(),
@@ -454,7 +456,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, rows as u32, cols as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), rows as u32, cols as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -485,7 +487,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, output.data.as_ref(), gradients.data.as_ref(), lr, n as u32)?;
+        launch_kernel!(kernel, config, output.storage.as_slice(), gradients.storage.as_slice(), lr, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -509,7 +511,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, negative_slope, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), negative_slope, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -532,7 +534,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, alpha, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), alpha, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -560,7 +562,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, exponent, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), exponent, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -583,7 +585,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -606,7 +608,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -629,7 +631,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.data.as_ref(), &*output.data, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)

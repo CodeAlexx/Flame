@@ -69,14 +69,20 @@ impl CudaTensor {
         // Use the kernel that updates weights and returns new tensor
         let kernels = CudaKernels::new(self.device.clone())?;
         let gradient_tensor = Tensor {
-            data: Arc::new(gradient.data.clone()),
+            storage: crate::tensor_storage::TensorStorage::F32 { 
+                data: gradient.data.clone(), 
+                numel: gradient.shape.elem_count() 
+            },
             shape: gradient.shape.clone(),
             device: gradient.device.clone(),
             id: crate::tensor::TensorId::new(),
             requires_grad: false,
         };
         let self_tensor = Tensor {
-            data: Arc::new(self.data.clone()),
+            storage: crate::tensor_storage::TensorStorage::F32 { 
+                data: self.data.clone(), 
+                numel: self.shape.elem_count() 
+            },
             shape: self.shape.clone(),
             device: self.device.clone(),
             id: crate::tensor::TensorId::new(),
@@ -84,7 +90,12 @@ impl CudaTensor {
         };
         let updated = kernels.update_weights(&self_tensor, &gradient_tensor, lr)?;
         // Extract the data from the Arc - we need to clone it
-        self.data = (*updated.data).clone();
+        // Extract data from the updated tensor's storage
+        if let crate::tensor_storage::TensorStorage::F32 { data, .. } = &updated.storage {
+            self.data = data.clone();
+        } else {
+            return Err(FlameError::InvalidOperation("Expected F32 storage".into()));
+        }
         Ok(())
     }
 
@@ -144,21 +155,32 @@ impl CudaTensor {
         if self.shape == other.shape {
             let kernels = CudaKernels::new(self.device.clone())?;
             let self_tensor = Tensor {
-                data: Arc::new(self.data.clone()),
+                storage: crate::tensor_storage::TensorStorage::F32 { 
+                    data: self.data.clone(), 
+                    numel: self.shape.elem_count() 
+                },
                 shape: self.shape.clone(),
                 device: self.device.clone(),
                 id: crate::tensor::TensorId::new(),
                 requires_grad: false,
             };
             let other_tensor = Tensor {
-                data: Arc::new(other.data.clone()),
+                storage: crate::tensor_storage::TensorStorage::F32 { 
+                    data: other.data.clone(), 
+                    numel: other.shape.elem_count() 
+                },
                 shape: other.shape.clone(),
                 device: other.device.clone(),
                 id: crate::tensor::TensorId::new(),
                 requires_grad: false,
             };
             let result = kernels.add(&self_tensor, &other_tensor)?;
-            output.data = (*result.data).clone();
+            // Extract data from result's storage
+            if let crate::tensor_storage::TensorStorage::F32 { data, .. } = &result.storage {
+                output.data = data.clone();
+            } else {
+                return Err(FlameError::InvalidOperation("Expected F32 storage".into()));
+            }
         } else {
             return Err(FlameError::InvalidOperation("Broadcasting not implemented yet".into()));
         }
@@ -175,21 +197,32 @@ impl CudaTensor {
         let mut output = CudaTensor::zeros(self.shape.clone(), self.device.clone())?;
         let kernels = CudaKernels::new(self.device.clone())?;
         let self_tensor = Tensor {
-            data: Arc::new(self.data.clone()),
+            storage: crate::tensor_storage::TensorStorage::F32 { 
+                data: self.data.clone(), 
+                numel: self.shape.elem_count() 
+            },
             shape: self.shape.clone(),
             device: self.device.clone(),
             id: crate::tensor::TensorId::new(),
             requires_grad: false,
         };
         let other_tensor = Tensor {
-            data: Arc::new(other.data.clone()),
+            storage: crate::tensor_storage::TensorStorage::F32 { 
+                data: other.data.clone(), 
+                numel: other.shape.elem_count() 
+            },
             shape: other.shape.clone(),
             device: other.device.clone(),
             id: crate::tensor::TensorId::new(),
             requires_grad: false,
         };
         let result = kernels.mul(&self_tensor, &other_tensor)?;
-        output.data = (*result.data).clone();
+        // Extract data from result's storage
+        if let crate::tensor_storage::TensorStorage::F32 { data, .. } = &result.storage {
+            output.data = data.clone();
+        } else {
+            return Err(FlameError::InvalidOperation("Expected F32 storage".into()));
+        }
         Ok(output)
     }
 
@@ -198,14 +231,22 @@ impl CudaTensor {
         let mut output = CudaTensor::zeros(self.shape.clone(), self.device.clone())?;
         let kernels = CudaKernels::new(self.device.clone())?;
         let self_tensor = Tensor {
-            data: Arc::new(self.data.clone()),
+            storage: crate::tensor_storage::TensorStorage::F32 { 
+                data: self.data.clone(), 
+                numel: self.shape.elem_count() 
+            },
             shape: self.shape.clone(),
             device: self.device.clone(),
             id: crate::tensor::TensorId::new(),
             requires_grad: false,
         };
         let result = kernels.mul_scalar(&self_tensor, scalar)?;
-        output.data = (*result.data).clone();
+        // Extract data from result's storage
+        if let crate::tensor_storage::TensorStorage::F32 { data, .. } = &result.storage {
+            output.data = data.clone();
+        } else {
+            return Err(FlameError::InvalidOperation("Expected F32 storage".into()));
+        }
         Ok(output)
     }
 
@@ -214,14 +255,22 @@ impl CudaTensor {
         let mut output = CudaTensor::zeros(self.shape.clone(), self.device.clone())?;
         let kernels = CudaKernels::new(self.device.clone())?;
         let self_tensor = Tensor {
-            data: Arc::new(self.data.clone()),
+            storage: crate::tensor_storage::TensorStorage::F32 { 
+                data: self.data.clone(), 
+                numel: self.shape.elem_count() 
+            },
             shape: self.shape.clone(),
             device: self.device.clone(),
             id: crate::tensor::TensorId::new(),
             requires_grad: false,
         };
         let result = kernels.relu(&self_tensor)?;
-        output.data = (*result.data).clone();
+        // Extract data from result's storage
+        if let crate::tensor_storage::TensorStorage::F32 { data, .. } = &result.storage {
+            output.data = data.clone();
+        } else {
+            return Err(FlameError::InvalidOperation("Expected F32 storage".into()));
+        }
         Ok(output)
     }
 
@@ -258,7 +307,10 @@ impl CudaTensor {
         // Launch custom reduction kernel
         let kernels = CudaKernels::new(self.device.clone())?;
         let self_tensor = Tensor {
-            data: Arc::new(self.data.clone()),
+            storage: crate::tensor_storage::TensorStorage::F32 { 
+                data: self.data.clone(), 
+                numel: self.shape.elem_count() 
+            },
             shape: self.shape.clone(),
             device: self.device.clone(),
             id: crate::tensor::TensorId::new(),
@@ -267,11 +319,16 @@ impl CudaTensor {
         let sum_result = kernels.sum_kernel(&self_tensor)?;
         
         // Convert back to CudaTensor
-        Ok(CudaTensor {
-            data: (*sum_result.data).clone(),
-            shape: sum_result.shape.clone(),
-            device: sum_result.device.clone(),
-        })
+        // Note: sum_result is a Tensor with storage field, not data
+        if let crate::tensor_storage::TensorStorage::F32 { data, .. } = &sum_result.storage {
+            Ok(CudaTensor {
+                data: data.clone(),
+                shape: sum_result.shape.clone(),
+                device: sum_result.device.clone(),
+            })
+        } else {
+            Err(FlameError::InvalidOperation("Expected F32 storage".into()))
+        }
     }
 
     /// Get shape

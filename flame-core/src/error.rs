@@ -31,6 +31,12 @@ pub enum FlameError {
     
     #[error("Kernel error: {0}")]
     KernelError(String),
+    
+    #[error("Out of memory: {0}")]
+    OutOfMemory(String),
+    
+    #[error("Autograd error: {0}")]
+    Autograd(String),
 }
 
 // Now actually converts cudarc errors

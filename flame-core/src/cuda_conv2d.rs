@@ -3,11 +3,29 @@
 use crate::{Tensor, Shape, Result, FlameError};
 use crate::autograd::{AutogradContext, Op};
 use crate::tensor::TensorId;
-use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+use crate::tensor_storage::TensorStorage;
+use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig, CudaSlice};
 use std::sync::Arc;
 
 // Import kernel source from dedicated module
 use crate::cuda_conv2d_kernels::CONV2D_KERNELS;
+
+// Helper function for allocating and copying to GPU via memory pool
+fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(device: &Arc<CudaDevice>, data: T) -> Result<CudaSlice<f32>> {
+    let slice = data.as_ref();
+    let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
+    device.htod_copy_into(slice.to_vec(), &mut cuda_data).map_err(|_| FlameError::CudaDriver)?;
+    Ok(cuda_data)
+}
+
+// Helper to allocate from pool and copy i32 data (converted to f32)
+fn alloc_from_pool_and_copy_i32(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<f32>> {
+    let f32_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
+    let mut cuda_data = crate::tensor::alloc_from_pool(device, f32_data.len())?;
+    device.htod_copy_into(f32_data, &mut cuda_data).map_err(|_| FlameError::CudaDriver)?;
+    Ok(cuda_data)
+}
+
 
 // Helper macro for kernel launches
 macro_rules! launch_kernel {
@@ -82,7 +100,7 @@ impl CudaConv2d {
         
         // Allocate col buffer for im2col
         let col_size = batch_size * in_channels * kernel_h * kernel_w * out_height * out_width;
-        let col_buffer = device.alloc_zeros::<f32>(col_size)?;
+        let col_buffer = crate::tensor::alloc_zeros_from_pool(&device, col_size)?;
         
         // Check dimensions first
         let error_flag = device.alloc_zeros::<i32>(1)?;
@@ -136,14 +154,14 @@ impl CudaConv2d {
                 out_width as i32,
             ];
             
-            let dims_gpu = device.htod_sync_copy(&dims)?;
-            let params_gpu = device.htod_sync_copy(&conv_params)?;
+            let dims_gpu = alloc_from_pool_and_copy_i32(&device, &dims)?;
+            let params_gpu = alloc_from_pool_and_copy_i32(&device, &conv_params)?;
             
             let f = device.get_func("conv2d_ops", "im2col_kernel")
                 .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel".into()))?;
             
             launch_kernel!(f, cfg,
-                input.data.as_ref(),
+                input.storage.as_slice(),
                 &col_buffer,
                 &dims_gpu,
                 &params_gpu
@@ -151,9 +169,10 @@ impl CudaConv2d {
         }
         
         // Reshape for matrix multiplication
+        let col_shape = Shape::from_dims(&[batch_size * out_height * out_width, in_channels * kernel_h * kernel_w]);
         let col_tensor = Tensor {
-            data: Arc::new(col_buffer),
-            shape: Shape::from_dims(&[batch_size * out_height * out_width, in_channels * kernel_h * kernel_w]),
+            storage: TensorStorage::F32 { data: col_buffer, numel: col_shape.elem_count() },
+            shape: col_shape,
             device: device.clone(),
             id: TensorId::new(),
             requires_grad: false,
@@ -223,8 +242,8 @@ impl CudaConv2d {
         let cfg = LaunchConfig::for_num_elems((batch_size * channels * spatial_size) as u32);
         
         launch_kernel!(f, cfg,
-            result.data.as_ref(),
-            bias.data.as_ref(),
+            result.storage.as_slice(),
+            bias.storage.as_slice(),
             batch_size as i32,
             channels as i32,
             spatial_size as i32
@@ -273,7 +292,7 @@ impl CudaConv2d {
         // Weight gradient: grad_output @ input^T (after im2col)
         // First, im2col on input
         let input_col_size = batch_size * in_channels * kernel_h * kernel_w * out_height * out_width;
-        let input_col_buffer = device.alloc_zeros::<f32>(input_col_size)?;
+        let input_col_buffer = crate::tensor::alloc_zeros_from_pool(&device, input_col_size)?;
         
         let cfg = LaunchConfig::for_num_elems(input_col_size as u32);
         
@@ -282,7 +301,7 @@ impl CudaConv2d {
                 .ok_or_else(|| FlameError::Cuda("Failed to get im2col_kernel_simple".into()))?;
             
             launch_kernel!(f_im2col, cfg,
-                input.data.as_ref(),
+                input.storage.as_slice(),
                 &input_col_buffer,
                 batch_size as i32,
                 in_channels as i32,
@@ -311,14 +330,14 @@ impl CudaConv2d {
                 out_width as i32,
             ];
             
-            let dims_gpu = device.htod_sync_copy(&dims)?;
-            let params_gpu = device.htod_sync_copy(&conv_params)?;
+            let dims_gpu = alloc_from_pool_and_copy_i32(&device, &dims)?;
+            let params_gpu = alloc_from_pool_and_copy_i32(&device, &conv_params)?;
             
             let f_im2col = device.get_func("conv2d_ops", "im2col_kernel_v2")
                 .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel v2".into()))?;
             
             launch_kernel!(f_im2col, cfg,
-                input.data.as_ref(),
+                input.storage.as_slice(),
                 &input_col_buffer,
                 &dims_gpu,
                 &params_gpu
@@ -328,9 +347,10 @@ impl CudaConv2d {
         device.synchronize()?;
         
         // Compute weight gradient
+        let input_col_shape = Shape::from_dims(&[batch_size * out_height * out_width, in_channels * kernel_h * kernel_w]);
         let input_col_tensor = Tensor {
-            data: Arc::new(input_col_buffer),
-            shape: Shape::from_dims(&[batch_size * out_height * out_width, in_channels * kernel_h * kernel_w]),
+            storage: TensorStorage::F32 { data: input_col_buffer, numel: input_col_shape.elem_count() },
+            shape: input_col_shape,
             device: device.clone(),
             id: TensorId::new(),
             requires_grad: false,
@@ -347,7 +367,7 @@ impl CudaConv2d {
         let grad_input_col = grad_col.matmul(&weight_t)?;
         
         // Now use col2im to get grad_input
-        let grad_input_data = device.alloc_zeros::<f32>(input.shape().elem_count())?;
+        let grad_input_data = crate::tensor::alloc_zeros_from_pool(&device, input.shape().elem_count())?;
         
         let cfg = LaunchConfig::for_num_elems(input.shape().elem_count() as u32);
         
@@ -369,14 +389,14 @@ impl CudaConv2d {
                 out_width as i32,
             ];
             
-            let dims_gpu = device.htod_sync_copy(&dims)?;
-            let params_gpu = device.htod_sync_copy(&conv_params)?;
+            let dims_gpu = alloc_from_pool_and_copy_i32(&device, &dims)?;
+            let params_gpu = alloc_from_pool_and_copy_i32(&device, &conv_params)?;
             
             let f_col2im = device.get_func("conv2d_ops", "col2im_kernel_v2")
                 .ok_or_else(|| FlameError::Cuda("Failed to get col2im kernel v2".into()))?;
             
             launch_kernel!(f_col2im, cfg,
-                grad_input_col.data.as_ref(),
+                grad_input_col.storage.as_slice(),
                 &grad_input_data,
                 &dims_gpu,
                 &params_gpu
@@ -386,7 +406,7 @@ impl CudaConv2d {
         device.synchronize()?;
         
         let grad_input = Tensor {
-            data: Arc::new(grad_input_data),
+            storage: TensorStorage::F32 { data: grad_input_data, numel: input.shape().elem_count() },
             shape: input.shape().clone(),
             device: device.clone(),
             id: TensorId::new(),
@@ -395,14 +415,14 @@ impl CudaConv2d {
         
         // Bias gradient is sum over batch and spatial dimensions
         let grad_bias = if grad_output.shape().dims().len() == 4 {
-            let grad_bias_data = device.alloc_zeros::<f32>(out_channels)?;
+            let grad_bias_data = crate::tensor::alloc_zeros_from_pool(&device, out_channels)?;
             
             let f_bias_grad = device.get_func("conv2d_ops", "bias_grad_kernel")
                 .ok_or_else(|| FlameError::Cuda("Failed to get bias_grad kernel".into()))?;
             
             let cfg = LaunchConfig::for_num_elems(out_channels as u32);
             launch_kernel!(f_bias_grad, cfg,
-                grad_output.data.as_ref(),
+                grad_output.storage.as_slice(),
                 &grad_bias_data,
                 batch_size as i32,
                 out_channels as i32,
@@ -412,7 +432,7 @@ impl CudaConv2d {
             device.synchronize()?;
             
             Some(Tensor {
-                data: Arc::new(grad_bias_data),
+                storage: TensorStorage::F32 { data: grad_bias_data, numel: out_channels },
                 shape: Shape::from_dims(&[out_channels]),
                 device: device.clone(),
                 id: TensorId::new(),

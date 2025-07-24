@@ -10,6 +10,7 @@ pub enum DType {
     U8,
     U32,
     I64,
+    I8,  // INT8 for Sage Attention
 }
 
 impl DType {
@@ -18,7 +19,7 @@ impl DType {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
             Self::F64 | Self::I64 => 8,
-            Self::U8 => 1,
+            Self::U8 | Self::I8 => 1,
             Self::U32 => 4,
         }
     }
@@ -32,6 +33,7 @@ impl DType {
             Self::U8 => "u8",
             Self::U32 => "u32",
             Self::I64 => "i64",
+            Self::I8 => "i8",
         }
     }
 }

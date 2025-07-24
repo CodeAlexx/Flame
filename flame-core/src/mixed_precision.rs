@@ -4,6 +4,15 @@ use cudarc::driver::{CudaDevice, CudaSlice};
 use half::{f16, bf16};
 use std::collections::HashMap;
 
+// Helper function for allocating and copying to GPU via memory pool
+fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(device: &Arc<CudaDevice>, data: T) -> Result<CudaSlice<f32>> {
+    let slice = data.as_ref();
+    let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
+    device.htod_copy_into(slice.to_vec(), &mut cuda_data).map_err(|_| FlameError::CudaDriver)?;
+    Ok(cuda_data)
+}
+
+
 /// Automatic Mixed Precision (AMP) context
 pub struct AMPContext {
     /// Whether AMP is enabled
@@ -177,7 +186,7 @@ impl HalfTensor {
                 let f32_data: Vec<f32> = half_data.iter()
                     .map(|&x| x.to_f32())
                     .collect();
-                let cuda_data = device.htod_sync_copy(&f32_data)
+                let cuda_data = alloc_and_copy_to_pool(&device, &f32_data)
                     .map_err(|_| FlameError::CudaDriver)?;
                 
                 Ok(Self {
@@ -197,7 +206,7 @@ impl HalfTensor {
                 let f32_data: Vec<f32> = half_data.iter()
                     .map(|&x| x.to_f32())
                     .collect();
-                let cuda_data = device.htod_sync_copy(&f32_data)
+                let cuda_data = alloc_and_copy_to_pool(&device, &f32_data)
                     .map_err(|_| FlameError::CudaDriver)?;
                 
                 Ok(Self {

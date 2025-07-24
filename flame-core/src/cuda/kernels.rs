@@ -5,6 +5,24 @@ use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 use std::sync::Arc;
 use crate::{Result, FlameError};
 
+// Helper to allocate from pool and copy data
+fn alloc_from_pool_and_copy(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<f32>> {
+    let f32_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
+    let mut cuda_data = crate::tensor::alloc_from_pool(device, f32_data.len())?;
+    device.htod_copy_into(&f32_data, &mut cuda_data).map_err(|_| FlameError::CudaDriver)?;
+    Ok(cuda_data)
+}
+
+
+// Helper function for allocating and copying to GPU via memory pool
+fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(device: &Arc<CudaDevice>, data: T) -> Result<CudaSlice<f32>> {
+    let slice = data.as_ref();
+    let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
+    device.htod_copy_into(slice, &mut cuda_data).map_err(|_| FlameError::CudaDriver)?;
+    Ok(cuda_data)
+}
+
+
 // PTX code for our kernels (compiled from CUDA)
 const UPDATE_WEIGHTS_PTX: &str = r#"
 .version 7.0
@@ -87,7 +105,7 @@ impl CudaKernels {
         }
 
         // Copy back
-        *weights = self.device.htod_sync_copy(&weights_cpu)
+        *weights = alloc_from_pool_and_copy(&self.device, &weights_cpu)
             .map_err(|_| FlameError::CudaDriver)?;
 
         Ok(())
@@ -117,7 +135,7 @@ impl CudaKernels {
             result[i] = a_cpu[i] + b_cpu[i];
         }
 
-        Ok(self.device.htod_sync_copy(&result)
+        Ok(alloc_from_pool_and_copy(&self.device, &result)
             .map_err(|_| FlameError::CudaDriver)?)
     }
 
@@ -145,7 +163,7 @@ impl CudaKernels {
             result[i] = a_cpu[i] * b_cpu[i];
         }
 
-        Ok(self.device.htod_sync_copy(&result)
+        Ok(alloc_from_pool_and_copy(&self.device, &result)
             .map_err(|_| FlameError::CudaDriver)?)
     }
 
@@ -166,7 +184,7 @@ impl CudaKernels {
             result[i] = input_cpu[i] * scalar;
         }
 
-        Ok(self.device.htod_sync_copy(&result)
+        Ok(alloc_from_pool_and_copy(&self.device, &result)
             .map_err(|_| FlameError::CudaDriver)?)
     }
 
@@ -186,7 +204,7 @@ impl CudaKernels {
             result[i] = input_cpu[i].max(0.0);
         }
 
-        Ok(self.device.htod_sync_copy(&result)
+        Ok(alloc_from_pool_and_copy(&self.device, &result)
             .map_err(|_| FlameError::CudaDriver)?)
     }
 
@@ -197,7 +215,7 @@ impl CudaKernels {
         num_elements: usize,
     ) -> Result<CudaSlice<f32>> {
         let data = vec![value; num_elements];
-        Ok(self.device.htod_sync_copy(&data)
+        Ok(alloc_from_pool_and_copy(&self.device, &data)
             .map_err(|_| FlameError::CudaDriver)?)
     }
 }
