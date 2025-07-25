@@ -24,7 +24,7 @@ fn main() -> Result<()> {
     println!("\nTest 2: FLAME autograd");
     let x = Parameter::new(Tensor::randn(&[5, 5], DType::F32, &device)?);
     let y = x.as_tensor().mul(x.as_tensor())?;
-    let loss = y.sum_all()?;
+    let loss = y.sum()?;
     
     let grads = backward(&loss)?;
     if let Some(grad) = grads.get(&x) {
@@ -55,7 +55,7 @@ fn main() -> Result<()> {
     for i in 0..5 {
         // Forward
         let pred = param.as_tensor();
-        let loss = pred.sub(&target)?.pow_scalar(2.0)?.sum_all()?;
+        let loss = pred.sub(&target)?.pow_scalar(2.0)?.sum()?;
         
         // Backward
         let grads = backward(&loss)?;
