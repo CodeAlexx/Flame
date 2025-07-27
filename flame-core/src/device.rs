@@ -3,6 +3,7 @@ use cudarc::driver::{CudaDevice as CudarcDevice};
 use std::sync::Arc;
 
 /// Device management for FLAME
+#[derive(Clone)]
 pub struct Device {
     inner: Arc<CudarcDevice>,
 }
