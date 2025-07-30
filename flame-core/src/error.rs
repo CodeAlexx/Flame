@@ -51,3 +51,21 @@ impl From<cudarc::cublas::result::CublasError> for FlameError {
         FlameError::CuBlas
     }
 }
+
+impl From<std::io::Error> for FlameError {
+    fn from(err: std::io::Error) -> Self {
+        FlameError::Io(err.to_string())
+    }
+}
+
+impl From<serde_json::Error> for FlameError {
+    fn from(err: serde_json::Error) -> Self {
+        FlameError::InvalidOperation(format!("JSON error: {}", err))
+    }
+}
+
+impl From<image::ImageError> for FlameError {
+    fn from(err: image::ImageError) -> Self {
+        FlameError::InvalidOperation(format!("Image error: {}", err))
+    }
+}

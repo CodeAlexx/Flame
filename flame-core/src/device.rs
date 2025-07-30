@@ -29,6 +29,11 @@ impl Device {
         &self.inner
     }
     
+    /// Get a clone of the underlying CUDA device Arc
+    pub fn cuda_device_arc(&self) -> Arc<CudarcDevice> {
+        self.inner.clone()
+    }
+    
     /// Get device ordinal
     pub fn ordinal(&self) -> usize {
         self.inner.ordinal()
