@@ -1347,25 +1347,4 @@ fn inverse_permutation(perm: &[usize]) -> Vec<usize> {
     inverse
 }
 
-/// Comparison operations
-impl Tensor {
-    /// Element-wise greater than comparison
-    pub fn gt(&self, other: &Tensor) -> Result<Tensor> {
-        if self.shape != other.shape {
-            return Err(FlameError::ShapeMismatch {
-                expected: self.shape.clone(),
-                got: other.shape.clone(),
-            });
-        }
-        
-        let self_data = self.to_vec()?;
-        let other_data = other.to_vec()?;
-        
-        let result: Vec<f32> = self_data.iter()
-            .zip(other_data.iter())
-            .map(|(a, b)| if a > b { 1.0 } else { 0.0 })
-            .collect();
-        
-        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
-    }
-}
+// Comparison operations are implemented in tensor_ops_extended.rs

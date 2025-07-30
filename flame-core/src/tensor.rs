@@ -1069,6 +1069,25 @@ extern "C" __global__ void slice_kernel(
         &self.shape
     }
     
+    /// Reshape tensor to new shape
+    pub fn reshape(&self, shape: &[usize]) -> Result<Tensor> {
+        let new_shape = Shape::from_dims(shape);
+        if self.shape.elem_count() != new_shape.elem_count() {
+            return Err(FlameError::ShapeMismatch {
+                expected: new_shape,
+                got: self.shape.clone(),
+            });
+        }
+        
+        Ok(Tensor {
+            id: TensorId::new(),
+            storage: self.storage.clone(),
+            shape: new_shape,
+            device: self.device.clone(),
+            requires_grad: self.requires_grad,
+        })
+    }
+    
     /// Get device
     pub fn device(&self) -> &Arc<CudaDevice> {
         &self.device
@@ -1120,21 +1139,6 @@ extern "C" __global__ void slice_kernel(
     }
     
     /// Transpose two dimensions of a tensor
-    pub fn transpose_dims(&self, dim0: usize, dim1: usize) -> Result<Tensor> {
-        let dims = self.shape.dims();
-        if dim0 >= dims.len() || dim1 >= dims.len() {
-            return Err(FlameError::InvalidOperation(
-                format!("Transpose dimensions out of bounds: {} and {} for tensor with {} dims", 
-                    dim0, dim1, dims.len())
-            ));
-        }
-        
-        // Create permutation
-        let mut perm: Vec<usize> = (0..dims.len()).collect();
-        perm.swap(dim0, dim1);
-        
-        self.permute(&perm)
-    }
     
     /// Broadcast tensor to a new shape
     pub fn broadcast_to(&self, target_shape: &Shape) -> Result<Tensor> {
@@ -1244,38 +1248,6 @@ extern "C" __global__ void slice_kernel(
     
     
     
-    /// Reshape tensor to new dimensions
-    pub fn reshape(&self, new_shape: &[usize]) -> Result<Tensor> {
-        let new_size: usize = new_shape.iter().product();
-        if new_size != self.shape.elem_count() {
-            return Err(FlameError::InvalidOperation(
-                format!("Cannot reshape from {:?} to {:?}", self.shape.dims(), new_shape)
-            ));
-        }
-        
-        let mut output = Tensor {
-            storage: self.storage.clone(),
-            shape: Shape::from_dims(new_shape),
-            device: self.device.clone(),
-            id: TensorId::new(),
-            requires_grad: self.requires_grad,
-        };
-        
-        // AUTOGRAD: Record operation if needed
-        if self.requires_grad {
-            AutogradContext::record_op(
-                output.id,
-                Op::Reshape { 
-                    input: self.id,
-                    new_shape: self.shape.dims().to_vec() // Store original shape for backward
-                },
-                vec![(self.id, self.clone()?)]
-            );
-        }
-        
-        Ok(output)
-    }
-    
     /// Create a view of the tensor with new shape (shares data)
     pub fn view(&self, new_shape: &[usize]) -> Result<Tensor> {
         // For now, view is the same as reshape since we clone the data pointer
@@ -1298,46 +1270,7 @@ extern "C" __global__ void slice_kernel(
         self.reshape(&[batch_size, feature_size])
     }
     
-    /// Squeeze: Remove dimensions of size 1
-    pub fn squeeze(&self, dim: Option<usize>) -> Result<Tensor> {
-        let dims = self.shape.dims();
-        
-        let new_dims: Vec<usize> = if let Some(d) = dim {
-            if d >= dims.len() {
-                return Err(FlameError::InvalidOperation(
-                    format!("Dimension {} out of range", d)
-                ));
-            }
-            if dims[d] != 1 {
-                return Ok(self.clone()?);
-            }
-            dims.iter().enumerate()
-                .filter(|(i, _)| *i != d)
-                .map(|(_, &size)| size)
-                .collect()
-        } else {
-            dims.iter().copied()
-                .filter(|&size| size != 1)
-                .collect()
-        };
-        
-        self.reshape(&new_dims)
-    }
     
-    /// Unsqueeze: Add a dimension of size 1
-    pub fn unsqueeze(&self, dim: usize) -> Result<Tensor> {
-        let dims = self.shape.dims();
-        if dim > dims.len() {
-            return Err(FlameError::InvalidOperation(
-                format!("Dimension {} out of range for unsqueeze", dim)
-            ));
-        }
-        
-        let mut new_dims = dims.to_vec();
-        new_dims.insert(dim, 1);
-        
-        self.reshape(&new_dims)
-    }
     
     /// Permute/transpose dimensions
     pub fn permute(&self, dims: &[usize]) -> Result<Tensor> {

@@ -52,6 +52,18 @@ impl Parameter {
         self.data.lock().unwrap().clone()
     }
     
+    /// Get a reference to the tensor (as_tensor compatibility)
+    pub fn as_tensor(&self) -> Result<Tensor> {
+        self.tensor()
+    }
+    
+    /// Set the parameter data directly
+    pub fn set_data(&self, tensor: Tensor) -> Result<()> {
+        let mut data_lock = self.data.lock().unwrap();
+        *data_lock = tensor;
+        Ok(())
+    }
+    
     /// Set gradient for this parameter
     pub fn set_grad(&self, grad: Tensor) -> Result<()> {
         let mut grad_lock = self.grad.lock().unwrap();

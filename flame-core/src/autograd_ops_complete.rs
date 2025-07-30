@@ -415,18 +415,6 @@ impl Tensor {
     }
     
     
-    /// Sum along dimension keeping the dimension
-    pub fn sum_keepdim(&self, dim: isize) -> Result<Tensor> {
-        let ndim = self.shape().dims().len() as isize;
-        let dim = if dim < 0 { ndim + dim } else { dim } as usize;
-        
-        let sum = self.sum_dim(dim)?;
-        
-        // Reshape to keep dimension as 1
-        let mut new_shape = self.shape().dims().to_vec();
-        new_shape[dim] = 1;
-        sum.reshape(&new_shape)
-    }
     
     /// Compute reciprocal (1/x)
     pub fn reciprocal(&self) -> Result<Tensor> {

@@ -8,6 +8,258 @@ use std::sync::Arc;
 use cudarc::driver::CudaDevice;
 
 impl Tensor {
+    /// Random uniform tensor
+    pub fn rand(shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
+        let size = shape.elem_count();
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        
+        let data: Vec<f32> = (0..size)
+            .map(|_| rng.gen::<f32>())
+            .collect();
+            
+        Self::from_vec(data, shape, device)
+    }
+    
+    /// Create a tensor with uniform distribution
+    pub fn uniform(shape: Shape, low: f32, high: f32, device: Arc<CudaDevice>) -> Result<Self> {
+        let size = shape.elem_count();
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        
+        let data: Vec<f32> = (0..size)
+            .map(|_| rng.gen_range(low..high))
+            .collect();
+            
+        Self::from_vec(data, shape, device)
+    }
+    
+    /// Create a tensor with normal distribution
+    pub fn normal(shape: Shape, mean: f32, std: f32, device: Arc<CudaDevice>) -> Result<Self> {
+        Self::randn(shape, mean, std, device)
+    }
+    
+    /// Permute/transpose dimensions
+    pub fn transpose_dims(&self, dim0: usize, dim1: usize) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        if dim0 >= dims.len() || dim1 >= dims.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Transpose dimensions out of bounds: {} and {} for tensor with {} dims", 
+                    dim0, dim1, dims.len())
+            ));
+        }
+        
+        // Create permutation
+        let mut perm: Vec<usize> = (0..dims.len()).collect();
+        perm.swap(dim0, dim1);
+        
+        self.permute(&perm)
+    }
+    
+    /// Squeeze dimensions of size 1
+    pub fn squeeze(&self, dim: Option<usize>) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        
+        let new_dims: Vec<usize> = if let Some(d) = dim {
+            if d >= dims.len() {
+                return Err(FlameError::InvalidOperation(
+                    format!("Dimension {} out of range", d)
+                ));
+            }
+            if dims[d] != 1 {
+                return Ok(self.clone()?);
+            }
+            dims.iter().enumerate()
+                .filter(|(i, _)| *i != d)
+                .map(|(_, &size)| size)
+                .collect()
+        } else {
+            dims.iter().copied()
+                .filter(|&size| size != 1)
+                .collect()
+        };
+        
+        self.reshape(&new_dims)
+    }
+    
+    /// Unsqueeze: Add a dimension of size 1
+    pub fn unsqueeze(&self, dim: usize) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        if dim > dims.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Dimension {} out of range for unsqueeze", dim)
+            ));
+        }
+        
+        let mut new_dims = dims.to_vec();
+        new_dims.insert(dim, 1);
+        
+        self.reshape(&new_dims)
+    }
+    
+    /// Greater than comparison
+    pub fn gt(&self, other: &Tensor) -> Result<Tensor> {
+        if self.shape != other.shape {
+            return Err(FlameError::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: other.shape.clone(),
+            });
+        }
+        
+        let self_data = self.to_vec()?;
+        let other_data = other.to_vec()?;
+        
+        let result: Vec<f32> = self_data.iter()
+            .zip(other_data.iter())
+            .map(|(a, b)| if a > b { 1.0 } else { 0.0 })
+            .collect();
+        
+        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Greater than or equal comparison
+    pub fn ge(&self, other: &Tensor) -> Result<Tensor> {
+        if self.shape != other.shape {
+            return Err(FlameError::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: other.shape.clone(),
+            });
+        }
+        
+        let self_data = self.to_vec()?;
+        let other_data = other.to_vec()?;
+        
+        let result: Vec<f32> = self_data.iter()
+            .zip(other_data.iter())
+            .map(|(a, b)| if a >= b { 1.0 } else { 0.0 })
+            .collect();
+        
+        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Less than comparison
+    pub fn lt(&self, other: &Tensor) -> Result<Tensor> {
+        if self.shape != other.shape {
+            return Err(FlameError::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: other.shape.clone(),
+            });
+        }
+        
+        let self_data = self.to_vec()?;
+        let other_data = other.to_vec()?;
+        
+        let result: Vec<f32> = self_data.iter()
+            .zip(other_data.iter())
+            .map(|(a, b)| if a < b { 1.0 } else { 0.0 })
+            .collect();
+        
+        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Not equal comparison
+    pub fn ne(&self, other: &Tensor) -> Result<Tensor> {
+        if self.shape != other.shape {
+            return Err(FlameError::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: other.shape.clone(),
+            });
+        }
+        
+        let self_data = self.to_vec()?;
+        let other_data = other.to_vec()?;
+        
+        let result: Vec<f32> = self_data.iter()
+            .zip(other_data.iter())
+            .map(|(a, b)| if a != b { 1.0 } else { 0.0 })
+            .collect();
+        
+        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Conditional where operation
+    pub fn where_op(&self, condition: &Tensor, other: &Tensor) -> Result<Tensor> {
+        // self is the true value, other is the false value, condition is the mask
+        condition.where_tensor(self, other)
+    }
+    
+    /// Compute variance along dimensions
+    pub fn var(&self, dims: &[usize], unbiased: bool, keepdim: bool) -> Result<Tensor> {
+        // Compute mean
+        let mean = self.mean_along_dims(dims, keepdim)?;
+        
+        // Compute (x - mean)^2
+        let diff = self.sub(&mean)?;
+        let sq_diff = diff.square()?;
+        
+        // Compute mean of squared differences
+        let var = sq_diff.mean_along_dims(dims, keepdim)?;
+        
+        // If unbiased, apply Bessel's correction
+        if unbiased {
+            let n = dims.iter().map(|&d| self.shape.dims()[d]).product::<usize>() as f32;
+            if n > 1.0 {
+                var.mul_scalar(n / (n - 1.0))
+            } else {
+                Ok(var)
+            }
+        } else {
+            Ok(var)
+        }
+    }
+    
+    /// Compute mean along dimensions
+    pub fn mean_along_dims(&self, dims: &[usize], keepdim: bool) -> Result<Tensor> {
+        // Sum along dimensions
+        let mut result = self.clone()?;
+        for &dim in dims {
+            result = result.sum_dim(dim)?;
+        }
+        
+        // Compute divisor
+        let divisor = dims.iter()
+            .map(|&d| self.shape.dims()[d])
+            .product::<usize>() as f32;
+        
+        // Divide by count
+        result.mul_scalar(1.0 / divisor)
+    }
+    
+    /// Create a tensor like another tensor
+    pub fn full_like(&self, value: f32) -> Result<Tensor> {
+        Self::full(self.shape.clone(), value, self.device.clone())
+    }
+    
+    /// Create zeros like another tensor
+    pub fn zeros_like(&self) -> Result<Tensor> {
+        Self::zeros(self.shape.clone(), self.device.clone())
+    }
+    
+    /// Create ones like another tensor  
+    pub fn ones_like(&self) -> Result<Tensor> {
+        Self::ones(self.shape.clone(), self.device.clone())
+    }
+    
+    /// Apply affine transformation: a * x + b
+    pub fn affine(&self, a: f32, b: f32) -> Result<Tensor> {
+        self.mul_scalar(a)?.add_scalar(b)
+    }
+    
+    /// Sum along dimension with option to keep dimension
+    pub fn sum_keepdim(&self, dim: isize) -> Result<Tensor> {
+        let ndim = self.shape.dims().len() as isize;
+        let dim = if dim < 0 { ndim + dim } else { dim } as usize;
+        
+        if dim >= self.shape.dims().len() {
+            return Err(FlameError::InvalidOperation(
+                format!("Dimension {} out of bounds", dim)
+            ));
+        }
+        
+        self.sum_dim_keepdim(dim)
+    }
+    
+    /// Permute tensor dimensions (already implemented above)
     /// Chunk tensor into n chunks along specified dimension
     pub fn chunk(&self, chunks: usize, dim: usize) -> Result<Vec<Tensor>> {
         let shape = self.shape().dims();
@@ -681,6 +933,36 @@ impl Tensor {
         Tensor::from_vec(sign_data, self.shape.clone(), self.device.clone())
     }
     
+    /// Element-wise floor operation
+    pub fn floor(&self) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let floor_data: Vec<f32> = data.iter()
+            .map(|&x| x.floor())
+            .collect();
+        
+        Tensor::from_vec(floor_data, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Element-wise ceil operation
+    pub fn ceil(&self) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let ceil_data: Vec<f32> = data.iter()
+            .map(|&x| x.ceil())
+            .collect();
+        
+        Tensor::from_vec(ceil_data, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Element-wise round operation
+    pub fn round(&self) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let round_data: Vec<f32> = data.iter()
+            .map(|&x| x.round())
+            .collect();
+        
+        Tensor::from_vec(round_data, self.shape.clone(), self.device.clone())
+    }
+    
     /// Element-wise less than or equal comparison
     pub fn le(&self, other: &Tensor) -> Result<Tensor> {
         if self.shape != other.shape {
@@ -697,6 +979,80 @@ impl Tensor {
             .zip(other_data.iter())
             .map(|(a, b)| if a <= b { 1.0 } else { 0.0 })
             .collect();
+        
+        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Subtract a scalar from all elements
+    pub fn sub_scalar(&self, scalar: f32) -> Result<Tensor> {
+        let neg_scalar = -scalar;
+        self.add_scalar(neg_scalar)
+    }
+    
+    /// Find the maximum value in the tensor
+    pub fn max_all(&self) -> Result<f32> {
+        let data = self.to_vec()?;
+        if data.is_empty() {
+            return Err(FlameError::InvalidOperation("Cannot find max of empty tensor".into()));
+        }
+        Ok(data.iter().cloned().fold(f32::NEG_INFINITY, f32::max))
+    }
+    
+    /// Find the sum of all elements in the tensor
+    pub fn sum_all(&self) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let sum: f32 = data.iter().sum();
+        Tensor::from_slice(&[sum], Shape::from_dims(&[1]), self.device.clone())
+    }
+    
+    /// Flip tensor along specified dimensions
+    pub fn flip(&self, dims: &[usize]) -> Result<Tensor> {
+        let mut data = self.to_vec()?;
+        let shape_dims = self.shape.dims();
+        
+        // For simplicity, only implement flipping along the last dimension for now
+        if dims.len() == 1 && dims[0] == shape_dims.len() - 1 {
+            let last_dim_size = shape_dims[dims[0]];
+            let stride = data.len() / last_dim_size;
+            
+            for i in 0..stride {
+                let start = i * last_dim_size;
+                let end = start + last_dim_size;
+                data[start..end].reverse();
+            }
+        } else {
+            return Err(FlameError::InvalidOperation("Flip only supports flipping along the last dimension currently".into()));
+        }
+        
+        Tensor::from_vec(data, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Create upper triangular matrix (ones above diagonal, zeros below)
+    pub fn triu(&self, diagonal: i32) -> Result<Tensor> {
+        let shape_dims = self.shape.dims();
+        if shape_dims.len() < 2 {
+            return Err(FlameError::InvalidOperation("triu requires at least 2D tensor".into()));
+        }
+        
+        let data = self.to_vec()?;
+        let mut result = vec![0.0f32; data.len()];
+        
+        let rows = shape_dims[shape_dims.len() - 2];
+        let cols = shape_dims[shape_dims.len() - 1];
+        let matrix_size = rows * cols;
+        let num_matrices = data.len() / matrix_size;
+        
+        for m in 0..num_matrices {
+            let offset = m * matrix_size;
+            for i in 0..rows {
+                for j in 0..cols {
+                    if j as i32 >= i as i32 + diagonal {
+                        let idx = offset + i * cols + j;
+                        result[idx] = data[idx];
+                    }
+                }
+            }
+        }
         
         Tensor::from_vec(result, self.shape.clone(), self.device.clone())
     }

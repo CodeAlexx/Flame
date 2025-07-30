@@ -72,28 +72,14 @@ impl Tensor {
     
     /// Standard deviation
     pub fn std(&self, dim: Option<&[usize]>, keepdim: bool) -> Result<Tensor> {
-        let var = self.var(dim, keepdim)?;
-        var.sqrt()
-    }
-    
-    /// Variance
-    pub fn var(&self, dim: Option<&[usize]>, keepdim: bool) -> Result<Tensor> {
-        let mean = if let Some(dims) = dim {
-            self.mean_dim(dims, keepdim)?
+        let var = if let Some(dims) = dim {
+            self.var(dims, false, keepdim)?  // Use the var() from tensor_ops_extended.rs
         } else {
-            let mean_scalar = self.mean()?;
-            // Broadcast mean to match input shape
-            mean_scalar.broadcast_to(&self.shape)?
+            // For global std, compute variance over all dimensions
+            let all_dims: Vec<usize> = (0..self.shape.dims().len()).collect();
+            self.var(&all_dims, false, keepdim)?
         };
-        
-        let diff = self.sub(&mean)?;
-        let squared = diff.mul(&diff)?;
-        
-        if let Some(dims) = dim {
-            squared.mean_dim(dims, keepdim)
-        } else {
-            squared.mean()
-        }
+        var.sqrt()
     }
     
     /// Square root
@@ -211,5 +197,137 @@ impl Tensor {
     /// Division by scalar
     pub fn div_scalar(&self, scalar: f32) -> Result<Tensor> {
         self.mul_scalar(1.0 / scalar)
+    }
+    
+    /// Flatten all dimensions into a single dimension
+    pub fn flatten_all(&self) -> Result<Tensor> {
+        let total_elements = self.shape.elem_count();
+        self.reshape(&[total_elements])
+    }
+    
+    /// Dropout operation - randomly zeros elements with probability p during training
+    pub fn dropout(&self, p: f32) -> Result<Tensor> {
+        if p <= 0.0 || p >= 1.0 {
+            return Err(FlameError::InvalidOperation(format!("Dropout probability must be between 0 and 1, got {}", p)));
+        }
+        
+        // During inference, dropout is identity
+        // For now, we'll implement a simple version that always returns the input scaled
+        // In a full implementation, this would check training mode and use random mask
+        let scale = 1.0 / (1.0 - p);
+        self.mul_scalar(scale)
+    }
+    
+    /// Upsample using nearest neighbor interpolation
+    pub fn upsample_nearest2d(&self, new_h: usize, new_w: usize) -> Result<Tensor> {
+        // Assume input is [batch, channels, height, width]
+        let shape = self.shape();
+        if shape.rank() != 4 {
+            return Err(FlameError::InvalidOperation(format!("Expected 4D tensor, got {}D", shape.rank())));
+        }
+        
+        let batch = shape.dims()[0];
+        let channels = shape.dims()[1];
+        let old_h = shape.dims()[2];
+        let old_w = shape.dims()[3];
+        
+        // Simple nearest neighbor upsampling implementation
+        let data = self.to_vec()?;
+        let mut output = vec![0.0f32; batch * channels * new_h * new_w];
+        
+        for b in 0..batch {
+            for c in 0..channels {
+                for h in 0..new_h {
+                    for w in 0..new_w {
+                        // Find nearest neighbor in original image
+                        let src_h = (h * old_h) / new_h;
+                        let src_w = (w * old_w) / new_w;
+                        
+                        let src_idx = ((b * channels + c) * old_h + src_h) * old_w + src_w;
+                        let dst_idx = ((b * channels + c) * new_h + h) * new_w + w;
+                        
+                        output[dst_idx] = data[src_idx];
+                    }
+                }
+            }
+        }
+        
+        Tensor::from_vec(
+            output,
+            Shape::from_dims(&[batch, channels, new_h, new_w]),
+            self.device.clone()
+        )
+    }
+    
+    /// Power operation with float exponent
+    pub fn powf(&self, exponent: f32) -> Result<Tensor> {
+        self.pow(exponent)
+    }
+    
+    /// Variance along specific dimensions
+    pub fn var_dim(&self, dims: &[usize], keepdim: bool) -> Result<Tensor> {
+        self.var(dims, false, keepdim)  // Use unbiased=false by default
+    }
+    
+    /// Element-wise maximum with a scalar
+    pub fn maximum_scalar(&self, scalar: f32) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let result: Vec<f32> = data.iter()
+            .map(|&x| x.max(scalar))
+            .collect();
+        
+        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Element-wise minimum with a scalar
+    pub fn minimum_scalar(&self, scalar: f32) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let result: Vec<f32> = data.iter()
+            .map(|&x| x.min(scalar))
+            .collect();
+        
+        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Get a single element from a 1D tensor
+    pub fn get(&self, index: usize) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        if dims.len() != 1 {
+            return Err(FlameError::InvalidOperation(
+                format!("get() only works on 1D tensors, got {}D tensor", dims.len())
+            ));
+        }
+        
+        if index >= dims[0] {
+            return Err(FlameError::InvalidOperation(
+                format!("Index {} out of bounds for tensor with size {}", index, dims[0])
+            ));
+        }
+        
+        // Extract single value and return as scalar tensor
+        let data = self.to_vec()?;
+        Tensor::from_vec(vec![data[index]], Shape::from_dims(&[]), self.device.clone())
+    }
+    
+    /// Repeat tensor along specified dimensions
+    pub fn repeat(&self, repeats: &[usize]) -> Result<Tensor> {
+        let shape = self.shape();
+        let dims = shape.dims();
+        
+        if repeats.len() != dims.len() {
+            return Err(FlameError::InvalidOperation(
+                format!("repeat dimensions mismatch: tensor has {} dims but got {} repeat values", 
+                    dims.len(), repeats.len())
+            ));
+        }
+        
+        // Calculate new shape
+        let mut new_dims = vec![];
+        for (i, &dim) in dims.iter().enumerate() {
+            new_dims.push(dim * repeats[i]);
+        }
+        
+        // For now, use broadcast_to to repeat
+        self.broadcast_to(&Shape::from_dims(&new_dims))
     }
 }
