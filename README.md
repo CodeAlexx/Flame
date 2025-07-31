@@ -26,17 +26,35 @@ Despite extensive efforts to modify Candle for training support, its fundamental
 
 ### ✅ Working
 - Basic tensor operations (add, mul, matmul, etc.)
-- Activation functions (ReLU, Sigmoid, GELU, SiLU, Tanh)
+- Activation functions (ReLU, Sigmoid, GELU, SiLU, Tanh, LeakyReLU)
 - Gradient tracking with `requires_grad`
 - Manual gradient computation
 - CUDA memory management
 - NVRTC kernel compilation
+- Conv2D forward and backward pass with CUDA kernels
+- Advanced gradient modifications:
+  - Gradient clipping (value and norm)
+  - Gradient normalization
+  - Gradient noise injection
+  - Per-layer gradient statistics tracking
+- Tensor methods: min_all(), max_all(), sum_all(), floor(), ceil(), round()
+- Tensor manipulation: triu(), flip(), sub_scalar()
+- Device management with Arc<CudaDevice> pattern
+- anyhow::Error integration for better error handling
+- Debug trait implementation for tensors
 
 ### 🚧 In Progress
 - Automatic differentiation API improvements
-- Convolution operations
+- Layer normalization (required for transformers)
 - Batch normalization
 - Full model migration examples
+- Integration with EriDiffusion Flux model
+
+### ❌ Not Working Yet
+- Distributed training
+- Mixed precision (FP16/BF16) - planned but not implemented
+- Flash Attention - planned for future
+- CPU fallback (by design - GPU only)
 
 ## Quick Start
 
