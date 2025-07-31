@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::cuda_ops::GpuOps;
 use crate::cuda_kernels::CudaKernels;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::fmt;
 
 // Helper macro for kernel launches
 macro_rules! launch_kernel {
@@ -59,6 +60,7 @@ fn broadcast_shapes(shape1: &[usize], shape2: &[usize]) -> Result<Vec<usize>> {
 }
 
 /// The core tensor type with GPU-accelerated operations
+#[derive(Clone)]
 pub struct Tensor {
     /// GPU memory storage with dtype support
     pub(crate) storage: TensorStorage,
@@ -79,6 +81,13 @@ pub struct Tensor {
 impl AsRef<Tensor> for Tensor {
     fn as_ref(&self) -> &Tensor {
         self
+    }
+}
+
+impl fmt::Debug for Tensor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Tensor {{ shape: {:?}, dtype: {:?}, device: cuda:{}, id: {} }}", 
+               self.shape, self.storage.dtype(), self.device.ordinal(), self.id.0)
     }
 }
 

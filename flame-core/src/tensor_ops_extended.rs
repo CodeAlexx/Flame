@@ -998,6 +998,15 @@ impl Tensor {
         Ok(data.iter().cloned().fold(f32::NEG_INFINITY, f32::max))
     }
     
+    /// Find the minimum value in the tensor
+    pub fn min_all(&self) -> Result<f32> {
+        let data = self.to_vec()?;
+        if data.is_empty() {
+            return Err(FlameError::InvalidOperation("Cannot find min of empty tensor".into()));
+        }
+        Ok(data.iter().cloned().fold(f32::INFINITY, f32::min))
+    }
+    
     /// Find the sum of all elements in the tensor
     pub fn sum_all(&self) -> Result<Tensor> {
         let data = self.to_vec()?;

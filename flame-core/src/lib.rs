@@ -27,7 +27,7 @@ pub mod cuda_kernels_gpu;
 pub mod cuda_kernel_sources;
 pub mod cuda_kernel_compiler;
 pub mod cuda_ops;
-pub mod cuda_kernels_v2;
+// pub mod cuda_kernels_v2;  // Removed: experimental version
 pub mod cuda_conv2d_kernels;
 pub mod cuda_gradient_ops;
 pub mod cuda_tensor_gpu;

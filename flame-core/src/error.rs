@@ -69,3 +69,9 @@ impl From<image::ImageError> for FlameError {
         FlameError::InvalidOperation(format!("Image error: {}", err))
     }
 }
+
+impl From<anyhow::Error> for FlameError {
+    fn from(err: anyhow::Error) -> Self {
+        FlameError::InvalidOperation(format!("Anyhow error: {}", err))
+    }
+}
