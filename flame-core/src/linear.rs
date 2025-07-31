@@ -2,6 +2,11 @@ use crate::{Tensor, Result, FlameError, Shape};
 use cudarc::driver::CudaDevice;
 use std::sync::Arc;
 
+/// Create a linear layer (convenience function)
+pub fn linear(in_features: usize, out_features: usize, device: &Arc<CudaDevice>) -> Result<Linear> {
+    Linear::new(in_features, out_features, true, device)
+}
+
 /// Linear (fully connected) layer
 pub struct Linear {
     pub weight: Tensor,

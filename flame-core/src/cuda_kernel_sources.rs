@@ -277,6 +277,52 @@ extern "C" __global__ void sqrt_kernel(
 }
 "#;
 
+pub const NARROW_KERNEL: &str = r#"
+extern "C" __global__ void narrow_kernel(
+    const float* input,
+    float* output,
+    int input_size0, int input_size1, int input_size2, int input_size3,
+    int output_size0, int output_size1, int output_size2, int output_size3,
+    int dim, int start
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_output_size = output_size0 * output_size1 * output_size2 * output_size3;
+    
+    if (idx >= total_output_size) return;
+    
+    // Calculate output indices
+    int out_idx3 = idx % output_size3;
+    int out_idx2 = (idx / output_size3) % output_size2;
+    int out_idx1 = (idx / (output_size3 * output_size2)) % output_size1;
+    int out_idx0 = idx / (output_size3 * output_size2 * output_size1);
+    
+    // Calculate input indices
+    int in_idx0 = out_idx0;
+    int in_idx1 = out_idx1;
+    int in_idx2 = out_idx2;
+    int in_idx3 = out_idx3;
+    
+    // Adjust the index for the narrowed dimension
+    if (dim == 0) {
+        in_idx0 += start;
+    } else if (dim == 1) {
+        in_idx1 += start;
+    } else if (dim == 2) {
+        in_idx2 += start;
+    } else if (dim == 3) {
+        in_idx3 += start;
+    }
+    
+    // Calculate flat index for input
+    int input_idx = in_idx0 * (input_size1 * input_size2 * input_size3) +
+                    in_idx1 * (input_size2 * input_size3) +
+                    in_idx2 * input_size3 +
+                    in_idx3;
+    
+    output[idx] = input[input_idx];
+}
+"#;
+
 /// Helper to compile CUDA C to PTX
 /// DEPRECATED: Use cuda_kernel_compiler::compile_cuda_kernel instead
 pub fn compile_cuda_kernel(source: &str) -> Result<cudarc::nvrtc::Ptx, Box<dyn std::error::Error>> {

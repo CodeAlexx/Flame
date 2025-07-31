@@ -64,11 +64,14 @@ pub fn group_norm(
         }
     }
     
-    // Compile kernel
+    // Compile kernels
     let kernel_code = get_group_norm_kernel();
+    crate::cuda_kernels::CudaKernels::ensure_kernel(&input.device, "group_norm_compute_stats", kernel_code)?;
     crate::cuda_kernels::CudaKernels::ensure_kernel(&input.device, "group_norm_forward", kernel_code)?;
     
-    let f = input.device.get_func("group_norm_forward", "group_norm_forward")
+    let f_stats = input.device.get_func("group_norm_compute_stats", "group_norm_compute_stats")
+        .ok_or_else(|| FlameError::Cuda("Failed to get group_norm_compute_stats kernel".into()))?;
+    let f_norm = input.device.get_func("group_norm_forward", "group_norm_forward")
         .ok_or_else(|| FlameError::Cuda("Failed to get group_norm_forward kernel".into()))?;
     
     // Allocate output and temporary buffers
@@ -76,11 +79,56 @@ pub fn group_norm(
     let mean_data = crate::tensor::alloc_zeros_from_pool(&input.device, batch_size * num_groups)?;
     let var_data = crate::tensor::alloc_zeros_from_pool(&input.device, batch_size * num_groups)?;
     
-    // Launch kernel
-    let threads_per_block = 256;
+    // Launch stats kernel first
+    let total_groups = batch_size * num_groups;
+    
+    // Adaptive thread count based on spatial size to avoid excessive memory/compute
+    let stats_threads = if spatial_size > 65536 { // Large spatial dimensions (>256x256)
+        512  // Use more threads for better parallelism
+    } else {
+        256
+    };
+    
+    let stats_cfg = LaunchConfig {
+        grid_dim: (total_groups as u32, 1, 1),  // One block per group
+        block_dim: (stats_threads as u32, 1, 1),
+        shared_mem_bytes: (stats_threads * 2 * 4) as u32,  // 2 floats per thread
+    };
+    
+    // Debug info for large tensors - disabled for performance
+    // if spatial_size > 100000 {
+    //     println!("GroupNorm: Large tensor detected - batch_size: {}, channels: {}, spatial: {}, groups: {}", 
+    //              batch_size, num_channels, spatial_size, num_groups);
+    // }
+    
+    launch_kernel!(f_stats, stats_cfg,
+        input.storage.as_slice(),
+        &mean_data,
+        &var_data,
+        batch_size as i32,
+        num_channels as i32,
+        num_groups as i32,
+        channels_per_group as i32,
+        spatial_size as i32
+    )?;
+    
+    // Synchronize to ensure stats are computed
+    input.device.synchronize()?;
+    
+    // Launch normalization kernel
+    // Use more threads for very large tensors to improve parallelism
+    let threads_per_block = if input.shape().elem_count() > 100_000_000 { // >100M elements
+        512
+    } else {
+        256
+    };
     let num_blocks = (input.shape().elem_count() + threads_per_block - 1) / threads_per_block;
     
-    let cfg = LaunchConfig {
+    // Cap the number of blocks to avoid excessive launch overhead
+    let max_blocks = 65535;
+    let num_blocks = num_blocks.min(max_blocks);
+    
+    let norm_cfg = LaunchConfig {
         grid_dim: (num_blocks as u32, 1, 1),
         block_dim: (threads_per_block as u32, 1, 1),
         shared_mem_bytes: 0,
@@ -100,7 +148,7 @@ pub fn group_norm(
     let dims1 = (batch_size << 16) | num_channels;
     let dims2 = (num_groups << 16) | channels_per_group;
     
-    launch_kernel!(f, cfg,
+    launch_kernel!(f_norm, norm_cfg,
         input.storage.as_slice(),
         &output_data,
         weight_ptr,
@@ -170,13 +218,83 @@ pub fn group_norm(
 
 fn get_group_norm_kernel() -> &'static str {
     r#"
+// Optimized kernel for computing group statistics with reduced memory access
+extern "C" __global__ void group_norm_compute_stats(
+    const float* input,
+    float* mean_out,
+    float* var_out,
+    int batch_size,
+    int num_channels,
+    int num_groups,
+    int channels_per_group,
+    int spatial_size
+) {
+    // Use shared memory for partial sums
+    extern __shared__ float shared_data[];
+    float* shared_sum = shared_data;
+    float* shared_sum_sq = &shared_data[blockDim.x];
+    
+    int tid = threadIdx.x;
+    int group_id = blockIdx.x;
+    
+    if (group_id >= batch_size * num_groups) return;
+    
+    int n = group_id / num_groups;
+    int g = group_id % num_groups;
+    
+    // Each thread handles a portion of the spatial dimension
+    float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
+    int elements_per_thread = (spatial_size * channels_per_group + blockDim.x - 1) / blockDim.x;
+    int start_idx = tid * elements_per_thread;
+    int end_idx = min(start_idx + elements_per_thread, spatial_size * channels_per_group);
+    
+    for (int idx = start_idx; idx < end_idx; idx++) {
+        int c_offset = idx / spatial_size;
+        int hw_offset = idx % spatial_size;
+        int ch = g * channels_per_group + c_offset;
+        
+        if (ch < num_channels) {
+            int input_idx = n * num_channels * spatial_size + ch * spatial_size + hw_offset;
+            float val = input[input_idx];
+            local_sum += val;
+            local_sum_sq += val * val;
+        }
+    }
+    
+    // Store local sums in shared memory
+    shared_sum[tid] = local_sum;
+    shared_sum_sq[tid] = local_sum_sq;
+    __syncthreads();
+    
+    // Reduce in shared memory
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+            shared_sum_sq[tid] += shared_sum_sq[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // Write result
+    if (tid == 0) {
+        int count = channels_per_group * spatial_size;
+        float mean = shared_sum[0] / count;
+        float var = shared_sum_sq[0] / count - mean * mean;
+        
+        mean_out[group_id] = mean;
+        var_out[group_id] = var;
+    }
+}
+
+// Main normalization kernel
 extern "C" __global__ void group_norm_forward(
     const float* input,
     float* output,
     const float* weight,
     const float* bias,
-    float* mean_out,
-    float* var_out,
+    const float* mean_in,
+    const float* var_in,
     int dims1,  // (batch_size << 16) | num_channels
     int dims2,  // (num_groups << 16) | channels_per_group
     int spatial_size,
@@ -202,34 +320,9 @@ extern "C" __global__ void group_norm_forward(
     int g = c / channels_per_group;
     int group_idx = n * num_groups + g;
     
-    // First pass: compute mean and variance (simplified - in production use shared memory)
-    if (hw == 0 && c % channels_per_group == 0) {
-        float sum = 0.0f;
-        float sum_sq = 0.0f;
-        int count = channels_per_group * spatial_size;
-        
-        for (int i = 0; i < channels_per_group; i++) {
-            int ch = g * channels_per_group + i;
-            for (int j = 0; j < spatial_size; j++) {
-                int input_idx = n * num_channels * spatial_size + ch * spatial_size + j;
-                float val = input[input_idx];
-                sum += val;
-                sum_sq += val * val;
-            }
-        }
-        
-        float mean = sum / count;
-        float var = sum_sq / count - mean * mean;
-        
-        mean_out[group_idx] = mean;
-        var_out[group_idx] = var;
-    }
-    
-    __syncthreads();
-    
-    // Second pass: normalize
-    float mean = mean_out[group_idx];
-    float var = var_out[group_idx];
+    // Normalize using pre-computed statistics
+    float mean = mean_in[group_idx];
+    float var = var_in[group_idx];
     float std = sqrtf(var + eps);
     
     float normalized = (input[idx] - mean) / std;

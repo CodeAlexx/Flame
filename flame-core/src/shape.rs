@@ -3,6 +3,30 @@
 
 use crate::error::{FlameError, Result};
 
+/// Dimension helper for tensor indexing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum D {
+    Minus(i32),
+}
+
+impl D {
+    pub fn to_index(&self, shape: &Shape, index: usize) -> Result<usize> {
+        match self {
+            D::Minus(offset) => {
+                let rank = shape.rank() as i32;
+                let idx = rank + offset;
+                if idx < 0 || idx >= rank {
+                    return Err(FlameError::InvalidIndex(format!(
+                        "D::Minus({}) out of range for shape {:?}",
+                        offset, shape
+                    )));
+                }
+                Ok(idx as usize)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Shape {
     dims: Vec<usize>,

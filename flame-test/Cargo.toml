@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 flame-core = { path = "../flame-core" }
 cudarc = { workspace = true }
-candle-core = { path = "../../candle-fork/candle-core" }
 
 [[bin]]
 name = "simple_accuracy"

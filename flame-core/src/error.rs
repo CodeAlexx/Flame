@@ -37,6 +37,9 @@ pub enum FlameError {
     
     #[error("Autograd error: {0}")]
     Autograd(String),
+    
+    #[error("Invalid index: {0}")]
+    InvalidIndex(String),
 }
 
 // Now actually converts cudarc errors

@@ -29,8 +29,8 @@ pub fn create_output_tensor(data: CudaSlice<f32>, shape: Shape, device: Arc<Cuda
 
 /// GPU-only CUDA kernels using NVRTC runtime compilation
 pub struct CudaKernels {
-    device: Arc<CudaDevice>,
-    kernels: HashMap<String, CudaFunction>,
+    pub device: Arc<CudaDevice>,
+    pub kernels: HashMap<String, CudaFunction>,
 }
 
 
@@ -72,6 +72,7 @@ impl CudaKernels {
         kernels.insert("sin_kernel".to_string(), compile_and_load_kernel(&device, SIN_KERNEL, "sin_kernel")?);
         kernels.insert("cos_kernel".to_string(), compile_and_load_kernel(&device, COS_KERNEL, "cos_kernel")?);
         kernels.insert("sqrt_kernel".to_string(), compile_and_load_kernel(&device, SQRT_KERNEL, "sqrt_kernel")?);
+        kernels.insert("narrow_kernel".to_string(), compile_and_load_kernel(&device, NARROW_KERNEL, "narrow_kernel")?);
         
         Ok(Self { device, kernels })
     }
@@ -843,8 +844,24 @@ impl CudaKernels {
         Ok(output)
     }
     
-    // Stub for ensure_kernel - not needed with pre-compiled kernels
-    pub fn ensure_kernel(_device: &CudaDevice, _kernel_name: &str, _kernel_code: &str) -> Result<()> {
+    // Ensure a kernel is compiled and loaded
+    pub fn ensure_kernel(device: &Arc<CudaDevice>, kernel_name: &str, kernel_code: &str) -> Result<()> {
+        // Check if kernel is already loaded
+        if device.get_func(kernel_name, kernel_name).is_some() {
+            return Ok(());
+        }
+        
+        // Compile the kernel
+        let ptx = compile_ptx(kernel_code)
+            .map_err(|e| FlameError::KernelError(format!("Failed to compile {}: {:?}", kernel_name, e)))?;
+        
+        // Use Box::leak to get 'static lifetime for kernel names
+        let kernel_name_static = Box::leak(kernel_name.to_string().into_boxed_str());
+        
+        // Load the PTX module
+        device.load_ptx(ptx, kernel_name_static, &[kernel_name_static])
+            .map_err(|e| FlameError::Cuda(format!("Failed to load kernel {}: {:?}", kernel_name, e)))?;
+        
         Ok(())
     }
     

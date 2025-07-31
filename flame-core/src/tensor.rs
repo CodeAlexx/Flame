@@ -253,6 +253,40 @@ extern "C" __global__ void masked_fill_kernel(
             requires_grad: false,
         })
     }
+    
+    /// Create a new tensor from a Vec with specific dtype
+    pub fn from_vec_dtype(data: Vec<f32>, shape: Shape, device: Arc<CudaDevice>, dtype: DType) -> Result<Self> {
+        if data.len() != shape.elem_count() {
+            return Err(FlameError::ShapeMismatch {
+                expected: shape.clone(),
+                got: Shape::from_dims(&[data.len()]),
+            });
+        }
+        // Allocate from memory pool
+        let numel = data.len();
+        let mut cuda_data = alloc_from_pool(&device, numel)?;
+        // Copy data to GPU
+        device.htod_copy_into(data, &mut cuda_data)
+            .map_err(|_| FlameError::CudaDriver)?;
+        
+        // Create storage with specified dtype
+        let storage = match dtype {
+            DType::F32 => TensorStorage::F32 { data: cuda_data, numel },
+            DType::F16 => TensorStorage::F16 { data: cuda_data, numel, scale: 1.0 },
+            DType::BF16 => TensorStorage::BF16 { data: cuda_data, numel },
+            _ => return Err(FlameError::InvalidOperation(
+                format!("Unsupported dtype for from_vec_dtype: {:?}", dtype)
+            )),
+        };
+        
+        Ok(Self { 
+            storage, 
+            shape, 
+            device,
+            id: TensorId::new(),
+            requires_grad: false,
+        })
+    }
 
     /// Create tensor from raw GPU data
     pub fn from_raw(
@@ -1212,14 +1246,44 @@ extern "C" __global__ void slice_kernel(
     
     /// Clone the tensor (creates a new tensor with copied data)
     pub fn clone(&self) -> Result<Tensor> {
-        let mut data = unsafe { self.device.alloc::<f32>(self.shape.elem_count()) }
-            .map_err(|_| FlameError::CudaDriver)?;
+        // Commented out for performance
+        // println!("CLONE DEBUG: Cloning tensor with shape {:?}, dtype {:?}, elem_count: {}", 
+        //          self.shape, self.dtype(), self.shape.elem_count());
         
-        self.device.dtod_copy(self.storage.as_slice(), &mut data)
-            .map_err(|_| FlameError::CudaDriver)?;
+        // Clone the storage while preserving dtype
+        let storage = match &self.storage {
+            TensorStorage::F32 { data, numel } => {
+                let mut new_data = unsafe { self.device.alloc::<f32>(*numel) }
+                    .map_err(|_| FlameError::CudaDriver)?;
+                self.device.dtod_copy(data, &mut new_data)
+                    .map_err(|_| FlameError::CudaDriver)?;
+                TensorStorage::F32 { data: new_data, numel: *numel }
+            }
+            TensorStorage::F16 { data, numel, scale } => {
+                let mut new_data = unsafe { self.device.alloc::<f32>(*numel) }
+                    .map_err(|_| FlameError::CudaDriver)?;
+                self.device.dtod_copy(data, &mut new_data)
+                    .map_err(|_| FlameError::CudaDriver)?;
+                TensorStorage::F16 { data: new_data, numel: *numel, scale: *scale }
+            }
+            TensorStorage::BF16 { data, numel } => {
+                let mut new_data = unsafe { self.device.alloc::<f32>(*numel) }
+                    .map_err(|_| FlameError::CudaDriver)?;
+                self.device.dtod_copy(data, &mut new_data)
+                    .map_err(|_| FlameError::CudaDriver)?;
+                TensorStorage::BF16 { data: new_data, numel: *numel }
+            }
+            TensorStorage::I8 { data, numel } => {
+                let mut new_data = unsafe { self.device.alloc::<i8>(*numel) }
+                    .map_err(|_| FlameError::CudaDriver)?;
+                self.device.dtod_copy(data, &mut new_data)
+                    .map_err(|_| FlameError::CudaDriver)?;
+                TensorStorage::I8 { data: new_data, numel: *numel }
+            }
+        };
         
         Ok(Tensor {
-            storage: TensorStorage::F32 { data, numel: self.shape.elem_count() },
+            storage,
             shape: self.shape.clone(),
             device: self.device.clone(),
             id: TensorId::new(),
@@ -1229,14 +1293,40 @@ extern "C" __global__ void slice_kernel(
     
     /// Detach from computation graph
     pub fn detach(&self) -> Result<Tensor> {
-        let mut data = unsafe { self.device.alloc::<f32>(self.shape.elem_count()) }
-            .map_err(|_| FlameError::CudaDriver)?;
-        
-        self.device.dtod_copy(self.storage.as_slice(), &mut data)
-            .map_err(|_| FlameError::CudaDriver)?;
+        // Clone the storage while preserving dtype
+        let storage = match &self.storage {
+            TensorStorage::F32 { data, numel } => {
+                let mut new_data = unsafe { self.device.alloc::<f32>(*numel) }
+                    .map_err(|_| FlameError::CudaDriver)?;
+                self.device.dtod_copy(data, &mut new_data)
+                    .map_err(|_| FlameError::CudaDriver)?;
+                TensorStorage::F32 { data: new_data, numel: *numel }
+            }
+            TensorStorage::F16 { data, numel, scale } => {
+                let mut new_data = unsafe { self.device.alloc::<f32>(*numel) }
+                    .map_err(|_| FlameError::CudaDriver)?;
+                self.device.dtod_copy(data, &mut new_data)
+                    .map_err(|_| FlameError::CudaDriver)?;
+                TensorStorage::F16 { data: new_data, numel: *numel, scale: *scale }
+            }
+            TensorStorage::BF16 { data, numel } => {
+                let mut new_data = unsafe { self.device.alloc::<f32>(*numel) }
+                    .map_err(|_| FlameError::CudaDriver)?;
+                self.device.dtod_copy(data, &mut new_data)
+                    .map_err(|_| FlameError::CudaDriver)?;
+                TensorStorage::BF16 { data: new_data, numel: *numel }
+            }
+            TensorStorage::I8 { data, numel } => {
+                let mut new_data = unsafe { self.device.alloc::<i8>(*numel) }
+                    .map_err(|_| FlameError::CudaDriver)?;
+                self.device.dtod_copy(data, &mut new_data)
+                    .map_err(|_| FlameError::CudaDriver)?;
+                TensorStorage::I8 { data: new_data, numel: *numel }
+            }
+        };
             
         Ok(Tensor {
-            storage: TensorStorage::F32 { data, numel: self.shape.elem_count() },
+            storage,
             shape: self.shape.clone(),
             device: self.device.clone(),
             id: TensorId::new(),
@@ -1668,7 +1758,7 @@ extern "C" __global__ void slice_kernel(
         self.reshape(&new_dims)
     }
     
-    /// Narrow (slice) a tensor along a dimension
+    /// Narrow (slice) a tensor along a dimension - CUDA only implementation
     pub fn narrow(&self, dim: usize, start: usize, length: usize) -> Result<Tensor> {
         let dims = self.shape.dims();
         if dim >= dims.len() {
@@ -1684,84 +1774,64 @@ extern "C" __global__ void slice_kernel(
             ));
         }
         
-        // Calculate new shape
-        let mut new_dims = dims.to_vec();
-        new_dims[dim] = length;
-        let new_shape = Shape::from_dims(&new_dims);
+        // Create output shape
+        let mut output_dims = dims.to_vec();
+        output_dims[dim] = length;
+        let output_shape = Shape::from_dims(&output_dims);
         
-        // Implement slicing with a kernel
-        let kernel_code = r#"
-extern "C" __global__ void narrow_kernel(
-    float* output,
-    const float* input,
-    int* dims,
-    int ndim,
-    int slice_dim,
-    int slice_start,
-    int slice_length,
-    int total_output
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total_output) return;
-    
-    // Calculate coordinates in output tensor
-    int coords[10];  // Max 10 dimensions
-    int remaining = idx;
-    for (int d = ndim - 1; d >= 0; d--) {
-        int dim_size = (d == slice_dim) ? slice_length : dims[d];
-        coords[d] = remaining % dim_size;
-        remaining /= dim_size;
-    }
-    
-    // Adjust coordinate for sliced dimension
-    if (slice_dim < ndim) {
-        coords[slice_dim] += slice_start;
-    }
-    
-    // Calculate input index
-    int input_idx = 0;
-    int stride = 1;
-    for (int d = ndim - 1; d >= 0; d--) {
-        input_idx += coords[d] * stride;
-        stride *= dims[d];
-    }
-    
-    output[idx] = input[input_idx];
-}"#;
+        // For now, only support up to 4D tensors
+        if dims.len() > 4 {
+            return Err(FlameError::InvalidOperation(
+                format!("narrow operation currently supports up to 4D tensors, got {}D", dims.len())
+            ));
+        }
         
-        CudaKernels::ensure_kernel(&self.device, "narrow_kernel", kernel_code)?;
+        // Pad dimensions to 4D for kernel
+        let mut input_size = [1, 1, 1, 1];
+        let mut output_size = [1, 1, 1, 1];
+        for (i, &d) in dims.iter().enumerate() {
+            input_size[i] = d;
+        }
+        for (i, &d) in output_dims.iter().enumerate() {
+            output_size[i] = d;
+        }
         
-        let f = self.device.get_func("narrow_kernel", "narrow_kernel")
-            .ok_or_else(|| FlameError::Cuda("Failed to get narrow_kernel".into()))?;
+        // Get CUDA kernels instance
+        use crate::cuda_kernels::CudaKernels;
+        let cuda_kernels = CudaKernels::new(self.device.clone())?;
         
-        let output_size = new_shape.elem_count();
-        let output_data = alloc_zeros_from_pool(&self.device, output_size)?;
+        // Allocate output tensor
+        let mut output = Tensor::zeros(output_shape, self.device.clone())?;
         
-        // Upload dimensions
-        let dims_vec: Vec<f32> = dims.iter().map(|&x| x as f32).collect();
-        let mut dims_gpu = alloc_from_pool(&self.device, dims_vec.len())?;
-        self.device.htod_copy_into(dims_vec, &mut dims_gpu)
-            .map_err(|_| FlameError::CudaDriver)?;
+        // Get the narrow kernel
+        let kernel = cuda_kernels.kernels.get("narrow_kernel")
+            .ok_or_else(|| FlameError::KernelError("narrow_kernel not found".into()))?
+            .clone();
         
-        let cfg = LaunchConfig::for_num_elems(output_size as u32);
-        launch_kernel!(f, cfg,
-            &output_data,
-            self.storage.as_slice(),
-            &dims_gpu,
-            dims.len() as i32,
-            dim as i32,
-            start as i32,
-            length as i32,
-            output_size as i32
-        )?;
+        // Launch kernel
+        let n = output.shape.elem_count();
+        let block_size = 256;
+        let grid_size = (n + block_size - 1) / block_size;
         
-        Ok(Tensor {
-            storage: TensorStorage::F32 { data: output_data, numel: output_size },
-            shape: new_shape,
-            device: self.device.clone(),
-            id: TensorId::new(),
-            requires_grad: false,
-        })
+        let config = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_size as u32, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        
+        unsafe {
+            kernel.launch(config, (
+                self.storage.as_slice(),
+                output.storage.as_slice(),
+                input_size[0] as i32, input_size[1] as i32, input_size[2] as i32, input_size[3] as i32,
+                output_size[0] as i32, output_size[1] as i32, output_size[2] as i32, output_size[3] as i32,
+                dim as i32, start as i32
+            ))?;
+        }
+        
+        self.device.synchronize()?;
+        
+        Ok(output)
     }
     
     /// Copy data from another tensor

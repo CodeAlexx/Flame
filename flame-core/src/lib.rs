@@ -74,12 +74,42 @@ pub mod sage_attention;
 
 pub use dtype::DType;
 pub use error::{FlameError, Result};
-pub use shape::Shape;
+pub use shape::{Shape, D};
 pub use tensor::{Tensor, TensorId};
 pub use autograd::{AutogradContext, Op};
 pub use gradient::{GradientMap, TensorGradExt};
 pub use group_norm::{group_norm, GroupNorm};
 pub use flash_attention::{flash_attention_forward, FlashAttention};
+pub use device::Device;
+pub use parameter::Parameter as Var;
 
 // Re-export cudarc types we use
 pub use cudarc::driver::CudaDevice;
+
+// Module trait for layers
+pub trait Module {
+    fn forward(&self, x: &Tensor) -> Result<Tensor>;
+}
+
+// Backprop module for compatibility
+pub mod backprop {
+    pub use crate::gradient::GradientMap as GradStore;
+}
+
+// nn module for neural network layers
+pub mod nn {
+    pub use crate::linear::{Linear, linear};
+    pub use crate::layer_norm::LayerNorm;
+    pub use crate::embedding::Embedding;
+    pub use crate::conv::Conv2d;
+    pub use crate::cuda_conv2d::conv2d;
+    pub use crate::adam::AdamW;
+    
+    // Re-export optimizer trait
+    pub trait Optimizer {
+        fn step(&mut self) -> Result<()>;
+        fn zero_grad(&mut self);
+    }
+    
+    use crate::Result;
+}
