@@ -39,8 +39,14 @@ impl Device {
         self.inner.ordinal()
     }
     
+    /// Synchronize the device
+    pub fn synchronize(&self) -> Result<()> {
+        self.inner.synchronize()
+            .map_err(|_| FlameError::CudaDriver)
+    }
+    
     /// Set random seed for the device
-    pub fn set_seed(&self, seed: u64) -> Result<()> {
+    pub fn set_seed(&self, _seed: u64) -> Result<()> {
         // For now, this is a no-op as FLAME doesn't have a global RNG state
         // In the future, we might want to integrate with cuRAND
         Ok(())

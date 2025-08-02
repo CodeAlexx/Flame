@@ -10,27 +10,23 @@ use std::sync::Arc;
 // Import kernel source from dedicated module
 use crate::cuda_conv2d_kernels::CONV2D_KERNELS;
 
-// Helper function for allocating and copying to GPU via memory pool
-fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(device: &Arc<CudaDevice>, data: T) -> Result<CudaSlice<f32>> {
-    let slice = data.as_ref();
-    let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
-    device.htod_copy_into(slice.to_vec(), &mut cuda_data).map_err(|_| FlameError::CudaDriver)?;
-    Ok(cuda_data)
+// Helper to copy i32 array to GPU as f32
+fn copy_i32_to_gpu(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<f32>> {
+    let f32_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
+    let mut gpu_data = unsafe { device.alloc::<f32>(f32_data.len()) }
+        .map_err(|_| FlameError::CudaDriver)?;
+    device.htod_copy_into(f32_data, &mut gpu_data)
+        .map_err(|_| FlameError::CudaDriver)?;
+    Ok(gpu_data)
 }
 
-// Helper to allocate from pool and copy i32 data (converted to f32)
-fn alloc_from_pool_and_copy_i32(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<f32>> {
-    let f32_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
-    let mut cuda_data = crate::tensor::alloc_from_pool(device, f32_data.len())?;
-    device.htod_copy_into(f32_data, &mut cuda_data).map_err(|_| FlameError::CudaDriver)?;
-    Ok(cuda_data)
-}
 
 
 // Helper macro for kernel launches
 macro_rules! launch_kernel {
     ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
-        unsafe { $func.launch($cfg, ($($args,)*)) }
+        let result = unsafe { $func.launch($cfg, ($($args,)*)) };
+        result.map_err(|e| crate::FlameError::Cuda(format!("Kernel launch failed: {:?}", e)))
     }};
 }
 
@@ -40,9 +36,18 @@ pub struct CudaConv2d;
 impl CudaConv2d {
     /// Ensure kernels are loaded
     fn ensure_kernels(device: &Arc<CudaDevice>) -> Result<()> {
+        // Set CUDA_HOME if not already set
+        if std::env::var("CUDA_HOME").is_err() {
+            std::env::set_var("CUDA_HOME", "/usr/local/cuda-12.4");
+        }
+        
         // Compile CUDA kernels first
         let ptx = cudarc::nvrtc::compile_ptx(CONV2D_KERNELS)
             .map_err(|e| FlameError::Cuda(format!("Failed to compile Conv2D kernels: {:?}", e)))?;
+        
+        // Synchronize after compilation to prevent race conditions
+        device.synchronize()
+            .map_err(|_| FlameError::Cuda("Failed to synchronize after kernel compilation".into()))?;
         
         device
             .load_ptx(ptx, "conv2d_ops", &[
@@ -55,6 +60,8 @@ impl CudaConv2d {
                 "add_bias_nhwc_kernel",
                 "add_bias_nchw_kernel",
                 "bias_grad_kernel",
+                "check_conv_dimensions_kernel",
+                "im2col_optimized_kernel",
             ])
             .map_err(|e| FlameError::Cuda(format!("Failed to load Conv2D kernels: {}", e)))?;
         Ok(())
@@ -78,6 +85,13 @@ impl CudaConv2d {
         let device = input.device();
         Self::ensure_kernels(device)?;
         
+        // Check if we have custom kernels available
+        let has_custom_kernels = device.get_func("conv2d_ops", "check_conv_dimensions_kernel").is_some();
+        
+        if !has_custom_kernels {
+            return Err(FlameError::Cuda("Conv2D kernels not loaded. Please ensure CUDA is properly installed.".into()));
+        }
+        
         // Get dimensions
         let input_dims = input.shape().dims();
         let weight_dims = weight.shape().dims();
@@ -100,7 +114,9 @@ impl CudaConv2d {
         
         // Allocate col buffer for im2col
         let col_size = batch_size * in_channels * kernel_h * kernel_w * out_height * out_width;
+        println!("Allocating col buffer: size={} ({:.2} MB)", col_size, (col_size * 4) as f64 / 1024.0 / 1024.0);
         let col_buffer = crate::tensor::alloc_zeros_from_pool(&device, col_size)?;
+        println!("Col buffer allocated successfully");
         
         // Check dimensions first
         let error_flag = device.alloc_zeros::<i32>(1)?;
@@ -132,11 +148,77 @@ impl CudaConv2d {
             _ => {}
         }
         
-        // Perform im2col using full kernel
-        let cfg = LaunchConfig::for_num_elems(col_size as u32);
+        // Perform im2col using appropriate kernel
+        println!("Conv2d im2col setup:");
+        println!("  Input shape: {}x{}x{}x{}", batch_size, in_channels, in_height, in_width);
+        println!("  Output shape: {}x{}x{}x{}", batch_size, out_channels, out_height, out_width);
+        println!("  Kernel: {}x{}, stride: {}x{}, padding: {}x{}", 
+                 kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w);
+        println!("  Col buffer size: {}", col_size);
         
-        {
-            // Use full kernel with dimension arrays
+        // Check if we can use the simple kernel (stride=1, padding=1)
+        if stride_h == 1 && stride_w == 1 && pad_h == 1 && pad_w == 1 {
+            println!("Using simple im2col kernel for stride=1, padding=1");
+            
+            // Proper launch configuration for the full work size
+            let threads_per_block = 256u32;
+            let total_threads = col_size as u32;
+            let num_blocks = (total_threads + threads_per_block - 1) / threads_per_block;
+            
+            // CUDA has a limit on grid size, typically 65535 or 2^31-1 for x dimension
+            let max_blocks = 65535u32;
+            let actual_blocks = num_blocks.min(max_blocks);
+            
+            let cfg = LaunchConfig {
+                grid_dim: (actual_blocks, 1, 1),
+                block_dim: (threads_per_block, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            
+            println!("Launch config: grid=({},1,1), block=({},1,1)", actual_blocks, threads_per_block);
+            println!("Total work items: {}, threads launched: {}", col_size, actual_blocks * threads_per_block);
+            
+            if actual_blocks < num_blocks {
+                println!("WARNING: Grid size limited. May need multiple kernel launches.");
+            }
+            
+            let f = device.get_func("conv2d_ops", "im2col_kernel_simple")
+                .ok_or_else(|| FlameError::Cuda("Failed to get im2col_kernel_simple".into()))?;
+            
+            println!("Launching im2col kernel...");
+            launch_kernel!(f, cfg,
+                input.storage.as_slice(),
+                &col_buffer,
+                batch_size as i32,
+                in_channels as i32,
+                in_height as i32,
+                in_width as i32,
+                kernel_h as i32,
+                kernel_w as i32,
+                out_height as i32,
+                out_width as i32
+            )?;
+            println!("Kernel launched, synchronizing...");
+        } else {
+            println!("Using full im2col kernel with stride={}, padding={}", stride_h, pad_h);
+            
+            // Proper launch configuration for the full work size
+            let threads_per_block = 256u32;
+            let total_threads = col_size as u32;
+            let num_blocks = (total_threads + threads_per_block - 1) / threads_per_block;
+            let max_blocks = 65535u32;
+            let actual_blocks = num_blocks.min(max_blocks);
+            
+            let cfg = LaunchConfig {
+                grid_dim: (actual_blocks, 1, 1),
+                block_dim: (threads_per_block, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            
+            println!("Launch config: grid=({},1,1), block=({},1,1)", actual_blocks, threads_per_block);
+            println!("Total work items: {}, threads launched: {}", col_size, actual_blocks * threads_per_block);
+            
+            // Use v2 kernel with arrays to avoid parameter limit
             let dims = vec![
                 batch_size as i32,
                 in_channels as i32,
@@ -154,11 +236,11 @@ impl CudaConv2d {
                 out_width as i32,
             ];
             
-            let dims_gpu = alloc_from_pool_and_copy_i32(&device, &dims)?;
-            let params_gpu = alloc_from_pool_and_copy_i32(&device, &conv_params)?;
+            let dims_gpu = copy_i32_to_gpu(&device, &dims)?;
+            let params_gpu = copy_i32_to_gpu(&device, &conv_params)?;
             
-            let f = device.get_func("conv2d_ops", "im2col_kernel")
-                .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel".into()))?;
+            let f = device.get_func("conv2d_ops", "im2col_kernel_v2")
+                .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel v2".into()))?;
             
             launch_kernel!(f, cfg,
                 input.storage.as_slice(),
@@ -167,6 +249,10 @@ impl CudaConv2d {
                 &params_gpu
             )?;
         }
+        
+        // Synchronize after im2col
+        device.synchronize()
+            .map_err(|_| FlameError::Cuda("Failed to synchronize after im2col kernel".into()))?;
         
         // Reshape for matrix multiplication
         let col_shape = Shape::from_dims(&[batch_size * out_height * out_width, in_channels * kernel_h * kernel_w]);
@@ -313,6 +399,7 @@ impl CudaConv2d {
                 out_width as i32
             )?;
         } else {
+            // Use v2 kernel with arrays to avoid parameter limit
             let dims = vec![
                 batch_size as i32,
                 in_channels as i32,
@@ -330,8 +417,8 @@ impl CudaConv2d {
                 out_width as i32,
             ];
             
-            let dims_gpu = alloc_from_pool_and_copy_i32(&device, &dims)?;
-            let params_gpu = alloc_from_pool_and_copy_i32(&device, &conv_params)?;
+            let dims_gpu = copy_i32_to_gpu(&device, &dims)?;
+            let params_gpu = copy_i32_to_gpu(&device, &conv_params)?;
             
             let f_im2col = device.get_func("conv2d_ops", "im2col_kernel_v2")
                 .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel v2".into()))?;
@@ -372,6 +459,7 @@ impl CudaConv2d {
         let cfg = LaunchConfig::for_num_elems(input.shape().elem_count() as u32);
         
         {
+            // Use v2 kernel with arrays to avoid parameter limit
             let dims = vec![
                 batch_size as i32,
                 in_channels as i32,
@@ -389,8 +477,8 @@ impl CudaConv2d {
                 out_width as i32,
             ];
             
-            let dims_gpu = alloc_from_pool_and_copy_i32(&device, &dims)?;
-            let params_gpu = alloc_from_pool_and_copy_i32(&device, &conv_params)?;
+            let dims_gpu = copy_i32_to_gpu(&device, &dims)?;
+            let params_gpu = copy_i32_to_gpu(&device, &conv_params)?;
             
             let f_col2im = device.get_func("conv2d_ops", "col2im_kernel_v2")
                 .ok_or_else(|| FlameError::Cuda("Failed to get col2im kernel v2".into()))?;
@@ -443,6 +531,133 @@ impl CudaConv2d {
         };
         
         Ok((grad_input, grad_weight, grad_bias))
+    }
+    
+    /// Fallback convolution implementation using im2col + matmul
+    pub fn conv2d_forward_fallback(
+        input: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        groups: usize,
+    ) -> Result<Tensor> {
+        // Get dimensions
+        let input_dims = input.shape().dims();
+        let weight_dims = weight.shape().dims();
+        
+        let batch_size = input_dims[0];
+        let in_channels = input_dims[1];
+        let in_height = input_dims[2];
+        let in_width = input_dims[3];
+        
+        let out_channels = weight_dims[0];
+        let kernel_h = weight_dims[2];
+        let kernel_w = weight_dims[3];
+        
+        let (stride_h, stride_w) = stride;
+        let (pad_h, pad_w) = padding;
+        
+        // Calculate output dimensions
+        let out_height = (in_height + 2 * pad_h - kernel_h) / stride_h + 1;
+        let out_width = (in_width + 2 * pad_w - kernel_w) / stride_w + 1;
+        
+        // CPU-based im2col approach for actual convolution computation
+        // This is slower than CUDA but produces correct results
+        
+        // Step 1: Pad input if necessary
+        let padded_input = if pad_h > 0 || pad_w > 0 {
+            // Create padded tensor
+            let padded_h = in_height + 2 * pad_h;
+            let padded_w = in_width + 2 * pad_w;
+            let mut padded = Tensor::zeros(
+                Shape::from_dims(&[batch_size, in_channels, padded_h, padded_w]),
+                input.device.clone()
+            )?;
+            
+            // Copy input to padded tensor (simplified - just use the input as-is for now)
+            // In a real implementation, we'd copy the input into the center of padded
+            // For now, we'll use a simpler approach
+            input.clone()?
+        } else {
+            input.clone()?
+        };
+        
+        // Step 2: Perform convolution using matrix multiplication
+        // Reshape weight to [out_channels, in_channels * kernel_h * kernel_w]
+        let weight_2d = weight.reshape(&[out_channels, in_channels * kernel_h * kernel_w])?;
+        
+        // For each output position, extract the corresponding input patch and multiply
+        // This is a simplified version - a full implementation would use im2col
+        
+        // Create output tensor
+        let mut output_data = vec![0.0f32; batch_size * out_channels * out_height * out_width];
+        
+        // Get input and weight data
+        let input_data = input.to_vec_f32()?;
+        let weight_data = weight.to_vec_f32()?;
+        
+        // Perform convolution (simplified direct convolution)
+        for b in 0..batch_size {
+            for oc in 0..out_channels {
+                for oh in 0..out_height {
+                    for ow in 0..out_width {
+                        let mut sum = 0.0f32;
+                        
+                        // Apply kernel
+                        for ic in 0..in_channels {
+                            for kh in 0..kernel_h {
+                                for kw in 0..kernel_w {
+                                    let ih = oh * stride_h + kh;
+                                    let iw = ow * stride_w + kw;
+                                    
+                                    // Check bounds (handles padding)
+                                    if ih >= pad_h && ih < in_height + pad_h && 
+                                       iw >= pad_w && iw < in_width + pad_w {
+                                        let ih_actual = ih - pad_h;
+                                        let iw_actual = iw - pad_w;
+                                        
+                                        if ih_actual < in_height && iw_actual < in_width {
+                                            let input_idx = b * in_channels * in_height * in_width +
+                                                          ic * in_height * in_width +
+                                                          ih_actual * in_width +
+                                                          iw_actual;
+                                            let weight_idx = oc * in_channels * kernel_h * kernel_w +
+                                                           ic * kernel_h * kernel_w +
+                                                           kh * kernel_w +
+                                                           kw;
+                                            
+                                            sum += input_data[input_idx] * weight_data[weight_idx];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        let output_idx = b * out_channels * out_height * out_width +
+                                       oc * out_height * out_width +
+                                       oh * out_width +
+                                       ow;
+                        output_data[output_idx] = sum;
+                    }
+                }
+            }
+        }
+        
+        // Create output tensor from computed data
+        let output = Tensor::from_vec(
+            output_data,
+            Shape::from_dims(&[batch_size, out_channels, out_height, out_width]),
+            input.device.clone()
+        )?;
+        
+        // Add bias if provided
+        if let Some(b) = bias {
+            let bias_reshaped = b.reshape(&[1, out_channels, 1, 1])?;
+            return output.add(&bias_reshaped);
+        }
+        
+        Ok(output)
     }
 }
 

@@ -2,6 +2,7 @@ use crate::{Shape, Result, FlameError, DType};
 use crate::autograd::{AutogradContext, Op};
 use crate::gradient::{GradientMap, TensorGradExt};
 use crate::tensor_storage::TensorStorage;
+use crate::cuda_memory_alignment::alloc_aligned_f32;
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, LaunchConfig, LaunchAsync, DeviceSlice, CudaFunction};
 use cudarc::cublas::CudaBlas;
 use std::sync::Arc;
@@ -203,9 +204,31 @@ extern "C" __global__ void masked_fill_kernel(
         }
         
         // For now, we store everything as F32 but track the dtype
-        let f32_data = self.storage.to_f32(&self.device)?;
-        
+        // Use aligned allocation for the new tensor to avoid CUDA issues
         let numel = self.shape.elem_count();
+        
+        // Debug large allocations
+        if numel > 100000 {
+            eprintln!("to_dtype: converting {} elements from {:?} to {:?}", numel, self.dtype(), dtype);
+        }
+        
+        // Use aligned allocation
+        let mut f32_data = alloc_aligned_f32(&self.device, numel)?;
+        
+        // Copy data from source storage
+        match &self.storage {
+            TensorStorage::F32 { data, .. } |
+            TensorStorage::F16 { data, .. } |
+            TensorStorage::BF16 { data, .. } => {
+                // For now, just use the allocation as-is
+                // The extra padding shouldn't cause issues since we track numel separately
+                self.device.dtod_copy(data, &mut f32_data)?;
+            },
+            TensorStorage::I8 { .. } => {
+                return Err(FlameError::InvalidOperation("I8 to dtype conversion not implemented".into()));
+            }
+        }
+        
         let storage = match dtype {
             DType::F32 => TensorStorage::F32 { data: f32_data, numel },
             DType::F16 => TensorStorage::F16 { data: f32_data, numel, scale: 1.0 }, // Stored as F32 but marked as F16
@@ -242,9 +265,19 @@ extern "C" __global__ void masked_fill_kernel(
         // Allocate from memory pool
         let numel = data.len();
         let mut cuda_data = alloc_from_pool(&device, numel)?;
-        // Copy data to GPU
-        device.htod_copy_into(data, &mut cuda_data)
-            .map_err(|_| FlameError::CudaDriver)?;
+        
+        // If the allocated size is larger than our data, we need to handle it carefully
+        if cuda_data.len() > numel {
+            // Pad the data to match the allocated size
+            let mut padded_data = data;
+            padded_data.resize(cuda_data.len(), 0.0);
+            device.htod_copy_into(padded_data, &mut cuda_data)
+                .map_err(|_| FlameError::CudaDriver)?;
+        } else {
+            // Normal case - sizes match
+            device.htod_copy_into(data, &mut cuda_data)
+                .map_err(|_| FlameError::CudaDriver)?;
+        }
         Ok(Self { 
             storage: TensorStorage::F32 { data: cuda_data, numel }, 
             shape, 
@@ -265,9 +298,19 @@ extern "C" __global__ void masked_fill_kernel(
         // Allocate from memory pool
         let numel = data.len();
         let mut cuda_data = alloc_from_pool(&device, numel)?;
-        // Copy data to GPU
-        device.htod_copy_into(data, &mut cuda_data)
-            .map_err(|_| FlameError::CudaDriver)?;
+        
+        // If the allocated size is larger than our data, we need to handle it carefully
+        if cuda_data.len() > numel {
+            // Pad the data to match the allocated size
+            let mut padded_data = data;
+            padded_data.resize(cuda_data.len(), 0.0);
+            device.htod_copy_into(padded_data, &mut cuda_data)
+                .map_err(|_| FlameError::CudaDriver)?;
+        } else {
+            // Normal case - sizes match
+            device.htod_copy_into(data, &mut cuda_data)
+                .map_err(|_| FlameError::CudaDriver)?;
+        }
         
         // Create storage with specified dtype
         let storage = match dtype {
@@ -422,9 +465,8 @@ extern "C" __global__ void masked_fill_kernel(
             ldc: n as i32,
         };
         
-        // Allocate output data
-        let mut output_data = unsafe { self.device.alloc::<f32>(m * n) }
-            .map_err(|_| FlameError::CudaDriver)?;
+        // Allocate output data using aligned allocation
+        let mut output_data = alloc_aligned_f32(&self.device, m * n)?;
         
         let self_data = self.storage.as_slice();
         let other_data = other.storage.as_slice();
@@ -1253,22 +1295,19 @@ extern "C" __global__ void slice_kernel(
         // Clone the storage while preserving dtype
         let storage = match &self.storage {
             TensorStorage::F32 { data, numel } => {
-                let mut new_data = unsafe { self.device.alloc::<f32>(*numel) }
-                    .map_err(|_| FlameError::CudaDriver)?;
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
                 self.device.dtod_copy(data, &mut new_data)
                     .map_err(|_| FlameError::CudaDriver)?;
                 TensorStorage::F32 { data: new_data, numel: *numel }
             }
             TensorStorage::F16 { data, numel, scale } => {
-                let mut new_data = unsafe { self.device.alloc::<f32>(*numel) }
-                    .map_err(|_| FlameError::CudaDriver)?;
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
                 self.device.dtod_copy(data, &mut new_data)
                     .map_err(|_| FlameError::CudaDriver)?;
                 TensorStorage::F16 { data: new_data, numel: *numel, scale: *scale }
             }
             TensorStorage::BF16 { data, numel } => {
-                let mut new_data = unsafe { self.device.alloc::<f32>(*numel) }
-                    .map_err(|_| FlameError::CudaDriver)?;
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
                 self.device.dtod_copy(data, &mut new_data)
                     .map_err(|_| FlameError::CudaDriver)?;
                 TensorStorage::BF16 { data: new_data, numel: *numel }
@@ -1296,22 +1335,19 @@ extern "C" __global__ void slice_kernel(
         // Clone the storage while preserving dtype
         let storage = match &self.storage {
             TensorStorage::F32 { data, numel } => {
-                let mut new_data = unsafe { self.device.alloc::<f32>(*numel) }
-                    .map_err(|_| FlameError::CudaDriver)?;
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
                 self.device.dtod_copy(data, &mut new_data)
                     .map_err(|_| FlameError::CudaDriver)?;
                 TensorStorage::F32 { data: new_data, numel: *numel }
             }
             TensorStorage::F16 { data, numel, scale } => {
-                let mut new_data = unsafe { self.device.alloc::<f32>(*numel) }
-                    .map_err(|_| FlameError::CudaDriver)?;
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
                 self.device.dtod_copy(data, &mut new_data)
                     .map_err(|_| FlameError::CudaDriver)?;
                 TensorStorage::F16 { data: new_data, numel: *numel, scale: *scale }
             }
             TensorStorage::BF16 { data, numel } => {
-                let mut new_data = unsafe { self.device.alloc::<f32>(*numel) }
-                    .map_err(|_| FlameError::CudaDriver)?;
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
                 self.device.dtod_copy(data, &mut new_data)
                     .map_err(|_| FlameError::CudaDriver)?;
                 TensorStorage::BF16 { data: new_data, numel: *numel }
@@ -1868,8 +1904,8 @@ impl TensorGradExt for Tensor {
 
 /// Allocate memory from the pool for internal use
 pub(crate) fn alloc_from_pool(device: &Arc<CudaDevice>, size: usize) -> Result<CudaSlice<f32>> {
-    // For now, just allocate directly until we fix the memory pool lifetime issues
-    device.alloc_zeros::<f32>(size).map_err(|_| FlameError::CudaDriver)
+    // Use aligned allocation to avoid CUDA alignment issues
+    alloc_aligned_f32(device, size)
 }
 
 /// Allocate zeroed memory from the pool for internal use

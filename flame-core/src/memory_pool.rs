@@ -4,6 +4,7 @@
 //! and memory fragmentation during training and inference.
 
 use crate::{Result, FlameError, Shape};
+use crate::cuda_memory_alignment::{align_size, is_problematic_size};
 use cudarc::driver::{CudaDevice, CudaSlice};
 use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, VecDeque};
@@ -68,13 +69,14 @@ impl DeviceMemoryPool {
     pub fn allocate(&mut self, size: usize) -> Result<CudaSlice<f32>> {
         self.stats.allocations += 1;
         
-        // Round up to next power of 2 for better pooling
-        let pool_size = Self::next_power_of_2(size);
+        // Use alignment-aware size calculation
+        let aligned_size = align_size(size);
+        let pool_size = Self::next_power_of_2(aligned_size);
         
         // Check if we have a free block in the pool
         if let Some(pool) = self.pools.get_mut(&pool_size) {
             for block in pool.iter_mut() {
-                if !block.in_use && block.size >= size {
+                if !block.in_use && block.size >= aligned_size {
                     block.in_use = true;
                     self.stats.cache_hits += 1;
                     self.stats.reuses += 1;
@@ -96,9 +98,16 @@ impl DeviceMemoryPool {
             }
         }
         
-        // Allocate new block
-        let ptr = self.device.alloc_zeros::<f32>(pool_size)
-            .map_err(|e| FlameError::CudaDriver)?;
+        // Allocate new block with proper alignment
+        let ptr = match self.device.alloc_zeros::<f32>(pool_size) {
+            Ok(p) => p,
+            Err(_) if pool_size != aligned_size => {
+                // If power-of-2 allocation fails, try aligned size
+                self.device.alloc_zeros::<f32>(aligned_size)
+                    .map_err(|_| FlameError::CudaDriver)?
+            }
+            Err(e) => return Err(FlameError::CudaDriver),
+        };
         
         let block = MemoryBlock {
             ptr: ptr.clone(),

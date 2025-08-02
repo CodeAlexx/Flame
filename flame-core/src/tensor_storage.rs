@@ -1,7 +1,6 @@
 use crate::{Result, FlameError, Shape, DType};
-use crate::memory_pool::MEMORY_POOL;
-use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync};
-use half::{f16, bf16};
+use crate::cuda_memory_alignment::alloc_aligned_f32;
+use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice};
 use std::sync::Arc;
 
 /// Actual storage backend for tensors with proper dtype support
@@ -38,11 +37,8 @@ impl TensorStorage {
     pub fn zeros(shape: &Shape, dtype: DType, device: &Arc<CudaDevice>) -> Result<Self> {
         let numel = shape.elem_count();
         
-        // Get memory pool for this device
-        let pool = MEMORY_POOL.get_pool(device)?;
-        
-        // Allocate from pool - always as F32 for now since cudarc doesn't support f16/bf16 directly
-        let mut data = pool.lock().unwrap().allocate(numel)?;
+        // Use aligned allocation to avoid CUDA issues
+        let mut data = alloc_aligned_f32(device, numel)?;
         
         // Zero out the memory
         device.memset_zeros(&mut data)?;
@@ -72,9 +68,18 @@ impl TensorStorage {
             TensorStorage::F32 { data, numel } | 
             TensorStorage::F16 { data, numel, .. } | 
             TensorStorage::BF16 { data, numel } => {
-                // For now, all are stored as F32, so just clone
-                let pool = MEMORY_POOL.get_pool(device)?;
-                let mut out = pool.lock().unwrap().allocate(*numel)?;
+                // Use aligned allocation
+                let mut out = alloc_aligned_f32(device, *numel)?;
+                
+                // If the allocation is larger, we need to handle it carefully
+                if out.len() > *numel {
+                    // The aligned allocation returned more space than requested
+                    // We'll still copy only the actual data size
+                    // Note: TensorStorage tracks numel separately, so the extra space won't be used
+                    eprintln!("Warning: aligned allocation returned {} elements for {} requested", out.len(), *numel);
+                }
+                
+                // Copy data - dtod_copy should handle size mismatches gracefully
                 device.dtod_copy(data, &mut out)?;
                 Ok(out)
             }

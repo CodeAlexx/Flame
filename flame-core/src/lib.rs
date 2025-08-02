@@ -29,6 +29,7 @@ pub mod cuda_kernel_compiler;
 pub mod cuda_ops;
 // pub mod cuda_kernels_v2;  // Removed: experimental version
 pub mod cuda_conv2d_kernels;
+pub mod cuda_memory_alignment;
 pub mod cuda_gradient_ops;
 pub mod cuda_tensor_gpu;
 pub mod autograd_ops_complete;

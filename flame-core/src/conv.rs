@@ -170,8 +170,13 @@ impl Conv2d {
             out_width,
         ]);
         
-        // Perform convolution using im2col approach
-        let output = self.conv2d_im2col(input, output_shape)?;
+        // Always use GPU convolution since FLAME only supports CUDA
+        let output = input.conv2d(
+            &self.weight,
+            self.bias.as_ref(),
+            self.config.stride.0,
+            self.config.padding.0,
+        )?;
         
         // Add bias if present
         let mut output = if let Some(bias) = &self.bias {

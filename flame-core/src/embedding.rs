@@ -3,6 +3,7 @@
 use crate::{Tensor, Shape, Result, FlameError};
 use crate::tensor::TensorId;
 use crate::autograd::{AutogradContext, Op};
+use crate::cuda_memory_alignment::is_problematic_size;
 use std::sync::Arc;
 use cudarc::driver::CudaDevice;
 
@@ -65,6 +66,31 @@ impl Embedding {
         } else {
             vec![batch_size, self.embedding_dim]
         };
+        
+        // Check if the output size would be problematic
+        let total_elements: usize = output_shape.iter().product();
+        if is_problematic_size(total_elements) {
+            // For problematic sizes, pad the embeddings vector
+            let padded_size = ((total_elements + 1023) / 1024) * 1024; // Round up to next 1024
+            embeddings.resize(padded_size, 0.0);
+            
+            // Create tensor with padded size, then slice back
+            let padded_shape = if output_shape.len() > 1 {
+                vec![output_shape[0], output_shape[1], padded_size / (output_shape[0] * output_shape[1])]
+            } else {
+                vec![padded_size]
+            };
+            
+            let padded_tensor = Tensor::from_vec(
+                embeddings, 
+                Shape::from_dims(&padded_shape), 
+                self.weight.device().clone()
+            )?;
+            
+            // Reshape back to original size
+            return padded_tensor.narrow(output_shape.len() - 1, 0, output_shape[output_shape.len() - 1])
+                .and_then(|t| t.reshape(&output_shape));
+        }
         
         let mut output = Tensor::from_vec(
             embeddings, 
