@@ -9,7 +9,7 @@ use half::bf16;
 pub enum TensorStorage {
     F32 { data: CudaSlice<f32>, numel: usize },
     F16 { data: CudaSlice<f32>, numel: usize, scale: f32 },  // Store as F32 but with quantization scale
-    BF16 { data: CudaSlice<bf16>, numel: usize }, // Real BF16 storage - 50% memory savings!
+    BF16 { data: CudaSlice<f32>, numel: usize }, // BF16 stored as F32 for now (cudarc limitation)
     I8 { data: CudaSlice<i8>, numel: usize },  // INT8 support for Sage Attention
 }
 
@@ -52,8 +52,9 @@ impl TensorStorage {
                 Ok(TensorStorage::F16 { data, numel, scale: 1.0 })
             }
             DType::BF16 => {
-                // Allocate real BF16 storage - 50% memory savings!
-                let data = device.alloc_zeros::<bf16>(numel)?;
+                // BF16 uses F32 storage for now (cudarc limitation)
+                let mut data = alloc_aligned_f32(device, numel)?;
+                device.memset_zeros(&mut data)?;
                 Ok(TensorStorage::BF16 { data, numel })
             }
             DType::I8 => {
@@ -88,10 +89,16 @@ impl TensorStorage {
                 Ok(out)
             }
             TensorStorage::BF16 { data, numel } => {
-                // Convert BF16 to F32 using proper conversion
-                use crate::bf16_support::bf16_to_f32;
+                // BF16 is stored as F32 for now
                 let mut out = alloc_aligned_f32(device, *numel)?;
-                bf16_to_f32(device, data, &mut out)?;
+                
+                // If the allocation is larger, we need to handle it carefully
+                if out.len() > *numel {
+                    eprintln!("Warning: aligned allocation returned {} elements for {} requested", out.len(), *numel);
+                }
+                
+                // Copy data - dtod_copy should handle size mismatches gracefully
+                device.dtod_copy(data, &mut out)?;
                 Ok(out)
             }
             TensorStorage::I8 { .. } => {
@@ -106,17 +113,9 @@ impl TensorStorage {
     pub fn as_slice(&self) -> &CudaSlice<f32> {
         match self {
             TensorStorage::F32 { data, .. } |
-            TensorStorage::F16 { data, .. } => data,
-            TensorStorage::BF16 { .. } => panic!("Cannot get f32 slice from BF16 storage - use as_bf16_slice"),
+            TensorStorage::F16 { data, .. } |
+            TensorStorage::BF16 { data, .. } => data,  // BF16 stored as F32 for now
             TensorStorage::I8 { .. } => panic!("Cannot get f32 slice from I8 storage"),
-        }
-    }
-    
-    /// Get a reference to the underlying BF16 CudaSlice
-    pub fn as_bf16_slice(&self) -> Result<&CudaSlice<bf16>> {
-        match self {
-            TensorStorage::BF16 { data, .. } => Ok(data),
-            _ => Err(FlameError::InvalidOperation("Not a BF16 tensor".into())),
         }
     }
     

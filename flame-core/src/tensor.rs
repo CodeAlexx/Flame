@@ -273,11 +273,18 @@ extern "C" __global__ void masked_fill_kernel(
         })
     }
     
-    /// Create a new tensor filled with ones
+    /// Create a new tensor filled with ones (defaults to F32)
     pub fn ones(shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
         let size = shape.elem_count();
         let ones_vec = vec![1.0f32; size];
         Self::from_vec(ones_vec, shape, device)
+    }
+    
+    /// Create a new tensor filled with ones with specific dtype
+    pub fn ones_dtype(shape: Shape, dtype: DType, device: Arc<CudaDevice>) -> Result<Self> {
+        let size = shape.elem_count();
+        let ones_vec = vec![1.0f32; size];
+        Self::from_vec_dtype(ones_vec, shape, device, dtype)
     }
 
     /// Create a new tensor from a Vec
@@ -343,23 +350,8 @@ extern "C" __global__ void masked_fill_kernel(
             DType::F32 => TensorStorage::F32 { data: cuda_data, numel },
             DType::F16 => TensorStorage::F16 { data: cuda_data, numel, scale: 1.0 },
             DType::BF16 => {
-                // Convert F32 data to real BF16!
-                use half::bf16;
-                use crate::bf16_support::f32_to_bf16;
-                
-                // Allocate BF16 storage
-                let mut bf16_data = device.alloc::<bf16>(numel)?;
-                
-                // Convert F32 to BF16 on GPU
-                f32_to_bf16(&device, &cuda_data, &mut bf16_data)?;
-                
-                // Return the pool memory for F32 since we don't need it
-                if let Ok(pool) = device.memory_pool() {
-                    let mut pool_guard = pool.lock().unwrap();
-                    pool_guard.deallocate(cuda_data);
-                }
-                
-                TensorStorage::BF16 { data: bf16_data, numel }
+                // BF16 stored as F32 for now (cudarc limitation)
+                TensorStorage::BF16 { data: cuda_data, numel }
             }
             _ => return Err(FlameError::InvalidOperation(
                 format!("Unsupported dtype for from_vec_dtype: {:?}", dtype)
@@ -416,8 +408,8 @@ extern "C" __global__ void masked_fill_kernel(
         Self::randn(tensor.shape.clone(), 0.0, 1.0, tensor.device.clone())
     }
     
-    /// Create a BF16 tensor from a BF16 CUDA slice
-    pub fn from_bf16_slice(data: CudaSlice<half::bf16>, shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
+    /// Create a BF16 tensor from F32 data (stored as F32 internally)
+    pub fn from_bf16_slice(data: CudaSlice<f32>, shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
         let numel = shape.elem_count();
         if data.len() != numel {
             return Err(FlameError::ShapeMismatch {
@@ -441,9 +433,12 @@ extern "C" __global__ void masked_fill_kernel(
         BF16Ops::from_f32(data, shape, device)
     }
     
-    /// Get BF16 slice if tensor is BF16
-    pub fn as_bf16_slice(&self) -> Result<&CudaSlice<half::bf16>> {
-        self.storage.as_bf16_slice()
+    /// Get F32 slice for BF16 tensor (stored as F32 internally)
+    pub fn as_bf16_slice(&self) -> Result<&CudaSlice<f32>> {
+        if self.dtype() != DType::BF16 {
+            return Err(FlameError::InvalidOperation("Not a BF16 tensor".to_string()));
+        }
+        Ok(self.storage.as_slice())
     }
     
     /// Convert tensor to BF16
@@ -457,8 +452,8 @@ extern "C" __global__ void masked_fill_kernel(
         Self::from_f32_to_bf16(f32_data, self.shape.clone(), self.device.clone())
     }
     
-    /// Create a BF16 tensor from CUDA slice
-    pub fn from_cuda_bf16(data: CudaSlice<half::bf16>, shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
+    /// Create a BF16 tensor from CUDA slice (stored as F32)
+    pub fn from_cuda_bf16(data: CudaSlice<f32>, shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
         Self::from_bf16_slice(data, shape, device)
     }
 
@@ -477,6 +472,16 @@ extern "C" __global__ void masked_fill_kernel(
             });
         }
         Self::from_vec(data.to_vec(), shape, device)
+    }
+
+    pub fn from_slice_dtype(data: &[f32], shape: Shape, device: Arc<CudaDevice>, dtype: DType) -> Result<Self> {
+        if data.len() != shape.elem_count() {
+            return Err(FlameError::ShapeMismatch {
+                expected: shape.clone(),
+                got: Shape::from_dims(&[data.len()]),
+            });
+        }
+        Self::from_vec_dtype(data.to_vec(), shape, device, dtype)
     }
     
     /// Compute gradients via automatic differentiation
