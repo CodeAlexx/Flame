@@ -163,7 +163,7 @@ impl Conv2d {
         let out_height = (in_height + 2 * ph - kh) / sh + 1;
         let out_width = (in_width + 2 * pw - kw) / sw + 1;
         
-        let output_shape = Shape::from_dims(&[
+        let _output_shape = Shape::from_dims(&[
             batch_size,
             self.config.out_channels,
             out_height,
@@ -197,7 +197,7 @@ impl Conv2d {
             ];
             
             // Save bias if it exists and requires grad
-            let bias_id = if let Some(bias) = &self.bias {
+            let _bias_id = if let Some(bias) = &self.bias {
                 if bias.requires_grad() {
                     saved.push((bias.id(), bias.clone()?));
                 }

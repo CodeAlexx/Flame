@@ -758,7 +758,7 @@ pub fn flash_attention_backward(
     key: &Tensor,
     value: &Tensor,
     attention_mask: Option<&Tensor>,
-    output: &Tensor,
+    _output: &Tensor,
     scale: f32,
     causal: bool,
 ) -> Result<(Tensor, Tensor, Tensor)> {

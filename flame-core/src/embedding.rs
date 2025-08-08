@@ -39,13 +39,18 @@ impl Embedding {
         let batch_size = input_shape[0];
         let seq_len = if input_shape.len() > 1 { input_shape[1] } else { 1 };
         
+        println!("DEBUG Embedding forward: input shape = {:?}, batch_size = {}, seq_len = {}, embedding_dim = {}", 
+                 input_shape, batch_size, seq_len, self.embedding_dim);
+        
         // For now, implement as gather operation
         // Convert indices to one-hot and matmul with weight
         let indices = input.to_vec()?;
+        println!("DEBUG Embedding: Got {} indices", indices.len());
+        
         let mut embeddings = Vec::new();
         
-        for idx in indices {
-            let idx = idx as usize;
+        for (i, idx) in indices.iter().enumerate() {
+            let idx = *idx as usize;
             if idx >= self.vocab_size {
                 return Err(FlameError::InvalidOperation(
                     format!("Index {} out of vocabulary size {}", idx, self.vocab_size)
@@ -57,6 +62,10 @@ impl Embedding {
             let end = start + self.embedding_dim;
             
             let weight_data = self.weight.to_vec()?;
+            if i == 0 {
+                println!("DEBUG Embedding: weight_data size = {}, extracting range {}..{}", 
+                         weight_data.len(), start, end);
+            }
             embeddings.extend_from_slice(&weight_data[start..end]);
         }
         
@@ -69,34 +78,27 @@ impl Embedding {
         
         // Check if the output size would be problematic
         let total_elements: usize = output_shape.iter().product();
-        if is_problematic_size(total_elements) {
-            // For problematic sizes, pad the embeddings vector
-            let padded_size = ((total_elements + 1023) / 1024) * 1024; // Round up to next 1024
-            embeddings.resize(padded_size, 0.0);
-            
-            // Create tensor with padded size, then slice back
-            let padded_shape = if output_shape.len() > 1 {
-                vec![output_shape[0], output_shape[1], padded_size / (output_shape[0] * output_shape[1])]
-            } else {
-                vec![padded_size]
-            };
-            
-            let padded_tensor = Tensor::from_vec(
-                embeddings, 
-                Shape::from_dims(&padded_shape), 
-                self.weight.device().clone()
-            )?;
-            
-            // Reshape back to original size
-            return padded_tensor.narrow(output_shape.len() - 1, 0, output_shape[output_shape.len() - 1])
-                .and_then(|t| t.reshape(&output_shape));
+        
+        println!("DEBUG Embedding: Creating output tensor with shape {:?}, total elements: {}, embeddings.len() = {}", 
+                 output_shape, total_elements, embeddings.len());
+        
+        // Verify we have the right amount of data
+        if embeddings.len() != total_elements {
+            return Err(FlameError::ShapeMismatch {
+                expected: Shape::from_dims(&output_shape),
+                got: Shape::from_dims(&[embeddings.len()]),
+            });
         }
         
+        // Create the tensor - use regular from_vec since the shape is what matters
+        // The allocation will be handled internally
         let mut output = Tensor::from_vec(
             embeddings, 
             Shape::from_dims(&output_shape), 
             self.weight.device().clone()
         )?;
+        
+        println!("DEBUG Embedding: Created output tensor with shape {:?}", output.shape());
         
         // Record operation for autograd if needed
         if self.weight.requires_grad() {

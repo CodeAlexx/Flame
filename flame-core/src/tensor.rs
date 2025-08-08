@@ -197,6 +197,32 @@ extern "C" __global__ void masked_fill_kernel(
         }
     }
     
+    /// Get raw CUDA pointer for cuDNN operations (read-only)
+    pub fn cuda_ptr(&self) -> *const f32 {
+        use cudarc::driver::DevicePtr;
+        use std::ffi::c_void;
+        let ptr_addr = *self.storage.as_slice().device_ptr();
+        // Cast u64 GPU address to pointer
+        ptr_addr as *const c_void as *const f32
+    }
+    
+    /// Get mutable raw CUDA pointer for cuDNN operations
+    pub fn cuda_ptr_mut(&mut self) -> *mut f32 {
+        use cudarc::driver::DevicePtr;
+        use std::ffi::c_void;
+        // We need to get a mutable reference to the storage
+        // This is safe because we're the only owner of this tensor
+        let slice = match &mut self.storage {
+            TensorStorage::F32 { data, .. } |
+            TensorStorage::F16 { data, .. } |
+            TensorStorage::BF16 { data, .. } => data,
+            TensorStorage::I8 { .. } => panic!("Cannot get f32 pointer from I8 storage"),
+        };
+        let ptr_addr = *slice.device_ptr();
+        // Cast u64 GPU address to pointer
+        ptr_addr as *mut c_void as *mut f32
+    }
+    
     /// Cast to different dtype
     pub fn to_dtype(&self, dtype: DType) -> Result<Tensor> {
         if self.dtype() == dtype {
@@ -316,7 +342,25 @@ extern "C" __global__ void masked_fill_kernel(
         let storage = match dtype {
             DType::F32 => TensorStorage::F32 { data: cuda_data, numel },
             DType::F16 => TensorStorage::F16 { data: cuda_data, numel, scale: 1.0 },
-            DType::BF16 => TensorStorage::BF16 { data: cuda_data, numel },
+            DType::BF16 => {
+                // Convert F32 data to real BF16!
+                use half::bf16;
+                use crate::bf16_support::f32_to_bf16;
+                
+                // Allocate BF16 storage
+                let mut bf16_data = device.alloc::<bf16>(numel)?;
+                
+                // Convert F32 to BF16 on GPU
+                f32_to_bf16(&device, &cuda_data, &mut bf16_data)?;
+                
+                // Return the pool memory for F32 since we don't need it
+                if let Ok(pool) = device.memory_pool() {
+                    let mut pool_guard = pool.lock().unwrap();
+                    pool_guard.deallocate(cuda_data);
+                }
+                
+                TensorStorage::BF16 { data: bf16_data, numel }
+            }
             _ => return Err(FlameError::InvalidOperation(
                 format!("Unsupported dtype for from_vec_dtype: {:?}", dtype)
             )),
@@ -370,6 +414,52 @@ extern "C" __global__ void masked_fill_kernel(
     /// Create a tensor with random values like another tensor
     pub fn rand_like(tensor: &Tensor) -> Result<Self> {
         Self::randn(tensor.shape.clone(), 0.0, 1.0, tensor.device.clone())
+    }
+    
+    /// Create a BF16 tensor from a BF16 CUDA slice
+    pub fn from_bf16_slice(data: CudaSlice<half::bf16>, shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
+        let numel = shape.elem_count();
+        if data.len() != numel {
+            return Err(FlameError::ShapeMismatch {
+                expected: shape.clone(),
+                got: Shape::from_dims(&[data.len()]),
+            });
+        }
+        
+        Ok(Self {
+            storage: TensorStorage::BF16 { data, numel },
+            shape,
+            device,
+            id: TensorId::new(),
+            requires_grad: false,
+        })
+    }
+    
+    /// Create a BF16 tensor from F32 data
+    pub fn from_f32_to_bf16(data: Vec<f32>, shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
+        use crate::bf16_support::BF16Ops;
+        BF16Ops::from_f32(data, shape, device)
+    }
+    
+    /// Get BF16 slice if tensor is BF16
+    pub fn as_bf16_slice(&self) -> Result<&CudaSlice<half::bf16>> {
+        self.storage.as_bf16_slice()
+    }
+    
+    /// Convert tensor to BF16
+    pub fn to_bf16(&self) -> Result<Self> {
+        if self.dtype() == DType::BF16 {
+            return Ok(self.clone()?);
+        }
+        
+        // Convert to F32 first if needed
+        let f32_data = self.to_vec()?;
+        Self::from_f32_to_bf16(f32_data, self.shape.clone(), self.device.clone())
+    }
+    
+    /// Create a BF16 tensor from CUDA slice
+    pub fn from_cuda_bf16(data: CudaSlice<half::bf16>, shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
+        Self::from_bf16_slice(data, shape, device)
     }
 
     /// Enable gradient computation

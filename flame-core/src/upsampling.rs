@@ -80,7 +80,7 @@ impl Upsample2d {
             ));
         };
         
-        let output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
+        let _output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
         
         // Use CUDA kernel for the actual computation
         match self.config.mode {

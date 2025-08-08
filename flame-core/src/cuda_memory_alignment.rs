@@ -57,11 +57,29 @@ pub fn is_problematic_size(size: usize) -> bool {
 pub fn align_size(size: usize) -> usize {
     // Special handling for known problematic sizes
     match size {
-        3145728 => 4194304,  // 1024x1024x3 -> 4MB (1048576 elements)
-        1048576 => 1048576,  // 1024x1024 -> keep as is (it's 4MB exactly)
+        3145728 => 3145728,  // 1024x1024x3 -> keep as is (12MB is fine)
+        1048576 => 1048576,  // 1024x1024 -> keep as is (4MB exactly)
         295936 => 524288,    // 1088x1088 latent -> 512K elements
         59136 => 65536,      // 77x768 -> 64K elements
         147456 => 262144,    // Common VAE size -> 256K elements
+        1207959552 => {
+            // This is 1536x1536x512 - VAE internal allocation
+            // Try to allocate smaller chunks instead
+            eprintln!("WARNING: Attempting to allocate huge VAE buffer (1207959552 elements)");
+            eprintln!("This suggests VAE is processing at wrong resolution");
+            // Return original size - let it fail properly rather than hide the issue
+            1207959552
+        }
+        603979776 => {
+            // This is 1536x1536x256 - another VAE internal size
+            eprintln!("WARNING: Large VAE allocation (603979776 elements)");
+            603979776
+        }
+        301989888 => {
+            // This is 1536x1536x128 - VAE intermediate size
+            eprintln!("WARNING: Large VAE allocation (301989888 elements)");
+            301989888
+        }
         3 => 4,              // Very small tensor -> align to 4
         6 => 8,              // Small tensor -> align to 8
         _ => {
@@ -73,8 +91,14 @@ pub fn align_size(size: usize) -> usize {
                     // For small sizes, round up to next power of 2
                     next_power_of_2(size_in_bytes)
                 } else {
-                    // For large sizes, round up to next alignment boundary
-                    ((size_in_bytes + CUDA_ALIGNMENT_BYTES - 1) / CUDA_ALIGNMENT_BYTES) * CUDA_ALIGNMENT_BYTES
+                    // For large sizes, add minimal padding to reach alignment
+                    // Don't multiply the entire size!
+                    let remainder = size_in_bytes % CUDA_ALIGNMENT_BYTES;
+                    if remainder > 0 && remainder < MIN_ALLOCATION_SIZE {
+                        size_in_bytes + (CUDA_ALIGNMENT_BYTES - remainder)
+                    } else {
+                        size_in_bytes
+                    }
                 };
                 aligned_bytes / 4 // Convert back to element count
             } else {
@@ -101,40 +125,21 @@ pub fn alloc_aligned<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZero
     device: &Arc<CudaDevice>,
     size: usize,
 ) -> Result<CudaSlice<T>> {
-    // Debug print
-    if size > 100000 {
-        eprintln!("CUDA alloc_aligned: requested size = {} elements", size);
+    // Debug print for large allocations
+    if size > 10000000 {
+        eprintln!("CUDA alloc_aligned: LARGE allocation requested = {} elements ({} MB)", 
+                 size, (size * 4) / (1024 * 1024));
     }
     
-    // Align the size to avoid problematic allocations
-    let aligned_size = align_size(size);
-    
-    if aligned_size != size {
-        eprintln!("CUDA alloc_aligned: adjusted {} -> {} elements", size, aligned_size);
-    }
-    
-    // Try allocation with aligned size
-    match device.alloc_zeros::<T>(aligned_size) {
-        Ok(slice) => {
-            // If we allocated more than requested, we need to create a view
-            if aligned_size > size {
-                // For now, we'll use the full allocation but track the actual size
-                // In a production system, we'd implement proper slicing
-                Ok(slice)
-            } else {
-                Ok(slice)
-            }
-        }
+    // DO NOT ALIGN! Just allocate exactly what was requested!
+    // The alignment was causing massive over-allocation and OOM
+    match device.alloc_zeros::<T>(size) {
+        Ok(slice) => Ok(slice),
         Err(e) => {
-            eprintln!("CUDA alloc_aligned: first allocation failed with size {}: {:?}", aligned_size, e);
-            // If allocation still fails, try with next power of 2
-            let pow2_size = next_power_of_2(size);
-            eprintln!("CUDA alloc_aligned: trying power-of-2 size: {}", pow2_size);
-            device.alloc_zeros::<T>(pow2_size)
-                .map_err(|e2| {
-                    eprintln!("CUDA alloc_aligned: power-of-2 allocation also failed: {:?}", e2);
-                    FlameError::CudaDriver
-                })
+            eprintln!("CUDA allocation failed with size {}: {:?}", size, e);
+            // DO NOT try power-of-2! That makes it WORSE!
+            // Just fail cleanly so we know the real problem
+            Err(FlameError::CudaDriver)
         }
     }
 }

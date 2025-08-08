@@ -52,7 +52,7 @@ impl MaxPool2d {
         let h_out = (h_in + 2 * ph - dh * (kh - 1) - 1) / sh + 1;
         let w_out = (w_in + 2 * pw - dw * (kw - 1) - 1) / sw + 1;
         
-        let output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
+        let _output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
         
         // Use CUDA kernel for the actual computation
         let output = crate::cuda_kernels::CudaKernels::maxpool2d_forward(
@@ -133,7 +133,7 @@ impl AvgPool2d {
         let h_out = (h_in + 2 * ph - kh) / sh + 1;
         let w_out = (w_in + 2 * pw - kw) / sw + 1;
         
-        let output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
+        let _output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
         
         crate::cuda_kernels::CudaKernels::avgpool2d_forward(
             input,
@@ -185,7 +185,7 @@ impl AdaptiveAvgPool2d {
         let kernel_h = h_in - (h_out - 1) * stride_h;
         let kernel_w = w_in - (w_out - 1) * stride_w;
         
-        let output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
+        let _output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
         
         crate::cuda_kernels::CudaKernels::adaptive_avgpool2d_forward(
             input,
@@ -250,7 +250,7 @@ impl AdaptiveMaxPool2d {
         let kernel_h = h_in - (h_out - 1) * stride_h;
         let kernel_w = w_in - (w_out - 1) * stride_w;
         
-        let output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
+        let _output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
         
         let output = crate::cuda_kernels::CudaKernels::adaptive_maxpool2d_forward(
             input,

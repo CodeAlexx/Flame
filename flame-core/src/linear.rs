@@ -68,6 +68,46 @@ impl Linear {
             });
         }
         
+        // Check if we can use cuDNN for this operation
+        #[cfg(feature = "cudnn")]
+        if crate::cudnn::is_cudnn_linear_compatible(input, &self.weight, self.bias.as_ref()) {
+            // Use cuDNN-accelerated linear operation
+            let output = crate::cudnn::cudnn_linear(input, &self.weight, self.bias.as_ref())?;
+            
+            // Record operation for autograd if needed
+            if input.requires_grad() || self.weight.requires_grad() {
+                use crate::autograd::{AutogradContext, Op};
+                
+                let mut saved = vec![
+                    (input.id(), input.clone()?),
+                    (self.weight.id(), self.weight.clone()?),
+                ];
+                
+                // Save bias if it exists and requires grad
+                let bias_id = if let Some(bias) = &self.bias {
+                    if bias.requires_grad() {
+                        saved.push((bias.id(), bias.clone()?));
+                        Some(bias.id())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                
+                let op = Op::Linear {
+                    input: input.id(),
+                    weight: self.weight.id(),
+                    bias: bias_id,
+                };
+                
+                AutogradContext::record_op(output.id(), op, saved);
+            }
+            
+            return Ok(output);
+        }
+        
+        // Fallback to regular implementation
         // Reshape input to 2D for matmul
         let batch_size = input_shape[..input_shape.len() - 1].iter().product::<usize>();
         let input_2d = input.reshape(&[batch_size, self.in_features])?;

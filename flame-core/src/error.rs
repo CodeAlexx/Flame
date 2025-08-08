@@ -40,6 +40,12 @@ pub enum FlameError {
     
     #[error("Invalid index: {0}")]
     InvalidIndex(String),
+    
+    #[error("Invalid shape: {0}")]
+    InvalidShape(String),
+    
+    #[error("CUDA error: {0}")]
+    CudaError(String),
 }
 
 // Now actually converts cudarc errors

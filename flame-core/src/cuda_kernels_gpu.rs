@@ -93,7 +93,7 @@ pub fn compile_kernel(name: &str, code: &str) -> Result<cudarc::nvrtc::Ptx> {
 
 impl CudaKernels {
     /// Create a new CudaKernels instance
-    pub fn new(device: Arc<CudaDevice>) -> Result<Self> {
+    pub fn new(_device: Arc<CudaDevice>) -> Result<Self> {
         Ok(CudaKernels)
     }
     

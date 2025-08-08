@@ -10,7 +10,7 @@ pub enum D {
 }
 
 impl D {
-    pub fn to_index(&self, shape: &Shape, index: usize) -> Result<usize> {
+    pub fn to_index(&self, shape: &Shape, _index: usize) -> Result<usize> {
         match self {
             D::Minus(offset) => {
                 let rank = shape.rank() as i32;

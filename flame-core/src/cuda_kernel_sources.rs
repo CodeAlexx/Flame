@@ -116,6 +116,41 @@ extern "C" __global__ void silu_kernel(
 }
 "#;
 
+// Permutation kernel: NHWC to NCHW format conversion
+// [batch, height, width, channels] -> [batch, channels, height, width]
+pub const PERMUTE_NHWC_TO_NCHW_KERNEL: &str = r#"
+extern "C" __global__ void permute_nhwc_to_nchw_kernel(
+    const float* input,
+    float* output,
+    int batch,
+    int height,
+    int width,
+    int channels
+) {
+    int total_elements = batch * height * width * channels;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < total_elements) {
+        // Decompose linear index into NHWC coordinates
+        int b = idx / (height * width * channels);
+        int remainder = idx % (height * width * channels);
+        int h = remainder / (width * channels);
+        remainder = remainder % (width * channels);
+        int w = remainder / channels;
+        int c = remainder % channels;
+        
+        // Calculate target index in NCHW format
+        int target_idx = b * (channels * height * width) +
+                        c * (height * width) +
+                        h * width +
+                        w;
+        
+        // Copy the element
+        output[target_idx] = input[idx];
+    }
+}
+"#;
+
 pub const TANH_KERNEL: &str = r#"
 extern "C" __global__ void tanh_kernel(
     const float* input,

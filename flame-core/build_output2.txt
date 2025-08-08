@@ -1,0 +1,1244 @@
+   Compiling flame-core v0.1.0 (/home/alex/diffusers-rs/flame/flame-core)
+warning: flame-core@0.1.0: Building with cuDNN support
+warning: flame-core@0.1.0: cuDNN lib path: /home/alex/SimpleTuner/.venv/lib/python3.11/site-packages/nvidia/cudnn/lib
+warning: flame-core@0.1.0: CUDA_HOME not set, CUDA kernels will not be available
+warning: unused imports: `CudaFunction` and `LaunchConfig`
+ --> flame-core/src/tensor.rs:6:56
+  |
+6 | use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, LaunchConfig, LaunchAsync, DeviceSlice, CudaFunction};
+  |                                                        ^^^^^^^^^^^^                            ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `is_problematic_size`
+ --> flame-core/src/memory_pool.rs:7:48
+  |
+7 | use crate::cuda_memory_alignment::{align_size, is_problematic_size};
+  |                                                ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `cudarc::cublas::CudaBlas`
+ --> flame-core/src/cuda_conv2d_direct.rs:8:5
+  |
+8 | use cudarc::cublas::CudaBlas;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CudaDevice`
+ --> flame-core/src/cuda_conv2d_fast.rs:7:22
+  |
+7 | use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+  |                      ^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> flame-core/src/cuda_conv2d_fast.rs:8:5
+  |
+8 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `cudarc::driver::DevicePtr`
+  --> flame-core/src/cudnn/conv2d.rs:10:5
+   |
+10 | use cudarc::driver::DevicePtr;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CudaDevice`, `CudaSlice`, and `DevicePtrMut`
+ --> flame-core/src/cudnn_conv2d.rs:5:22
+  |
+5 | use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, DevicePtrMut};
+  |                      ^^^^^^^^^^  ^^^^^^^^^             ^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> flame-core/src/cudnn_conv2d.rs:6:5
+  |
+6 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused imports: `CudaSlice` and `LaunchConfig`
+ --> flame-core/src/layer_norm.rs:7:34
+  |
+7 | use cudarc::driver::{CudaDevice, CudaSlice, LaunchConfig, LaunchAsync};
+  |                                  ^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused imports: `CudaFunction`, `DevicePtr`, and `cublas::CudaBlas`
+ --> flame-core/src/cuda_kernels_gpu.rs:4:64
+  |
+4 |     driver::{CudaDevice, LaunchAsync, LaunchConfig, CudaSlice, DevicePtr, CudaFunction}, 
+  |                                                                ^^^^^^^^^  ^^^^^^^^^^^^
+5 |     nvrtc::{compile_ptx_with_opts, CompileOptions},
+6 |     cublas::CudaBlas
+  |     ^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::os::raw::c_void`
+  --> flame-core/src/cuda_kernels_gpu.rs:11:5
+   |
+11 | use std::os::raw::c_void;
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Shape`
+ --> flame-core/src/cuda_gradient_ops.rs:4:41
+  |
+4 | use crate::{Tensor, Result, FlameError, Shape, cuda_kernel_compiler::compile_cuda_kernel};
+  |                                         ^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> flame-core/src/autograd_ops_complete.rs:6:5
+  |
+6 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `CudaDevice`
+ --> flame-core/src/autograd_ops_complete.rs:7:22
+  |
+7 | use cudarc::driver::{CudaDevice, LaunchAsync};
+  |                      ^^^^^^^^^^
+
+warning: unused import: `DType`
+ --> flame-core/src/autograd.rs:6:48
+  |
+6 | use crate::{Tensor, Result, FlameError, Shape, DType};
+  |                                                ^^^^^
+
+warning: unused doc comment
+   --> flame-core/src/autograd_v3.rs:415:1
+    |
+415 | /// Thread-local autograd engine
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: unused imports: `FlameError` and `Shape`
+ --> flame-core/src/optimizers.rs:1:29
+  |
+1 | use crate::{Tensor, Result, FlameError, Shape};
+  |                             ^^^^^^^^^^  ^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> flame-core/src/optimizers.rs:2:5
+  |
+2 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `cudarc::driver::CudaDevice`
+ --> flame-core/src/optimizers.rs:3:5
+  |
+3 | use cudarc::driver::CudaDevice;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `FlameError`
+ --> flame-core/src/pooling_impl.rs:3:36
+  |
+3 | use crate::{Tensor, Shape, Result, FlameError};
+  |                                    ^^^^^^^^^^
+
+warning: unused import: `LaunchConfig`
+ --> flame-core/src/conv3d_simple.rs:9:35
+  |
+9 | use cudarc::driver::{LaunchAsync, LaunchConfig, CudaSlice};
+  |                                   ^^^^^^^^^^^^
+
+warning: unused import: `CudaDevice`
+ --> flame-core/src/fused_kernels.rs:6:48
+  |
+6 | use crate::{Tensor, Shape, Result, FlameError, CudaDevice};
+  |                                                ^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> flame-core/src/fused_kernels.rs:8:5
+  |
+8 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `CudaFunction`
+ --> flame-core/src/fused_kernels.rs:9:35
+  |
+9 | use cudarc::driver::{LaunchAsync, CudaFunction};
+  |                                   ^^^^^^^^^^^^
+
+warning: unused import: `super::*`
+   --> flame-core/src/fp16.rs:306:9
+    |
+306 |     use super::*;
+    |         ^^^^^^^^
+
+warning: unused imports: `CudaFunction`, `DeviceRepr`, `LaunchAsync`, and `LaunchConfig`
+ --> flame-core/src/kernel_launcher.rs:8:26
+  |
+8 |     driver::{CudaDevice, CudaFunction, LaunchAsync, LaunchConfig, DeviceRepr},
+  |                          ^^^^^^^^^^^^  ^^^^^^^^^^^  ^^^^^^^^^^^^  ^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> flame-core/src/tensor_ops_missing.rs:4:5
+  |
+4 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `FlameError`
+ --> flame-core/src/parameter.rs:3:39
+  |
+3 | use crate::{Tensor, TensorId, Result, FlameError, Shape};
+  |                                       ^^^^^^^^^^
+
+warning: unused import: `FlameError`
+ --> flame-core/src/adam.rs:3:39
+  |
+3 | use crate::{Tensor, TensorId, Result, FlameError, parameter::Parameter};
+  |                                       ^^^^^^^^^^
+
+warning: unused import: `FlameError`
+ --> flame-core/src/lora.rs:3:36
+  |
+3 | use crate::{Tensor, Shape, Result, FlameError};
+  |                                    ^^^^^^^^^^
+
+warning: unused imports: `Shape` and `TensorId`
+ --> flame-core/src/loss.rs:6:62
+  |
+6 | use crate::{Tensor, Result, FlameError, AutogradContext, Op, TensorId, Shape};
+  |                                                              ^^^^^^^^  ^^^^^
+
+warning: unused doc comment
+  --> flame-core/src/gradient_checkpointing.rs:15:1
+   |
+15 | /// Global checkpoint manager
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+   |
+   = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused imports: `AutogradContext` and `Op`
+ --> flame-core/src/gradient_checkpointing.rs:8:16
+  |
+8 |     autograd::{AutogradContext, Op},
+  |                ^^^^^^^^^^^^^^^  ^^
+
+warning: unused imports: `CudaStream`, `DevicePtr`, `LaunchAsync`, and `LaunchConfig`
+  --> flame-core/src/gradient_checkpointing.rs:12:34
+   |
+12 | use cudarc::driver::{CudaDevice, CudaStream, DevicePtr, LaunchAsync, LaunchConfig};
+   |                                  ^^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused import: `cudarc::nvrtc::compile_ptx`
+  --> flame-core/src/gradient_checkpointing.rs:13:5
+   |
+13 | use cudarc::nvrtc::compile_ptx;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TensorId`
+ --> flame-core/src/sage_attention.rs:4:21
+  |
+4 | use crate::{Tensor, TensorId, Shape, Result, FlameError, DType};
+  |                     ^^^^^^^^
+
+warning: unused import: `CudaDevice`
+ --> flame-core/src/sage_attention.rs:7:35
+  |
+7 | use cudarc::driver::{LaunchAsync, CudaDevice};
+  |                                   ^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> flame-core/src/sage_attention.rs:8:5
+  |
+8 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `DevicePtr`
+ --> flame-core/src/tensor.rs:6:45
+  |
+6 | use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, LaunchConfig, LaunchAsync, DeviceSlice, CudaFunction};
+  |                                             ^^^^^^^^^
+
+warning: unused import: `LaunchAsync`
+ --> flame-core/src/layer_norm.rs:7:59
+  |
+7 | use cudarc::driver::{CudaDevice, CudaSlice, LaunchConfig, LaunchAsync};
+  |                                                           ^^^^^^^^^^^
+
+warning: unused variable: `index`
+  --> flame-core/src/shape.rs:13:43
+   |
+13 |     pub fn to_index(&self, shape: &Shape, index: usize) -> Result<usize> {
+   |                                           ^^^^^ help: if this is intentional, prefix it with an underscore: `_index`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+error[E0004]: non-exhaustive patterns: `dtype::DType::I32` not covered
+  --> flame-core/src/tensor_storage.rs:46:15
+   |
+46 |         match dtype {
+   |               ^^^^^ pattern `dtype::DType::I32` not covered
+   |
+note: `dtype::DType` defined here
+  --> flame-core/src/dtype.rs:5:10
+   |
+5  | pub enum DType {
+   |          ^^^^^
+...
+12 |     I32,
+   |     --- not covered
+   = note: the matched value is of type `dtype::DType`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+   |
+61 ~             },
+62 +             dtype::DType::I32 => todo!()
+   |
+
+warning: unused variable: `blas`
+   --> flame-core/src/tensor.rs:603:13
+    |
+603 |         let blas = CudaBlas::new(self.device.clone())
+    |             ^^^^ help: if this is intentional, prefix it with an underscore: `_blas`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/tensor.rs:797:13
+    |
+797 |         let mut output = self.add(&neg_other)?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+warning: variable does not need to be mutable
+    --> flame-core/src/tensor.rs:1906:13
+     |
+1906 |         let mut output = Tensor::zeros(output_shape, self.device.clone())?;
+     |             ----^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `e`
+   --> flame-core/src/memory_pool.rs:109:17
+    |
+109 |             Err(e) => return Err(FlameError::CudaDriver),
+    |                 ^ help: if this is intentional, prefix it with an underscore: `_e`
+
+warning: unused variable: `ptr`
+   --> flame-core/src/memory_pool.rs:130:34
+    |
+130 |     pub fn deallocate(&mut self, ptr: CudaSlice<f32>) {
+    |                                  ^^^ help: if this is intentional, prefix it with an underscore: `_ptr`
+
+warning: unused variable: `output_shape`
+   --> flame-core/src/conv.rs:166:13
+    |
+166 |         let output_shape = Shape::from_dims(&[
+    |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_output_shape`
+
+warning: unused variable: `bias_id`
+   --> flame-core/src/conv.rs:200:17
+    |
+200 |             let bias_id = if let Some(bias) = &self.bias {
+    |                 ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_bias_id`
+
+warning: unused variable: `bias_id`
+   --> flame-core/src/cuda_conv2d.rs:340:17
+    |
+340 |             let bias_id = if let Some(b) = bias {
+    |                 ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_bias_id`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_conv2d.rs:371:13
+    |
+371 |         let mut result = output.clone()?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `col_size`
+   --> flame-core/src/cuda_conv2d.rs:423:13
+    |
+423 |         let col_size = batch_size * out_channels * out_height * out_width;
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_col_size`
+
+warning: unused variable: `padded_input`
+   --> flame-core/src/cuda_conv2d.rs:617:13
+    |
+617 |         let padded_input = if pad_h > 0 || pad_w > 0 {
+    |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_padded_input`
+
+warning: unused variable: `padded`
+   --> flame-core/src/cuda_conv2d.rs:621:21
+    |
+621 |             let mut padded = Tensor::zeros(
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_padded`
+
+warning: unused variable: `weight_2d`
+   --> flame-core/src/cuda_conv2d.rs:636:13
+    |
+636 |         let weight_2d = weight.reshape(&[out_channels, in_channels * kernel_h * kernel_w])?;
+    |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_weight_2d`
+
+warning: unused variable: `groups`
+   --> flame-core/src/cuda_conv2d.rs:591:9
+    |
+591 |         groups: usize,
+    |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_groups`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_conv2d.rs:621:17
+    |
+621 |             let mut padded = Tensor::zeros(
+    |                 ----^^^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: unused variable: `device`
+  --> flame-core/src/cuda_conv2d_direct.rs:30:13
+   |
+30 |         let device = input.device();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_device`
+
+warning: unused variable: `batch_size`
+  --> flame-core/src/cuda_conv2d_direct.rs:36:13
+   |
+36 |         let batch_size = input_dims[0];
+   |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_batch_size`
+
+warning: unused variable: `in_channels`
+  --> flame-core/src/cuda_conv2d_direct.rs:37:13
+   |
+37 |         let in_channels = input_dims[1];
+   |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_in_channels`
+
+warning: unused variable: `out_channels`
+  --> flame-core/src/cuda_conv2d_direct.rs:41:13
+   |
+41 |         let out_channels = weight_dims[0];
+   |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_out_channels`
+
+warning: unused variable: `out_height`
+  --> flame-core/src/cuda_conv2d_direct.rs:49:13
+   |
+49 |         let out_height = (in_height + 2 * pad_h - kernel_h) / stride_h + 1;
+   |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_out_height`
+
+warning: unused variable: `out_width`
+  --> flame-core/src/cuda_conv2d_direct.rs:50:13
+   |
+50 |         let out_width = (in_width + 2 * pad_w - kernel_w) / stride_w + 1;
+   |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_out_width`
+
+warning: unused variable: `device`
+   --> flame-core/src/cuda_conv2d_direct.rs:271:41
+    |
+271 |     fn gemm_f32(a: &Tensor, b: &Tensor, device: &Arc<CudaDevice>) -> Result<Tensor> {
+    |                                         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_device`
+
+warning: unused variable: `batch_size`
+  --> flame-core/src/cudnn/algorithms.rs:24:9
+   |
+24 |         batch_size: usize,
+   |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_batch_size`
+
+warning: unnecessary `unsafe` block
+   --> flame-core/src/layer_norm.rs:246:5
+    |
+246 |     unsafe {
+    |     ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` on by default
+
+warning: unused variable: `output`
+   --> flame-core/src/flash_attention.rs:761:5
+    |
+761 |     output: &Tensor,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> flame-core/src/cuda_kernels.rs:90:13
+   |
+90 |         let mut output = Tensor::zeros(a.shape.clone(), a.device.clone())?;
+   |             ----^^^^^^
+   |             |
+   |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:121:13
+    |
+121 |         let mut output = Tensor::zeros(a.shape.clone(), a.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:145:13
+    |
+145 |         let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:169:13
+    |
+169 |         let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:193:13
+    |
+193 |         let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:217:13
+    |
+217 |         let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:241:13
+    |
+241 |         let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:265:13
+    |
+265 |         let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:289:13
+    |
+289 |         let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable `count` is assigned to, but never used
+   --> flame-core/src/cuda_kernels.rs:391:21
+    |
+391 |             let mut count = 0;
+    |                     ^^^^^
+    |
+    = note: consider using `_count` instead
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:368:13
+    |
+368 |         let mut output = Tensor::zeros(Shape::from_dims(&output_shape), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:445:13
+    |
+445 |         let mut output = Tensor::zeros(Shape::from_dims(&[cols, rows]), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:500:13
+    |
+500 |         let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:523:13
+    |
+523 |         let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:551:13
+    |
+551 |         let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:574:13
+    |
+574 |         let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:597:13
+    |
+597 |         let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:620:13
+    |
+620 |         let mut output = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels.rs:996:13
+    |
+996 |         let mut output = Tensor::zeros(output_shape, tensor.device.clone())?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> flame-core/src/cuda_kernels.rs:1041:13
+     |
+1041 |         let mut input_grad = Tensor::zeros(Shape::from_dims(input_shape), device.clone())?;
+     |             ----^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> flame-core/src/cuda_kernels.rs:1075:13
+     |
+1075 |         let mut input_grad = Tensor::zeros(Shape::from_dims(input_shape), device.clone())?;
+     |             ----^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `ptx`
+    --> flame-core/src/cuda_kernels.rs:1113:9
+     |
+1113 |     let ptx = compile_ptx(kernel_code)
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_ptx`
+
+warning: unused variable: `device`
+  --> flame-core/src/cuda_kernels_gpu.rs:96:16
+   |
+96 |     pub fn new(device: Arc<CudaDevice>) -> Result<Self> {
+   |                ^^^^^^ help: if this is intentional, prefix it with an underscore: `_device`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:161:13
+    |
+161 |         let mut output_data = unsafe { tensor.device.alloc::<f32>(out_elements) }
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:287:13
+    |
+287 |         let mut output_data = crate::tensor::alloc_from_pool(&a.device, numel)
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:322:13
+    |
+322 |         let mut output_data = crate::tensor::alloc_from_pool(&a.device, numel)
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:350:13
+    |
+350 |         let mut output_data = unsafe { tensor.device.alloc::<f32>(numel) }
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:378:13
+    |
+378 |         let mut output_data = unsafe { tensor.device.alloc::<f32>(numel) }
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:407:13
+    |
+407 |         let mut output_data = unsafe { tensor.device.alloc::<f32>(numel) }
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:440:13
+    |
+440 |         let mut output_data = unsafe { tensor.device.alloc::<f32>(numel) }
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:469:13
+    |
+469 |         let mut output_data = unsafe { tensor.device.alloc::<f32>(numel) }
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:497:13
+    |
+497 |         let mut output_data = unsafe { tensor.device.alloc::<f32>(numel) }
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:525:13
+    |
+525 |         let mut output_data = unsafe { tensor.device.alloc::<f32>(numel) }
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:634:13
+    |
+634 |         let mut output_data = unsafe { tensor.device.alloc::<f32>(rows * cols) }
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:670:13
+    |
+670 |         let mut output_data = unsafe { tensor.device.alloc::<f32>(numel) }
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:696:13
+    |
+696 |         let mut output_data = unsafe { tensor.device.alloc::<f32>(numel) }
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unnecessary `unsafe` block
+   --> flame-core/src/cuda_kernels_gpu.rs:739:9
+    |
+739 |         unsafe {
+    |         ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:735:13
+    |
+735 |         let mut output_data = unsafe { tensor.device.alloc::<f32>(numel) }
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unnecessary `unsafe` block
+   --> flame-core/src/cuda_kernels_gpu.rs:838:9
+    |
+838 |         unsafe {
+    |         ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:832:13
+    |
+832 |         let mut output_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/cuda_kernels_gpu.rs:834:13
+    |
+834 |         let mut indices_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
+    |             ----^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unnecessary `unsafe` block
+    --> flame-core/src/cuda_kernels_gpu.rs:1013:9
+     |
+1013 |         unsafe {
+     |         ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+    --> flame-core/src/cuda_kernels_gpu.rs:1009:13
+     |
+1009 |         let mut output_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
+     |             ----^^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unnecessary `unsafe` block
+    --> flame-core/src/cuda_kernels_gpu.rs:1143:9
+     |
+1143 |         unsafe {
+     |         ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+    --> flame-core/src/cuda_kernels_gpu.rs:1139:13
+     |
+1139 |         let mut grad_input = crate::tensor::alloc_from_pool(&input.device, input_numel)
+     |             ----^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unnecessary `unsafe` block
+    --> flame-core/src/cuda_kernels_gpu.rs:1228:9
+     |
+1228 |         unsafe {
+     |         ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+    --> flame-core/src/cuda_kernels_gpu.rs:1224:13
+     |
+1224 |         let mut output_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
+     |             ----^^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unnecessary `unsafe` block
+    --> flame-core/src/cuda_kernels_gpu.rs:1302:9
+     |
+1302 |         unsafe {
+     |         ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+    --> flame-core/src/cuda_kernels_gpu.rs:1298:13
+     |
+1298 |         let mut output_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
+     |             ----^^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unnecessary `unsafe` block
+    --> flame-core/src/cuda_kernels_gpu.rs:1367:9
+     |
+1367 |         unsafe {
+     |         ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+    --> flame-core/src/cuda_kernels_gpu.rs:1363:13
+     |
+1363 |         let mut output_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
+     |             ----^^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unnecessary `unsafe` block
+    --> flame-core/src/cuda_kernels_gpu.rs:1461:9
+     |
+1461 |         unsafe {
+     |         ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+    --> flame-core/src/cuda_kernels_gpu.rs:1457:13
+     |
+1457 |         let mut output_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
+     |             ----^^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `input_offset`
+    --> flame-core/src/cuda_kernels_gpu.rs:1540:17
+     |
+1540 |             let input_offset = b * in_channels * h_in * w_in;
+     |                 ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_offset`
+
+warning: unused variable: `grid_dim`
+    --> flame-core/src/cuda_kernels_gpu.rs:1549:17
+     |
+1549 |             let grid_dim = (
+     |                 ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_grid_dim`
+
+warning: unused variable: `block_dim`
+    --> flame-core/src/cuda_kernels_gpu.rs:1554:17
+     |
+1554 |             let block_dim = (16, 16, 4);
+     |                 ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_block_dim`
+
+warning: variable does not need to be mutable
+    --> flame-core/src/cuda_kernels_gpu.rs:1647:13
+     |
+1647 |         let mut output_data = crate::tensor::alloc_from_pool(&input.device, numel)
+     |             ----^^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `dim`
+    --> flame-core/src/cuda_kernels_gpu.rs:1667:9
+     |
+1667 |         dim: usize,
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_dim`
+
+warning: unnecessary `unsafe` block
+    --> flame-core/src/cuda_kernels_gpu.rs:1711:9
+     |
+1711 |         unsafe {
+     |         ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+    --> flame-core/src/cuda_kernels_gpu.rs:1696:13
+     |
+1696 |         let mut output_data = unsafe {
+     |             ----^^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `n`
+   --> flame-core/src/cuda_gradient_ops.rs:241:13
+    |
+241 |         let n = grad.shape().elem_count();
+    |             ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: unused variable: `total_elements`
+   --> flame-core/src/cuda_tensor_gpu.rs:300:13
+    |
+300 |         let total_elements = self.shape.elem_count();
+    |             ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_total_elements`
+
+warning: unused variable: `sum_buf`
+   --> flame-core/src/cuda_tensor_gpu.rs:303:13
+    |
+303 |         let sum_buf = unsafe {
+    |             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_sum_buf`
+
+warning: unused variable: `device`
+  --> flame-core/src/autograd_ops_complete.rs:28:9
+   |
+28 |     let device = input.device();
+   |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_device`
+
+warning: unused variable: `batch_size`
+  --> flame-core/src/autograd_ops_complete.rs:37:9
+   |
+37 |     let batch_size = input.shape().elem_count() / norm_size;
+   |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_batch_size`
+
+warning: unused variable: `mean`
+  --> flame-core/src/autograd_ops_complete.rs:23:5
+   |
+23 |     mean: &Tensor,
+   |     ^^^^ help: if this is intentional, prefix it with an underscore: `_mean`
+
+warning: unused variable: `device`
+   --> flame-core/src/autograd_ops_complete.rs:108:9
+    |
+108 |     let device = input.device();
+    |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_device`
+
+warning: unused variable: `channels`
+   --> flame-core/src/autograd_ops_complete.rs:143:9
+    |
+143 |     let channels = shape[1];
+    |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_channels`
+
+warning: unused variable: `i`
+   --> flame-core/src/autograd_ops_complete.rs:352:9
+    |
+352 |     for i in 0..offset {
+    |         ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `output`
+   --> flame-core/src/autograd_ops_complete.rs:648:5
+    |
+648 |     output: Option<&Tensor>,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: unreachable pattern
+    --> flame-core/src/autograd.rs:1196:9
+     |
+1196 |         _ => {
+     |         ^ no value can reach this
+     |
+note: multiple earlier patterns match some of the same values
+    --> flame-core/src/autograd.rs:1196:9
+     |
+344  |         Op::Add { lhs, rhs } => {
+     |         -------------------- matches some of the same values
+...
+370  |         Op::Sub { lhs, rhs } => {
+     |         -------------------- matches some of the same values
+...
+379  |         Op::Mul { lhs, rhs } => {
+     |         -------------------- matches some of the same values
+...
+402  |         Op::MulScalar { input, scalar } => {
+     |         ------------------------------- matches some of the same values
+...
+1196 |         _ => {
+     |         ^ ...and 40 other patterns collectively make this unreachable
+     = note: `#[warn(unreachable_patterns)]` on by default
+
+warning: unused variable: `has_affine`
+   --> flame-core/src/autograd.rs:558:17
+    |
+558 |             let has_affine = entry.saved_tensors.len() > 1;
+    |                 ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_has_affine`
+
+warning: unused variable: `dim`
+   --> flame-core/src/autograd.rs:803:36
+    |
+803 |         Op::SumDimKeepdim { input, dim } => {
+    |                                    ^^^ help: try ignoring the field: `dim: _`
+
+warning: unused variable: `sizes`
+   --> flame-core/src/autograd.rs:886:28
+    |
+886 |         Op::Split { input, sizes, dim } => {
+    |                            ^^^^^ help: try ignoring the field: `sizes: _`
+
+warning: unused variable: `input_size`
+   --> flame-core/src/autograd.rs:891:17
+    |
+891 |             let input_size = input_tensor.shape().dims()[*dim];
+    |                 ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_size`
+
+warning: unused variable: `num_channels`
+    --> flame-core/src/autograd.rs:1080:17
+     |
+1080 |             let num_channels = shape[1];
+     |                 ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_num_channels`
+
+warning: unused variable: `bias_tensor`
+    --> flame-core/src/autograd.rs:1093:17
+     |
+1093 |             let bias_tensor = bias.and_then(|b| entry.saved_tensors.get(&b));
+     |                 ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_bias_tensor`
+
+warning: unused variable: `device`
+   --> flame-core/src/autograd.rs:340:5
+    |
+340 |     device: &Arc<CudaDevice>
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_device`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/autograd.rs:824:17
+    |
+824 |             let mut weight_grad = Tensor::zeros(weight_tensor.shape().clone(), weight_tensor.device().clone())?;
+    |                 ----^^^^^^^^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> flame-core/src/autograd.rs:1051:17
+     |
+1051 |             let mut grad_log_probs = Tensor::zeros(log_probs_tensor.shape().clone(), log_probs_tensor.device().clone())?;
+     |                 ----^^^^^^^^^^^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> flame-core/src/autograd.rs:1149:17
+     |
+1149 |             let mut grads = vec![
+     |                 ----^^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: unused variable: `i`
+   --> flame-core/src/autograd_v3.rs:333:21
+    |
+333 |                 for i in 0..grad_shape.len() - 1 {
+    |                     ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/autograd_v3.rs:389:13
+    |
+389 |         let mut grad_in = crate::tensor::alloc_from_pool(&input.device, numel)
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `output_shape`
+  --> flame-core/src/pooling.rs:55:13
+   |
+55 |         let output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
+   |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_output_shape`
+
+warning: unused variable: `indices`
+  --> flame-core/src/pooling.rs:74:9
+   |
+74 |         indices: Option<&Tensor>,
+   |         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indices`
+
+warning: unused variable: `output_shape`
+   --> flame-core/src/pooling.rs:136:13
+    |
+136 |         let output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
+    |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_output_shape`
+
+warning: unused variable: `kernel_h`
+   --> flame-core/src/pooling.rs:185:13
+    |
+185 |         let kernel_h = h_in - (h_out - 1) * stride_h;
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_kernel_h`
+
+warning: unused variable: `kernel_w`
+   --> flame-core/src/pooling.rs:186:13
+    |
+186 |         let kernel_w = w_in - (w_out - 1) * stride_w;
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_kernel_w`
+
+warning: unused variable: `output_shape`
+   --> flame-core/src/pooling.rs:188:13
+    |
+188 |         let output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
+    |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_output_shape`
+
+warning: unused variable: `kernel_h`
+   --> flame-core/src/pooling.rs:250:13
+    |
+250 |         let kernel_h = h_in - (h_out - 1) * stride_h;
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_kernel_h`
+
+warning: unused variable: `kernel_w`
+   --> flame-core/src/pooling.rs:251:13
+    |
+251 |         let kernel_w = w_in - (w_out - 1) * stride_w;
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_kernel_w`
+
+warning: unused variable: `output_shape`
+   --> flame-core/src/pooling.rs:253:13
+    |
+253 |         let output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
+    |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_output_shape`
+
+warning: unused variable: `output_shape`
+  --> flame-core/src/upsampling.rs:83:13
+   |
+83 |         let output_shape = Shape::from_dims(&[batch, channels, h_out, w_out]);
+   |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_output_shape`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/conv3d_simple.rs:261:13
+    |
+261 |         let mut output_data = crate::tensor::alloc_from_pool(&self.device, output_numel)
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `training`
+   --> flame-core/src/conv3d_simple.rs:382:47
+    |
+382 |     pub fn forward(&mut self, input: &Tensor, training: bool) -> Result<Tensor> {
+    |                                               ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_training`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/conv3d_simple.rs:439:13
+    |
+439 |         let mut output_data = crate::tensor::alloc_from_pool(&self.device, numel)
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> flame-core/src/fused_kernels.rs:55:13
+   |
+55 |         let mut output = Tensor::zeros(x.shape().clone(), x.device.clone())?;
+   |             ----^^^^^^
+   |             |
+   |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/fused_kernels.rs:175:13
+    |
+175 |         let mut output = Tensor::zeros(
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `kernel_code`
+   --> flame-core/src/fused_kernels.rs:222:13
+    |
+222 |         let kernel_code = r#"
+    |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_kernel_code`
+
+warning: unused variable: `scale`
+   --> flame-core/src/fused_kernels.rs:219:9
+    |
+219 |         scale: f32,
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_scale`
+
+warning: unused variable: `kernel_code`
+   --> flame-core/src/fused_kernels.rs:343:13
+    |
+343 |         let kernel_code = r#"
+    |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_kernel_code`
+
+warning: variable does not need to be mutable
+   --> flame-core/src/fused_kernels.rs:458:13
+    |
+458 |         let mut grad_input = Tensor::zeros(input.shape().clone(), input.device.clone())?;
+    |             ----^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `i`
+   --> flame-core/src/fp16.rs:259:18
+    |
+259 |             for (i, (fp32_param, grad)) in self.fp32_params.iter_mut().zip(unscaled_grads.iter()).enumerate() {
+    |                  ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `kernel`
+  --> flame-core/src/kernel_launcher.rs:82:9
+   |
+82 |         kernel: &CompiledKernel,
+   |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_kernel`
+
+warning: unused variable: `module_name`
+  --> flame-core/src/kernel_launcher.rs:83:9
+   |
+83 |         module_name: &str,
+   |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_module_name`
+
+warning: unused variable: `keepdim`
+   --> flame-core/src/tensor_ops_extended.rs:212:51
+    |
+212 |     pub fn mean_along_dims(&self, dims: &[usize], keepdim: bool) -> Result<Tensor> {
+    |                                                   ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_keepdim`
+
+warning: unused variable: `i`
+    --> flame-core/src/tensor_ops_extended.rs:1235:18
+     |
+1235 |             for (i, tensor) in result.iter_mut().enumerate() {
+     |                  ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `dtype`
+   --> flame-core/src/gradient_checkpointing.rs:183:54
+    |
+183 |             CheckpointedTensor::OnCPU { data, shape, dtype } => {
+    |                                                      ^^^^^ help: try ignoring the field: `dtype: _`
+
+warning: unused variable: `input_info`
+   --> flame-core/src/gradient_checkpointing.rs:240:13
+    |
+240 |         let input_info: Vec<(Shape, Arc<CudaDevice>)> = inputs.iter()
+    |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_info`
+
+warning: unused variable: `causal`
+   --> flame-core/src/sage_attention.rs:396:5
+    |
+396 |     causal: bool,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_causal`
+
+warning: unused variable: `quantized`
+   --> flame-core/src/sage_attention.rs:397:5
+    |
+397 |     quantized: bool,
+    |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_quantized`
+
+For more information about this error, try `rustc --explain E0004`.
+warning: `flame-core` (lib) generated 177 warnings
+warning: flame-core@0.1.0: Building with cuDNN support
+warning: flame-core@0.1.0: cuDNN lib path: /home/alex/SimpleTuner/.venv/lib/python3.11/site-packages/nvidia/cudnn/lib
+warning: flame-core@0.1.0: CUDA_HOME not set, CUDA kernels will not be available
+error: could not compile `flame-core` (lib) due to 1 previous error; 177 warnings emitted

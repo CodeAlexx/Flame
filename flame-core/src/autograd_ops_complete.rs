@@ -25,7 +25,7 @@ pub fn layer_norm_backward(
     normalized_shape: &[usize],
     eps: f32,
 ) -> Result<(Tensor, Option<Tensor>, Option<Tensor>)> {
-    let device = input.device();
+    let _device = input.device();
     
     // Get dimensions
     let shape = input.shape().dims();
@@ -105,7 +105,7 @@ pub fn batch_norm_backward(
     training: bool,
     eps: f32,
 ) -> Result<(Tensor, Option<Tensor>, Option<Tensor>)> {
-    let device = input.device();
+    let _device = input.device();
     let shape = input.shape().dims();
     
     if !training {
@@ -645,7 +645,7 @@ pub fn flash_attention_backward(
     query: &Tensor,
     key: &Tensor,
     value: &Tensor,
-    output: Option<&Tensor>,
+    _output: Option<&Tensor>,
     scale: f32,
     causal: bool,
 ) -> Result<(Tensor, Tensor, Tensor)> {

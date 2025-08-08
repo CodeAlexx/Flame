@@ -18,12 +18,18 @@ rand_distr = "0.4"
 lazy_static = "1.4"
 serde_json = "1.0"
 image = "0.24"
+ctor = "0.2"
 
 
 [features]
-default = []
+default = ["cudnn"]  # cuDNN is now enabled by default
 cuda = []  # CUDA support is always enabled when cudarc is available
 flash-attn = []  # Enable Flash Attention GPU kernels
+cudnn = []  # Enable cuDNN for optimized operations (conv, linear, norm, etc)
+
+[[example]]
+name = "test_cudnn_conv2d"
+required-features = ["cudnn"]
 
 [[example]]
 name = "weight_update"
@@ -81,3 +87,6 @@ name = "autograd_v2_test"
 
 [[example]]
 name = "kernel_launcher_example"
+[[example]]
+name = "test_cudnn_simple"
+required-features = ["cudnn"]

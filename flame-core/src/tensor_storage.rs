@@ -2,13 +2,14 @@ use crate::{Result, FlameError, Shape, DType};
 use crate::cuda_memory_alignment::alloc_aligned_f32;
 use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice};
 use std::sync::Arc;
+use half::bf16;
 
 /// Actual storage backend for tensors with proper dtype support
 #[derive(Clone)]
 pub enum TensorStorage {
     F32 { data: CudaSlice<f32>, numel: usize },
     F16 { data: CudaSlice<f32>, numel: usize, scale: f32 },  // Store as F32 but with quantization scale
-    BF16 { data: CudaSlice<f32>, numel: usize }, // Store as F32 but convert on operations
+    BF16 { data: CudaSlice<bf16>, numel: usize }, // Real BF16 storage - 50% memory savings!
     I8 { data: CudaSlice<i8>, numel: usize },  // INT8 support for Sage Attention
 }
 
@@ -37,24 +38,31 @@ impl TensorStorage {
     pub fn zeros(shape: &Shape, dtype: DType, device: &Arc<CudaDevice>) -> Result<Self> {
         let numel = shape.elem_count();
         
-        // Use aligned allocation to avoid CUDA issues
-        let mut data = alloc_aligned_f32(device, numel)?;
-        
-        // Zero out the memory
-        device.memset_zeros(&mut data)?;
-        
         match dtype {
-            DType::F32 => Ok(TensorStorage::F32 { data, numel }),
-            DType::F16 => Ok(TensorStorage::F16 { data, numel, scale: 1.0 }),
-            DType::BF16 => Ok(TensorStorage::BF16 { data, numel }),
+            DType::F32 => {
+                // Use aligned allocation for F32
+                let mut data = alloc_aligned_f32(device, numel)?;
+                device.memset_zeros(&mut data)?;
+                Ok(TensorStorage::F32 { data, numel })
+            }
+            DType::F16 => {
+                // F16 still uses F32 storage with scale
+                let mut data = alloc_aligned_f32(device, numel)?;
+                device.memset_zeros(&mut data)?;
+                Ok(TensorStorage::F16 { data, numel, scale: 1.0 })
+            }
+            DType::BF16 => {
+                // Allocate real BF16 storage - 50% memory savings!
+                let data = device.alloc_zeros::<bf16>(numel)?;
+                Ok(TensorStorage::BF16 { data, numel })
+            }
             DType::I8 => {
                 // For I8, we need to allocate i8 storage
-                // Note: This requires proper i8 allocation support in memory pool
                 Err(FlameError::InvalidOperation(
                     "I8 allocation not yet supported in zeros - use quantization functions".into()
                 ))
             }
-            DType::F64 | DType::U8 | DType::U32 | DType::I64 => {
+            DType::F64 | DType::U8 | DType::U32 | DType::I32 | DType::I64 => {
                 Err(FlameError::InvalidOperation(
                     format!("Unsupported dtype in TensorStorage: {:?}", dtype)
                 ))
@@ -62,25 +70,28 @@ impl TensorStorage {
         }
     }
     
-    /// Convert to F32 (for operations that don't support F16)
+    /// Convert to F32 (for operations that don't support F16/BF16)
     pub fn to_f32(&self, device: &Arc<CudaDevice>) -> Result<CudaSlice<f32>> {
         match self {
             TensorStorage::F32 { data, numel } | 
-            TensorStorage::F16 { data, numel, .. } | 
-            TensorStorage::BF16 { data, numel } => {
+            TensorStorage::F16 { data, numel, .. } => {
                 // Use aligned allocation
                 let mut out = alloc_aligned_f32(device, *numel)?;
                 
                 // If the allocation is larger, we need to handle it carefully
                 if out.len() > *numel {
-                    // The aligned allocation returned more space than requested
-                    // We'll still copy only the actual data size
-                    // Note: TensorStorage tracks numel separately, so the extra space won't be used
                     eprintln!("Warning: aligned allocation returned {} elements for {} requested", out.len(), *numel);
                 }
                 
                 // Copy data - dtod_copy should handle size mismatches gracefully
                 device.dtod_copy(data, &mut out)?;
+                Ok(out)
+            }
+            TensorStorage::BF16 { data, numel } => {
+                // Convert BF16 to F32 using proper conversion
+                use crate::bf16_support::bf16_to_f32;
+                let mut out = alloc_aligned_f32(device, *numel)?;
+                bf16_to_f32(device, data, &mut out)?;
                 Ok(out)
             }
             TensorStorage::I8 { .. } => {
@@ -95,9 +106,17 @@ impl TensorStorage {
     pub fn as_slice(&self) -> &CudaSlice<f32> {
         match self {
             TensorStorage::F32 { data, .. } |
-            TensorStorage::F16 { data, .. } |
-            TensorStorage::BF16 { data, .. } => data,
+            TensorStorage::F16 { data, .. } => data,
+            TensorStorage::BF16 { .. } => panic!("Cannot get f32 slice from BF16 storage - use as_bf16_slice"),
             TensorStorage::I8 { .. } => panic!("Cannot get f32 slice from I8 storage"),
+        }
+    }
+    
+    /// Get a reference to the underlying BF16 CudaSlice
+    pub fn as_bf16_slice(&self) -> Result<&CudaSlice<bf16>> {
+        match self {
+            TensorStorage::BF16 { data, .. } => Ok(data),
+            _ => Err(FlameError::InvalidOperation("Not a BF16 tensor".into())),
         }
     }
     

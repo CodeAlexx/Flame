@@ -114,9 +114,49 @@ impl CudaConv2d {
         
         // Allocate col buffer for im2col
         let col_size = batch_size * in_channels * kernel_h * kernel_w * out_height * out_width;
-        println!("Allocating col buffer: size={} ({:.2} MB)", col_size, (col_size * 4) as f64 / 1024.0 / 1024.0);
+        
+        // Special check for the problematic VAE case
+        if col_size == 1207959552 {
+            eprintln!("\n!!! FOUND THE PROBLEMATIC CONVOLUTION !!!");
+            eprintln!("Input dimensions: {}x{}x{}x{}", batch_size, in_channels, in_height, in_width);
+            eprintln!("Kernel: {}x{}", kernel_h, kernel_w);
+            eprintln!("Stride: {}x{}", stride_h, stride_w);
+            eprintln!("Padding: {}x{}", pad_h, pad_w);
+            eprintln!("Output dimensions: {}x{}x{}x{}", batch_size, out_channels, out_height, out_width);
+            eprintln!("This is trying to allocate for 1536x1536x512 = {}", 1536*1536*512);
+            eprintln!("Actual col_size calculation: {} * {} * {} * {} * {} * {} = {}", 
+                     batch_size, in_channels, kernel_h, kernel_w, out_height, out_width, col_size);
+            
+            // Try to understand what's happening
+            if out_height == 1536 && out_width == 1536 {
+                eprintln!("ERROR: Output is 1536x1536 but input is {}x{}", in_height, in_width);
+                eprintln!("This means the padding formula is wrong!");
+                let expected_out_h = (in_height + 2 * pad_h - kernel_h) / stride_h + 1;
+                let expected_out_w = (in_width + 2 * pad_w - kernel_w) / stride_w + 1;
+                eprintln!("Expected output size: {}x{}", expected_out_h, expected_out_w);
+            }
+        }
+        
+        // Debug large allocations
+        if col_size > 100_000_000 {
+            eprintln!("WARNING: Large conv2d allocation detected!");
+            eprintln!("  Input: {}x{}x{}x{}", batch_size, in_channels, in_height, in_width);
+            eprintln!("  Output: {}x{}x{}x{}", batch_size, out_channels, out_height, out_width);
+            eprintln!("  Kernel: {}x{}, stride: {}x{}, padding: {}x{}", 
+                     kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w);
+            eprintln!("  Col buffer size: {} elements ({:.1} MB)", 
+                     col_size, (col_size * 4) as f64 / 1024.0 / 1024.0);
+            
+            // Check if this is the problematic 1536x1536 case
+            if col_size == 1207959552 {
+                eprintln!("  ERROR: This is the 1536x1536x512 allocation!");
+                eprintln!("  This suggests the VAE is configured for 1536x1536 but receiving 1024x1024");
+                eprintln!("  The VAE may be padding the input internally");
+            }
+        }
+        // println!("Allocating col buffer: size={} ({:.2} MB)", col_size, (col_size * 4) as f64 / 1024.0 / 1024.0);
         let col_buffer = crate::tensor::alloc_zeros_from_pool(&device, col_size)?;
-        println!("Col buffer allocated successfully");
+        // println!("Col buffer allocated successfully");
         
         // Check dimensions first
         let error_flag = device.alloc_zeros::<i32>(1)?;
@@ -149,74 +189,82 @@ impl CudaConv2d {
         }
         
         // Perform im2col using appropriate kernel
-        println!("Conv2d im2col setup:");
-        println!("  Input shape: {}x{}x{}x{}", batch_size, in_channels, in_height, in_width);
-        println!("  Output shape: {}x{}x{}x{}", batch_size, out_channels, out_height, out_width);
-        println!("  Kernel: {}x{}, stride: {}x{}, padding: {}x{}", 
-                 kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w);
-        println!("  Col buffer size: {}", col_size);
+        // println!("Conv2d im2col setup:");
+        // println!("  Input shape: {}x{}x{}x{}", batch_size, in_channels, in_height, in_width);
+        // println!("  Output shape: {}x{}x{}x{}", batch_size, out_channels, out_height, out_width);
+        // println!("  Kernel: {}x{}, stride: {}x{}, padding: {}x{}", 
+        //          kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w);
+        // println!("  Col buffer size: {}", col_size);
         
         // Check if we can use the simple kernel (stride=1, padding=1)
         if stride_h == 1 && stride_w == 1 && pad_h == 1 && pad_w == 1 {
-            println!("Using simple im2col kernel for stride=1, padding=1");
+        // println!("Using simple im2col kernel for stride=1, padding=1");
             
-            // Proper launch configuration for the full work size
+            // Launch enough threads to cover all elements
             let threads_per_block = 256u32;
+            // Don't artificially limit blocks - we need to process all elements efficiently
+            let max_blocks = 65535u32; // CUDA max grid size in x dimension
             let total_threads = col_size as u32;
-            let num_blocks = (total_threads + threads_per_block - 1) / threads_per_block;
-            
-            // CUDA has a limit on grid size, typically 65535 or 2^31-1 for x dimension
-            let max_blocks = 65535u32;
-            let actual_blocks = num_blocks.min(max_blocks);
+            let num_blocks = ((total_threads + threads_per_block - 1) / threads_per_block).min(max_blocks);
             
             let cfg = LaunchConfig {
-                grid_dim: (actual_blocks, 1, 1),
+                grid_dim: (num_blocks, 1, 1),
                 block_dim: (threads_per_block, 1, 1),
                 shared_mem_bytes: 0,
             };
             
-            println!("Launch config: grid=({},1,1), block=({},1,1)", actual_blocks, threads_per_block);
-            println!("Total work items: {}, threads launched: {}", col_size, actual_blocks * threads_per_block);
+        // println!("Launch config: grid=({},1,1), block=({},1,1)", num_blocks, threads_per_block);
+        // println!("Total work items: {}, threads launched: {}", col_size, num_blocks * threads_per_block);
             
-            if actual_blocks < num_blocks {
-                println!("WARNING: Grid size limited. May need multiple kernel launches.");
+            if num_blocks == max_blocks {
+        // println!("WARNING: Grid size limited. May need multiple kernel launches.");
             }
             
             let f = device.get_func("conv2d_ops", "im2col_kernel_simple")
                 .ok_or_else(|| FlameError::Cuda("Failed to get im2col_kernel_simple".into()))?;
             
-            println!("Launching im2col kernel...");
-            launch_kernel!(f, cfg,
-                input.storage.as_slice(),
-                &col_buffer,
-                batch_size as i32,
-                in_channels as i32,
-                in_height as i32,
-                in_width as i32,
-                kernel_h as i32,
-                kernel_w as i32,
-                out_height as i32,
-                out_width as i32
-            )?;
-            println!("Kernel launched, synchronizing...");
-        } else {
-            println!("Using full im2col kernel with stride={}, padding={}", stride_h, pad_h);
+        // println!("Launching im2col kernel...");
             
-            // Proper launch configuration for the full work size
+            // Launch with explicit synchronization
+            unsafe {
+                f.launch(cfg, (
+                    input.storage.as_slice(),
+                    &col_buffer,
+                    batch_size as i32,
+                    in_channels as i32,
+                    in_height as i32,
+                    in_width as i32,
+                    kernel_h as i32,
+                    kernel_w as i32,
+                    out_height as i32,
+                    out_width as i32
+                )).map_err(|e| FlameError::Cuda(format!("Kernel launch failed: {:?}", e)))?;
+            }
+            
+        // println!("Kernel launched, synchronizing...");
+            
+            // Explicit synchronization
+            device.synchronize()
+                .map_err(|e| FlameError::Cuda(format!("Synchronization failed: {:?}", e)))?;
+            
+        // println!("Synchronization complete!");
+        } else {
+        // println!("Using full im2col kernel with stride={}, padding={}", stride_h, pad_h);
+            
+            // Launch enough threads to cover all elements
             let threads_per_block = 256u32;
+            let max_blocks = 65535u32; // CUDA max grid size in x dimension
             let total_threads = col_size as u32;
-            let num_blocks = (total_threads + threads_per_block - 1) / threads_per_block;
-            let max_blocks = 65535u32;
-            let actual_blocks = num_blocks.min(max_blocks);
+            let num_blocks = ((total_threads + threads_per_block - 1) / threads_per_block).min(max_blocks);
             
             let cfg = LaunchConfig {
-                grid_dim: (actual_blocks, 1, 1),
+                grid_dim: (num_blocks, 1, 1),
                 block_dim: (threads_per_block, 1, 1),
                 shared_mem_bytes: 0,
             };
             
-            println!("Launch config: grid=({},1,1), block=({},1,1)", actual_blocks, threads_per_block);
-            println!("Total work items: {}, threads launched: {}", col_size, actual_blocks * threads_per_block);
+        // println!("Launch config: grid=({},1,1), block=({},1,1)", num_blocks, threads_per_block);
+        // println!("Total work items: {}, threads launched: {}", col_size, num_blocks * threads_per_block);
             
             // Use v2 kernel with arrays to avoid parameter limit
             let dims = vec![
@@ -289,7 +337,7 @@ impl CudaConv2d {
                 (weight.id, weight.clone()?),
             ];
             
-            let bias_id = if let Some(b) = bias {
+            let _bias_id = if let Some(b) = bias {
                 saved_tensors.push((b.id, b.clone()?));
                 Some(b.id)
             } else {
@@ -372,7 +420,7 @@ impl CudaConv2d {
         
         // Gradient w.r.t. input using transposed convolution
         // First, perform im2col on grad_output
-        let col_size = batch_size * out_channels * out_height * out_width;
+        let _col_size = batch_size * out_channels * out_height * out_width;
         let grad_col = grad_output.reshape(&[batch_size * out_height * out_width, out_channels])?;
         
         // Weight gradient: grad_output @ input^T (after im2col)
@@ -566,11 +614,11 @@ impl CudaConv2d {
         // This is slower than CUDA but produces correct results
         
         // Step 1: Pad input if necessary
-        let padded_input = if pad_h > 0 || pad_w > 0 {
+        let _padded_input = if pad_h > 0 || pad_w > 0 {
             // Create padded tensor
             let padded_h = in_height + 2 * pad_h;
             let padded_w = in_width + 2 * pad_w;
-            let mut padded = Tensor::zeros(
+            let _padded = Tensor::zeros(
                 Shape::from_dims(&[batch_size, in_channels, padded_h, padded_w]),
                 input.device.clone()
             )?;
@@ -585,7 +633,7 @@ impl CudaConv2d {
         
         // Step 2: Perform convolution using matrix multiplication
         // Reshape weight to [out_channels, in_channels * kernel_h * kernel_w]
-        let weight_2d = weight.reshape(&[out_channels, in_channels * kernel_h * kernel_w])?;
+        let _weight_2d = weight.reshape(&[out_channels, in_channels * kernel_h * kernel_w])?;
         
         // For each output position, extract the corresponding input patch and multiply
         // This is a simplified version - a full implementation would use im2col

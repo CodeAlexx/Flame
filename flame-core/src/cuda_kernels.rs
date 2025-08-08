@@ -73,6 +73,7 @@ impl CudaKernels {
         kernels.insert("cos_kernel".to_string(), compile_and_load_kernel(&device, COS_KERNEL, "cos_kernel")?);
         kernels.insert("sqrt_kernel".to_string(), compile_and_load_kernel(&device, SQRT_KERNEL, "sqrt_kernel")?);
         kernels.insert("narrow_kernel".to_string(), compile_and_load_kernel(&device, NARROW_KERNEL, "narrow_kernel")?);
+        kernels.insert("permute_nhwc_to_nchw_kernel".to_string(), compile_and_load_kernel(&device, PERMUTE_NHWC_TO_NCHW_KERNEL, "permute_nhwc_to_nchw_kernel")?);
         
         Ok(Self { device, kernels })
     }
@@ -974,6 +975,53 @@ impl CudaKernels {
         let data = tensor.to_vec()?;
         let sum: f32 = data.iter().sum();
         Tensor::from_vec(vec![sum], Shape::from_dims(&[1]), tensor.device.clone())
+    }
+    
+    /// Permute tensor from NHWC to NCHW format on GPU
+    pub fn permute_nhwc_to_nchw(&self, tensor: &Tensor) -> Result<Tensor> {
+        let dims = tensor.shape.dims();
+        if dims.len() != 4 {
+            return Err(FlameError::InvalidOperation(
+                format!("Permute NHWC to NCHW requires 4D tensor, got {:?}", dims)
+            ));
+        }
+        
+        let batch = dims[0];
+        let height = dims[1];
+        let width = dims[2];
+        let channels = dims[3];
+        
+        // Create output tensor with NCHW shape
+        let output_shape = Shape::from_dims(&[batch, channels, height, width]);
+        let mut output = Tensor::zeros(output_shape, tensor.device.clone())?;
+        
+        let kernel = self.kernels.get("permute_nhwc_to_nchw_kernel")
+            .ok_or_else(|| FlameError::KernelError("permute_nhwc_to_nchw_kernel not found".into()))?
+            .clone();
+        
+        let total_elements = tensor.shape.elem_count();
+        let block_size = 256;
+        let grid_size = (total_elements + block_size - 1) / block_size;
+        
+        let config = LaunchConfig {
+            grid_dim: (grid_size as u32, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        
+        launch_kernel!(
+            kernel, 
+            config, 
+            tensor.storage.as_slice(), 
+            output.storage.as_slice(), 
+            batch as u32,
+            height as u32,
+            width as u32,
+            channels as u32
+        )?;
+        
+        self.device.synchronize()?;
+        Ok(output)
     }
 }
 

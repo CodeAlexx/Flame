@@ -69,6 +69,19 @@ impl LayerNorm {
     
     /// Forward pass
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        // Check if we can use cuDNN for this operation
+        #[cfg(feature = "cudnn")]
+        if crate::cudnn::is_cudnn_norm_compatible(input, "layer") {
+            return crate::cudnn::cudnn_layer_norm(
+                input,
+                &self.normalized_shape,
+                self.weight.as_ref(),
+                self.bias.as_ref(),
+                self.eps as f64,
+            );
+        }
+        
+        // Fallback to regular implementation
         layer_norm(
             input,
             &self.normalized_shape,

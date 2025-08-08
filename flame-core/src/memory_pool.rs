@@ -106,7 +106,7 @@ impl DeviceMemoryPool {
                 self.device.alloc_zeros::<f32>(aligned_size)
                     .map_err(|_| FlameError::CudaDriver)?
             }
-            Err(e) => return Err(FlameError::CudaDriver),
+            Err(_e) => return Err(FlameError::CudaDriver),
         };
         
         let block = MemoryBlock {
@@ -127,7 +127,7 @@ impl DeviceMemoryPool {
     }
     
     /// Return memory to the pool
-    pub fn deallocate(&mut self, ptr: CudaSlice<f32>) {
+    pub fn deallocate(&mut self, _ptr: CudaSlice<f32>) {
         self.stats.deallocations += 1;
         
         // Find the block and mark as free
@@ -143,6 +143,18 @@ impl DeviceMemoryPool {
                 }
             }
         }
+    }
+    
+    /// Force GPU synchronization and memory cleanup
+    pub fn force_cleanup(&self) -> Result<()> {
+        // Synchronize the device to ensure all operations complete
+        self.device.synchronize()
+            .map_err(|_| FlameError::CudaDriver)?;
+        
+        // Note: cuMemAdvise is not available in cudarc, but the synchronize
+        // above should help ensure memory operations complete
+        
+        Ok(())
     }
     
     /// Clear all unused memory
