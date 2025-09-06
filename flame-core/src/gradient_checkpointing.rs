@@ -81,6 +81,48 @@ impl CheckpointManager {
             tensor_registry: HashMap::new(),
         }
     }
+
+    /// Apply CPU offload policy for a saved activation tensor
+    pub fn checkpoint_saved_tensor(&mut self, id: TensorId, tensor: &Tensor) -> Result<()> {
+        match self.policy {
+            CheckpointPolicy::CPUOffload => {
+                let data = tensor.to_vec()?;
+                let shape = tensor.shape().clone();
+                let dtype = tensor.dtype();
+                self.saved_activations.insert(id, CheckpointedTensor::OnCPU { data, shape, dtype });
+                self.memory_saved += tensor.shape().elem_count() * 4; // approximate as f32
+            }
+            _ => {
+                // No-op for other policies unless explicitly set via set_recompute_for
+            }
+        }
+        Ok(())
+    }
+
+    /// Explicitly set a recompute closure for a saved tensor (used by Recompute policy)
+    pub fn set_recompute_for(&mut self, id: TensorId, shape: Shape, dtype: DType,
+        compute_fn: Box<dyn Fn() -> Result<Tensor> + Send + Sync>) {
+        self.saved_activations.insert(id, CheckpointedTensor::Deleted { compute_fn, shape, dtype });
+    }
+
+    /// Fetch a saved activation according to policy
+    /// Returns Some(restored_tensor) if a checkpoint exists; None if no checkpointing was applied
+    pub fn fetch_saved(&mut self, id: TensorId, device: &Arc<CudaDevice>) -> Result<Option<Tensor>> {
+        if let Some(entry) = self.saved_activations.get(&id) {
+            match entry {
+                CheckpointedTensor::OnCPU { data, shape, dtype: _ } => {
+                    // Recreate device tensor from host data
+                    let t = Tensor::from_slice(&data, shape.clone(), device.clone())?;
+                    return Ok(Some(t));
+                }
+                CheckpointedTensor::Deleted { compute_fn, .. } => {
+                    let t = (compute_fn)()?;
+                    return Ok(Some(t));
+                }
+            }
+        }
+        Ok(None)
+    }
     
     /// Set the checkpointing policy
     pub fn set_policy(&mut self, policy: CheckpointPolicy) {

@@ -295,7 +295,7 @@ impl DiffusionModel for FlameUNet {
 
 ## Current Status
 
-### ✅ Completed
+### partially done
 - Core tensor operations with autograd
 - All essential neural network layers
 - CUDA kernel infrastructure

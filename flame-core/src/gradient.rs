@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::{Tensor, Shape, Result};
+use crate::{Tensor, Shape, Result, DType};
 use crate::tensor::TensorId;
 use cudarc::driver::CudaDevice;
 
@@ -26,7 +26,8 @@ impl GradientMap {
     
     /// Set gradient to ones (for loss tensor)
     pub fn set_ones(&mut self, id: TensorId, shape: Shape) -> Result<()> {
-        let ones = Tensor::ones(shape, self.device.clone())?;
+        // Enforce FP32 gradients
+        let ones = Tensor::ones_dtype(shape, DType::F32, self.device.clone())?;
         self.gradients.insert(id, ones);
         Ok(())
     }
@@ -42,8 +43,11 @@ impl GradientMap {
     }
     
     /// Insert or replace gradient
-    pub fn insert(&mut self, id: TensorId, grad: Tensor) {
-        self.gradients.insert(id, grad);
+    pub fn insert(&mut self, id: TensorId, grad: Tensor) -> Result<()> {
+        // Enforce FP32 storage for all gradients
+        let grad_f32 = if grad.dtype() != DType::F32 { grad.to_dtype(DType::F32)? } else { grad };
+        self.gradients.insert(id, grad_f32);
+        Ok(())
     }
     
     /// Check if gradient exists
@@ -53,10 +57,19 @@ impl GradientMap {
     
     /// Accumulate gradient (in-place GPU addition)
     pub fn accumulate(&mut self, id: TensorId, grad: Tensor) -> Result<()> {
+        // Always upcast incoming gradient to FP32 before accumulation
+        let grad = if grad.dtype() != DType::F32 { grad.to_dtype(DType::F32)? } else { grad };
         match self.gradients.get_mut(&id) {
             Some(existing) => {
-                // In-place addition on GPU
-                *existing = existing.add(&grad)?;
+                // Ensure existing buffer is FP32
+                if existing.dtype() != DType::F32 {
+                    let up = existing.to_dtype(DType::F32)?;
+                    *existing = up;
+                }
+                // GPU add, then guarantee FP32 dtype on the stored tensor
+                let sum = existing.add(&grad)?;
+                let sum = if sum.dtype() != DType::F32 { sum.to_dtype(DType::F32)? } else { sum };
+                *existing = sum;
             }
             None => {
                 self.gradients.insert(id, grad);
@@ -68,7 +81,8 @@ impl GradientMap {
     /// Get or create gradient initialized to zeros
     pub fn get_or_create(&mut self, id: TensorId, shape: Shape) -> Result<&mut Tensor> {
         if !self.gradients.contains_key(&id) {
-            let zeros = Tensor::zeros(shape, self.device.clone())?;
+            // Create FP32 zero buffer for gradients
+            let zeros = Tensor::zeros_dtype(shape, DType::F32, self.device.clone())?;
             self.gradients.insert(id, zeros);
         }
         Ok(self.gradients.get_mut(&id).unwrap())

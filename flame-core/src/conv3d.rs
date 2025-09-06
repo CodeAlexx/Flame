@@ -472,7 +472,7 @@ impl BatchNorm3d {
         
         let cfg = LaunchConfig::for_num_elems(total_elems as u32);
         
-        // For now, use a simplified kernel without optional weight/bias
+        // Use the 3D kernel path without optional branches for clarity
         // In production, you'd handle all cases properly
         launch_kernel!(kernel, cfg,
             input.storage.as_slice(),

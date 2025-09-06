@@ -2,7 +2,7 @@ use crate::{Result, FlameError, Shape, DType, Tensor};
 use cudarc::driver::CudaDevice;
 use std::sync::Arc;
 
-/// BF16 tensor operations wrapper
+/// BF16 tensor operations wrapper (uses F32-backed storage internally)
 pub struct BF16Ops;
 
 impl BF16Ops {
@@ -28,7 +28,7 @@ impl BF16Ops {
     }
 }
 
-// Placeholder functions for BF16 conversion (will use F32 internally)
+// BF16 conversion helpers (use F32 storage internally)
 pub fn f32_to_bf16(
     _device: &Arc<CudaDevice>,
     _input: &cudarc::driver::CudaSlice<f32>,

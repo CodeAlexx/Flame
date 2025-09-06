@@ -6,13 +6,12 @@
 
 use anyhow::Result;
 use flame_core::{CudaDevice, Tensor, Shape};
-use std::sync::Arc;
 
 fn main() -> Result<()> {
     println!("=== Simple FLAME Numerical Test ===");
     
     // Initialize device
-    let device = Arc::new(CudaDevice::new(0)?);
+    let device = CudaDevice::new(0)?;
     println!("Using CUDA device: {:?}", device);
     
     // Test parameters

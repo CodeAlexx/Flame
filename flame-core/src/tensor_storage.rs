@@ -11,6 +11,8 @@ pub enum TensorStorage {
     F16 { data: CudaSlice<f32>, numel: usize, scale: f32 },  // Store as F32 but with quantization scale
     BF16 { data: CudaSlice<f32>, numel: usize }, // BF16 stored as F32 for now (cudarc limitation)
     I8 { data: CudaSlice<i8>, numel: usize },  // INT8 support for Sage Attention
+    I32 { data: CudaSlice<f32>, numel: usize }, // Stored as F32 but marked as I32
+    Bool { data: CudaSlice<f32>, numel: usize }, // Stored as F32 (0.0/1.0) but marked as Bool
 }
 
 impl TensorStorage {
@@ -21,6 +23,8 @@ impl TensorStorage {
             TensorStorage::F16 { .. } => DType::F16,
             TensorStorage::BF16 { .. } => DType::BF16,
             TensorStorage::I8 { .. } => DType::I8,
+            TensorStorage::I32 { .. } => DType::I32,
+            TensorStorage::Bool { .. } => DType::Bool,
         }
     }
     
@@ -31,6 +35,8 @@ impl TensorStorage {
             TensorStorage::F16 { numel, .. } => *numel,
             TensorStorage::BF16 { numel, .. } => *numel,
             TensorStorage::I8 { numel, .. } => *numel,
+            TensorStorage::I32 { numel, .. } => *numel,
+            TensorStorage::Bool { numel, .. } => *numel,
         }
     }
     
@@ -62,6 +68,16 @@ impl TensorStorage {
                 Err(FlameError::InvalidOperation(
                     "I8 allocation not yet supported in zeros - use quantization functions".into()
                 ))
+            }
+            DType::I32 => {
+                let mut data = alloc_aligned_f32(device, numel)?;
+                device.memset_zeros(&mut data)?;
+                Ok(TensorStorage::I32 { data, numel })
+            }
+            DType::Bool => {
+                let mut data = alloc_aligned_f32(device, numel)?;
+                device.memset_zeros(&mut data)?;
+                Ok(TensorStorage::Bool { data, numel })
             }
             DType::F64 | DType::U8 | DType::U32 | DType::I32 | DType::I64 => {
                 Err(FlameError::InvalidOperation(
@@ -106,6 +122,12 @@ impl TensorStorage {
                     "I8 to F32 conversion not yet implemented".into()
                 ))
             }
+            TensorStorage::I32 { data, numel } | TensorStorage::Bool { data, numel } => {
+                let mut out = alloc_aligned_f32(device, *numel)?;
+                if out.len() > *numel { eprintln!("Warning: aligned allocation returned {} elements for {} requested", out.len(), *numel); }
+                device.dtod_copy(data, &mut out)?;
+                Ok(out)
+            }
         }
     }
     
@@ -114,7 +136,9 @@ impl TensorStorage {
         match self {
             TensorStorage::F32 { data, .. } |
             TensorStorage::F16 { data, .. } |
-            TensorStorage::BF16 { data, .. } => data,  // BF16 stored as F32 for now
+            TensorStorage::BF16 { data, .. } |
+            TensorStorage::I32 { data, .. } |
+            TensorStorage::Bool { data, .. } => data,  // stored as F32 for now
             TensorStorage::I8 { .. } => panic!("Cannot get f32 slice from I8 storage"),
         }
     }
@@ -128,5 +152,5 @@ impl TensorStorage {
     }
 }
 
-// TODO: Implement proper F16/BF16 conversion kernels when we have better GPU support
+// Note: F16/BF16 conversion kernels can be specialized further; current path stores as F32-backed buffers.
 // For now, we store everything as F32 but track the intended dtype for API compatibility

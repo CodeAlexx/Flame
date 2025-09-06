@@ -5,6 +5,8 @@ use crate::{Tensor, Shape, Result, FlameError};
 use crate::autograd::{AutogradContext, Op};
 use crate::cuda_ops::GpuOps;
 use std::sync::Arc;
+use crate::config::default_dtype;
+use crate::DType;
 use cudarc::driver::CudaDevice;
 
 impl Tensor {
@@ -245,18 +247,17 @@ impl Tensor {
         self.mul_scalar(a)?.add_scalar(b)
     }
     
-    /// Sum along dimension with option to keep dimension
+    /// Sum along dimension with option to keep dimension (GPU-only)
     pub fn sum_keepdim(&self, dim: isize) -> Result<Tensor> {
         let ndim = self.shape.dims().len() as isize;
         let dim = if dim < 0 { ndim + dim } else { dim } as usize;
-        
         if dim >= self.shape.dims().len() {
             return Err(FlameError::InvalidOperation(
                 format!("Dimension {} out of bounds", dim)
             ));
         }
-        
-        self.sum_dim_keepdim(dim)
+        // Delegate to GPU axis-reduction that keeps dimension (FP32 compute)
+        GpuOps::sum_dim_keepdim(self, dim)
     }
     
     /// Permute tensor dimensions (already implemented above)
@@ -303,79 +304,17 @@ impl Tensor {
     
     /// Slice tensor along multiple dimensions
     pub fn slice(&self, ranges: &[(usize, usize)]) -> Result<Tensor> {
-        // Validate ranges
-        let shape = self.shape().dims();
-        if ranges.len() != shape.len() {
-            return Err(FlameError::InvalidOperation(
-                format!("Number of ranges {} doesn't match tensor dimensions {}", ranges.len(), shape.len())
-            ));
+        let mut output = GpuOps::slice(self, ranges)?;
+        // Record autograd slice op
+        if self.requires_grad {
+            output.requires_grad = true;
+            AutogradContext::record_op(
+                output.id,
+                Op::Slice { input: self.id, ranges: ranges.to_vec(), input_shape: self.shape.clone() },
+                vec![(self.id, self.clone()?)]
+            );
         }
-        
-        // Calculate new shape
-        let mut new_shape = Vec::new();
-        for (i, &(start, end)) in ranges.iter().enumerate() {
-            if start >= end || end > shape[i] {
-                return Err(FlameError::InvalidOperation(
-                    format!("Invalid range [{}, {}) for dimension {} of size {}", start, end, i, shape[i])
-                ));
-            }
-            new_shape.push(end - start);
-        }
-        
-        // For now, implement as a copy operation
-        // In production, this would be a view into the original data
-        let new_size = new_shape.iter().product();
-        let mut output_data = vec![0.0f32; new_size];
-        
-        // Copy data (simplified - in production would use CUDA kernels)
-        let src_data = self.to_vec()?;
-        
-        // Calculate strides
-        let mut src_strides = vec![1; shape.len()];
-        for i in (0..shape.len() - 1).rev() {
-            src_strides[i] = src_strides[i + 1] * shape[i + 1];
-        }
-        
-        let mut dst_strides = vec![1; new_shape.len()];
-        for i in (0..new_shape.len() - 1).rev() {
-            dst_strides[i] = dst_strides[i + 1] * new_shape[i + 1];
-        }
-        
-        // Copy elements
-        fn copy_recursive(
-            src: &[f32],
-            dst: &mut [f32],
-            ranges: &[(usize, usize)],
-            src_shape: &[usize],
-            src_strides: &[usize],
-            dst_strides: &[usize],
-            dim: usize,
-            src_offset: usize,
-            dst_offset: usize,
-        ) {
-            if dim == ranges.len() {
-                dst[dst_offset] = src[src_offset];
-                return;
-            }
-            
-            let (start, end) = ranges[dim];
-            for i in start..end {
-                let new_src_offset = src_offset + i * src_strides[dim];
-                let new_dst_offset = dst_offset + (i - start) * dst_strides[dim];
-                copy_recursive(
-                    src, dst, ranges, src_shape, src_strides, dst_strides,
-                    dim + 1, new_src_offset, new_dst_offset
-                );
-            }
-        }
-        
-        copy_recursive(
-            &src_data, &mut output_data, ranges, shape, &src_strides, &dst_strides,
-            0, 0, 0
-        );
-        
-        // Create output tensor
-        Tensor::from_slice(&output_data, Shape::from_dims(&new_shape), self.device.clone())
+        Ok(output)
     }
     
     /// Concatenate tensors along a dimension
@@ -521,83 +460,20 @@ impl Tensor {
             ));
         }
         
-        // Get indices as vec
-        let indices_data = indices.to_vec()?;
-        let num_indices = indices_data.len();
-        
-        // Calculate output shape
-        let mut output_shape = shape.to_vec();
-        output_shape[dim] = num_indices;
-        
-        // Gather data
-        let output_size: usize = output_shape.iter().product();
-        let mut output_data = vec![0.0f32; output_size];
-        let src_data = self.to_vec()?;
-        
-        // Calculate strides
-        let mut strides = vec![1; shape.len()];
-        for i in (0..shape.len() - 1).rev() {
-            strides[i] = strides[i + 1] * shape[i + 1];
+        let mut output = GpuOps::index_select(self, dim, indices)?;
+        // Record autograd op for backward via scatter_add
+        if self.requires_grad {
+            output.requires_grad = true;
+            AutogradContext::record_op(
+                output.id,
+                Op::IndexSelect { input: self.id, indices: indices.id(), dim },
+                vec![
+                    (self.id, self.clone()?),
+                    (indices.id(), indices.clone()?)
+                ]
+            );
         }
-        
-        // Copy selected indices
-        fn copy_indexed(
-            src: &[f32],
-            dst: &mut [f32],
-            shape: &[usize],
-            output_shape: &[usize],
-            strides: &[usize],
-            indices: &[f32],
-            select_dim: usize,
-            dim: usize,
-            src_base: usize,
-            dst_idx: usize,
-        ) {
-            if dim == shape.len() {
-                // We've reached a single element
-                return;
-            }
-            
-            if dim == select_dim {
-                // Use indices for this dimension
-                for (out_i, &idx) in indices.iter().enumerate() {
-                    let src_idx = src_base + (idx as usize) * strides[dim];
-                    let dst_offset = out_i * strides[dim] * output_shape[dim] / shape[dim];
-                    
-                    if dim + 1 == shape.len() {
-                        dst[dst_idx + dst_offset] = src[src_idx];
-                    } else {
-                        copy_indexed(
-                            src, dst, shape, output_shape, strides, indices, select_dim,
-                            dim + 1, src_idx, dst_idx + dst_offset
-                        );
-                    }
-                }
-            } else {
-                // Normal iteration for other dimensions
-                for i in 0..shape[dim] {
-                    let src_offset = i * strides[dim];
-                    let dst_offset = i * strides[dim] * output_shape[dim] / shape[dim];
-                    
-                    if dim + 1 == shape.len() {
-                        dst[dst_idx + dst_offset] = src[src_base + src_offset];
-                    } else {
-                        copy_indexed(
-                            src, dst, shape, output_shape, strides, indices, select_dim,
-                            dim + 1, src_base + src_offset, dst_idx + dst_offset
-                        );
-                    }
-                }
-            }
-        }
-        
-        copy_indexed(
-            &src_data, &mut output_data,
-            shape, &output_shape, &strides, &indices_data,
-            dim, 0, 0, 0
-        );
-        
-        Tensor::from_slice(&output_data, Shape::from_dims(&output_shape), self.device.clone())
+        Ok(output)
     }
     
     /// Expand tensor to a new shape (broadcasting)
@@ -627,11 +503,9 @@ impl Tensor {
     }
     
     
-    /// Compute natural logarithm
+    /// Compute natural logarithm (GPU)
     pub fn log(&self) -> Result<Tensor> {
-        let data = self.to_vec()?;
-        let output: Vec<f32> = data.iter().map(|x| x.ln()).collect();
-        Tensor::from_slice(&output, self.shape.clone(), self.device.clone())
+        GpuOps::log(self)
     }
     
     
@@ -661,32 +535,32 @@ impl Tensor {
         Tensor::from_slice(&output, self.shape.clone(), self.device.clone())
     }
     
-    /// Compute element-wise maximum with another tensor
+    /// Compute element-wise maximum with another tensor (GPU)
     pub fn maximum(&self, other: &Tensor) -> Result<Tensor> {
         // Check shapes are compatible for broadcasting
         let broadcast_shape = broadcast_shapes(self.shape().dims(), other.shape().dims())?;
-        
-        // Broadcast both tensors if needed
+
+        // Broadcast to common shape
         let a = if self.shape().dims() != &broadcast_shape {
             self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-        } else {
-            self.clone()?
-        };
-        
+        } else { self.clone()? };
         let b = if other.shape().dims() != &broadcast_shape {
             other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-        } else {
-            other.clone()?
-        };
-        
-        // Compute maximum
-        let a_data = a.to_vec()?;
-        let b_data = b.to_vec()?;
-        let output: Vec<f32> = a_data.iter().zip(b_data.iter())
-            .map(|(a, b)| a.max(*b))
-            .collect();
-        
-        Tensor::from_slice(&output, Shape::from_dims(&broadcast_shape), self.device.clone())
+        } else { other.clone()? };
+
+        // GPU elementwise max
+        let mut out = crate::cuda_ops::GpuOps::max_elemwise(&a, &b)?;
+
+        // Autograd record
+        if self.requires_grad || other.requires_grad {
+            out.requires_grad = true;
+            AutogradContext::record_op(
+                out.id,
+                Op::Maximum { a: self.id, b: other.id },
+                vec![ (self.id, self.clone()?), (other.id, other.clone()?) ]
+            );
+        }
+        Ok(out)
     }
     
     /// Compute element-wise minimum with another tensor
@@ -711,10 +585,18 @@ impl Tensor {
         let a_data = a.to_vec()?;
         let b_data = b.to_vec()?;
         let output: Vec<f32> = a_data.iter().zip(b_data.iter())
-            .map(|(a, b)| a.min(*b))
+            .map(|(av, bv)| av.min(*bv))
             .collect();
-        
-        Tensor::from_slice(&output, Shape::from_dims(&broadcast_shape), self.device.clone())
+        let mut out = Tensor::from_slice(&output, Shape::from_dims(&broadcast_shape), self.device.clone())?;
+        if self.requires_grad || other.requires_grad {
+            out.requires_grad = true;
+            AutogradContext::record_op(
+                out.id,
+                Op::Minimum { a: self.id, b: other.id },
+                vec![ (self.id, self.clone()?), (other.id, other.clone()?) ]
+            );
+        }
+        Ok(out)
     }
     
     
@@ -776,7 +658,7 @@ impl Tensor {
         Tensor::from_slice(&output, Shape::from_dims(&output_shape), self.device.clone())
     }
     
-    /// Sum along dimension keeping dimension
+    /// Sum along dimension keeping dimension (GPU-only)
     pub fn sum_dim_keepdim(&self, dim: usize) -> Result<Tensor> {
         let shape = self.shape().dims();
         if dim >= shape.len() {
@@ -784,44 +666,8 @@ impl Tensor {
                 format!("Dimension {} out of bounds", dim)
             ));
         }
-        
-        // Calculate output shape (keep dimension with size 1)
-        let mut output_shape = shape.to_vec();
-        output_shape[dim] = 1;
-        
-        // For now, implement with to_vec
-        let data = self.to_vec()?;
-        
-        // Calculate strides
-        let mut strides = vec![1; shape.len()];
-        for i in (0..shape.len() - 1).rev() {
-            strides[i] = strides[i + 1] * shape[i + 1];
-        }
-        
-        let output_size: usize = output_shape.iter().product();
-        let mut output = vec![0.0f32; output_size];
-        
-        // Sum along dimension
-        for idx in 0..data.len() {
-            // Decompose linear index
-            let mut remaining = idx;
-            let mut indices = vec![0; shape.len()];
-            for i in 0..shape.len() {
-                indices[i] = remaining / strides[i];
-                remaining %= strides[i];
-            }
-            
-            // Calculate output index (set dim index to 0)
-            indices[dim] = 0;
-            let mut out_idx = 0;
-            for i in 0..shape.len() {
-                out_idx += indices[i] * strides[i];
-            }
-            
-            output[out_idx] += data[idx];
-        }
-        
-        Tensor::from_slice(&output, Shape::from_dims(&output_shape), self.device.clone())
+        // Delegate to GPU axis-reduction that keeps dimension (FP32 compute)
+        GpuOps::sum_dim_keepdim(self, dim)
     }
     
     /// Divide by another tensor
@@ -894,7 +740,9 @@ impl Tensor {
     pub fn full(shape: Shape, value: f32, device: Arc<CudaDevice>) -> Result<Tensor> {
         let size = shape.elem_count();
         let data = vec![value; size];
-        Tensor::from_slice(&data, shape, device)
+        let t = Tensor::from_slice(&data, shape, device)?;
+        let dd = default_dtype();
+        if dd != DType::F32 { t.to_dtype(dd) } else { Ok(t) }
     }
     
     /// Create tensor filled with ones (static method)
@@ -1122,7 +970,10 @@ impl Tensor {
             );
         }
         
-        Ok(output)
+        match crate::config::default_dtype() {
+            DType::F32 => Ok(output),
+            dt => output.to_dtype(dt),
+        }
     }
     
     /// Get data as 1D vector of i64

@@ -246,7 +246,7 @@ fn load_tensors_binary(path: &Path, device: Arc<CudaDevice>) -> Result<HashMap<S
     Ok(tensors)
 }
 
-// SafeTensors format implementation (simplified)
+// SafeTensors format implementation
 fn save_tensor_safetensors(tensor: &Tensor, path: &Path) -> Result<()> {
     let mut tensors = HashMap::new();
     tensors.insert("tensor".to_string(), tensor);

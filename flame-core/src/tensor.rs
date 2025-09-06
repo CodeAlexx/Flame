@@ -1,4 +1,5 @@
 use crate::{Shape, Result, FlameError, DType};
+use crate::config::default_dtype;
 use crate::autograd::{AutogradContext, Op};
 use crate::gradient::{GradientMap, TensorGradExt};
 use crate::tensor_storage::TensorStorage;
@@ -163,9 +164,9 @@ extern "C" __global__ void masked_fill_kernel(
         })
     }
     
-    /// Create a new tensor filled with zeros (defaults to F32)
+    /// Create a new tensor filled with zeros (defaults to global default dtype)
     pub fn zeros(shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
-        Self::zeros_dtype(shape, DType::F32, device)
+        Self::zeros_dtype(shape, default_dtype(), device)
     }
     
     /// Create tensor with specific dtype
@@ -234,31 +235,22 @@ extern "C" __global__ void masked_fill_kernel(
         let numel = self.shape.elem_count();
         
         // Debug large allocations
-        if numel > 100000 {
-            eprintln!("to_dtype: converting {} elements from {:?} to {:?}", numel, self.dtype(), dtype);
-        }
+        // Commented out for cleaner training output
+        // if numel > 100000 {
+        //     eprintln!("to_dtype: converting {} elements from {:?} to {:?}", numel, self.dtype(), dtype);
+        // }
         
-        // Use aligned allocation
+        // Use aligned allocation and convert via f32 staging
         let mut f32_data = alloc_aligned_f32(&self.device, numel)?;
-        
-        // Copy data from source storage
-        match &self.storage {
-            TensorStorage::F32 { data, .. } |
-            TensorStorage::F16 { data, .. } |
-            TensorStorage::BF16 { data, .. } => {
-                // For now, just use the allocation as-is
-                // The extra padding shouldn't cause issues since we track numel separately
-                self.device.dtod_copy(data, &mut f32_data)?;
-            },
-            TensorStorage::I8 { .. } => {
-                return Err(FlameError::InvalidOperation("I8 to dtype conversion not implemented".into()));
-            }
-        }
+        let src_f32 = self.storage.to_f32(&self.device)?;
+        self.device.dtod_copy(&src_f32, &mut f32_data)?;
         
         let storage = match dtype {
             DType::F32 => TensorStorage::F32 { data: f32_data, numel },
-            DType::F16 => TensorStorage::F16 { data: f32_data, numel, scale: 1.0 }, // Stored as F32 but marked as F16
-            DType::BF16 => TensorStorage::BF16 { data: f32_data, numel }, // Stored as F32 but marked as BF16
+            DType::F16 => TensorStorage::F16 { data: f32_data, numel, scale: 1.0 },
+            DType::BF16 => TensorStorage::BF16 { data: f32_data, numel },
+            DType::I32 => TensorStorage::I32 { data: f32_data, numel },
+            DType::Bool => TensorStorage::Bool { data: f32_data, numel },
             _ => return Err(FlameError::InvalidOperation(
                 format!("Unsupported dtype: {:?}", dtype)
             )),
@@ -271,6 +263,55 @@ extern "C" __global__ void masked_fill_kernel(
             id: TensorId::new(),
             requires_grad: false,
         })
+    }
+
+    /// Gather rows from a 2D table along axis 0 using I32 indices; supports ids with arbitrary leading dims
+    pub fn index_select0(&self, ids: &Tensor) -> Result<Tensor> {
+        if self.shape.dims().len() != 2 { return Err(FlameError::InvalidOperation("index_select0 expects table [V,D]".into())); }
+        if ids.dtype() != DType::I32 { return Err(FlameError::InvalidOperation("index_select0 ids must be I32".into())); }
+        let v = self.shape.dims()[0];
+        let d = self.shape.dims()[1];
+        let ids_dims = ids.shape.dims().to_vec();
+        let ids_count = ids.shape.elem_count();
+        // CPU gather for now
+        let table = self.to_dtype(DType::F32)?.to_vec()?;
+        let ids_host_f = ids.to_dtype(DType::F32)?.to_vec()?;
+        let mut out = vec![0f32; ids_count * d];
+        for i in 0..ids_count {
+            let idx = ids_host_f[i].round().clamp(0.0, (v as f32 - 1.0)) as usize;
+            let src = idx * d;
+            let dst = i * d;
+            out[dst..dst+d].copy_from_slice(&table[src..src+d]);
+        }
+        let mut out_dims = ids_dims.clone(); out_dims.push(d);
+        let t = Tensor::from_vec(out, Shape::from(out_dims), self.device.clone())?;
+        match self.dtype() {
+            DType::BF16 => t.to_dtype(DType::BF16),
+            DType::F16 => t.to_dtype(DType::F16),
+            _ => Ok(t),
+        }
+    }
+
+    /// Elementwise equality returning Bool tensor (stored as F32 0.0/1.0)
+    pub fn eq(&self, rhs: &Tensor) -> Result<Tensor> {
+        let a = self.to_dtype(DType::F32)?.to_vec()?;
+        let b = rhs.to_dtype(DType::F32)?.to_vec()?;
+        if a.len() != b.len() { return Err(FlameError::InvalidOperation("eq: size mismatch".into())); }
+        let mut out = Vec::with_capacity(a.len());
+        for i in 0..a.len() { out.push(if a[i] == b[i] { 1.0 } else { 0.0 }); }
+        let t = Tensor::from_vec(out, self.shape.clone(), self.device.clone())?;
+        t.to_dtype(DType::Bool)
+    }
+
+    /// Where: out = mask ? a : b; mask Bool (0/1)
+    pub fn where_mask(mask: &Tensor, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let m = mask.to_dtype(DType::F32)?.to_vec()?;
+        let av = a.to_dtype(DType::F32)?.to_vec()?;
+        let bv = b.to_dtype(DType::F32)?.to_vec()?;
+        if av.len() != bv.len() || av.len() != m.len() { return Err(FlameError::InvalidOperation("where_mask: size mismatch".into())); }
+        let mut out = Vec::with_capacity(av.len());
+        for i in 0..av.len() { out.push(if m[i] != 0.0 { av[i] } else { bv[i] }); }
+        Tensor::from_vec(out, a.shape.clone(), a.device.clone())
     }
     
     /// Create a new tensor filled with ones (defaults to F32)
@@ -399,8 +440,9 @@ extern "C" __global__ void masked_fill_kernel(
         let cpu_data: Vec<f32> = (0..size)
             .map(|_| normal.sample(&mut rng))
             .collect();
-            
-        Self::from_vec(cpu_data, shape, device)
+        let t = Self::from_vec(cpu_data, shape, device)?;
+        let dd = default_dtype();
+        if dd != DType::F32 { t.to_dtype(dd) } else { Ok(t) }
     }
     
     /// Create a tensor with random values like another tensor
@@ -682,7 +724,7 @@ extern "C" __global__ void masked_fill_kernel(
             let other_offset = b * k * n;
             let output_offset = b * m * n;
             
-            // Create temporary tensors for this batch's slice
+        // Create per-batch tensors for this slice
             // This is inefficient but works for now
             let self_data = self.to_vec()?;
             let other_data = other.to_vec()?;
@@ -1095,11 +1137,9 @@ extern "C" __global__ void slice_kernel(
         Tensor::from_vec(result, self.shape.clone(), self.device.clone())
     }
     
-    /// Exponential function
+    /// Exponential function (GPU)
     pub fn exp(&self) -> Result<Tensor> {
-        let data = self.to_vec()?;
-        let result: Vec<f32> = data.iter().map(|&x| x.exp()).collect();
-        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+        GpuOps::exp(self)
     }
     
 
@@ -1172,65 +1212,61 @@ extern "C" __global__ void slice_kernel(
     
     /// Sum along specific dimensions
     pub fn sum_dims(&self, dims: &[usize]) -> Result<Tensor> {
-        // Use CUDA kernel for GPU-accelerated sum reduction along dims
-        let mut output = GpuOps::sum_dims(self, dims)?;
-        
-        // AUTOGRAD: Record operation if needed
+        // Reduce iteratively in descending order to avoid index shifts
+        if dims.is_empty() { return self.clone(); }
+        let mut dims_sorted: Vec<usize> = dims.iter().copied().collect();
+        dims_sorted.sort_unstable();
+        dims_sorted.dedup();
+
+        // Perform reductions without recording intermediate ops
+        let mut current = self.clone()?;
+        for &d in dims_sorted.iter().rev() {
+            let keep = GpuOps::sum_dim_keepdim(&current, d)?;
+            // Build new shape without dimension d
+            let mut new_shape = current.shape().dims().to_vec();
+            new_shape.remove(d);
+            current = keep.reshape(&new_shape)?;
+        }
+
+        // Record as a single multi-dim reduction for autograd clarity
         if self.requires_grad {
-            output.requires_grad = true;
-            
+            let mut out = current;
+            out.requires_grad = true;
             AutogradContext::record_op(
-                output.id,
-                Op::SumDim { 
-                    input: self.id,
-                    dim: dims[0] // Currently handling single dimension, multi-dim reduction handled iteratively
-                },
+                out.id,
+                Op::SumDims { input: self.id, dims: dims_sorted.clone() },
                 vec![(self.id, self.clone()?)]
             );
+            Ok(out)
+        } else {
+            Ok(current)
         }
-        
-        Ok(output)
     }
     
     /// Sum along a specific dimension
     pub fn sum_dim(&self, dim: usize) -> Result<Tensor> {
-        // For now, implement a simple version for the bias gradient case
-        // This should sum along dimension 0 (batch dimension)
         let dims = self.shape.dims();
         if dim >= dims.len() {
             return Err(FlameError::InvalidOperation(
                 format!("Dimension {} out of range for tensor with {} dimensions", dim, dims.len())
             ));
         }
-        
-        // For now, only implement dim=0 case which is needed for bias gradients
-        if dim != 0 {
-            return Err(FlameError::InvalidOperation(
-                "sum_dim currently only supports dim=0".into()
-            ));
+
+        // Compute sum keeping the dimension, then squeeze it away for the final shape
+        let summed_keepdim = GpuOps::sum_dim_keepdim(self, dim)?;
+
+        // Build output shape without the reduced dimension
+        let mut out_dims = Vec::with_capacity(dims.len() - 1);
+        for (i, &d) in dims.iter().enumerate() {
+            if i != dim { out_dims.push(d); }
         }
-        
-        // Sum along batch dimension
-        let batch_size = dims[0];
-        let remaining_dims: Vec<usize> = dims[1..].to_vec();
-        let remaining_size: usize = remaining_dims.iter().product();
-        
-        let data = self.to_vec()?;
-        let mut result = vec![0.0f32; remaining_size];
-        
-        for b in 0..batch_size {
-            let offset = b * remaining_size;
-            for i in 0..remaining_size {
-                result[i] += data[offset + i];
-            }
-        }
-        
-        let mut output = Tensor::from_vec(result, Shape::from_dims(&remaining_dims), self.device.clone())?;
-        
+
+        let mut output = summed_keepdim.reshape(&out_dims)?;
+
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
             output.requires_grad = true;
-            
+
             AutogradContext::record_op(
                 output.id,
                 Op::SumDim { 
@@ -1240,7 +1276,7 @@ extern "C" __global__ void slice_kernel(
                 vec![(self.id, self.clone()?)]
             );
         }
-        
+
         Ok(output)
     }
 
@@ -1527,6 +1563,7 @@ extern "C" __global__ void slice_kernel(
             seen[d] = true;
         }
         
+        // Optimized special-cases
         let mut output = if shape.len() == 2 && dims == &[1, 0] {
             // Simple 2D transpose
             self.transpose()?
@@ -1537,10 +1574,52 @@ extern "C" __global__ void slice_kernel(
             // [batch, num_heads, seq_len, head_dim] -> [batch, num_heads, head_dim, seq_len]
             self.permute_0132()?
         } else {
-            // General permutation not yet implemented
-            return Err(FlameError::InvalidOperation(
-                format!("General permutation {:?} not yet implemented", dims)
-            ));
+            // General permutation fallback (CPU copy for now)
+            let src_dims = shape;
+            let dst_dims: Vec<usize> = dims.iter().map(|&i| src_dims[i]).collect();
+
+            // Compute strides for source (row-major)
+            let mut src_strides = vec![1; src_dims.len()];
+            for i in (0..src_dims.len().saturating_sub(1)).rev() {
+                src_strides[i] = src_strides[i + 1] * src_dims[i + 1];
+            }
+
+            // Compute strides for destination
+            let mut dst_strides = vec![1; dst_dims.len()];
+            for i in (0..dst_dims.len().saturating_sub(1)).rev() {
+                dst_strides[i] = dst_strides[i + 1] * dst_dims[i + 1];
+            }
+
+            // Map each destination linear index to source linear index
+            let total: usize = dst_dims.iter().product();
+            let src_data = self.to_vec()?;
+            let mut dst_data = vec![0.0f32; total];
+
+            for dst_idx in 0..total {
+                // Decompose destination index to coordinates
+                let mut remaining = dst_idx;
+                let mut dst_coords = vec![0usize; dst_dims.len()];
+                for i in 0..dst_dims.len() {
+                    let stride = dst_strides[i];
+                    dst_coords[i] = remaining / stride;
+                    remaining %= stride;
+                }
+
+                // Build source coordinates by inverting permutation: src_coord[p] = dst_coord[idx]
+                let mut src_coords = vec![0usize; src_dims.len()];
+                for (dst_axis, &src_axis) in dims.iter().enumerate() {
+                    src_coords[src_axis] = dst_coords[dst_axis];
+                }
+
+                // Convert source coordinates to linear index
+                let mut src_idx = 0usize;
+                for i in 0..src_dims.len() {
+                    src_idx += src_coords[i] * src_strides[i];
+                }
+                dst_data[dst_idx] = src_data[src_idx];
+            }
+
+            Tensor::from_vec(dst_data, Shape::from_dims(&dst_dims), self.device.clone())?
         };
         
         // AUTOGRAD: Record operation if needed
@@ -1584,7 +1663,7 @@ extern "C" __global__ void slice_kernel(
         // Sum along dimension
         let sum_exp = GpuOps::sum_dim_keepdim(&exp_vals, dim)?;
         
-        // Divide by sum
+        // Divide by sum (compute in F32, cast back to default dtype if needed)
         let mut output = exp_vals.div(&sum_exp)?;
         
         // AUTOGRAD: Record operation if needed
@@ -1601,7 +1680,11 @@ extern "C" __global__ void slice_kernel(
             );
         }
         
-        Ok(output)
+        // Cast to default dtype if not F32
+        match crate::config::default_dtype() {
+            DType::F32 => Ok(output),
+            dt => output.to_dtype(dt),
+        }
     }
     
     /// Specific permutation: [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, num_heads, head_dim]

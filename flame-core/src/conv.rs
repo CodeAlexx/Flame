@@ -136,89 +136,15 @@ impl Conv2d {
     
     /// Forward pass of Conv2d
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        // Validate input shape: [batch, in_channels, height, width]
-        let input_dims = input.shape().dims();
-        if input_dims.len() != 4 {
-            return Err(FlameError::InvalidOperation(
-                format!("Conv2d expects 4D input [N,C,H,W], got {:?}", input_dims)
-            ));
-        }
-        
-        let batch_size = input_dims[0];
-        let in_channels = input_dims[1];
-        let in_height = input_dims[2];
-        let in_width = input_dims[3];
-        
-        if in_channels != self.config.in_channels {
-            return Err(FlameError::InvalidOperation(
-                format!("Expected {} input channels, got {}", self.config.in_channels, in_channels)
-            ));
-        }
-        
-        // Calculate output dimensions
-        let (kh, kw) = self.config.kernel_size;
-        let (sh, sw) = self.config.stride;
-        let (ph, pw) = self.config.padding;
-        
-        let out_height = (in_height + 2 * ph - kh) / sh + 1;
-        let out_width = (in_width + 2 * pw - kw) / sw + 1;
-        
-        let _output_shape = Shape::from_dims(&[
-            batch_size,
-            self.config.out_channels,
-            out_height,
-            out_width,
-        ]);
-        
-        // Always use GPU convolution since FLAME only supports CUDA
-        let output = input.conv2d(
+        // Prefer NHWC entrypoint for public API compatibility: input is NHWC
+        // Adapt to NCHW kernels under the hood.
+        crate::cuda_conv2d::CudaConv2d::conv2d_forward_nhwc(
+            input,
             &self.weight,
             self.bias.as_ref(),
-            self.config.stride.0,
-            self.config.padding.0,
-        )?;
-        
-        // Add bias if present
-        let mut output = if let Some(bias) = &self.bias {
-            self.add_bias(&output, bias)?
-        } else {
-            output
-        };
-        
-        // Record operation for autograd if needed
-        if input.requires_grad() || self.weight.requires_grad() {
-            use crate::autograd::{AutogradContext, Op};
-            
-            output.requires_grad = true;
-            
-            let mut saved = vec![
-                (input.id(), input.clone()?),
-                (self.weight.id(), self.weight.clone()?),
-            ];
-            
-            // Save bias if it exists and requires grad
-            let _bias_id = if let Some(bias) = &self.bias {
-                if bias.requires_grad() {
-                    saved.push((bias.id(), bias.clone()?));
-                }
-                Some(bias.id())
-            } else {
-                None
-            };
-            
-            AutogradContext::record_op(
-                output.id(),
-                Op::Conv2d {
-                    input: input.id(),
-                    weight: self.weight.id(),
-                    stride: self.config.stride.0,
-                    padding: self.config.padding.0,
-                },
-                saved,
-            );
-        }
-        
-        Ok(output)
+            self.config.stride,
+            self.config.padding,
+        )
     }
     
     /// Convolution using im2col algorithm

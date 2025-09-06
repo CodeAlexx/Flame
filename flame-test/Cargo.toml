@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 flame-core = { path = "../flame-core" }
 cudarc = { workspace = true }
+anyhow = "1.0"
 
 [[bin]]
 name = "simple_accuracy"

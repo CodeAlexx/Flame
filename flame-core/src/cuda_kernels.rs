@@ -57,6 +57,7 @@ impl CudaKernels {
         kernels.insert("add_kernel".to_string(), compile_and_load_kernel(&device, ADD_KERNEL, "add_kernel")?);
         kernels.insert("mul_kernel".to_string(), compile_and_load_kernel(&device, MUL_KERNEL, "mul_kernel")?);
         kernels.insert("mul_scalar_kernel".to_string(), compile_and_load_kernel(&device, MUL_SCALAR_KERNEL, "mul_scalar_kernel")?);
+        kernels.insert("div_kernel".to_string(), compile_and_load_kernel(&device, DIV_KERNEL, "div_kernel")?);
         kernels.insert("add_scalar_kernel".to_string(), compile_and_load_kernel(&device, ADD_SCALAR_KERNEL, "add_scalar_kernel")?);
         kernels.insert("relu_kernel".to_string(), compile_and_load_kernel(&device, RELU_KERNEL, "relu_kernel")?);
         kernels.insert("sigmoid_kernel".to_string(), compile_and_load_kernel(&device, SIGMOID_KERNEL, "sigmoid_kernel")?);
@@ -74,6 +75,19 @@ impl CudaKernels {
         kernels.insert("sqrt_kernel".to_string(), compile_and_load_kernel(&device, SQRT_KERNEL, "sqrt_kernel")?);
         kernels.insert("narrow_kernel".to_string(), compile_and_load_kernel(&device, NARROW_KERNEL, "narrow_kernel")?);
         kernels.insert("permute_nhwc_to_nchw_kernel".to_string(), compile_and_load_kernel(&device, PERMUTE_NHWC_TO_NCHW_KERNEL, "permute_nhwc_to_nchw_kernel")?);
+        kernels.insert("permute_nchw_to_nhwc_kernel".to_string(), compile_and_load_kernel(&device, PERMUTE_NCHW_TO_NHWC_KERNEL, "permute_nchw_to_nhwc_kernel")?);
+        kernels.insert("index_select_kernel".to_string(), compile_and_load_kernel(&device, INDEX_SELECT_KERNEL, "index_select_kernel")?);
+        kernels.insert("slice_kernel".to_string(), compile_and_load_kernel(&device, SLICE_KERNEL, "slice_kernel")?);
+        // Newly added elementwise math and reductions
+        kernels.insert("exp_kernel".to_string(), compile_and_load_kernel(&device, EXP_KERNEL, "exp_kernel")?);
+        kernels.insert("log_kernel".to_string(), compile_and_load_kernel(&device, LOG_KERNEL, "log_kernel")?);
+        kernels.insert("sum_dim_keepdim_kernel".to_string(), compile_and_load_kernel(&device, SUM_DIM_KEEPDIM_KERNEL, "sum_dim_keepdim_kernel")?);
+        kernels.insert("max_elemwise_kernel".to_string(), compile_and_load_kernel(&device, MAX_ELEMWISE_KERNEL, "max_elemwise_kernel")?);
+        kernels.insert("resize_bilinear_nhwc_kernel".to_string(), compile_and_load_kernel(&device, RESIZE_BILINEAR_NHWC_KERNEL, "resize_bilinear_nhwc_kernel")?);
+        kernels.insert("center_crop_nhwc_kernel".to_string(), compile_and_load_kernel(&device, CENTER_CROP_NHWC_KERNEL, "center_crop_nhwc_kernel")?);
+        kernels.insert("normalize_nhwc_kernel".to_string(), compile_and_load_kernel(&device, NORMALIZE_NHWC_KERNEL, "normalize_nhwc_kernel")?);
+        kernels.insert("permute_w_khwkicoc_to_ocickhkw".to_string(), compile_and_load_kernel(&device, PERMUTE_W_KH_KW_IC_OC_TO_OC_IC_KH_KW, "permute_w_khwkicoc_to_ocickhkw")?);
+        kernels.insert("permute_w_ocickhkw_to_khwkicoc".to_string(), compile_and_load_kernel(&device, PERMUTE_W_OC_IC_KH_KW_TO_KH_KW_IC_OC, "permute_w_ocickhkw_to_khwkicoc")?);
         
         Ok(Self { device, kernels })
     }
@@ -543,7 +557,7 @@ impl CudaKernels {
     }
     
     pub fn prelu(&self, _tensor: &Tensor, _weight: &Tensor) -> Result<Tensor> {
-        // PReLU requires channel-wise parameters - simplified version
+        // PReLU requires channel-wise parameters
         Err(FlameError::InvalidOperation("PReLU GPU kernel not yet implemented".into()))
     }
     
@@ -874,18 +888,20 @@ impl CudaKernels {
                 got: b.shape.clone(),
             });
         }
-        
-        let data = a.to_vec()?;
-        let b_data = b.to_vec()?;
-        let result: Vec<f32> = data.iter()
-            .zip(b_data.iter())
-            .map(|(x, y)| x / y)
-            .collect();
-            
-        Tensor::from_vec(result, a.shape.clone(), a.device.clone())
+        let mut output = Tensor::zeros(a.shape.clone(), a.device.clone())?;
+        let n = a.shape.elem_count();
+        let kernel = self.kernels.get("div_kernel")
+            .ok_or_else(|| FlameError::KernelError("div_kernel not found".into()))?
+            .clone();
+        let block_size = 256usize;
+        let grid_size = (n + block_size - 1) / block_size;
+        let cfg = LaunchConfig { grid_dim: (grid_size as u32,1,1), block_dim: (block_size as u32,1,1), shared_mem_bytes: 0 };
+        launch_kernel!(kernel, cfg, a.storage.as_slice(), b.storage.as_slice(), output.storage.as_slice(), n as u32)?;
+        self.device.synchronize()?;
+        Ok(output)
     }
     
-    /// Max reduction along dimension
+    /// Max reduction along dimension (GPU, with optional keepdim)
     pub fn max_dim(&self, tensor: &Tensor, dim: usize, keepdim: bool) -> Result<Tensor> {
         let dims = tensor.shape.dims();
         if dim >= dims.len() {
@@ -893,46 +909,98 @@ impl CudaKernels {
                 format!("Dimension {} out of range for tensor with {} dimensions", dim, dims.len())
             ));
         }
-        
-        // For now, implement on CPU
-        let data = tensor.to_vec()?;
-        let mut output_shape = dims.to_vec();
-        
-        if keepdim {
-            output_shape[dim] = 1;
-        } else {
-            output_shape.remove(dim);
+
+        // Kernel computes keepdim=true; we reshape if keepdim=false
+        let mut out_shape_keep = dims.to_vec();
+        out_shape_keep[dim] = 1;
+        let out_elems: usize = out_shape_keep.iter().product();
+
+        // Upload dims as f32
+        let dims_f32: Vec<f32> = dims.iter().map(|&x| x as f32).collect();
+        let mut dims_gpu = unsafe { self.device.alloc::<f32>(dims_f32.len()) }
+            .map_err(|_| FlameError::CudaDriver)?;
+        self.device.htod_copy_into(dims_f32, &mut dims_gpu)
+            .map_err(|_| FlameError::CudaDriver)?;
+
+        // Allocate output keepdim
+        let mut out = Tensor::zeros(Shape::from_dims(&out_shape_keep), tensor.device.clone())?;
+
+        // Inline kernel: max along reduce_dim, keeping dimension size 1
+        let kernel_code = r#"
+extern "C" __global__ void max_dim_keepdim_kernel(
+    const float* input,
+    float* output,
+    const float* dims_f32,
+    int ndim,
+    int reduce_dim,
+    int out_elems
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= out_elems) return;
+
+    int dims[8];
+    for (int i = 0; i < ndim && i < 8; ++i) dims[i] = (int)dims_f32[i];
+
+    int strides[8];
+    strides[ndim - 1] = 1;
+    for (int i = ndim - 2; i >= 0; --i) {
+        strides[i] = strides[i + 1] * dims[i + 1];
+    }
+
+    int rem = tid;
+    int out_coords[8];
+    for (int i = 0; i < ndim; ++i) {
+        int size = (i == reduce_dim) ? 1 : dims[i];
+        int stride = 1;
+        for (int j = i + 1; j < ndim; ++j) {
+            stride *= (j == reduce_dim) ? 1 : dims[j];
         }
-        
-        // Calculate strides for dimension iteration
-        let mut strides = vec![1; dims.len()];
-        for i in (0..dims.len() - 1).rev() {
-            strides[i] = strides[i + 1] * dims[i + 1];
-        }
-        
-        let outer_size: usize = dims[..dim].iter().product();
-        let dim_size = dims[dim];
-        let inner_size: usize = dims[dim + 1..].iter().product();
-        
-        let mut result = Vec::new();
-        
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut max_val = f32::NEG_INFINITY;
-                
-                for d in 0..dim_size {
-                    let idx = outer * dim_size * inner_size + d * inner_size + inner;
-                    max_val = max_val.max(data[idx]);
-                }
-                
-                result.push(max_val);
+        out_coords[i] = (size == 0) ? 0 : (rem / stride) % size;
+    }
+
+    int base_idx = 0;
+    for (int i = 0; i < ndim; ++i) {
+        int coord = (i == reduce_dim) ? 0 : out_coords[i];
+        base_idx += coord * strides[i];
+    }
+
+    float maxv = -3.402823e38f; // -FLT_MAX
+    for (int d = 0; d < dims[reduce_dim]; ++d) {
+        int idx = base_idx + d * strides[reduce_dim];
+        float v = input[idx];
+        if (v > maxv) maxv = v;
+    }
+    output[tid] = maxv;
+}
+"#;
+
+        // Compile/load once per process
+        Self::ensure_kernel(&self.device, "max_dim_keepdim_kernel", kernel_code)?;
+        let f = self.device.get_func("max_dim_keepdim_kernel", "max_dim_keepdim_kernel")
+            .ok_or_else(|| FlameError::Cuda("Failed to get max_dim_keepdim_kernel".into()))?;
+
+        let cfg = LaunchConfig::for_num_elems(out_elems as u32);
+        launch_kernel!(f, cfg,
+            tensor.storage.as_slice(),
+            out.storage.as_slice(),
+            &dims_gpu,
+            dims.len() as i32,
+            dim as i32,
+            out_elems as i32
+        )?;
+        self.device.synchronize()?;
+
+        if keepdim { Ok(out) } else {
+            // Squeeze the reduced dimension
+            let mut squeezed = Vec::with_capacity(dims.len() - 1);
+            for (i, &d) in dims.iter().enumerate() {
+                if i != dim { squeezed.push(d); }
             }
+            out.reshape(&squeezed)
         }
-        
-        Tensor::from_vec(result, Shape::from_dims(&output_shape), tensor.device.clone())
     }
     
-    /// Sum along dimension with keepdim
+    /// Sum along dimension with keepdim (GPU kernel)
     pub fn sum_dim_keepdim(&self, tensor: &Tensor, dim: usize) -> Result<Tensor> {
         let dims = tensor.shape.dims();
         if dim >= dims.len() {
@@ -940,33 +1008,36 @@ impl CudaKernels {
                 format!("Dimension {} out of range for tensor with {} dimensions", dim, dims.len())
             ));
         }
-        
-        // For now, implement on CPU
-        let data = tensor.to_vec()?;
-        let mut output_shape = dims.to_vec();
-        output_shape[dim] = 1;
-        
-        // Calculate strides for dimension iteration
-        let outer_size: usize = dims[..dim].iter().product();
-        let dim_size = dims[dim];
-        let inner_size: usize = dims[dim + 1..].iter().product();
-        
-        let mut result = Vec::new();
-        
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut sum = 0.0f32;
-                
-                for d in 0..dim_size {
-                    let idx = outer * dim_size * inner_size + d * inner_size + inner;
-                    sum += data[idx];
-                }
-                
-                result.push(sum);
-            }
-        }
-        
-        Tensor::from_vec(result, Shape::from_dims(&output_shape), tensor.device.clone())
+        // Build output shape keeping reduced dim = 1
+        let mut out_shape = dims.to_vec();
+        out_shape[dim] = 1;
+        let out_elems: usize = out_shape.iter().product();
+
+        // Upload dims to GPU as i32
+        let dims_i32: Vec<i32> = dims.iter().map(|&d| d as i32).collect();
+        let mut dims_gpu = unsafe { self.device.alloc::<f32>(dims_i32.len()) }
+            .map_err(|_| FlameError::CudaDriver)?;
+        self.device.htod_copy_into(dims_i32.iter().map(|&x| x as f32).collect::<Vec<_>>(), &mut dims_gpu)
+            .map_err(|_| FlameError::CudaDriver)?;
+
+        // Allocate output
+        let mut out = Tensor::zeros(Shape::from_dims(&out_shape), tensor.device.clone())?;
+
+        let kernel = self.kernels.get("sum_dim_keepdim_kernel")
+            .ok_or_else(|| FlameError::KernelError("sum_dim_keepdim_kernel not found".into()))?
+            .clone();
+
+        let cfg = LaunchConfig::for_num_elems(out_elems as u32);
+        launch_kernel!(kernel, cfg,
+            tensor.storage.as_slice(),
+            out.storage.as_slice(),
+            &dims_gpu,
+            dims.len() as i32,
+            dim as i32,
+            out_elems as i32
+        )?;
+        self.device.synchronize()?;
+        Ok(out)
     }
     
     /// Sum all elements in a tensor
@@ -975,6 +1046,73 @@ impl CudaKernels {
         let data = tensor.to_vec()?;
         let sum: f32 = data.iter().sum();
         Tensor::from_vec(vec![sum], Shape::from_dims(&[1]), tensor.device.clone())
+    }
+
+    /// Elementwise max kernel
+    pub fn max_elemwise(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        if a.shape != b.shape {
+            return Err(FlameError::ShapeMismatch { expected: a.shape.clone(), got: b.shape.clone() });
+        }
+        let mut output = Tensor::zeros(a.shape.clone(), a.device.clone())?;
+        let n = a.shape.elem_count();
+        let kernel = self.kernels.get("max_elemwise_kernel")
+            .ok_or_else(|| FlameError::KernelError("max_elemwise_kernel not found".into()))?
+            .clone();
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        launch_kernel!(kernel, cfg, a.storage.as_slice(), b.storage.as_slice(), output.storage.as_slice(), n as i32)?;
+        self.device.synchronize()?;
+        Ok(output)
+    }
+
+    /// Resize NHWC via bilinear interpolation
+    pub fn resize_bilinear_nhwc(&self, input: &Tensor, out_h: usize, out_w: usize, align_corners: bool) -> Result<Tensor> {
+        let dims = input.shape.dims();
+        let (n, h, w, c) = match dims { [n,h,w,c] => (*n,*h,*w,*c), _ => return Err(FlameError::InvalidOperation("resize_bilinear_nhwc expects NHWC".into())) };
+        let output_shape = Shape::from_dims(&[n, out_h, out_w, c]);
+        let total = n * out_h * out_w * c;
+        let mut out = Tensor::zeros(output_shape, input.device.clone())?;
+        let k = self.kernels.get("resize_bilinear_nhwc_kernel").ok_or_else(|| FlameError::KernelError("resize_bilinear_nhwc_kernel not found".into()))?.clone();
+        let cfg = LaunchConfig::for_num_elems(total as u32);
+        launch_kernel!(k, cfg, input.storage.as_slice(), out.storage.as_slice(), n as i32, h as i32, w as i32, c as i32, out_h as i32, out_w as i32, if align_corners {1} else {0})?;
+        self.device.synchronize()?;
+        Ok(out)
+    }
+
+    /// Center crop NHWC
+    pub fn center_crop_nhwc(&self, input: &Tensor, tgt_h: usize, tgt_w: usize) -> Result<Tensor> {
+        let dims = input.shape.dims();
+        let (n, h, w, c) = match dims { [n,h,w,c] => (*n,*h,*w,*c), _ => return Err(FlameError::InvalidOperation("center_crop_nhwc expects NHWC".into())) };
+        if tgt_h > h || tgt_w > w { return Err(FlameError::InvalidOperation("center crop size exceeds input".into())) }
+        let y0 = ((h - tgt_h) / 2) as i32;
+        let x0 = ((w - tgt_w) / 2) as i32;
+        let output_shape = Shape::from_dims(&[n, tgt_h, tgt_w, c]);
+        let total = n * tgt_h * tgt_w * c;
+        let mut out = Tensor::zeros(output_shape, input.device.clone())?;
+        let k = self.kernels.get("center_crop_nhwc_kernel").ok_or_else(|| FlameError::KernelError("center_crop_nhwc_kernel not found".into()))?.clone();
+        let cfg = LaunchConfig::for_num_elems(total as u32);
+        launch_kernel!(k, cfg, input.storage.as_slice(), out.storage.as_slice(), n as i32, h as i32, w as i32, c as i32, y0, x0, tgt_h as i32, tgt_w as i32)?;
+        self.device.synchronize()?;
+        Ok(out)
+    }
+
+    /// Normalize NHWC per channel
+    pub fn normalize_nhwc(&self, input: &Tensor, mean: &[f32], std: &[f32]) -> Result<Tensor> {
+        let dims = input.shape.dims();
+        let (n, h, w, c) = match dims { [n,h,w,c] => (*n,*h,*w,*c), _ => return Err(FlameError::InvalidOperation("normalize_nhwc expects NHWC".into())) };
+        if mean.len() != c || std.len() != c { return Err(FlameError::InvalidOperation("mean/std size must match channels".into())) }
+        let inv_std: Vec<f32> = std.iter().map(|&v| 1.0f32 / v).collect();
+        let mut mean_gpu = crate::tensor::alloc_from_pool(&input.device, c).map_err(|_| FlameError::CudaDriver)?;
+        let mut inv_gpu = crate::tensor::alloc_from_pool(&input.device, c).map_err(|_| FlameError::CudaDriver)?;
+        input.device.htod_copy_into(mean.to_vec(), &mut mean_gpu).map_err(|_| FlameError::CudaDriver)?;
+        input.device.htod_copy_into(inv_std, &mut inv_gpu).map_err(|_| FlameError::CudaDriver)?;
+        let output_shape = input.shape.clone();
+        let total = n * h * w * c;
+        let mut out = Tensor::zeros(output_shape, input.device.clone())?;
+        let k = self.kernels.get("normalize_nhwc_kernel").ok_or_else(|| FlameError::KernelError("normalize_nhwc_kernel not found".into()))?.clone();
+        let cfg = LaunchConfig::for_num_elems(total as u32);
+        launch_kernel!(k, cfg, input.storage.as_slice(), out.storage.as_slice(), &mean_gpu, &inv_gpu, n as i32, h as i32, w as i32, c as i32)?;
+        self.device.synchronize()?;
+        Ok(out)
     }
     
     /// Permute tensor from NHWC to NCHW format on GPU
@@ -1020,6 +1158,198 @@ impl CudaKernels {
             channels as u32
         )?;
         
+        self.device.synchronize()?;
+        Ok(output)
+    }
+
+    /// Permute tensor from NCHW to NHWC format on GPU
+    pub fn permute_nchw_to_nhwc(&self, tensor: &Tensor) -> Result<Tensor> {
+        let dims = tensor.shape.dims();
+        if dims.len() != 4 {
+            return Err(FlameError::InvalidOperation(
+                format!("Permute NCHW to NHWC requires 4D tensor, got {:?}", dims)
+            ));
+        }
+        let (batch, channels, height, width) = (dims[0], dims[1], dims[2], dims[3]);
+        let output_shape = Shape::from_dims(&[batch, height, width, channels]);
+        let mut output = Tensor::zeros(output_shape, tensor.device.clone())?;
+        let kernel = self.kernels.get("permute_nchw_to_nhwc_kernel")
+            .ok_or_else(|| FlameError::KernelError("permute_nchw_to_nhwc_kernel not found".into()))?
+            .clone();
+        let total_elements = tensor.shape.elem_count();
+        let block_size = 256;
+        let grid_size = (total_elements + block_size - 1) / block_size;
+        let config = LaunchConfig { grid_dim: (grid_size as u32,1,1), block_dim: (block_size as u32,1,1), shared_mem_bytes: 0 };
+        launch_kernel!(
+            kernel, 
+            config, 
+            tensor.storage.as_slice(), 
+            output.storage.as_slice(), 
+            batch as u32,
+            channels as u32,
+            height as u32,
+            width as u32
+        )?;
+        self.device.synchronize()?;
+        Ok(output)
+    }
+
+    /// Permute weights [KH,KW,IC,OC] -> [OC,IC,KH,KW]
+    pub fn weight_khwkicoc_to_ocickhkw(&self, w: &Tensor) -> Result<Tensor> {
+        let d = w.shape.dims();
+        if d.len() != 4 { return Err(FlameError::InvalidOperation("weight permute expects 4D".into())); }
+        let (kh, kw, ic, oc) = (d[0], d[1], d[2], d[3]);
+        let mut out = Tensor::zeros(Shape::from_dims(&[oc, ic, kh, kw]), w.device.clone())?;
+        let k = self.kernels.get("permute_w_khwkicoc_to_ocickhkw")
+            .ok_or_else(|| FlameError::KernelError("permute_w_khwkicoc_to_ocickhkw not found".into()))?
+            .clone();
+        let total = (kh * kw * ic * oc) as u32;
+        let cfg = LaunchConfig::for_num_elems(total);
+        launch_kernel!(k, cfg, w.storage.as_slice(), out.storage.as_slice(), kh as i32, kw as i32, ic as i32, oc as i32)?;
+        self.device.synchronize()?;
+        Ok(out)
+    }
+
+    /// Permute weights [OC,IC,KH,KW] -> [KH,KW,IC,OC]
+    pub fn weight_ocickhkw_to_khwkicoc(&self, w: &Tensor) -> Result<Tensor> {
+        let d = w.shape.dims();
+        if d.len() != 4 { return Err(FlameError::InvalidOperation("weight permute expects 4D".into())); }
+        let (oc, ic, kh, kw) = (d[0], d[1], d[2], d[3]);
+        let mut out = Tensor::zeros(Shape::from_dims(&[kh, kw, ic, oc]), w.device.clone())?;
+        let k = self.kernels.get("permute_w_ocickhkw_to_khwkicoc")
+            .ok_or_else(|| FlameError::KernelError("permute_w_ocickhkw_to_khwkicoc not found".into()))?
+            .clone();
+        let total = (kh * kw * ic * oc) as u32;
+        let cfg = LaunchConfig::for_num_elems(total);
+        launch_kernel!(k, cfg, w.storage.as_slice(), out.storage.as_slice(), oc as i32, ic as i32, kh as i32, kw as i32)?;
+        self.device.synchronize()?;
+        Ok(out)
+    }
+
+    /// Elementwise exponential
+    pub fn exp(&self, tensor: &Tensor) -> Result<Tensor> {
+        let mut out = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+        let n = tensor.shape.elem_count();
+        let kernel = self.kernels.get("exp_kernel")
+            .ok_or_else(|| FlameError::KernelError("exp_kernel not found".into()))?
+            .clone();
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        launch_kernel!(kernel, cfg, tensor.storage.as_slice(), out.storage.as_slice(), n as i32)?;
+        self.device.synchronize()?;
+        Ok(out)
+    }
+
+    /// Elementwise natural logarithm
+    pub fn log(&self, tensor: &Tensor) -> Result<Tensor> {
+        let mut out = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
+        let n = tensor.shape.elem_count();
+        let kernel = self.kernels.get("log_kernel")
+            .ok_or_else(|| FlameError::KernelError("log_kernel not found".into()))?
+            .clone();
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        launch_kernel!(kernel, cfg, tensor.storage.as_slice(), out.storage.as_slice(), n as i32)?;
+        self.device.synchronize()?;
+        Ok(out)
+    }
+
+    /// Index select along a dimension (GPU kernel)
+    pub fn index_select(&self, tensor: &Tensor, dim: usize, indices: &Tensor) -> Result<Tensor> {
+        let shape = tensor.shape().dims();
+        let idx_shape = indices.shape().dims();
+        if dim >= shape.len() { return Err(FlameError::InvalidOperation(format!("Dimension {} out of bounds", dim))); }
+        if idx_shape.len() != 1 { return Err(FlameError::InvalidOperation(format!("Indices must be 1D, got {:?}", idx_shape))); }
+        let num_indices = indices.shape().elem_count();
+        let mut out_shape = shape.to_vec();
+        out_shape[dim] = num_indices;
+        let out_shape_s = Shape::from_dims(&out_shape);
+        let mut output = Tensor::zeros(out_shape_s.clone(), tensor.device.clone())?;
+
+        // Prepare strides and dims arrays
+        let ndim = shape.len() as i32;
+        let in_dims: Vec<i32> = shape.iter().map(|&x| x as i32).collect();
+        let out_dims: Vec<i32> = out_shape.iter().map(|&x| x as i32).collect();
+        let mut in_strides = vec![1i32; shape.len()];
+        for i in (0..shape.len()-1).rev() { in_strides[i] = in_strides[i+1] * shape[i+1] as i32; }
+        let mut out_strides = vec![1i32; out_shape.len()];
+        for i in (0..out_shape.len()-1).rev() { out_strides[i] = out_strides[i+1] * out_shape[i+1] as i32; }
+
+        // Copy arrays to device
+        let d_in_dims = unsafe { self.device.alloc::<i32>(in_dims.len()) }?; self.device.htod_copy_into(in_dims.clone(), &mut {let mut x = d_in_dims.clone(); x})?;
+        let d_out_dims = unsafe { self.device.alloc::<i32>(out_dims.len()) }?; self.device.htod_copy_into(out_dims.clone(), &mut {let mut x = d_out_dims.clone(); x})?;
+        let d_in_strides = unsafe { self.device.alloc::<i32>(in_strides.len()) }?; self.device.htod_copy_into(in_strides.clone(), &mut {let mut x = d_in_strides.clone(); x})?;
+        let d_out_strides = unsafe { self.device.alloc::<i32>(out_strides.len()) }?; self.device.htod_copy_into(out_strides.clone(), &mut {let mut x = d_out_strides.clone(); x})?;
+
+        let kernel = self.kernels.get("index_select_kernel")
+            .ok_or_else(|| FlameError::KernelError("index_select_kernel not found".into()))?
+            .clone();
+
+        let numel = out_shape_s.elem_count();
+        let block = 256usize;
+        let grid = (numel + block - 1) / block;
+        let cfg = LaunchConfig { grid_dim: (grid as u32, 1, 1), block_dim: (block as u32, 1, 1), shared_mem_bytes: 0 };
+
+        launch_kernel!(
+            kernel,
+            cfg,
+            tensor.storage.as_slice(),
+            indices.storage.as_slice(),
+            output.storage.as_slice(),
+            ndim,
+            &d_in_dims,
+            &d_out_dims,
+            &d_in_strides,
+            &d_out_strides,
+            dim as i32,
+            numel as i32
+        )?;
+
+        self.device.synchronize()?;
+        Ok(output)
+    }
+
+    /// General slice across multiple dimensions (GPU kernel)
+    pub fn slice(&self, tensor: &Tensor, ranges: &[(usize, usize)]) -> Result<Tensor> {
+        let shape = tensor.shape().dims();
+        if ranges.len() != shape.len() { return Err(FlameError::InvalidOperation(format!("ranges/dims mismatch"))); }
+        let mut out_shape = Vec::with_capacity(ranges.len());
+        let mut starts: Vec<i32> = Vec::with_capacity(ranges.len());
+        for (i, &(s,e)) in ranges.iter().enumerate() {
+            if s>=e || e>shape[i] { return Err(FlameError::InvalidOperation(format!("invalid range {}-{} for dim {}", s,e,i))); }
+            out_shape.push(e - s);
+            starts.push(s as i32);
+        }
+        let out_s = Shape::from_dims(&out_shape);
+        let mut output = Tensor::zeros(out_s.clone(), tensor.device.clone())?;
+
+        // Strides
+        let mut in_strides = vec![1i32; shape.len()];
+        for i in (0..shape.len()-1).rev() { in_strides[i] = in_strides[i+1] * shape[i+1] as i32; }
+        let mut out_strides = vec![1i32; out_shape.len()];
+        for i in (0..out_shape.len()-1).rev() { out_strides[i] = out_strides[i+1] * out_shape[i+1] as i32; }
+
+        let d_in_strides = unsafe { self.device.alloc::<i32>(in_strides.len()) }?; self.device.htod_copy_into(in_strides.clone(), &mut {let mut x = d_in_strides.clone(); x})?;
+        let d_out_strides = unsafe { self.device.alloc::<i32>(out_strides.len()) }?; self.device.htod_copy_into(out_strides.clone(), &mut {let mut x = d_out_strides.clone(); x})?;
+        let d_starts = unsafe { self.device.alloc::<i32>(starts.len()) }?; self.device.htod_copy_into(starts.clone(), &mut {let mut x = d_starts.clone(); x})?;
+
+        let kernel = self.kernels.get("slice_kernel")
+            .ok_or_else(|| FlameError::KernelError("slice_kernel not found".into()))?
+            .clone();
+        let numel = out_s.elem_count();
+        let block = 256usize; let grid = (numel + block - 1)/block;
+        let cfg = LaunchConfig{ grid_dim:(grid as u32,1,1), block_dim:(block as u32,1,1), shared_mem_bytes:0};
+
+        launch_kernel!(
+            kernel,
+            cfg,
+            tensor.storage.as_slice(),
+            output.storage.as_slice(),
+            shape.len() as i32,
+            &d_in_strides,
+            &d_out_strides,
+            &d_starts,
+            numel as i32
+        )?;
+
         self.device.synchronize()?;
         Ok(output)
     }

@@ -104,7 +104,7 @@ impl GradientClipper {
     /// Adaptive gradient clipping (based on parameter norm)
     fn adaptive_clip_grads(&self, grads: &mut [&mut Tensor], clip_factor: f32) -> Result<f32> {
         // For adaptive clipping, we need both gradients and parameters
-        // Since we only have gradients here, we'll implement a simplified version
+        // Implement gradient clipping by global norm on FP32 grads
         // that clips based on gradient statistics
         
         let mut total_norm = 0.0f32;

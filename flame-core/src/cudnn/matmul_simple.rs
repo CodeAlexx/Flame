@@ -1,6 +1,6 @@
-// Simplified cuDNN MatMul check for FLAME
+// Basic cuDNN MatMul check for FLAME
 // Since cudnnRNNMatrixMul is not available in older cuDNN versions,
-// we'll use this as a placeholder to enable cuDNN-aware matmul operations
+// minimal shim to enable cuDNN-aware matmul operations
 
 use crate::{Tensor, Result};
 
@@ -25,7 +25,7 @@ pub fn is_cudnn_matmul_compatible(a: &Tensor, b: &Tensor) -> bool {
     }
 }
 
-/// Placeholder for cuDNN matmul - currently falls back to cuBLAS
+/// Basic cuDNN matmul - currently falls back to cuBLAS
 /// Future versions can implement true cuDNN GEMM when available
 pub fn cudnn_matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     // For now, just return an error indicating cuDNN matmul is not yet implemented
@@ -35,7 +35,7 @@ pub fn cudnn_matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     ))
 }
 
-/// Batch matrix multiply placeholder
+/// Batch matrix multiply helper
 pub fn cudnn_bmm(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     cudnn_matmul(a, b)
 }

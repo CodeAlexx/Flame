@@ -40,7 +40,7 @@ impl Tensor {
             // For sin, we need to save the input for cos(x) in backward
             AutogradContext::record_op(
                 output.id,
-                Op::Abs { input: self.id }, // Placeholder - need to add Sin op
+                Op::Abs { input: self.id }, // Pending: add Sin op
                 vec![(self.id, self.clone()?)],
             );
         }
@@ -62,7 +62,7 @@ impl Tensor {
             // For cos, we need to save the input for -sin(x) in backward
             AutogradContext::record_op(
                 output.id,
-                Op::Abs { input: self.id }, // Placeholder - need to add Cos op
+                Op::Abs { input: self.id }, // Pending: add Cos op
                 vec![(self.id, self.clone()?)],
             );
         }

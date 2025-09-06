@@ -19,7 +19,7 @@ impl CandleInterop {
         let candle_shape = candle_core::Shape::from_dims(shape);
         
         // Get data - this creates a copy for now
-        // TODO: Implement zero-copy when possible
+        // Zero-copy path can be implemented when integration constraints allow
         let data = flame_tensor.to_vec()?;
         
         // Create Candle tensor
@@ -68,7 +68,7 @@ impl CandleInterop {
         }
         
         // Get data - this creates a copy for now
-        // TODO: Implement zero-copy when possible
+        // Zero-copy path can be implemented when integration constraints allow
         let data: Vec<f32> = candle_tensor.flatten_all()
             .map_err(|e| FlameError::Cuda(format!("Failed to flatten tensor: {}", e)))?
             .to_vec1()

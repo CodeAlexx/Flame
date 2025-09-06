@@ -1,0 +1,51 @@
+warning: flame-core@0.1.0: CUDA_HOME not set, CUDA kernels will not be available
+warning: unused import: `half::bf16`
+ --> flame-core/src/tensor_storage.rs:5:5
+  |
+5 | use half::bf16;
+  |     ^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused imports: `CudaFunction` and `LaunchConfig`
+ --> flame-core/src/tensor.rs:7:56
+  |
+7 | use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, LaunchConfig, LaunchAsync, DeviceSlice, CudaFunction};
+  |                                                        ^^^^^^^^^^^^                            ^^^^^^^^^^^^
+
+warning: unused import: `is_problematic_size`
+ --> flame-core/src/memory_pool.rs:7:48
+  |
+7 | use crate::cuda_memory_alignment::{align_size, is_problematic_size};
+  |                                                ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `cudarc::cublas::CudaBlas`
+ --> flame-core/src/cuda_conv2d_direct.rs:8:5
+  |
+8 | use cudarc::cublas::CudaBlas;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CudaDevice`
+ --> flame-core/src/cuda_conv2d_fast.rs:7:22
+  |
+7 | use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+  |                      ^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> flame-core/src/cuda_conv2d_fast.rs:8:5
+  |
+8 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused imports: `CudaSlice` and `LaunchConfig`
+ --> flame-core/src/layer_norm.rs:7:34
+  |
+7 | use cudarc::driver::{CudaDevice, CudaSlice, LaunchConfig, LaunchAsync};
+  |                                  ^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused import: `crate::cuda_memory_alignment::is_problematic_size`
+ --> flame-core/src/embedding.rs:6:5
+  |
+6 | use crate::cuda_memory_alignment::is_problematic_size;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

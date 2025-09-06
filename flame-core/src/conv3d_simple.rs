@@ -2,7 +2,7 @@
 //! 
 //! This module provides 3D convolution operations and batch normalization
 //! for processing video data with temporal dimensions.
-//! Currently implements CPU versions with TODO for CUDA kernels.
+//! Contains CPU-oriented 3D conv helpers; CUDA kernels are used elsewhere in active paths.
 
 use crate::{Tensor, Shape, Result, FlameError, CudaDevice};
 use std::sync::Arc;

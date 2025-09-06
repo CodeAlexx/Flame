@@ -125,10 +125,10 @@ pub fn alloc_aligned<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZero
     device: &Arc<CudaDevice>,
     size: usize,
 ) -> Result<CudaSlice<T>> {
-    // Debug print for large allocations
-    if size > 10000000 {
-        eprintln!("CUDA alloc_aligned: LARGE allocation requested = {} elements ({} MB)", 
-                 size, (size * 4) / (1024 * 1024));
+    // Only debug print for HUGE allocations (over 1GB) to avoid spam
+    if size > 250_000_000 {
+        eprintln!("CUDA alloc_aligned: HUGE allocation requested = {} elements ({} GB)", 
+                 size, (size * 4) as f32 / (1024.0 * 1024.0 * 1024.0));
     }
     
     // DO NOT ALIGN! Just allocate exactly what was requested!

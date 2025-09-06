@@ -326,10 +326,17 @@ extern "C" __global__ void fused_attention_kernel(
 }
 "#;
         
-        // Use Flash Attention for fused implementation
-        let fa = crate::flash_attention::FlashAttention::new()
-            .with_causal(mask.is_some());
-        fa.forward(q, k, v, mask)
+        // Use Flash Attention for fused implementation when available
+        #[cfg(feature = "flash_attn")]
+        {
+            let fa = crate::flash_attention::FlashAttention::new()
+                .with_causal(mask.is_some());
+            fa.forward(q, k, v, mask)
+        }
+        #[cfg(not(feature = "flash_attn"))]
+        {
+            return Err(crate::FlameError::InvalidOperation("flash_attn feature disabled".into()));
+        }
     }
     
     /// Fused residual + LayerNorm

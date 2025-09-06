@@ -1,4 +1,4 @@
-/// Simplified autograd implementation that properly tracks tensors
+/// Alternate autograd implementation that properly tracks tensors
 use crate::{Tensor, Result, FlameError};
 use std::rc::Rc;
 use std::cell::RefCell;

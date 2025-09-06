@@ -9,6 +9,7 @@ use crate::tensor_storage::TensorStorage;
 use crate::gradient::GradientMap;
 use crate::cuda_ops::GpuOps;
 use crate::cuda_kernels_gpu::CudaKernels;
+use crate::gradient_checkpointing::CHECKPOINT_MANAGER;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use cudarc::driver::CudaDevice;
@@ -47,16 +48,21 @@ pub enum Op {
     AddBias { input: TensorId, bias: TensorId },
     SumDim { input: TensorId, dim: usize },
     SumDimKeepdim { input: TensorId, dim: usize },
+    SumDims { input: TensorId, dims: Vec<usize> },
     MaxDim { input: TensorId, dim: usize, keepdim: bool },
     Clamp { input: TensorId, min: f32, max: f32 },
     Embedding { weight: TensorId, indices: TensorId },
     IndexSelect { input: TensorId, indices: TensorId, dim: usize },
     Cat { inputs: Vec<TensorId>, dim: usize },
     Split { input: TensorId, sizes: Vec<usize>, dim: usize },
+    Slice { input: TensorId, ranges: Vec<(usize, usize)>, input_shape: Shape },
     Abs { input: TensorId },
     Log { input: TensorId },
     Softmax { input: TensorId, dim: isize },
     LogSoftmax { input: TensorId, dim: isize },
+    Maximum { a: TensorId, b: TensorId },
+    Minimum { a: TensorId, b: TensorId },
+    Where { cond: TensorId, t: TensorId, f: TensorId },
     MSELoss { predictions: TensorId, targets: TensorId, num_elements: usize },
     L1Loss { predictions: TensorId, targets: TensorId, num_elements: usize },
     HuberLoss { predictions: TensorId, targets: TensorId, delta: f32, num_elements: usize },
@@ -72,6 +78,8 @@ pub enum Op {
         causal: bool,
         quantized: bool,
     },
+    /// NHWC conv2d op wrapper using NCHW kernels under the hood
+    Conv2dNHWC { input: TensorId, weight: TensorId, stride: usize, padding: usize },
 }
 
 /// Entry in the computation tape
@@ -131,10 +139,15 @@ impl AutogradContext {
             return;
         }
         
+        // Apply checkpointing policy to saved tensors (CPU offload registration)
         let mut saved = HashMap::new();
-        for (id, tensor) in saved_tensors {
-            saved.insert(id, tensor);
+        {
+            let mut mgr = CHECKPOINT_MANAGER.lock().unwrap();
+            for (id, tensor) in &saved_tensors {
+                let _ = mgr.checkpoint_saved_tensor(*id, tensor);
+            }
         }
+        for (id, tensor) in saved_tensors { saved.insert(id, tensor); }
         
         ctx.record(TapeEntry {
             output_id,
@@ -339,6 +352,15 @@ fn compute_gradients(
     output_grad: &Tensor,
     device: &Arc<CudaDevice>
 ) -> Result<Vec<(TensorId, Tensor)>> {
+    // Helper to fetch saved tensors, restoring or recomputing if checkpointed
+    let mut fetch_saved = |tid: &TensorId| -> Result<Tensor> {
+        if let Some(t) = CHECKPOINT_MANAGER.lock().unwrap().fetch_saved(*tid, device)? {
+            return Ok(t);
+        }
+        entry.saved_tensors.get(tid)
+            .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor".into()))
+            .and_then(|t| t.clone())
+    };
     
     match &entry.op {
         Op::Add { lhs, rhs } => {
@@ -381,16 +403,22 @@ fn compute_gradients(
             println!("  Computing Mul gradients...");
             println!("  Getting saved tensors for lhs={:?}, rhs={:?}", lhs, rhs);
             
-            let lhs_tensor = entry.saved_tensors.get(lhs)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for lhs in Mul".into()))?;
-            let rhs_tensor = entry.saved_tensors.get(rhs)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for rhs in Mul".into()))?;
+            let lhs_tensor = &fetch_saved(lhs)?;
+            let rhs_tensor = &fetch_saved(rhs)?;
             
             println!("  Got saved tensors, computing grad_lhs...");
             // Use GPU ops directly to avoid autograd recording
-            let grad_lhs = GpuOps::mul(output_grad, rhs_tensor)?;
+            let mut grad_lhs = GpuOps::mul(output_grad, rhs_tensor)?;
             println!("  grad_lhs computed, computing grad_rhs...");
-            let grad_rhs = GpuOps::mul(output_grad, lhs_tensor)?;
+            let mut grad_rhs = GpuOps::mul(output_grad, lhs_tensor)?;
+            
+            // Reduce for broadcasting if shapes differ
+            if grad_lhs.shape() != lhs_tensor.shape() {
+                grad_lhs = reduce_grad_for_broadcast(&grad_lhs, lhs_tensor.shape())?;
+            }
+            if grad_rhs.shape() != rhs_tensor.shape() {
+                grad_rhs = reduce_grad_for_broadcast(&grad_rhs, rhs_tensor.shape())?;
+            }
             println!("  Both gradients computed");
             
             Ok(vec![
@@ -413,10 +441,8 @@ fn compute_gradients(
         Op::MatMul { lhs, rhs } => {
             // d/dA(A @ B) = grad @ B^T
             // d/dB(A @ B) = A^T @ grad
-            let lhs_tensor = entry.saved_tensors.get(lhs)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for lhs in MatMul".into()))?;
-            let rhs_tensor = entry.saved_tensors.get(rhs)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for rhs in MatMul".into()))?;
+            let lhs_tensor = &fetch_saved(lhs)?;
+            let rhs_tensor = &fetch_saved(rhs)?;
             
             // Gradient w.r.t. lhs: grad @ B^T
             // Use GPU ops directly to avoid autograd recording
@@ -435,32 +461,28 @@ fn compute_gradients(
         
         Op::ReLU { input } => {
             // d/dx ReLU(x) = 1 if x > 0, else 0
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &fetch_saved(input)?;
             let grad = relu_backward(output_grad, input_tensor)?;
             Ok(vec![(*input, grad)])
         }
         
         Op::GELU { input } => {
             // Use the complete GELU backward implementation
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &fetch_saved(input)?;
             let grad = crate::autograd_ops_complete::gelu_backward(output_grad, input_tensor)?;
             Ok(vec![(*input, grad)])
         }
         
         Op::SiLU { input } => {
             // Use the complete SiLU backward implementation
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &fetch_saved(input)?;
             let grad = crate::autograd_ops_complete::silu_backward(output_grad, input_tensor)?;
             Ok(vec![(*input, grad)])
         }
         
         Op::Tanh { input } => {
             // Use the complete Tanh backward implementation
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &fetch_saved(input)?;
             let output_tensor = input_tensor.tanh()?;
             let grad = crate::autograd_ops_complete::tanh_backward(output_grad, &output_tensor)?;
             Ok(vec![(*input, grad)])
@@ -477,8 +499,7 @@ fn compute_gradients(
         
         Op::Square { input } => {
             // d/dx(x^2) = 2x
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_tensor = &fetch_saved(input)?;
             let two_x = GpuOps::mul_scalar(input_tensor, 2.0)?;
             let grad = GpuOps::mul(output_grad, &two_x)?;
             Ok(vec![(*input, grad)])
@@ -540,6 +561,36 @@ fn compute_gradients(
                 }
             }
             
+            Ok(grads)
+        }
+
+        Op::Conv2dNHWC { input, weight, stride, padding } => {
+            // Saved tensors for NHWC path should include NCHW input and OC,IC,KH,KW weight
+            let input_nchw = entry.saved_tensors.get(input)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input(NCHW)".into()))?;
+            let weight_ocic = entry.saved_tensors.get(weight)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for weight(OC,IC,KH,KW)".into()))?;
+
+            // Convert grad_output NHWC -> NCHW
+            let grad_out_nchw = crate::cuda_ops::GpuOps::permute_nhwc_to_nchw(output_grad)?;
+
+            let (grad_in_nchw, grad_w_ocic, grad_b) = crate::cuda_conv2d::CudaConv2d::conv2d_backward(
+                &grad_out_nchw,
+                input_nchw,
+                weight_ocic,
+                (*stride, *stride),
+                (*padding, *padding),
+            )?;
+
+            // Convert grads back to NHWC / [KH,KW,IC,OC]
+            let grad_input = crate::cuda_ops::GpuOps::permute_nchw_to_nhwc(&grad_in_nchw)?;
+            let grad_weight = crate::cuda_ops::GpuOps::weight_ocickhkw_to_khwkicoc(&grad_w_ocic)?;
+
+            let mut grads = vec![
+                (*input, grad_input),
+                (*weight, grad_weight),
+            ];
+            if let Some(gb) = grad_b { grads.push((entry.saved_tensors.keys().copied().find(|&k| k != *input && k != *weight).unwrap_or(*weight), gb)); }
             Ok(grads)
         }
         
@@ -641,10 +692,8 @@ fn compute_gradients(
             // d/dx(Wx + b) = W^T @ grad
             // d/dW(Wx + b) = grad @ x^T
             // d/db(Wx + b) = grad
-            let input_tensor = entry.saved_tensors.get(input)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
-            let weight_tensor = entry.saved_tensors.get(weight)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for weight".into()))?;
+            let input_tensor = &fetch_saved(input)?;
+            let weight_tensor = &fetch_saved(weight)?;
             
             // Gradient w.r.t. input: W^T @ grad
             let weight_t = weight_tensor.transpose()?;
@@ -671,10 +720,8 @@ fn compute_gradients(
         
         Op::BatchMatMul { lhs, rhs } => {
             // Similar to MatMul but preserves batch dimension
-            let lhs_tensor = entry.saved_tensors.get(lhs)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for lhs in BatchMatMul".into()))?;
-            let rhs_tensor = entry.saved_tensors.get(rhs)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for rhs in BatchMatMul".into()))?;
+            let lhs_tensor = &fetch_saved(lhs)?;
+            let rhs_tensor = &fetch_saved(rhs)?;
             
             // Gradient w.r.t. lhs: grad @ rhs^T (batched)
             let rhs_t = rhs_tensor.transpose_batch()?;
@@ -752,19 +799,25 @@ fn compute_gradients(
         Op::Div { lhs, rhs } => {
             // d/dx (x/y) = 1/y
             // d/dy (x/y) = -x/y^2
-            let lhs_tensor = entry.saved_tensors.get(lhs)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for lhs in Div".into()))?;
-            let rhs_tensor = entry.saved_tensors.get(rhs)
-                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for rhs in Div".into()))?;
+            let lhs_tensor = &fetch_saved(lhs)?;
+            let rhs_tensor = &fetch_saved(rhs)?;
             
             // Gradient w.r.t. lhs: grad * (1/rhs)
-            let grad_lhs = GpuOps::div(output_grad, rhs_tensor)?;
+            let mut grad_lhs = GpuOps::div(output_grad, rhs_tensor)?;
             
             // Gradient w.r.t. rhs: grad * (-lhs/rhs^2)
             let rhs_squared = GpuOps::mul(rhs_tensor, rhs_tensor)?; // x^2 = x * x
             let neg_lhs = GpuOps::mul_scalar(lhs_tensor, -1.0)?;
             let grad_rhs_term = GpuOps::div(&neg_lhs, &rhs_squared)?;
-            let grad_rhs = GpuOps::mul(output_grad, &grad_rhs_term)?;
+            let mut grad_rhs = GpuOps::mul(output_grad, &grad_rhs_term)?;
+            
+            // Reduce for broadcasting if shapes differ
+            if grad_lhs.shape() != lhs_tensor.shape() {
+                grad_lhs = reduce_grad_for_broadcast(&grad_lhs, lhs_tensor.shape())?;
+            }
+            if grad_rhs.shape() != rhs_tensor.shape() {
+                grad_rhs = reduce_grad_for_broadcast(&grad_rhs, rhs_tensor.shape())?;
+            }
             
             Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
         }
@@ -809,6 +862,30 @@ fn compute_gradients(
             // Broadcast gradient back to input shape
             let grad = output_grad.broadcast_to(input_shape)?;
             
+            Ok(vec![(*input, grad)])
+        }
+        
+        Op::SumDims { input, dims } => {
+            // Gradient broadcast back over all reduced dims
+            let input_tensor = entry.saved_tensors.get(input)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for input".into()))?;
+            let input_shape = input_tensor.shape();
+            
+            // Starting from output_grad, expand reduced dims as size-1 where needed then broadcast
+            let mut grad = output_grad.clone()?;
+            let mut target = input_shape.dims().to_vec();
+            // Create a shape with 1s at reduced dims
+            let mut reshape_dims = input_shape.dims().to_vec();
+            for &d in dims {
+                if d < reshape_dims.len() {
+                    reshape_dims[d] = 1;
+                }
+            }
+            grad = if grad.shape().dims() != &reshape_dims[..] {
+                // If output_grad is already squeezed, reshape up to insert 1s
+                grad.reshape(&reshape_dims)?
+            } else { grad };
+            let grad = grad.broadcast_to(input_shape)?;
             Ok(vec![(*input, grad)])
         }
         
@@ -882,6 +959,50 @@ fn compute_gradients(
             
             Ok(grads)
         }
+
+        Op::Slice { input, ranges, input_shape } => {
+            // Backward for slice: scatter output_grad back into a zero tensor of input shape
+            let device = device.clone();
+            let mut zeros = Tensor::zeros(input_shape.clone(), device.clone())?;
+            
+            // CPU fallback scatter-add
+            let in_shape = input_shape.dims();
+            let out_shape = output_grad.shape().dims();
+            let src = output_grad.to_vec()?;
+            let mut dst = zeros.to_vec()?;
+            
+            // Compute strides
+            let mut in_strides = vec![1; in_shape.len()];
+            for i in (0..in_shape.len() - 1).rev() {
+                in_strides[i] = in_strides[i + 1] * in_shape[i + 1];
+            }
+            let mut out_strides = vec![1; out_shape.len()];
+            for i in (0..out_shape.len() - 1).rev() {
+                out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
+            }
+            
+            fn scatter_recursive(
+                dst: &mut [f32], src: &[f32], ranges: &[(usize, usize)],
+                in_strides: &[usize], out_strides: &[usize], dim: usize,
+                in_off: usize, out_off: usize,
+            ) {
+                if dim == ranges.len() {
+                    dst[in_off] += src[out_off];
+                    return;
+                }
+                let (start, end) = ranges[dim];
+                for i in start..end {
+                    let new_in = in_off + i * in_strides[dim];
+                    let new_out = out_off + (i - start) * out_strides[dim];
+                    scatter_recursive(dst, src, ranges, in_strides, out_strides,
+                                      dim + 1, new_in, new_out);
+                }
+            }
+            
+            scatter_recursive(&mut dst, &src, ranges, &in_strides, &out_strides, 0, 0, 0);
+            let grad_input = Tensor::from_slice(&dst, input_shape.clone(), device.clone())?;
+            Ok(vec![(*input, grad_input)])
+        }
         
         Op::Split { input, sizes, dim } => {
             // Concatenate gradients back to original tensor
@@ -940,6 +1061,62 @@ fn compute_gradients(
             let output = input_tensor.log_softmax(*dim)?;
             let grad = crate::autograd_ops_complete::log_softmax_backward(output_grad, &output, *dim)?;
             Ok(vec![(*input, grad)])
+        }
+
+        Op::Maximum { a, b } => {
+            let a_tensor = entry.saved_tensors.get(a)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for a in Maximum".into()))?;
+            let b_tensor = entry.saved_tensors.get(b)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for b in Maximum".into()))?;
+            let mask_a = a_tensor.ge(b_tensor)?; // 1 where a>=b
+            let mask_b = mask_a.neg()?.add_scalar(1.0)?; // 1 - mask
+            let mut grad_a = output_grad.mul(&mask_a)?;
+            let mut grad_b = output_grad.mul(&mask_b)?;
+            if grad_a.shape() != a_tensor.shape() {
+                grad_a = reduce_grad_for_broadcast(&grad_a, a_tensor.shape())?;
+            }
+            if grad_b.shape() != b_tensor.shape() {
+                grad_b = reduce_grad_for_broadcast(&grad_b, b_tensor.shape())?;
+            }
+            Ok(vec![(*a, grad_a), (*b, grad_b)])
+        }
+
+        Op::Minimum { a, b } => {
+            let a_tensor = entry.saved_tensors.get(a)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for a in Minimum".into()))?;
+            let b_tensor = entry.saved_tensors.get(b)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for b in Minimum".into()))?;
+            let mask_a = a_tensor.le(b_tensor)?; // 1 where a<=b
+            let mask_b = mask_a.neg()?.add_scalar(1.0)?;
+            let mut grad_a = output_grad.mul(&mask_a)?;
+            let mut grad_b = output_grad.mul(&mask_b)?;
+            if grad_a.shape() != a_tensor.shape() {
+                grad_a = reduce_grad_for_broadcast(&grad_a, a_tensor.shape())?;
+            }
+            if grad_b.shape() != b_tensor.shape() {
+                grad_b = reduce_grad_for_broadcast(&grad_b, b_tensor.shape())?;
+            }
+            Ok(vec![(*a, grad_a), (*b, grad_b)])
+        }
+
+        Op::Where { cond, t, f } => {
+            let cond_tensor = entry.saved_tensors.get(cond)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for cond in Where".into()))?;
+            let t_tensor = entry.saved_tensors.get(t)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for true tensor in Where".into()))?;
+            let f_tensor = entry.saved_tensors.get(f)
+                .ok_or_else(|| FlameError::InvalidOperation("Missing saved tensor for false tensor in Where".into()))?;
+            let mask_t = cond_tensor.clone()?; // 1 where true
+            let mask_f = mask_t.neg()?.add_scalar(1.0)?; // 1 - mask
+            let mut grad_t = output_grad.mul(&mask_t)?;
+            let mut grad_f = output_grad.mul(&mask_f)?;
+            if grad_t.shape() != t_tensor.shape() {
+                grad_t = reduce_grad_for_broadcast(&grad_t, t_tensor.shape())?;
+            }
+            if grad_f.shape() != f_tensor.shape() {
+                grad_f = reduce_grad_for_broadcast(&grad_f, f_tensor.shape())?;
+            }
+            Ok(vec![(*t, grad_t), (*f, grad_f)])
         }
         
         Op::MSELoss { predictions, targets, num_elements } => {
@@ -1113,6 +1290,7 @@ fn compute_gradients(
             Ok(grads)
         }
         
+        #[cfg(feature = "flash_attn")]
         Op::FlashAttention { query, key, value, mask, scale, causal } => {
             // FlashAttention backward pass
             let query_tensor = entry.saved_tensors.get(query)
@@ -1153,6 +1331,10 @@ fn compute_gradients(
             ];
             
             Ok(grads)
+        }
+        #[cfg(not(feature = "flash_attn"))]
+        Op::FlashAttention { .. } => {
+            Err(FlameError::InvalidOperation("flash_attn feature disabled".into()))
         }
         
         Op::SageAttention { query_id, key_id, value_id, scale, causal, quantized } => {

@@ -367,7 +367,19 @@ pub fn layer_norm(
         );
     }
     
-    Ok(output)
+    // Cast to default dtype if needed, preserve requires_grad
+    let dt = crate::config::default_dtype();
+    if dt == crate::DType::F32 {
+        Ok(output)
+    } else {
+        let mut out = output.to_dtype(dt)?;
+        // Preserve autograd flag
+        // Note: we didn't record a new op here; this is a dtype cast for numerics
+        if input.requires_grad || (weight.is_some() && weight.unwrap().requires_grad) || (bias.is_some() && bias.unwrap().requires_grad) {
+            out.requires_grad = true;
+        }
+        Ok(out)
+    }
 }
 
 /// Add layer norm method to Tensor

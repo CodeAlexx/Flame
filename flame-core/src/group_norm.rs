@@ -74,7 +74,7 @@ pub fn group_norm(
     let f_norm = input.device.get_func("group_norm_forward", "group_norm_forward")
         .ok_or_else(|| FlameError::Cuda("Failed to get group_norm_forward kernel".into()))?;
     
-    // Allocate output and temporary buffers
+    // Allocate output and scratch buffers
     let output_data = crate::tensor::alloc_zeros_from_pool(&input.device, input.shape().elem_count())?;
     let mean_data = crate::tensor::alloc_zeros_from_pool(&input.device, batch_size * num_groups)?;
     let var_data = crate::tensor::alloc_zeros_from_pool(&input.device, batch_size * num_groups)?;

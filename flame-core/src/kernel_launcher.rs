@@ -166,7 +166,7 @@ extern "C" __global__ void {kernel_name}(
 }}"#, kernel_name = kernel_name, operation = operation)
     }
     
-    /// Generate reduction kernel (simplified)
+    /// Generate reduction kernel
     pub fn reduction_sum() -> &'static str {
         r#"
 extern "C" __global__ void reduction_sum(

@@ -22,10 +22,21 @@ ctor = "0.2"
 
 
 [features]
-default = ["cudnn"]  # cuDNN is now enabled by default
-cuda = []  # CUDA support is always enabled when cudarc is available
-flash-attn = []  # Enable Flash Attention GPU kernels
-cudnn = []  # Enable cuDNN for optimized operations (conv, linear, norm, etc)
+# Keep defaults minimal and explicit: only NVRTC path by default.
+default = ["nvrtc"]
+nvrtc = []
+flash_attn = []   # Opt-in only (not enabled by default)
+cudnn = []        # Opt-in only
+# Retain legacy/cuda toggles for compatibility (off by default)
+legacy = []
+cuda = []
+capi = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[build-dependencies]
+cbindgen = "0.26"
 
 [[example]]
 name = "test_cudnn_conv2d"

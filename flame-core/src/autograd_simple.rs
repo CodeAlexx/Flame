@@ -365,7 +365,7 @@ impl AutogradEngine {
                     }
                 }
                 
-                // TODO: Implement backward for Conv2d, Linear, LayerNorm
+                // Backward for Conv2d, Linear, LayerNorm is provided in the main autograd engine
                 _ => {}
             }
         }

@@ -1,24 +1,37 @@
 /// FLAME Configuration
 /// Controls global behavior and optimization settings
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use crate::DType;
 
 /// Global flag to force cuDNN usage
-static FORCE_CUDNN: AtomicBool = AtomicBool::new(true);  // Default to always use cuDNN
+static FORCE_CUDNN: AtomicBool = AtomicBool::new(false);  // Default to not force cuDNN
+static DEFAULT_DTYPE: AtomicU8 = AtomicU8::new(2); // 0=F32,1=F16,2=BF16 (default BF16)
 
 /// Check if cuDNN should be forced
 pub fn should_use_cudnn() -> bool {
     FORCE_CUDNN.load(Ordering::Relaxed)
 }
 
-/// Set whether to force cuDNN usage (default: true)
+/// Set whether to force cuDNN usage (default: false)
 pub fn set_force_cudnn(force: bool) {
     FORCE_CUDNN.store(force, Ordering::Relaxed);
-    if force {
-        println!("🚀 FLAME: cuDNN acceleration ENABLED - 60% memory reduction active!");
-    } else {
-        println!("⚠️  FLAME: cuDNN acceleration DISABLED - memory usage will increase!");
+    // Intentionally quiet by default; callers can log their own messages.
+}
+
+/// Get the global default dtype used for new tensors without explicit dtype
+pub fn default_dtype() -> DType {
+    match DEFAULT_DTYPE.load(Ordering::Relaxed) {
+        0 => DType::F32,
+        1 => DType::F16,
+        _ => DType::BF16,
     }
+}
+
+/// Set the global default dtype
+pub fn set_default_dtype(dtype: DType) {
+    let v = match dtype { DType::F32 => 0, DType::F16 => 1, _ => 2 };
+    DEFAULT_DTYPE.store(v, Ordering::Relaxed);
 }
 
 /// FLAME optimization settings
@@ -39,7 +52,7 @@ pub struct FlameConfig {
 impl Default for FlameConfig {
     fn default() -> Self {
         Self {
-            force_cudnn: true,        // Always use cuDNN by default
+            force_cudnn: false,       // Do not force cuDNN by default
             enable_memory_pool: true,
             enable_fusion: true,
             max_batch_size: 1024,

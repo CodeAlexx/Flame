@@ -136,7 +136,7 @@ impl DeviceMemoryPool {
                 // Compare by size since we can't directly compare pointers
                 // This assumes we're deallocating the same size that was allocated
                 // Just mark the first in-use block of matching size as free
-                // This is a simplified approach since we can't compare pointers directly
+                // Approach based on sizes only; we don't compare raw pointers here
                 if block.in_use {
                     block.in_use = false;
                     return;
@@ -332,7 +332,7 @@ impl Workspace {
         }
     }
     
-    /// Get a temporary buffer
+    /// Get a scratch buffer
     pub fn get_buffer(&mut self, size: usize) -> Result<&CudaSlice<f32>> {
         let buffer = self.pool.allocate(size)?;
         self.buffers.push(buffer);

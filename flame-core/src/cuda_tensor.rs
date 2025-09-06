@@ -110,7 +110,7 @@ impl CudaTensor {
             });
         }
 
-        // Download to CPU for matmul (temporary)
+        // Download to host for matmul (debug path; not used in active GPU ops)
         let a_data = self.device.dtoh_sync_copy(&self.data())
             .map_err(|_| FlameError::CudaDriver)?;
         let b_data = other.device.dtoh_sync_copy(&other.data())

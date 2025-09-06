@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::collections::HashMap;
 
 lazy_static! {
+    // Keyed by device Arc pointer to ensure per-context cache, not just ordinal
     static ref KERNELS_CACHE: Mutex<HashMap<usize, Arc<CudaKernels>>> = Mutex::new(HashMap::new());
 }
 
@@ -18,7 +19,7 @@ pub struct GpuOps;
 impl GpuOps {
     /// Get or create CudaKernels instance for a device
     fn get_kernels(device: &Arc<cudarc::driver::CudaDevice>) -> Result<Arc<CudaKernels>> {
-        let device_id = device.ordinal();
+        let device_id = Arc::as_ptr(device) as usize;
         let mut cache = KERNELS_CACHE.lock().unwrap();
         
         if let Some(kernels) = cache.get(&device_id) {
@@ -176,6 +177,30 @@ impl GpuOps {
         let kernels = Self::get_kernels(&a.device)?;
         kernels.div(a, b)
     }
+
+    /// Elementwise maximum (assumes shapes already broadcasted to equal)
+    pub fn max_elemwise(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&a.device)?;
+        kernels.max_elemwise(a, b)
+    }
+
+    /// NHWC image ops: resize bilinear
+    pub fn resize_bilinear_nhwc(input: &Tensor, out_h: usize, out_w: usize, align_corners: bool) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&input.device)?;
+        kernels.resize_bilinear_nhwc(input, out_h, out_w, align_corners)
+    }
+
+    /// NHWC image ops: center crop
+    pub fn center_crop_nhwc(input: &Tensor, tgt_h: usize, tgt_w: usize) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&input.device)?;
+        kernels.center_crop_nhwc(input, tgt_h, tgt_w)
+    }
+
+    /// NHWC image ops: normalize per channel
+    pub fn normalize_nhwc(input: &Tensor, mean: &[f32], std: &[f32]) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&input.device)?;
+        kernels.normalize_nhwc(input, mean, std)
+    }
     
     /// Max reduction along dimension
     pub fn max_dim(tensor: &Tensor, dim: usize, keepdim: bool) -> Result<Tensor> {
@@ -187,6 +212,54 @@ impl GpuOps {
     pub fn sum_dim_keepdim(tensor: &Tensor, dim: usize) -> Result<Tensor> {
         let kernels = Self::get_kernels(&tensor.device)?;
         kernels.sum_dim_keepdim(tensor, dim)
+    }
+
+    /// NHWC -> NCHW
+    pub fn permute_nhwc_to_nchw(tensor: &Tensor) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&tensor.device)?;
+        kernels.permute_nhwc_to_nchw(tensor)
+    }
+
+    /// NCHW -> NHWC
+    pub fn permute_nchw_to_nhwc(tensor: &Tensor) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&tensor.device)?;
+        kernels.permute_nchw_to_nhwc(tensor)
+    }
+
+    /// Weights [KH,KW,IC,OC] -> [OC,IC,KH,KW]
+    pub fn weight_khwkicoc_to_ocickhkw(w: &Tensor) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&w.device)?;
+        kernels.weight_khwkicoc_to_ocickhkw(w)
+    }
+
+    /// Weights [OC,IC,KH,KW] -> [KH,KW,IC,OC]
+    pub fn weight_ocickhkw_to_khwkicoc(w: &Tensor) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&w.device)?;
+        kernels.weight_ocickhkw_to_khwkicoc(w)
+    }
+
+    /// Elementwise exponential
+    pub fn exp(tensor: &Tensor) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&tensor.device)?;
+        kernels.exp(tensor)
+    }
+
+    /// Elementwise natural logarithm
+    pub fn log(tensor: &Tensor) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&tensor.device)?;
+        kernels.log(tensor)
+    }
+
+    /// Index select along a dimension
+    pub fn index_select(tensor: &Tensor, dim: usize, indices: &Tensor) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&tensor.device)?;
+        kernels.index_select(tensor, dim, indices)
+    }
+
+    /// Slice along multiple dimensions
+    pub fn slice(tensor: &Tensor, ranges: &[(usize, usize)]) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&tensor.device)?;
+        kernels.slice(tensor, ranges)
     }
     
     /// Matrix multiplication using cuBLAS

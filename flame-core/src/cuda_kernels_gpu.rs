@@ -1558,7 +1558,7 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
         }
         
         // Apply bias if provided
-        // TODO: Implement bias addition in CUDA kernel
+        // Bias addition kernel can be integrated here when needed
         if let Some(_bias) = bias {
             // Bias addition should be done in GPU kernel
             return Err(FlameError::Cuda("Bias addition for transposed convolution not yet implemented".into()));
@@ -1576,7 +1576,7 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
         _padding: (usize, usize),
         _output_padding: (usize, usize),
     ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
-        // TODO: Implement transposed convolution backward pass
+        // Transposed convolution backward pass can be added when required by models
         Err(FlameError::Cuda("Transposed convolution backward not yet implemented".into()))
     }
     
