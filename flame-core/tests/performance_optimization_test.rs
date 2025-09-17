@@ -136,7 +136,7 @@ fn test_memory_bandwidth() -> Result<()> {
             &format!("  Copy {}MB", size_mb),
             50,
             || {
-                let _copy = tensor.clone()?;
+                let _copy = tensor.clone_result()?;
                 Ok(())
             }
         )?;

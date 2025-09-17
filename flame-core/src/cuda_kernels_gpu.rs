@@ -70,8 +70,10 @@ pub fn create_output_tensor(data: CudaSlice<f32>, shape: Shape, device: Arc<Cuda
 
 /// Calculate strides for a shape
 fn calculate_strides(shape: &[usize]) -> Vec<usize> {
-    let mut strides = vec![1; shape.len()];
-    for i in (0..shape.len() - 1).rev() {
+    let n = shape.len();
+    let mut strides = vec![1; n];
+    if n == 0 { return strides; }
+    for i in (0..n - 1).rev() {
         strides[i] = strides[i + 1] * shape[i + 1];
     }
     strides
@@ -163,7 +165,7 @@ extern "C" __global__ void sum_dim_keepdim_kernel(
         
         let cfg = LaunchConfig::for_num_elems(out_elements as u32);
         launch_kernel!(f, cfg,
-            tensor.storage.as_slice(),
+            tensor.storage.try_as_slice_f32()?,
             &output_data,
             &dims_gpu,
             dims_vec.len() as i32,
@@ -227,12 +229,13 @@ extern "C" __global__ void sum_all_kernel(
         };
         
         launch_kernel!(f, cfg,
-            tensor.storage.as_slice(),
+            tensor.storage.try_as_slice_f32()?,
             &output_data,
             n as i32
         )?;
         
-        Ok(create_output_tensor(output_data, Shape::from_dims(&[1]), tensor.device.clone()))
+        // Return a true scalar shape (rank-0) for sums
+        Ok(create_output_tensor(output_data, Shape::from_dims(&[]), tensor.device.clone()))
     }
     /// Ensure kernel is loaded - compiles and loads CUDA kernel on first use
     pub(crate) fn ensure_kernel(device: &Arc<CudaDevice>, kernel_name: &str, kernel_code: &str) -> Result<()> {
@@ -261,12 +264,15 @@ extern "C" __global__ void sum_all_kernel(
     
     /// Element-wise addition kernel
     pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        if a.shape != b.shape {
-            return Err(FlameError::ShapeMismatch {
-                expected: a.shape.clone(),
-                got: b.shape.clone(),
-            });
-        }
+        // Support broadcasting: upcast operands to a common target shape
+        let (a_t, b_t) = if a.shape != b.shape {
+            let target = a.shape.broadcast_shape_binary_op(&b.shape)?;
+            let a_bc = if &a.shape != &target { Self::broadcast(a, &target)? } else { a.clone_result()? };
+            let b_bc = if &b.shape != &target { Self::broadcast(b, &target)? } else { b.clone_result()? };
+            (a_bc, b_bc)
+        } else {
+            (a.clone_result()?, b.clone_result()?)
+        };
         
         let kernel_code = r#"
 extern "C" __global__ void add_kernel(float *out, const float *a, const float *b, int numel) {
@@ -276,32 +282,35 @@ extern "C" __global__ void add_kernel(float *out, const float *a, const float *b
     }
 }"#;
         
-        Self::ensure_kernel(&a.device, ADD_KERNEL, kernel_code)?;
+        Self::ensure_kernel(&a_t.device, ADD_KERNEL, kernel_code)?;
         
-        let f = a.device.get_func(ADD_KERNEL, ADD_KERNEL)
+        let f = a_t.device.get_func(ADD_KERNEL, ADD_KERNEL)
             .ok_or_else(|| FlameError::Cuda("Failed to get add_kernel".into()))?;
         
-        let numel = a.shape.elem_count();
+        let numel = a_t.shape.elem_count();
         
         // Allocate output data
-        let mut output_data = crate::tensor::alloc_from_pool(&a.device, numel)
+        let mut output_data = crate::tensor::alloc_from_pool(&a_t.device, numel)
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, &output_data, a.storage.as_slice(), b.storage.as_slice(), numel as i32)?;
+        launch_kernel!(f, cfg, &output_data, a_t.storage.try_as_slice_f32()?, b_t.storage.try_as_slice_f32()?, numel as i32)?;
         
         // Create output tensor
-        Ok(create_output_tensor(output_data, a.shape.clone(), a.device.clone()))
+        Ok(create_output_tensor(output_data, a_t.shape.clone(), a_t.device.clone()))
     }
     
     /// Element-wise multiplication kernel
     pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        if a.shape != b.shape {
-            return Err(FlameError::ShapeMismatch {
-                expected: a.shape.clone(),
-                got: b.shape.clone(),
-            });
-        }
+        // Support broadcasting: upcast operands to a common target shape
+        let (a_t, b_t) = if a.shape != b.shape {
+            let target = a.shape.broadcast_shape_binary_op(&b.shape)?;
+            let a_bc = if &a.shape != &target { Self::broadcast(a, &target)? } else { a.clone_result()? };
+            let b_bc = if &b.shape != &target { Self::broadcast(b, &target)? } else { b.clone_result()? };
+            (a_bc, b_bc)
+        } else {
+            (a.clone_result()?, b.clone_result()?)
+        };
         
         let kernel_code = r#"
 extern "C" __global__ void mul_kernel(float *out, const float *a, const float *b, int numel) {
@@ -311,22 +320,22 @@ extern "C" __global__ void mul_kernel(float *out, const float *a, const float *b
     }
 }"#;
         
-        Self::ensure_kernel(&a.device, MUL_KERNEL, kernel_code)?;
+        Self::ensure_kernel(&a_t.device, MUL_KERNEL, kernel_code)?;
         
-        let f = a.device.get_func(MUL_KERNEL, MUL_KERNEL)
+        let f = a_t.device.get_func(MUL_KERNEL, MUL_KERNEL)
             .ok_or_else(|| FlameError::Cuda("Failed to get mul_kernel".into()))?;
         
-        let numel = a.shape.elem_count();
+        let numel = a_t.shape.elem_count();
         
         // Allocate output data
-        let mut output_data = crate::tensor::alloc_from_pool(&a.device, numel)
+        let mut output_data = crate::tensor::alloc_from_pool(&a_t.device, numel)
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, &output_data, a.storage.as_slice(), b.storage.as_slice(), numel as i32)?;
+        launch_kernel!(f, cfg, &output_data, a_t.storage.try_as_slice_f32()?, b_t.storage.try_as_slice_f32()?, numel as i32)?;
         
         // Create output tensor
-        Ok(create_output_tensor(output_data, a.shape.clone(), a.device.clone()))
+        Ok(create_output_tensor(output_data, a_t.shape.clone(), a_t.device.clone()))
     }
     
     /// Scalar multiplication kernel
@@ -351,7 +360,7 @@ extern "C" __global__ void mul_scalar_kernel(float *out, const float *input, flo
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, &output_data, tensor.storage.as_slice(), scalar, numel as i32)?;
+        launch_kernel!(f, cfg, &output_data, tensor.storage.try_as_slice_f32()?, scalar, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -379,7 +388,7 @@ extern "C" __global__ void add_scalar_kernel(float *out, const float *input, flo
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, &output_data, tensor.storage.as_slice(), scalar, numel as i32)?;
+        launch_kernel!(f, cfg, &output_data, tensor.storage.try_as_slice_f32()?, scalar, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -408,7 +417,7 @@ extern "C" __global__ void relu_kernel(float *out, const float *input, int numel
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, &output_data, tensor.storage.as_slice(), numel as i32)?;
+        launch_kernel!(f, cfg, &output_data, tensor.storage.try_as_slice_f32()?, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -441,7 +450,7 @@ extern "C" __global__ void gelu_kernel(float *out, const float *input, int numel
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, &output_data, tensor.storage.as_slice(), numel as i32)?;
+        launch_kernel!(f, cfg, &output_data, tensor.storage.try_as_slice_f32()?, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -470,7 +479,7 @@ extern "C" __global__ void silu_kernel(float *out, const float *input, int numel
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, &output_data, tensor.storage.as_slice(), numel as i32)?;
+        launch_kernel!(f, cfg, &output_data, tensor.storage.try_as_slice_f32()?, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -498,7 +507,7 @@ extern "C" __global__ void tanh_kernel(float *out, const float *input, int numel
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, &output_data, tensor.storage.as_slice(), numel as i32)?;
+        launch_kernel!(f, cfg, &output_data, tensor.storage.try_as_slice_f32()?, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -526,7 +535,7 @@ extern "C" __global__ void sigmoid_kernel(float *out, const float *input, int nu
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, &output_data, tensor.storage.as_slice(), numel as i32)?;
+        launch_kernel!(f, cfg, &output_data, tensor.storage.try_as_slice_f32()?, numel as i32)?;
         
         // Create output tensor
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
@@ -578,7 +587,7 @@ extern "C" __global__ void sum_kernel(float *out, const float *input, int numel)
             shared_mem_bytes: block_size * 4, // 4 bytes per float
         };
         
-        launch_kernel!(f, cfg, &output_data, tensor.storage.as_slice(), numel)?;
+        launch_kernel!(f, cfg, &output_data, tensor.storage.try_as_slice_f32()?, numel)?;
         
         // Create scalar output tensor
         Ok(create_output_tensor(output_data, Shape::from_dims(&[]), tensor.device.clone()))
@@ -644,7 +653,7 @@ extern "C" __global__ void transpose_kernel(
             shared_mem_bytes: (tile_size * (tile_size + 1) * 4) as u32,
         };
         
-        launch_kernel!(f, cfg, &output_data, tensor.storage.as_slice(), rows as i32, cols as i32)?;
+        launch_kernel!(f, cfg, &output_data, tensor.storage.try_as_slice_f32()?, rows as i32, cols as i32)?;
         
         // Create transposed tensor
         Ok(create_output_tensor(output_data, Shape::from_dims(&[cols, rows]), tensor.device.clone()))
@@ -671,7 +680,7 @@ extern "C" __global__ void leaky_relu_kernel(float *out, const float *input, flo
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, &output_data, tensor.storage.as_slice(), negative_slope, numel as i32)?;
+        launch_kernel!(f, cfg, &output_data, tensor.storage.try_as_slice_f32()?, negative_slope, numel as i32)?;
         
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
     }
@@ -697,7 +706,7 @@ extern "C" __global__ void elu_kernel(float *out, const float *input, float alph
             .map_err(|_| FlameError::CudaDriver)?;
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg, &output_data, tensor.storage.as_slice(), alpha, numel as i32)?;
+        launch_kernel!(f, cfg, &output_data, tensor.storage.try_as_slice_f32()?, alpha, numel as i32)?;
         
         Ok(create_output_tensor(output_data, tensor.shape.clone(), tensor.device.clone()))
     }
@@ -739,8 +748,8 @@ extern "C" __global__ void prelu_kernel(
         unsafe {
             launch_kernel!(f, cfg,
                 &output_data,
-                tensor.storage.as_slice(),
-                weight.storage.as_slice(),
+                tensor.storage.try_as_slice_f32()?,
+                weight.storage.try_as_slice_f32()?,
                 numel as i32,
                 num_channels as i32,
                 channel_size as i32
@@ -847,7 +856,7 @@ extern "C" __global__ void maxpool2d_with_indices_kernel(
             launch_kernel!(f, cfg,
                 &output_data,
                 &indices_data,
-                input.storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
                 input_dims,
                 input_hw,
                 output_hw,
@@ -918,8 +927,8 @@ extern "C" __global__ void maxpool2d_backward_with_indices_kernel(
         let cfg = LaunchConfig::for_num_elems(output_numel as u32);
         launch_kernel!(f, cfg,
             &grad_input,
-            grad_output.storage.as_slice(),
-            indices.storage.as_slice(),
+            grad_output.storage.try_as_slice_f32()?,
+            indices.storage.try_as_slice_f32()?,
             input_numel as i32,
             output_numel as i32
         )?;
@@ -1021,7 +1030,7 @@ extern "C" __global__ void avgpool2d_kernel(
             
             launch_kernel!(f, cfg,
                 &output_data,
-                input.storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
                 input_dims,
                 input_hw,
                 output_hw,
@@ -1151,7 +1160,7 @@ extern "C" __global__ void avgpool2d_backward_kernel(
             
             launch_kernel!(f, cfg,
                 &grad_input,
-                grad_output.storage.as_slice(),
+                grad_output.storage.try_as_slice_f32()?,
                 input_dims,
                 input_hw,
                 output_hw,
@@ -1228,7 +1237,7 @@ extern "C" __global__ void adaptive_maxpool2d_kernel(
         unsafe {
             launch_kernel!(f, cfg,
                 &output_data,
-                input.storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
                 (batch * channels) as i32,
                 h_in as i32,
                 w_in as i32,
@@ -1302,7 +1311,7 @@ extern "C" __global__ void adaptive_avgpool2d_kernel(
         unsafe {
             launch_kernel!(f, cfg,
                 &output_data,
-                input.storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
                 (batch * channels) as i32,
                 h_in as i32,
                 w_in as i32,
@@ -1367,7 +1376,7 @@ extern "C" __global__ void upsample2d_nearest_kernel(
         unsafe {
             launch_kernel!(f, cfg,
                 &output_data,
-                input.storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
                 (batch * channels) as i32,
                 h_in as i32,
                 w_in as i32,
@@ -1461,7 +1470,7 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
         unsafe {
             launch_kernel!(f, cfg,
                 &output_data,
-                input.storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
                 (batch * channels) as i32,
                 h_in as i32,
                 w_in as i32,
@@ -1649,7 +1658,7 @@ extern "C" __global__ void broadcast_kernel(
         
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(f, cfg,
-            &output_data, input.storage.as_slice(),
+            &output_data, input.storage.try_as_slice_f32()?,
             &src_shape_gpu, &dst_shape_gpu,
             &src_strides_gpu, &dst_strides_gpu,
             src_ndim as i32, dst_ndim as i32,
@@ -1657,6 +1666,184 @@ extern "C" __global__ void broadcast_kernel(
         )?;
         
         Ok(create_output_tensor(output_data, target_shape.clone(), input.device.clone()))
+    }
+
+    /// Elementwise multiply with stride-based broadcasting (GPU, no materialization)
+    pub fn mul_bc(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let ad: Vec<i32> = a.shape().dims().iter().map(|&x| x as i32).collect();
+        let bd: Vec<i32> = b.shape().dims().iter().map(|&x| x as i32).collect();
+        let as_: Vec<i32> = calculate_strides(a.shape().dims()).iter().map(|&x| x as i32).collect();
+        let bs: Vec<i32> = calculate_strides(b.shape().dims()).iter().map(|&x| x as i32).collect();
+        let tr = ad.len().max(bd.len());
+        // Scalar×scalar: defer to equal-shape path
+        if tr == 0 {
+            return Self::mul(a, b);
+        }
+        let mut adp = vec![1i32; tr];
+        let mut bdp = vec![1i32; tr];
+        let mut asp = vec![0i32; tr];
+        let mut bsp = vec![0i32; tr];
+        for i in 0..ad.len() { adp[tr - ad.len() + i] = ad[i]; }
+        for i in 0..bd.len() { bdp[tr - bd.len() + i] = bd[i]; }
+        for i in 0..as_.len() { asp[tr - as_.len() + i] = as_[i]; }
+        for i in 0..bs.len() { bsp[tr - bs.len() + i] = bs[i]; }
+        let mut out: Vec<i32> = Vec::with_capacity(tr);
+        let mut ao: Vec<i32> = Vec::with_capacity(tr);
+        let mut bo: Vec<i32> = Vec::with_capacity(tr);
+        for i in 0..tr {
+            let (ai, bi) = (adp[i], bdp[i]);
+            let od = if ai == bi { ai } else if ai == 1 { bi } else if bi == 1 { ai } else {
+                return Err(FlameError::BroadcastIncompatible { lhs: a.shape().clone(), rhs: b.shape().clone() });
+            };
+            out.push(od);
+            ao.push(if adp[i] == 1 { 0 } else { asp[i] });
+            bo.push(if bdp[i] == 1 { 0 } else { bsp[i] });
+        }
+        let total: i32 = out.iter().product();
+
+        let code = r#"
+extern "C" __global__
+void mul_bc_kernel(const float* __restrict__ A, const float* __restrict__ B,
+                   float* __restrict__ O,
+                   const float* __restrict__ out_dims,
+                   const float* __restrict__ a_strides,
+                   const float* __restrict__ b_strides,
+                   int ndims, int total) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int grid = gridDim.x * blockDim.x;
+    if (ndims == 0) {
+        if (tid == 0) { O[0] = A[0] * B[0]; }
+        return;
+    }
+    while (tid < total) {
+        int rem = tid;
+        int a_off = 0, b_off = 0;
+        #pragma unroll 4
+        for (int i = ndims - 1; i >= 0; --i) {
+            int d = (int)out_dims[i];
+            int idx = rem % d; rem /= d;
+            a_off += idx * (int)a_strides[i];
+            b_off += idx * (int)b_strides[i];
+        }
+        O[tid] = A[a_off] * B[b_off];
+        tid += grid;
+    }
+}
+"#;
+        Self::ensure_kernel(&a.device, "mul_bc_kernel", code)?;
+        let f = a.device.get_func("mul_bc_kernel", "mul_bc_kernel")
+            .ok_or_else(|| FlameError::Cuda("Failed to get mul_bc_kernel".into()))?;
+
+        // Upload metadata using local helper (matches existing broadcast helpers)
+        let out_gpu = alloc_from_pool_and_copy(&a.device, &out)?;
+        let a_str_gpu = alloc_from_pool_and_copy(&a.device, &ao)?;
+        let b_str_gpu = alloc_from_pool_and_copy(&a.device, &bo)?;
+
+        let out_shape = Shape::from_dims(&out.iter().map(|&x| x as usize).collect::<Vec<_>>());
+        let mut output = Tensor::zeros(out_shape, a.device.clone())?;
+
+        let cfg = LaunchConfig::for_num_elems(total as u32);
+        unsafe {
+            launch_kernel!(f, cfg,
+                a.storage.try_as_slice_f32()?,
+                b.storage.try_as_slice_f32()?,
+                output.storage.try_as_slice_f32()?,
+                &out_gpu,
+                &a_str_gpu,
+                &b_str_gpu,
+                tr as i32,
+                total as i32
+            )?;
+        }
+        Ok(output)
+    }
+
+    /// Elementwise add with stride-based broadcasting (GPU)
+    pub fn add_bc(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let ad: Vec<i32> = a.shape().dims().iter().map(|&x| x as i32).collect();
+        let bd: Vec<i32> = b.shape().dims().iter().map(|&x| x as i32).collect();
+        let as_: Vec<i32> = calculate_strides(a.shape().dims()).iter().map(|&x| x as i32).collect();
+        let bs: Vec<i32> = calculate_strides(b.shape().dims()).iter().map(|&x| x as i32).collect();
+        let tr = ad.len().max(bd.len());
+        if tr == 0 {
+            return Self::add(a, b);
+        }
+        let mut adp = vec![1i32; tr];
+        let mut bdp = vec![1i32; tr];
+        let mut asp = vec![0i32; tr];
+        let mut bsp = vec![0i32; tr];
+        for i in 0..ad.len() { adp[tr - ad.len() + i] = ad[i]; }
+        for i in 0..bd.len() { bdp[tr - bd.len() + i] = bd[i]; }
+        for i in 0..as_.len() { asp[tr - as_.len() + i] = as_[i]; }
+        for i in 0..bs.len() { bsp[tr - bs.len() + i] = bs[i]; }
+        let mut out: Vec<i32> = Vec::with_capacity(tr);
+        let mut ao: Vec<i32> = Vec::with_capacity(tr);
+        let mut bo: Vec<i32> = Vec::with_capacity(tr);
+        for i in 0..tr {
+            let (ai, bi) = (adp[i], bdp[i]);
+            let od = if ai == bi { ai } else if ai == 1 { bi } else if bi == 1 { ai } else {
+                return Err(FlameError::BroadcastIncompatible { lhs: a.shape().clone(), rhs: b.shape().clone() });
+            };
+            out.push(od);
+            ao.push(if adp[i] == 1 { 0 } else { asp[i] });
+            bo.push(if bdp[i] == 1 { 0 } else { bsp[i] });
+        }
+        let total: i32 = out.iter().product();
+
+        let code = r#"
+extern "C" __global__
+void add_bc_kernel(const float* __restrict__ A, const float* __restrict__ B,
+                   float* __restrict__ O,
+                   const float* __restrict__ out_dims,
+                   const float* __restrict__ a_strides,
+                   const float* __restrict__ b_strides,
+                   int ndims, int total) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int grid = gridDim.x * blockDim.x;
+    if (ndims == 0) {
+        if (tid == 0) { O[0] = A[0] + B[0]; }
+        return;
+    }
+    while (tid < total) {
+        int rem = tid;
+        int a_off = 0, b_off = 0;
+        #pragma unroll 4
+        for (int i = ndims - 1; i >= 0; --i) {
+            int d = (int)out_dims[i];
+            int idx = rem % d; rem /= d;
+            a_off += idx * (int)a_strides[i];
+            b_off += idx * (int)b_strides[i];
+        }
+        O[tid] = A[a_off] + B[b_off];
+        tid += grid;
+    }
+}
+"#;
+        Self::ensure_kernel(&a.device, "add_bc_kernel", code)?;
+        let f = a.device.get_func("add_bc_kernel", "add_bc_kernel")
+            .ok_or_else(|| FlameError::Cuda("Failed to get add_bc_kernel".into()))?;
+
+        let out_gpu = alloc_from_pool_and_copy(&a.device, &out)?;
+        let a_str_gpu = alloc_from_pool_and_copy(&a.device, &ao)?;
+        let b_str_gpu = alloc_from_pool_and_copy(&a.device, &bo)?;
+
+        let out_shape = Shape::from_dims(&out.iter().map(|&x| x as usize).collect::<Vec<_>>());
+        let mut output = Tensor::zeros(out_shape, a.device.clone())?;
+
+        let cfg = LaunchConfig::for_num_elems(total as u32);
+        unsafe {
+            launch_kernel!(f, cfg,
+                a.storage.try_as_slice_f32()?,
+                b.storage.try_as_slice_f32()?,
+                output.storage.try_as_slice_f32()?,
+                &out_gpu,
+                &a_str_gpu,
+                &b_str_gpu,
+                tr as i32,
+                total as i32
+            )?;
+        }
+        Ok(output)
     }
     
     /// Scatter add operation - adds values from src to dst at indices
@@ -1697,7 +1884,7 @@ extern "C" __global__ void scatter_add_kernel(
             let size = dst.shape.elem_count();
             let mut data = dst.device.alloc::<f32>(size)
                 .map_err(|_| FlameError::CudaDriver)?;
-            dst.device.dtod_copy(dst.storage.as_slice(), &mut data)
+            dst.device.dtod_copy(dst.storage.try_as_slice_f32()?, &mut data)
                 .map_err(|_| FlameError::CudaDriver)?;
             data
         };
@@ -1711,8 +1898,8 @@ extern "C" __global__ void scatter_add_kernel(
         unsafe {
             launch_kernel!(f, cfg,
                 &output_data,
-                indices.storage.as_slice(),
-                src.storage.as_slice(),
+                indices.storage.try_as_slice_f32()?,
+                src.storage.try_as_slice_f32()?,
                 batch_size,
                 embedding_dim,
                 num_indices

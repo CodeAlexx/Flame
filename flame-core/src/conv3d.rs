@@ -145,7 +145,7 @@ impl Conv3d {
         // Compile and load kernel
         let kernel_code = get_conv3d_kernel_code();
         let ptx = compile_ptx(&kernel_code)
-            .map_err(|e| FlameError::KernelError(format!("Failed to compile conv3d kernel: {:?}", e)))?;
+            .map_err(|e| FlameError::Cuda(format!("Failed to compile conv3d kernel: {:?}", e)))?;
         self.device.load_ptx(ptx, "conv3d", &["conv3d_kernel"])
             .map_err(|e| FlameError::Cuda(format!("Failed to load conv3d kernel: {:?}", e)))?;
         
@@ -187,8 +187,8 @@ impl Conv3d {
         };
         
         launch_kernel!(f, cfg,
-            input.storage.as_slice(),
-            self.weight.storage.as_slice(),
+            input.storage.try_as_slice_f32()?,
+            self.weight.storage.try_as_slice_f32()?,
             &mut output_data,
             params
         )?;
@@ -213,7 +213,7 @@ impl Conv3d {
         // Compile and load kernel
         let kernel_code = get_add_bias_3d_kernel_code();
         let ptx = compile_ptx(&kernel_code)
-            .map_err(|e| FlameError::KernelError(format!("Failed to compile add_bias_3d kernel: {:?}", e)))?;
+            .map_err(|e| FlameError::Cuda(format!("Failed to compile add_bias_3d kernel: {:?}", e)))?;
         self.device.load_ptx(ptx, "add_bias_3d", &["add_bias_3d_kernel"])
             .map_err(|e| FlameError::Cuda(format!("Failed to load add_bias_3d kernel: {:?}", e)))?;
         
@@ -232,8 +232,8 @@ impl Conv3d {
         
         launch_kernel!(kernel, cfg,
             &mut output_data,
-            output.storage.as_slice(),
-            bias.storage.as_slice(),
+            output.storage.try_as_slice_f32()?,
+            bias.storage.try_as_slice_f32()?,
             total_elems as i32,
             self.out_channels as i32,
             elems_per_channel
@@ -455,7 +455,7 @@ impl BatchNorm3d {
         // Compile and load kernel
         let kernel_code = get_batch_norm_3d_kernel_code();
         let ptx = compile_ptx(&kernel_code)
-            .map_err(|e| FlameError::KernelError(format!("Failed to compile batch_norm_3d kernel: {:?}", e)))?;
+            .map_err(|e| FlameError::Cuda(format!("Failed to compile batch_norm_3d kernel: {:?}", e)))?;
         self.device.load_ptx(ptx, "batch_norm_3d", &["batch_norm_3d_kernel"])
             .map_err(|e| FlameError::Cuda(format!("Failed to load batch_norm_3d kernel: {:?}", e)))?;
         
@@ -475,9 +475,9 @@ impl BatchNorm3d {
         // Use the 3D kernel path without optional branches for clarity
         // In production, you'd handle all cases properly
         launch_kernel!(kernel, cfg,
-            input.storage.as_slice(),
-            mean.storage.as_slice(),
-            var.storage.as_slice(),
+            input.storage.try_as_slice_f32()?,
+            mean.storage.try_as_slice_f32()?,
+            var.storage.try_as_slice_f32()?,
             &mut output_data,
             total_elems as i32,
             self.num_features as i32,

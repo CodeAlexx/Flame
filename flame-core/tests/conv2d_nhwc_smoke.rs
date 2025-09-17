@@ -13,7 +13,7 @@ fn conv2d_nhwc_forward_backward_smoke() -> Result<()> {
 
     // Weights [KH,KW,IC,OC]
     let (kh, kw, oc) = (3usize, 3usize, 4usize);
-    let w = Tensor::rand(Shape::from_dims(&[kh, kw, ic, oc]), device.clone())?
+    let wt = Tensor::rand(Shape::from_dims(&[kh, kw, ic, oc]), device.clone())?
         .requires_grad_(true);
 
     // Bias [OC]
@@ -25,7 +25,7 @@ fn conv2d_nhwc_forward_backward_smoke() -> Result<()> {
     let padding = (1usize, 1usize);
 
     // Forward via NHWC adapter
-    let y = cuda_conv2d::CudaConv2d::conv2d_forward_nhwc(&x, &w, Some(&b), stride, padding)?;
+    let y = cuda_conv2d::CudaConv2d::conv2d_forward_nhwc(&x, &wt, Some(&b), stride, padding)?;
     let yd = y.shape().dims().to_vec();
     assert_eq!(yd, vec![n, h, w, oc]);
 
@@ -34,16 +34,16 @@ fn conv2d_nhwc_forward_backward_smoke() -> Result<()> {
     let grads = AutogradContext::backward(&loss)?;
 
     // Check grads exist and shapes match
-    let gx = grads.get(x.id()).unwrap().clone()?;
-    let gw = grads.get(w.id()).unwrap().clone()?;
-    let gb = grads.get(b.id()).unwrap().clone()?;
+    let gx = grads.get(x.id()).unwrap().clone();
+    let gw = grads.get(wt.id()).unwrap().clone();
+    let gb = grads.get(b.id()).unwrap().clone();
     assert_eq!(gx.shape().dims(), &[n, h, w, ic]);
     assert_eq!(gw.shape().dims(), &[kh, kw, ic, oc]);
     assert_eq!(gb.shape().dims(), &[oc]);
 
     // Parity vs. direct NCHW reference path
     let x_nchw = cuda_ops::GpuOps::permute_nhwc_to_nchw(&x)?;
-    let w_ocic = cuda_ops::GpuOps::weight_khwkicoc_to_ocickhkw(&w)?;
+    let w_ocic = cuda_ops::GpuOps::weight_khwkicoc_to_ocickhkw(&wt)?;
     let y_ref_nchw = cuda_conv2d::CudaConv2d::conv2d_forward(&x_nchw, &w_ocic, Some(&b), stride, padding, 1)?;
     let y_ref = cuda_ops::GpuOps::permute_nchw_to_nhwc(&y_ref_nchw)?;
     // Compare elementwise closely

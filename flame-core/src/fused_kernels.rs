@@ -63,9 +63,9 @@ extern "C" __global__ void bias_gelu_kernel(
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(total_elems);
         
         launch_kernel!(f, cfg,
-            output.storage.as_slice(),
-            x.storage.as_slice(),
-            bias.storage.as_slice(),
+            output.storage.try_as_slice_f32()?,
+            x.storage.try_as_slice_f32()?,
+            bias.storage.try_as_slice_f32()?,
             batch_size,
             seq_len,
             hidden_size
@@ -194,12 +194,12 @@ extern "C" __global__ void layernorm_linear_kernel(
         };
         
         launch_kernel!(f, grid,
-            output.storage.as_slice(),
-            x.storage.as_slice(),
-            gamma.storage.as_slice(),
-            beta.storage.as_slice(),
-            weight.storage.as_slice(),
-            bias_to_use.storage.as_slice(),
+            output.storage.try_as_slice_f32()?,
+            x.storage.try_as_slice_f32()?,
+            gamma.storage.try_as_slice_f32()?,
+            beta.storage.try_as_slice_f32()?,
+            weight.storage.try_as_slice_f32()?,
+            bias_to_use.storage.try_as_slice_f32()?,
             batch_size,
             seq_len,
             hidden_size,
@@ -420,8 +420,8 @@ extern "C" __global__ void residual_layernorm_kernel(
             normalized_shape: vec![residual_sum.shape().dims().last().copied().unwrap_or(1)],
             eps,
             elementwise_affine: true,
-            weight: Some(gamma.clone()?),
-            bias: Some(beta.clone()?),
+            weight: Some(gamma.clone_result()?),
+            bias: Some(beta.clone_result()?),
         };
         layer_norm.forward(&residual_sum)
     }
@@ -468,9 +468,9 @@ extern "C" __global__ void gelu_backward_kernel(
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
         
         launch_kernel!(f, cfg,
-            grad_input.storage.as_slice(),
-            grad_output.storage.as_slice(),
-            input.storage.as_slice(),
+            grad_input.storage.try_as_slice_f32()?,
+            grad_output.storage.try_as_slice_f32()?,
+            input.storage.try_as_slice_f32()?,
             numel
         )?;
         
@@ -529,10 +529,10 @@ extern "C" __global__ void adam_step_kernel(
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
         
         launch_kernel!(f, cfg,
-            param.storage.as_slice(),
-            m.storage.as_slice(),
-            v.storage.as_slice(),
-            grad.storage.as_slice(),
+            param.storage.try_as_slice_f32()?,
+            m.storage.try_as_slice_f32()?,
+            v.storage.try_as_slice_f32()?,
+            grad.storage.try_as_slice_f32()?,
             lr,
             beta1,
             beta2,

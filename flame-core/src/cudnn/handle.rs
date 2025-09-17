@@ -62,11 +62,11 @@ unsafe impl Sync for CudnnHandle {}
 
 /// Get or create the global cuDNN handle
 pub fn get_cudnn_handle() -> Result<Arc<Mutex<CudnnHandle>>> {
-    // Use get_or_init with unwrap since we need a stable API
-    Ok(CUDNN_HANDLE.get_or_init(|| {
-        match CudnnHandle::new() {
-            Ok(handle) => Arc::new(Mutex::new(handle)),
-            Err(e) => panic!("Failed to initialize cuDNN handle: {:?}", e),
-        }
-    }).clone())
+    if let Some(h) = CUDNN_HANDLE.get() {
+        return Ok(h.clone());
+    }
+    let handle = CudnnHandle::new()?;
+    let arc = Arc::new(Mutex::new(handle));
+    let _ = CUDNN_HANDLE.set(arc.clone());
+    Ok(arc)
 }

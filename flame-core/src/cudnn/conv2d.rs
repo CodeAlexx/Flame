@@ -64,16 +64,16 @@ pub fn cudnn_conv2d(
         let input_f32 = if input.dtype() == DType::BF16 {
             input.to_dtype(DType::F32)?
         } else {
-            input.clone()?
+            input.clone_result()?
         };
         let weight_f32 = if weight.dtype() == DType::BF16 {
             weight.to_dtype(DType::F32)?
         } else {
-            weight.clone()?
+            weight.clone_result()?
         };
         (input_f32, weight_f32)
     } else {
-        (input.clone()?, weight.clone()?)
+        (input.clone_result()?, weight.clone_result()?)
     };
     
     // Validate input dimensions
@@ -115,7 +115,7 @@ pub fn cudnn_conv2d(
     
     // Get cuDNN handle
     let handle = get_cudnn_handle()?;
-    let handle_guard = handle.lock().unwrap();
+    let handle_guard = handle.lock().map_err(|_| FlameError::Training("cudnn handle mutex poisoned".into()))?;
     
     // Create descriptors - use F32 dtype for cuDNN when working with converted tensors
     let working_dtype = if input.dtype() == DType::BF16 || weight.dtype() == DType::BF16 {
@@ -277,7 +277,7 @@ pub fn cudnn_conv2d(
             // Reshape bias from [out_channels] to [1, out_channels, 1, 1] for broadcasting
             bias.reshape(&[1, out_channels, 1, 1])?
         } else {
-            bias.clone()?
+            bias.clone_result()?
         };
         
         let bias_desc = TensorDescriptor::new(&[1, out_channels, 1, 1], DType::F32)?;

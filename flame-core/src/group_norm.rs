@@ -102,7 +102,7 @@ pub fn group_norm(
     // }
     
     launch_kernel!(f_stats, stats_cfg,
-        input.storage.as_slice(),
+        input.storage.try_as_slice_f32()?,
         &mean_data,
         &var_data,
         batch_size as i32,
@@ -137,19 +137,15 @@ pub fn group_norm(
     // Handle optional weight and bias
     // Create dummy tensors for None cases to avoid allocations in kernel launch
     let dummy = crate::tensor::alloc_zeros_from_pool(&input.device, 1)?;
-    let weight_ptr = weight
-        .map(|w| w.storage.as_slice())
-        .unwrap_or(&dummy);
-    let bias_ptr = bias
-        .map(|b| b.storage.as_slice())
-        .unwrap_or(&dummy);
+    let weight_ptr = if let Some(w) = weight { w.storage.try_as_slice_f32()? } else { &dummy };
+    let bias_ptr = if let Some(b) = bias { b.storage.try_as_slice_f32()? } else { &dummy };
     
     // Pack dimensions into fewer parameters to avoid exceeding LaunchAsync limit
     let dims1 = (batch_size << 16) | num_channels;
     let dims2 = (num_groups << 16) | channels_per_group;
     
     launch_kernel!(f_norm, norm_cfg,
-        input.storage.as_slice(),
+        input.storage.try_as_slice_f32()?,
         &output_data,
         weight_ptr,
         bias_ptr,
@@ -171,15 +167,15 @@ pub fn group_norm(
     };
     
     // Record for autograd
-    if input.requires_grad || (weight.is_some() && weight.unwrap().requires_grad) {
+    if input.requires_grad || weight.map(|w| w.requires_grad).unwrap_or(false) {
         output.requires_grad = true;
         
-        let mut saved_tensors = vec![(input.id, input.clone()?)];
+        let mut saved_tensors = vec![(input.id, input.clone_result()?)];
         if let Some(w) = weight {
-            saved_tensors.push((w.id, w.clone()?));
+            saved_tensors.push((w.id, w.clone_result()?));
         }
         if let Some(b) = bias {
-            saved_tensors.push((b.id, b.clone()?));
+            saved_tensors.push((b.id, b.clone_result()?));
         }
         
         // Save mean and var for backward

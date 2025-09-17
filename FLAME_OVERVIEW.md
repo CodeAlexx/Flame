@@ -352,7 +352,7 @@ FLAME is designed to be extensible. Key extension points:
 
 ## Comparison with Other Frameworks
 
-| Feature | FLAME | Candle | Burn | PyTorch |
+| Feature | FLAME | Legacy Rust DL | Burn | PyTorch |
 |---------|-------|---------|------|---------|
 | Language | Rust | Rust | Rust | Python/C++ |
 | Training | ✅ | ❌ | ✅ | ✅ |

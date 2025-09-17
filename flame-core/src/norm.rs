@@ -1000,7 +1000,7 @@ impl RMSNorm1d {
             eps: self.eps,
             elementwise_affine: self.weight.is_some(),
             weight: match &self.weight {
-                Some(w) => Some(w.clone()?),
+                Some(w) => Some(w.clone_result()?),
                 None => None,
             },
         };

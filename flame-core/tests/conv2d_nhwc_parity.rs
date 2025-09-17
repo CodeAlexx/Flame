@@ -37,20 +37,20 @@ fn conv2d_nhwc_forward_backward_parity() -> Result<()> {
     // Backward: NHWC path
     let loss = y_nhwc.mean()?;
     let grads = AutogradContext::backward(&loss)?;
-    let gx_nhwc = grads.get(x_nhwc.id()).unwrap().clone()?;
-    let gw_khwkicoc = grads.get(w_khwkicoc.id()).unwrap().clone()?;
-    let gb = grads.get(b.id()).unwrap().clone()?;
+    let gx_nhwc = grads.get(x_nhwc.id()).unwrap().clone_result()?;
+    let gw_khwkicoc = grads.get(w_khwkicoc.id()).unwrap().clone_result()?;
+    let gb = grads.get(b.id()).unwrap().clone_result()?;
 
     // Backward: NCHW reference
-    let x2_nchw = x_nchw.clone()?.requires_grad_(true);
-    let w2_ocic = w_ocic.clone()?.requires_grad_(true);
-    let b2 = b.clone()?.requires_grad_(true);
+    let x2_nchw = x_nchw.clone_result()?.requires_grad_(true);
+    let w2_ocic = w_ocic.clone_result()?.requires_grad_(true);
+    let b2 = b.clone_result()?.requires_grad_(true);
     let y2_nchw = cuda_conv2d::CudaConv2d::conv2d_forward(&x2_nchw, &w2_ocic, Some(&b2), stride, padding, 1)?;
     let loss2 = y2_nchw.mean()?;
     let grads2 = AutogradContext::backward(&loss2)?;
-    let gx2_nchw = grads2.get(x2_nchw.id()).unwrap().clone()?;
-    let gw2_ocic = grads2.get(w2_ocic.id()).unwrap().clone()?;
-    let gb2 = grads2.get(b2.id()).unwrap().clone()?;
+    let gx2_nchw = grads2.get(x2_nchw.id()).unwrap().clone_result()?;
+    let gw2_ocic = grads2.get(w2_ocic.id()).unwrap().clone_result()?;
+    let gb2 = grads2.get(b2.id()).unwrap().clone_result()?;
 
     // Convert reference grads back to NHWC / [KH,KW,IC,OC]
     let gx2_nhwc = cuda_ops::GpuOps::permute_nchw_to_nhwc(&gx2_nchw)?;
@@ -65,4 +65,3 @@ fn conv2d_nhwc_forward_backward_parity() -> Result<()> {
 
     Ok(())
 }
-

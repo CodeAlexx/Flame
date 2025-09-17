@@ -1,4 +1,15 @@
-use crate::{Tensor, Shape, Result, FlameError};
+use crate::{Tensor, Shape, Result, FlameError, DType};
+const MASK_NEG: f32 = -1e4;
+
+#[inline]
+fn flash_env_enabled() -> bool {
+    std::env::var("FLAME_DISABLE_FLASH").map(|v| v != "1").unwrap_or(true)
+}
+
+#[inline]
+fn prefer_flash() -> bool {
+    cfg!(feature = "flash_attn") && flash_env_enabled()
+}
 use crate::linear::Linear;
 use std::sync::Arc;
 
@@ -227,6 +238,115 @@ impl MultiHeadAttention {
         
         Tensor::from_vec(result, tensor.shape().clone(), tensor.device.clone())
     }
+}
+
+// --- Stable SDPA/FlashAttention helpers (public) ---
+
+/// Validate Q/K/V basic shape relationships. For brevity, only dimensionality is checked here.
+fn validate_qkv(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<()> {
+    let qd = q.shape().dims();
+    let kd = k.shape().dims();
+    let vd = v.shape().dims();
+    if !(qd.len() == 4 && kd.len() == 4 && vd.len() == 4) {
+        return Err(FlameError::InvalidInput("Q,K,V must be [B,H,SEQ,D]".into()));
+    }
+    let (b, h, q_len, dq) = (qd[0], qd[1], qd[2], qd[3]);
+    let (bk, hk, k_len, dk) = (kd[0], kd[1], kd[2], kd[3]);
+    let (bv, hv, kv, dv) = (vd[0], vd[1], vd[2], vd[3]);
+    if !(b == bk && b == bv && h == hk && h == hv && dq == dk && dk == dv && k_len == kv) {
+        return Err(FlameError::InvalidInput("Q,K,V dimension mismatch".into()));
+    }
+    Ok(())
+}
+
+fn validate_qkv_shapes(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<(usize, usize, usize, usize, usize)> {
+    validate_qkv(q, k, v)?;
+    let qd = q.shape().dims();
+    Ok((qd[0], qd[1], qd[2], k.shape().dims()[2], qd[3]))
+}
+
+fn validate_mask_shape(mask: &Tensor, b: usize, h: usize, q_len: usize, k_len: usize) -> Result<()> {
+    let md = mask.shape().dims();
+    if md.len() != 4 {
+        return Err(FlameError::InvalidInput("Mask must be 4D: [B,H,Q,K] / [B,1,Q,K] / [1,1,Q,K]".into()));
+    }
+    let (mb, mh, mq, mk) = (md[0], md[1], md[2], md[3]);
+    let ok_b = mb == b || mb == 1;
+    let ok_h = mh == h || mh == 1;
+    let ok_q = mq == q_len;
+    let ok_k = mk == k_len;
+    if !(ok_b && ok_h && ok_q && ok_k) {
+        return Err(FlameError::InvalidInput("Mask dims must broadcast to [B,H,Q,K]".into()));
+    }
+    match mask.dtype() {
+        DType::Bool | DType::F32 | DType::F16 | DType::BF16 => Ok(()),
+        _ => Err(FlameError::InvalidInput("Mask dtype must be bool or float (additive)".into())),
+    }
+}
+
+fn ensure_fp32_compute(x: &Tensor) -> Result<Tensor> {
+    if matches!(x.dtype(), DType::BF16) { x.to_dtype(DType::F32) } else { x.clone_result() }
+}
+
+fn maybe_downcast_to_input_dtype(y: &Tensor, reference: &Tensor) -> Result<Tensor> {
+    if matches!(reference.dtype(), DType::BF16) { y.to_dtype(DType::BF16) } else { y.clone_result() }
+}
+
+/// Scaled dot-product attention with FP32 softmax/reductions. Accepts [B,H,S,D] tensors.
+pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    let (b, h, q_len, k_len, _d) = validate_qkv_shapes(q, k, v)?;
+    if let Some(m) = mask { validate_mask_shape(m, b, h, q_len, k_len)?; }
+    // Upcast compute to FP32 when inputs are BF16
+    let q32 = ensure_fp32_compute(q)?;
+    let k32 = ensure_fp32_compute(k)?;
+    let v32 = ensure_fp32_compute(v)?;
+    // logits = Q @ K^T / sqrt(D)
+    let kt = k32.transpose_dims(2, 3)?;
+    let mut logits = q32.bmm(&kt)?;
+    let d = q.shape().dims()[3] as f32;
+    logits = logits.mul_scalar(1.0 / d.sqrt())?;
+    // Build additive mask if provided
+    if let Some(m) = mask {
+        let add_mask = if matches!(m.dtype(), DType::Bool) {
+            m.to_dtype(DType::F32)?.mul_scalar(MASK_NEG)?
+        } else { ensure_fp32_compute(m)? };
+        logits = logits.add(&add_mask)?;
+    }
+    // Softmax along last dim
+    let attn = logits.softmax(-1)?;
+    let y = attn.bmm(&v32)?;
+    maybe_downcast_to_input_dtype(&y, q)
+}
+
+/// FlashAttention wrapper; computes in FP32 and casts to match Q input when needed.
+#[cfg(feature = "flash_attn")]
+pub fn flash_attn(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    let (b, h, q_len, k_len, _d) = validate_qkv_shapes(q, k, v)?;
+    if let Some(m) = mask { validate_mask_shape(m, b, h, q_len, k_len)?; }
+    let q32 = ensure_fp32_compute(q)?;
+    let k32 = ensure_fp32_compute(k)?;
+    let v32 = ensure_fp32_compute(v)?;
+    // Build additive FP32 mask if present
+    let add_mask_owned;
+    let add_mask_ref = if let Some(m) = mask {
+        add_mask_owned = if matches!(m.dtype(), DType::Bool) {
+            m.to_dtype(DType::F32)?.mul_scalar(MASK_NEG)?
+        } else { ensure_fp32_compute(m)? };
+        Some(&add_mask_owned)
+    } else { None };
+    let y = crate::flash_attention::flash_attention_forward(&q32, &k32, &v32, add_mask_ref, None, false)?;
+    maybe_downcast_to_input_dtype(&y, q)
+}
+
+/// Generic attend: prefer FlashAttention when feature enabled, else SDPA.
+pub fn attend(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    if prefer_flash() {
+        #[cfg(feature = "flash_attn")] 
+        {
+            if let Ok(y) = flash_attn(q, k, v, mask) { return Ok(y); }
+        }
+    }
+    sdpa(q, k, v, mask)
 }
 
 
@@ -611,4 +731,3 @@ impl LayerNorm {
         Tensor::from_vec(output, x.shape().clone(), x.device.clone())
     }
 }
-

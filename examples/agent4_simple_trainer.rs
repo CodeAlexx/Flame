@@ -92,7 +92,8 @@ fn main() -> Result<()> {
         for param in [&lora_down, &lora_up] {
             if let Some(grad) = grads.get(param.id()) {
                 // Attach gradient and apply SGD step
-                param.set_grad(grad.clone()?)?;
+                // Clone the gradient tensor (no fallible op here)
+                param.set_grad(grad.clone())?;
                 param.update(config.learning_rate)?;
                 updated += 1;
             }

@@ -59,7 +59,8 @@ impl Adam {
                 self.states.insert(*param_id, (zeros_m, zeros_v));
             }
             
-            let (momentum, variance) = self.states.get_mut(param_id).unwrap();
+            let (momentum, variance) = self.states.get_mut(param_id)
+                .ok_or_else(|| FlameError::Training("adam: state missing for parameter".into()))?;
             
             // Update biased first moment estimate
             // m_t = beta1 * m_{t-1} + (1 - beta1) * g_t
@@ -137,7 +138,7 @@ impl SGD {
     /// Update parameters using SGD algorithm
     pub fn step(&mut self, params: &mut [(usize, &mut Tensor, &Tensor)]) -> Result<()> {
         for (param_id, param, grad) in params {
-            let mut update = grad.clone()?;
+            let mut update = grad.clone_result()?;
             
             // Apply weight decay
             if self.config.weight_decay > 0.0 {
@@ -152,10 +153,11 @@ impl SGD {
                     self.states.insert(*param_id, zeros);
                 }
                 
-                let velocity = self.states.get_mut(param_id).unwrap();
+                let velocity = self.states.get_mut(param_id)
+                    .ok_or_else(|| FlameError::Training("sgd: velocity state missing".into()))?;
                 let new_velocity = velocity.mul_scalar(self.config.momentum)?
                     .add(&update)?;
-                *velocity = new_velocity.clone()?;
+                *velocity = new_velocity.clone_result()?;
                 
                 if self.config.nesterov {
                     // Nesterov momentum

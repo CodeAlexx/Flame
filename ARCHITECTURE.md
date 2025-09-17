@@ -4,7 +4,7 @@
 
 Flame Minimal is a GPU-first deep learning framework designed specifically for training large diffusion models (SDXL, Flux, SD3.5) with limited GPU memory. It addresses the fundamental limitations of existing frameworks:
 
-- **Candle**: Immutable tensors make training impossible
+- Legacy Rust DL framework: Immutable tensors hinder training flexibility
 - **Burn**: Too heavy and complex for production inference
 - **PyTorch**: Not Rust native, heavy dependencies
 

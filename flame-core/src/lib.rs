@@ -1,3 +1,4 @@
+
 /// Macro for launching CUDA kernels
 #[macro_export]
 macro_rules! launch_kernel {
@@ -12,12 +13,14 @@ pub mod error;
 pub mod shape;
 pub mod tensor_storage;
 pub mod tensor;
+pub mod tensor_narrow;
 pub mod gradient;
 pub mod memory_pool;
 pub mod device;
 pub mod linear;
 pub mod conv;
 pub mod cuda_conv2d;
+pub mod cuda;
 pub mod cuda_conv2d_direct;
 pub mod cuda_conv2d_fast;
 
@@ -38,6 +41,8 @@ pub mod cuda_kernels_gpu;
 pub mod cuda_kernel_sources;
 pub mod cuda_kernel_compiler;
 pub mod cuda_ops;
+pub mod blas;
+pub mod logging;
 // pub mod cuda_kernels_v2;  // Removed: experimental version
 pub mod cuda_conv2d_kernels;
 pub mod cuda_memory_alignment;
@@ -50,7 +55,7 @@ pub mod autograd;
 // pub mod autograd_engine;  // Using new autograd
 #[cfg(feature = "legacy")]
 #[path = "legacy/autograd_v2.rs"]
-pub mod autograd_v2;  // legacy
+// TEMP-REMOVE: pub mod autograd_v2;  // legacy
 pub mod autograd_v3;  // This is used
 #[cfg(feature = "legacy")]
 #[path = "legacy/autograd_simple.rs"]
@@ -69,14 +74,12 @@ pub mod upsampling;
 pub mod activations;
 pub mod image_ops_nhwc;
 pub mod vae;
-#[cfg(feature = "legacy")]
-#[path = "legacy/candle_interop.rs"]
-pub mod candle_interop;  // Interop utilities (legacy)
+// candle_interop removed: no Candle interop in Flame
 // Model-specific blocks removed - these belong in the application layer, not the framework
 // pub mod modulated_blocks;  // Removed: model-specific
 // pub mod flux_blocks;  // Removed: model-specific
 // pub mod mmdit_blocks;  // Removed: model-specific
-// pub mod eridiffusion_adapter;  // Temporarily disable due to candle_interop dependency
+// eridiffusion_adapter removed: depended on Candle interop
 #[cfg(feature = "legacy")]
 #[path = "legacy/conv3d.rs"]
 pub mod conv3d;
@@ -87,6 +90,18 @@ pub mod fused_kernels;
 pub mod samplers;
 // pub mod tokenizer;  // Removed: model-specific
 pub mod fp16;
+#[cfg(feature = "bf16_u16")]
+pub mod bf16_ops;
+#[cfg(feature = "bf16_u16")]
+pub mod bf16_convert;
+#[cfg(feature = "bf16_u16")]
+pub mod bf16_factories;
+#[cfg(feature = "bf16_u16")]
+pub mod bf16_clamp;
+#[cfg(feature = "bf16_u16")]
+pub mod bf16_normal;
+#[cfg(feature = "bf16_u16")]
+pub mod bf16_elementwise;
 #[cfg(feature = "legacy")]
 #[path = "legacy/kernel_launcher.rs"]
 pub mod kernel_launcher;
@@ -105,6 +120,7 @@ pub mod sage_attention;
 pub use config::{FlameConfig, should_use_cudnn, set_force_cudnn, default_dtype, set_default_dtype};
 pub use dtype::DType;
 pub use error::{FlameError, Result};
+pub use error::FlameError as Error;
 pub use shape::{Shape, D};
 pub use tensor::{Tensor, TensorId};
 pub use autograd::{AutogradContext, Op};

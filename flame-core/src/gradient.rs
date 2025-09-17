@@ -85,7 +85,9 @@ impl GradientMap {
             let zeros = Tensor::zeros_dtype(shape, DType::F32, self.device.clone())?;
             self.gradients.insert(id, zeros);
         }
-        Ok(self.gradients.get_mut(&id).unwrap())
+        self.gradients
+            .get_mut(&id)
+            .ok_or_else(|| crate::FlameError::InvalidOperation("gradient missing after insert".into()))
     }
     
     /// Take gradient (remove from map)

@@ -276,7 +276,7 @@ where
     
     /// Forward pass with checkpointing
     pub fn forward(&self, inputs: &[Tensor]) -> Result<Vec<Tensor>> {
-        let mut manager = CHECKPOINT_MANAGER.lock().unwrap();
+        let mut manager = CHECKPOINT_MANAGER.lock().map_err(|_| FlameError::Training("checkpoint manager mutex poisoned".into()))?;
         
         // Store input shapes and device info for recomputation
         let input_info: Vec<(Shape, Arc<CudaDevice>)> = inputs.iter()
@@ -307,8 +307,9 @@ pub fn enable_gradient_checkpointing<M>(model: &mut M, policy: CheckpointPolicy)
 where
     M: CheckpointableModel,
 {
-    let mut manager = CHECKPOINT_MANAGER.lock().unwrap();
-    manager.set_policy(policy);
+    if let Ok(mut manager) = CHECKPOINT_MANAGER.lock() {
+        manager.set_policy(policy);
+    }
     model.enable_checkpointing();
 }
 

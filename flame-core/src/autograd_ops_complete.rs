@@ -40,7 +40,7 @@ pub fn layer_norm_backward(
     let grad_out_scaled = if let Some(w) = weight {
         grad_output.mul(w)?
     } else {
-        grad_output.clone()?
+        grad_output.clone_result()?
     };
     
     // Compute grad w.r.t normalized input
@@ -52,7 +52,7 @@ pub fn layer_norm_backward(
     
     // Compute intermediate values for input gradient
     // Sum over normalized dimensions
-    let mut mean_grad_normalized = grad_normalized.clone()?;
+    let mut mean_grad_normalized = grad_normalized.clone_result()?;
     for i in 0..normalized_shape.len() {
         let dim = ndim - normalized_shape.len() + i;
         mean_grad_normalized = mean_grad_normalized.sum_keepdim(dim as isize)?;
@@ -156,7 +156,7 @@ pub fn batch_norm_backward(
     let grad_out_scaled = if let Some(w) = weight {
         grad_output.mul(w)?
     } else {
-        grad_output.clone()?
+        grad_output.clone_result()?
     };
     
     // Intermediate computations
@@ -225,7 +225,7 @@ pub fn dropout_backward(
     training: bool,
 ) -> Result<Tensor> {
     if !training || dropout_prob == 0.0 {
-        return Ok(grad_output.clone()?);
+        return Ok(grad_output.clone_result()?);
     }
     
     // Scale by keep probability and apply mask
@@ -238,26 +238,39 @@ pub fn gelu_backward(
     grad_output: &Tensor,
     input: &Tensor,
 ) -> Result<Tensor> {
-    // GELU(x) = 0.5 * x * (1 + erf(x/sqrt(2)))
-    // GELU'(x) = 0.5 * (1 + erf(x/sqrt(2))) + x * pdf(x/sqrt(2)) / sqrt(2)
-    
-    let sqrt_2 = std::f32::consts::SQRT_2;
-    let x_scaled = input.div_scalar(sqrt_2)?;
-    
-    // Compute erf term with clamping for stability
-    let erf_term = x_scaled.erf()?;
-    
-    // Compute PDF term: exp(-0.5 * x^2) / sqrt(2*pi)
-    let neg_half_x_sq = x_scaled.square()?.mul_scalar(-0.5)?;
-    let pdf_term = neg_half_x_sq.exp()?.div_scalar((2.0 * std::f32::consts::PI).sqrt())?;
-    
-    // Compute derivative with numerical stability
-    let deriv_term1 = erf_term.add_scalar(1.0)?.mul_scalar(0.5)?;
-    let deriv_term2 = input.mul(&pdf_term)?.div_scalar(sqrt_2)?;
-    let derivative = deriv_term1.add(&deriv_term2)?
-        .clamp(1e-7, 1e7)?;  // Prevent numerical issues
-    
-    grad_output.mul(&derivative)
+    // Optional ultra-fast path: passthrough derivative (for debugging freezes)
+    if std::env::var("GELU_BWD_FAST").ok().as_deref() == Some("1") {
+        return grad_output.clone_result();
+    }
+    // Use the tanh-based GELU approximation derivative to avoid exp/erf kernels in backward.
+    // gelu(x) ≈ 0.5 x (1 + tanh(√(2/π)(x + 0.044715 x^3)))
+    // d/dx gelu(x) ≈ 0.5 (1 + t) + 0.5 x (1 - t^2) * √(2/π) * (1 + 3*0.044715 x^2), where t = tanh(…)
+    let c = 0.79788456f32; // √(2/π)
+    let k = 0.044715f32;
+
+    let x = input;
+    let x2 = x.square()?;                    // x^2
+    let x3 = x.mul(&x2)?;                    // x^3
+    let inner = x.add(&x3.affine(k, 0.0)?)?; // x + k*x^3
+    let inner = inner.mul_scalar(c)?;        // c*(x + k x^3)
+    // Rational tanh approximation: tanh(z) ≈ z * (27 + z^2) / (27 + 9 z^2)
+    let z2 = inner.square()?;
+    let num = inner.mul(&z2.add_scalar(27.0)?)?;
+    let den = z2.mul_scalar(9.0)?.add_scalar(27.0)?;
+    let t = num.div(&den)?;
+
+    let one = t.mul_scalar(0.0)?.add_scalar(1.0)?; // scalar 1 on device
+    let term1 = t.add_scalar(1.0)?.mul_scalar(0.5)?; // 0.5*(1+t)
+
+    let sech2 = one.sub(&t.square()?)?;             // 1 - t^2
+    let poly = x2.affine(3.0 * k, 1.0)?;            // 1 + 3k x^2
+    let term2 = x
+        .mul(&sech2)?
+        .mul_scalar(0.5 * c)?
+        .mul(&poly)?;                                // 0.5*x*(1 - t^2)*c*(1+3k x^2)
+
+    let deriv = term1.add(&term2)?;
+    grad_output.mul(&deriv)
 }
 
 /// Compute gradients for SiLU (Swish) operation
@@ -272,7 +285,7 @@ pub fn silu_backward(
     let one_minus_sigmoid = sigmoid.neg()?.add_scalar(1.0)?;
     
     // Compute derivative with stability
-    let term1 = sigmoid.clone()?;
+    let term1 = sigmoid.clone_result()?;
     let term2 = input.mul(&sigmoid)?.mul(&one_minus_sigmoid)?;
     let derivative = term1.add(&term2)?
         .clamp(1e-7, 1e7)?;  // Prevent numerical issues
@@ -314,7 +327,7 @@ pub fn broadcast_backward(
     let ndim_diff = output_shape.len() - original_shape.len();
     
     // Sum over broadcasted dimensions
-    let mut grad = grad_output.clone()?;
+    let mut grad = grad_output.clone_result()?;
     
     // First, sum over extra leading dimensions
     for _ in 0..ndim_diff {
@@ -339,11 +352,11 @@ pub fn reduce_grad_to_shape(
     let grad_shape = grad.shape().dims();
     
     if grad_shape == target_shape {
-        return Ok(grad.clone()?);
+        return Ok(grad.clone_result()?);
     }
     
     // Determine which dimensions to reduce
-    let mut result = grad.clone()?;
+    let mut result = grad.clone_result()?;
     
     // Handle different number of dimensions
     let offset = grad_shape.len().saturating_sub(target_shape.len());
@@ -434,7 +447,7 @@ impl Tensor {
         // Preserve gradient tracking
         if self.requires_grad {
             // Record clamp operation for autograd
-            let saved_tensors = vec![(self.id, self.clone()?)];
+            let saved_tensors = vec![(self.id, self.clone_result()? )];
             crate::autograd::AutogradContext::record_op(
                 result.id,
                 Op::Clamp { input: self.id, min, max },
@@ -518,9 +531,7 @@ pub fn group_norm_backward(
     // Create dummy tensor for None cases
     let dummy = crate::tensor::alloc_zeros_from_pool(&input.device, 1)?;
     
-    let weight_ptr = weight
-        .map(|w| w.storage.as_slice())
-        .unwrap_or(&dummy);
+    let weight_ptr = if let Some(w) = weight { w.storage.try_as_slice_f32()? } else { &dummy };
     
     let grad_weight_ptr = grad_weight_data.as_ref()
         .map(|d| d as &_)
@@ -532,10 +543,10 @@ pub fn group_norm_backward(
     let dims3 = ((spatial_size as i32) << 1) | (weight.is_some() as i32);
     
     launch_kernel!(f, cfg,
-        grad_output.storage.as_slice(),
-        input.storage.as_slice(),
-        mean.storage.as_slice(),
-        var.storage.as_slice(),
+        grad_output.storage.try_as_slice_f32()?,
+        input.storage.try_as_slice_f32()?,
+        mean.storage.try_as_slice_f32()?,
+        var.storage.try_as_slice_f32()?,
         weight_ptr,
         &grad_input_data,
         grad_weight_ptr,

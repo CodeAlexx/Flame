@@ -114,7 +114,7 @@ pub fn cast_tensor(tensor: &Tensor, target_dtype: DType) -> Result<Tensor> {
         }
         DType::F32 => {
             // Already F32
-            Ok(tensor.clone()?)
+            Ok(tensor.clone_result()?)
         }
         _ => Err(FlameError::InvalidOperation(
             format!("Unsupported dtype for casting: {:?}", target_dtype)
@@ -218,7 +218,7 @@ impl<O> FP16Optimizer<O> {
         
         for param in params {
             // Keep FP32 master copy
-            fp32_params.push(param.clone()?);
+            fp32_params.push(param.clone_result()?);
             
             // Create FP16 version
             let fp16_param = cast_tensor(&param, DType::F16)?;

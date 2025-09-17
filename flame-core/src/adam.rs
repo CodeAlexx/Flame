@@ -70,8 +70,10 @@ impl Adam {
                 }
                 
                 // Get momentum buffers
-                let m = self.m.get_mut(&param_id).unwrap();
-                let v = self.v.get_mut(&param_id).unwrap();
+                let m = self.m.get_mut(&param_id)
+                    .ok_or_else(|| FlameError::Training("optimizer m state missing".into()))?;
+                let v = self.v.get_mut(&param_id)
+                    .ok_or_else(|| FlameError::Training("optimizer v state missing".into()))?;
                 
                 // Update biased first moment: m_t = β1 * m_{t-1} + (1 - β1) * g_t
                 *m = m.mul_scalar(self.beta1)?.add(&grad.mul_scalar(1.0 - self.beta1)?)?;

@@ -43,14 +43,14 @@ impl CudaKernels {
         fn compile_and_load_kernel(device: &Arc<CudaDevice>, source: &str, kernel_name: &'static str) -> Result<CudaFunction> {
             // Compile the kernel
             let ptx = compile_ptx(source)
-                .map_err(|e| FlameError::KernelError(format!("Failed to compile {}: {:?}", kernel_name, e)))?;
+                .map_err(|e| FlameError::Cuda(format!("Failed to compile {}: {:?}", kernel_name, e)))?;
             
             // Load the PTX module
             device.load_ptx(ptx, kernel_name, &[kernel_name])?;
             
             // Get the function
             device.get_func(kernel_name, kernel_name)
-                .ok_or_else(|| FlameError::KernelError(format!("Failed to get function {}", kernel_name)))
+                .ok_or_else(|| FlameError::Cuda(format!("Failed to get function {}", kernel_name)))
         }
         
         // Compile all kernels
@@ -91,21 +91,35 @@ impl CudaKernels {
         
         Ok(Self { device, kernels })
     }
+
+    /// Elementwise add with stride-based broadcasting (delegates to GPU helper)
+    pub fn add_bc(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        crate::cuda_kernels_gpu::CudaKernels::add_bc(a, b)
+    }
+
+    /// Elementwise mul with stride-based broadcasting (delegates to GPU helper)
+    pub fn mul_bc(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        crate::cuda_kernels_gpu::CudaKernels::mul_bc(a, b)
+    }
     
-    /// Element-wise addition kernel
+    /// Element-wise addition kernel (rank-safe broadcasting)
     pub fn add(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        if a.shape != b.shape {
-            return Err(FlameError::ShapeMismatch {
-                expected: a.shape.clone(),
-                got: b.shape.clone(),
-            });
-        }
+        // Normalize via broadcast if shapes differ (NumPy semantics)
+        let (a_t, b_t) = if a.shape != b.shape {
+            let target = a.shape.broadcast_shape_binary_op(&b.shape)?;
+            // Use CPU-safe broadcast to handle rank differences robustly
+            let a_bc = if &a.shape != &target { crate::cuda_kernels::CudaKernels::broadcast(a, &target)? } else { a.clone_result()? };
+            let b_bc = if &b.shape != &target { crate::cuda_kernels::CudaKernels::broadcast(b, &target)? } else { b.clone_result()? };
+            (a_bc, b_bc)
+        } else {
+            (a.clone_result()?, b.clone_result()?)
+        };
         
-        let mut output = Tensor::zeros(a.shape.clone(), a.device.clone())?;
-        let n = a.shape.elem_count();
+        let mut output = Tensor::zeros(a_t.shape.clone(), a_t.device.clone())?;
+        let n = a_t.shape.elem_count();
         
         let kernel = self.kernels.get("add_kernel")
-            .ok_or_else(|| FlameError::KernelError("add_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("add_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -117,26 +131,29 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, a.storage.as_slice(), b.storage.as_slice(), output.storage.as_slice(), n as u32)?;
+        launch_kernel!(kernel, config, a_t.storage.try_as_slice_f32()?, b_t.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
     }
     
-    /// Element-wise multiplication kernel
+    /// Element-wise multiplication kernel (rank-safe broadcasting)
     pub fn mul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        if a.shape != b.shape {
-            return Err(FlameError::ShapeMismatch {
-                expected: a.shape.clone(),
-                got: b.shape.clone(),
-            });
-        }
+        // Normalize via broadcast if shapes differ (NumPy semantics)
+        let (a_t, b_t) = if a.shape != b.shape {
+            let target = a.shape.broadcast_shape_binary_op(&b.shape)?;
+            let a_bc = if &a.shape != &target { crate::cuda_kernels::CudaKernels::broadcast(a, &target)? } else { a.clone_result()? };
+            let b_bc = if &b.shape != &target { crate::cuda_kernels::CudaKernels::broadcast(b, &target)? } else { b.clone_result()? };
+            (a_bc, b_bc)
+        } else {
+            (a.clone_result()?, b.clone_result()?)
+        };
         
-        let mut output = Tensor::zeros(a.shape.clone(), a.device.clone())?;
-        let n = a.shape.elem_count();
+        let mut output = Tensor::zeros(a_t.shape.clone(), a_t.device.clone())?;
+        let n = a_t.shape.elem_count();
         
         let kernel = self.kernels.get("mul_kernel")
-            .ok_or_else(|| FlameError::KernelError("mul_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("mul_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -148,7 +165,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, a.storage.as_slice(), b.storage.as_slice(), output.storage.as_slice(), n as u32)?;
+        launch_kernel!(kernel, config, a_t.storage.try_as_slice_f32()?, b_t.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -160,7 +177,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         let kernel = self.kernels.get("mul_scalar_kernel")
-            .ok_or_else(|| FlameError::KernelError("mul_scalar_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("mul_scalar_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -172,7 +189,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), scalar, output.storage.as_slice(), n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, scalar, output.storage.try_as_slice_f32()?, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -184,7 +201,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         let kernel = self.kernels.get("add_scalar_kernel")
-            .ok_or_else(|| FlameError::KernelError("add_scalar_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("add_scalar_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -196,7 +213,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), scalar, output.storage.as_slice(), n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, scalar, output.storage.try_as_slice_f32()?, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -208,7 +225,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         let kernel = self.kernels.get("relu_kernel")
-            .ok_or_else(|| FlameError::KernelError("relu_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("relu_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -220,7 +237,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -232,7 +249,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         let kernel = self.kernels.get("sigmoid_kernel")
-            .ok_or_else(|| FlameError::KernelError("sigmoid_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("sigmoid_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -244,7 +261,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -256,7 +273,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         let kernel = self.kernels.get("gelu_kernel")
-            .ok_or_else(|| FlameError::KernelError("gelu_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("gelu_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -268,7 +285,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -280,7 +297,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         let kernel = self.kernels.get("silu_kernel")
-            .ok_or_else(|| FlameError::KernelError("silu_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("silu_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -292,7 +309,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -304,7 +321,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         let kernel = self.kernels.get("tanh_kernel")
-            .ok_or_else(|| FlameError::KernelError("tanh_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("tanh_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -316,7 +333,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -330,7 +347,7 @@ impl CudaKernels {
         let output_data = crate::tensor::alloc_zeros_from_pool(&self.device, 1)?;
         
         let kernel = self.kernels.get("sum_kernel")
-            .ok_or_else(|| FlameError::KernelError("sum_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("sum_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -342,7 +359,7 @@ impl CudaKernels {
             shared_mem_bytes: (block_size * 4) as u32,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), &output_data, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, &output_data, n as u32)?;
         
         self.device.synchronize()?;
         
@@ -459,7 +476,7 @@ impl CudaKernels {
         let mut output = Tensor::zeros(Shape::from_dims(&[cols, rows]), tensor.device.clone())?;
         
         let kernel = self.kernels.get("transpose_kernel")
-            .ok_or_else(|| FlameError::KernelError("transpose_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("transpose_kernel not found".into()))?
             .clone();
         
         let block_size = 16;
@@ -472,7 +489,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), rows as u32, cols as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, rows as u32, cols as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -487,11 +504,11 @@ impl CudaKernels {
             });
         }
         
-        let output = weights.clone()?;
+        let output = weights.clone_result()?;
         let n = weights.shape.elem_count();
         
         let kernel = self.kernels.get("update_weights_kernel")
-            .ok_or_else(|| FlameError::KernelError("update_weights_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("update_weights_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -503,7 +520,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, output.storage.as_slice(), gradients.storage.as_slice(), lr, n as u32)?;
+        launch_kernel!(kernel, config, output.storage.try_as_slice_f32()?, gradients.storage.try_as_slice_f32()?, lr, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -515,7 +532,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         let kernel = self.kernels.get("leaky_relu_kernel")
-            .ok_or_else(|| FlameError::KernelError("leaky_relu_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("leaky_relu_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -527,7 +544,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), negative_slope, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, negative_slope, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -538,7 +555,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         let kernel = self.kernels.get("elu_kernel")
-            .ok_or_else(|| FlameError::KernelError("elu_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("elu_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -550,7 +567,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), alpha, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, alpha, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -566,7 +583,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         let kernel = self.kernels.get("pow_kernel")
-            .ok_or_else(|| FlameError::KernelError("pow_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("pow_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -578,7 +595,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), exponent, n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, exponent, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -589,7 +606,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         let kernel = self.kernels.get("sin_kernel")
-            .ok_or_else(|| FlameError::KernelError("sin_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("sin_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -601,7 +618,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -612,7 +629,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         let kernel = self.kernels.get("cos_kernel")
-            .ok_or_else(|| FlameError::KernelError("cos_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("cos_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -624,7 +641,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -635,7 +652,7 @@ impl CudaKernels {
         let n = tensor.shape.elem_count();
         
         let kernel = self.kernels.get("sqrt_kernel")
-            .ok_or_else(|| FlameError::KernelError("sqrt_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("sqrt_kernel not found".into()))?
             .clone();
         
         let block_size = 256;
@@ -647,7 +664,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         
-        launch_kernel!(kernel, config, tensor.storage.as_slice(), output.storage.as_slice(), n as u32)?;
+        launch_kernel!(kernel, config, tensor.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, n as u32)?;
         
         self.device.synchronize()?;
         Ok(output)
@@ -812,7 +829,7 @@ impl CudaKernels {
     /// Broadcast tensor to a new shape
     pub fn broadcast(input: &Tensor, target_shape: &Shape) -> Result<Tensor> {
         if input.shape == *target_shape {
-            return Ok(input.clone()?);
+            return Ok(input.clone_result()?);
         }
         
         let input_dims = input.shape.dims();
@@ -868,7 +885,7 @@ impl CudaKernels {
         
         // Compile the kernel
         let ptx = compile_ptx(kernel_code)
-            .map_err(|e| FlameError::KernelError(format!("Failed to compile {}: {:?}", kernel_name, e)))?;
+            .map_err(|e| FlameError::Cuda(format!("Failed to compile {}: {:?}", kernel_name, e)))?;
         
         // Use Box::leak to get 'static lifetime for kernel names
         let kernel_name_static = Box::leak(kernel_name.to_string().into_boxed_str());
@@ -891,12 +908,12 @@ impl CudaKernels {
         let mut output = Tensor::zeros(a.shape.clone(), a.device.clone())?;
         let n = a.shape.elem_count();
         let kernel = self.kernels.get("div_kernel")
-            .ok_or_else(|| FlameError::KernelError("div_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("div_kernel not found".into()))?
             .clone();
         let block_size = 256usize;
         let grid_size = (n + block_size - 1) / block_size;
         let cfg = LaunchConfig { grid_dim: (grid_size as u32,1,1), block_dim: (block_size as u32,1,1), shared_mem_bytes: 0 };
-        launch_kernel!(kernel, cfg, a.storage.as_slice(), b.storage.as_slice(), output.storage.as_slice(), n as u32)?;
+        launch_kernel!(kernel, cfg, a.storage.try_as_slice_f32()?, b.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, n as u32)?;
         self.device.synchronize()?;
         Ok(output)
     }
@@ -981,8 +998,8 @@ extern "C" __global__ void max_dim_keepdim_kernel(
 
         let cfg = LaunchConfig::for_num_elems(out_elems as u32);
         launch_kernel!(f, cfg,
-            tensor.storage.as_slice(),
-            out.storage.as_slice(),
+            tensor.storage.try_as_slice_f32()?,
+            out.storage.try_as_slice_f32()?,
             &dims_gpu,
             dims.len() as i32,
             dim as i32,
@@ -1024,13 +1041,13 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let mut out = Tensor::zeros(Shape::from_dims(&out_shape), tensor.device.clone())?;
 
         let kernel = self.kernels.get("sum_dim_keepdim_kernel")
-            .ok_or_else(|| FlameError::KernelError("sum_dim_keepdim_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("sum_dim_keepdim_kernel not found".into()))?
             .clone();
 
         let cfg = LaunchConfig::for_num_elems(out_elems as u32);
         launch_kernel!(kernel, cfg,
-            tensor.storage.as_slice(),
-            out.storage.as_slice(),
+            tensor.storage.try_as_slice_f32()?,
+            out.storage.try_as_slice_f32()?,
             &dims_gpu,
             dims.len() as i32,
             dim as i32,
@@ -1056,10 +1073,10 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let mut output = Tensor::zeros(a.shape.clone(), a.device.clone())?;
         let n = a.shape.elem_count();
         let kernel = self.kernels.get("max_elemwise_kernel")
-            .ok_or_else(|| FlameError::KernelError("max_elemwise_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("max_elemwise_kernel not found".into()))?
             .clone();
         let cfg = LaunchConfig::for_num_elems(n as u32);
-        launch_kernel!(kernel, cfg, a.storage.as_slice(), b.storage.as_slice(), output.storage.as_slice(), n as i32)?;
+        launch_kernel!(kernel, cfg, a.storage.try_as_slice_f32()?, b.storage.try_as_slice_f32()?, output.storage.try_as_slice_f32()?, n as i32)?;
         self.device.synchronize()?;
         Ok(output)
     }
@@ -1071,9 +1088,9 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let output_shape = Shape::from_dims(&[n, out_h, out_w, c]);
         let total = n * out_h * out_w * c;
         let mut out = Tensor::zeros(output_shape, input.device.clone())?;
-        let k = self.kernels.get("resize_bilinear_nhwc_kernel").ok_or_else(|| FlameError::KernelError("resize_bilinear_nhwc_kernel not found".into()))?.clone();
+        let k = self.kernels.get("resize_bilinear_nhwc_kernel").ok_or_else(|| FlameError::Cuda("resize_bilinear_nhwc_kernel not found".into()))?.clone();
         let cfg = LaunchConfig::for_num_elems(total as u32);
-        launch_kernel!(k, cfg, input.storage.as_slice(), out.storage.as_slice(), n as i32, h as i32, w as i32, c as i32, out_h as i32, out_w as i32, if align_corners {1} else {0})?;
+        launch_kernel!(k, cfg, input.storage.try_as_slice_f32()?, out.storage.try_as_slice_f32()?, n as i32, h as i32, w as i32, c as i32, out_h as i32, out_w as i32, if align_corners {1} else {0})?;
         self.device.synchronize()?;
         Ok(out)
     }
@@ -1088,9 +1105,9 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let output_shape = Shape::from_dims(&[n, tgt_h, tgt_w, c]);
         let total = n * tgt_h * tgt_w * c;
         let mut out = Tensor::zeros(output_shape, input.device.clone())?;
-        let k = self.kernels.get("center_crop_nhwc_kernel").ok_or_else(|| FlameError::KernelError("center_crop_nhwc_kernel not found".into()))?.clone();
+        let k = self.kernels.get("center_crop_nhwc_kernel").ok_or_else(|| FlameError::Cuda("center_crop_nhwc_kernel not found".into()))?.clone();
         let cfg = LaunchConfig::for_num_elems(total as u32);
-        launch_kernel!(k, cfg, input.storage.as_slice(), out.storage.as_slice(), n as i32, h as i32, w as i32, c as i32, y0, x0, tgt_h as i32, tgt_w as i32)?;
+        launch_kernel!(k, cfg, input.storage.try_as_slice_f32()?, out.storage.try_as_slice_f32()?, n as i32, h as i32, w as i32, c as i32, y0, x0, tgt_h as i32, tgt_w as i32)?;
         self.device.synchronize()?;
         Ok(out)
     }
@@ -1108,9 +1125,9 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let output_shape = input.shape.clone();
         let total = n * h * w * c;
         let mut out = Tensor::zeros(output_shape, input.device.clone())?;
-        let k = self.kernels.get("normalize_nhwc_kernel").ok_or_else(|| FlameError::KernelError("normalize_nhwc_kernel not found".into()))?.clone();
+        let k = self.kernels.get("normalize_nhwc_kernel").ok_or_else(|| FlameError::Cuda("normalize_nhwc_kernel not found".into()))?.clone();
         let cfg = LaunchConfig::for_num_elems(total as u32);
-        launch_kernel!(k, cfg, input.storage.as_slice(), out.storage.as_slice(), &mean_gpu, &inv_gpu, n as i32, h as i32, w as i32, c as i32)?;
+        launch_kernel!(k, cfg, input.storage.try_as_slice_f32()?, out.storage.try_as_slice_f32()?, &mean_gpu, &inv_gpu, n as i32, h as i32, w as i32, c as i32)?;
         self.device.synchronize()?;
         Ok(out)
     }
@@ -1134,7 +1151,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let mut output = Tensor::zeros(output_shape, tensor.device.clone())?;
         
         let kernel = self.kernels.get("permute_nhwc_to_nchw_kernel")
-            .ok_or_else(|| FlameError::KernelError("permute_nhwc_to_nchw_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("permute_nhwc_to_nchw_kernel not found".into()))?
             .clone();
         
         let total_elements = tensor.shape.elem_count();
@@ -1150,8 +1167,8 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         launch_kernel!(
             kernel, 
             config, 
-            tensor.storage.as_slice(), 
-            output.storage.as_slice(), 
+            tensor.storage.try_as_slice_f32()?, 
+            output.storage.try_as_slice_f32()?, 
             batch as u32,
             height as u32,
             width as u32,
@@ -1174,7 +1191,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let output_shape = Shape::from_dims(&[batch, height, width, channels]);
         let mut output = Tensor::zeros(output_shape, tensor.device.clone())?;
         let kernel = self.kernels.get("permute_nchw_to_nhwc_kernel")
-            .ok_or_else(|| FlameError::KernelError("permute_nchw_to_nhwc_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("permute_nchw_to_nhwc_kernel not found".into()))?
             .clone();
         let total_elements = tensor.shape.elem_count();
         let block_size = 256;
@@ -1183,8 +1200,8 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         launch_kernel!(
             kernel, 
             config, 
-            tensor.storage.as_slice(), 
-            output.storage.as_slice(), 
+            tensor.storage.try_as_slice_f32()?, 
+            output.storage.try_as_slice_f32()?, 
             batch as u32,
             channels as u32,
             height as u32,
@@ -1201,11 +1218,11 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let (kh, kw, ic, oc) = (d[0], d[1], d[2], d[3]);
         let mut out = Tensor::zeros(Shape::from_dims(&[oc, ic, kh, kw]), w.device.clone())?;
         let k = self.kernels.get("permute_w_khwkicoc_to_ocickhkw")
-            .ok_or_else(|| FlameError::KernelError("permute_w_khwkicoc_to_ocickhkw not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("permute_w_khwkicoc_to_ocickhkw not found".into()))?
             .clone();
         let total = (kh * kw * ic * oc) as u32;
         let cfg = LaunchConfig::for_num_elems(total);
-        launch_kernel!(k, cfg, w.storage.as_slice(), out.storage.as_slice(), kh as i32, kw as i32, ic as i32, oc as i32)?;
+        launch_kernel!(k, cfg, w.storage.try_as_slice_f32()?, out.storage.try_as_slice_f32()?, kh as i32, kw as i32, ic as i32, oc as i32)?;
         self.device.synchronize()?;
         Ok(out)
     }
@@ -1217,11 +1234,11 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let (oc, ic, kh, kw) = (d[0], d[1], d[2], d[3]);
         let mut out = Tensor::zeros(Shape::from_dims(&[kh, kw, ic, oc]), w.device.clone())?;
         let k = self.kernels.get("permute_w_ocickhkw_to_khwkicoc")
-            .ok_or_else(|| FlameError::KernelError("permute_w_ocickhkw_to_khwkicoc not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("permute_w_ocickhkw_to_khwkicoc not found".into()))?
             .clone();
         let total = (kh * kw * ic * oc) as u32;
         let cfg = LaunchConfig::for_num_elems(total);
-        launch_kernel!(k, cfg, w.storage.as_slice(), out.storage.as_slice(), oc as i32, ic as i32, kh as i32, kw as i32)?;
+        launch_kernel!(k, cfg, w.storage.try_as_slice_f32()?, out.storage.try_as_slice_f32()?, oc as i32, ic as i32, kh as i32, kw as i32)?;
         self.device.synchronize()?;
         Ok(out)
     }
@@ -1231,10 +1248,10 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let mut out = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
         let n = tensor.shape.elem_count();
         let kernel = self.kernels.get("exp_kernel")
-            .ok_or_else(|| FlameError::KernelError("exp_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("exp_kernel not found".into()))?
             .clone();
         let cfg = LaunchConfig::for_num_elems(n as u32);
-        launch_kernel!(kernel, cfg, tensor.storage.as_slice(), out.storage.as_slice(), n as i32)?;
+        launch_kernel!(kernel, cfg, tensor.storage.try_as_slice_f32()?, out.storage.try_as_slice_f32()?, n as i32)?;
         self.device.synchronize()?;
         Ok(out)
     }
@@ -1244,10 +1261,10 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let mut out = Tensor::zeros(tensor.shape.clone(), tensor.device.clone())?;
         let n = tensor.shape.elem_count();
         let kernel = self.kernels.get("log_kernel")
-            .ok_or_else(|| FlameError::KernelError("log_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("log_kernel not found".into()))?
             .clone();
         let cfg = LaunchConfig::for_num_elems(n as u32);
-        launch_kernel!(kernel, cfg, tensor.storage.as_slice(), out.storage.as_slice(), n as i32)?;
+        launch_kernel!(kernel, cfg, tensor.storage.try_as_slice_f32()?, out.storage.try_as_slice_f32()?, n as i32)?;
         self.device.synchronize()?;
         Ok(out)
     }
@@ -1280,7 +1297,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let d_out_strides = unsafe { self.device.alloc::<i32>(out_strides.len()) }?; self.device.htod_copy_into(out_strides.clone(), &mut {let mut x = d_out_strides.clone(); x})?;
 
         let kernel = self.kernels.get("index_select_kernel")
-            .ok_or_else(|| FlameError::KernelError("index_select_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("index_select_kernel not found".into()))?
             .clone();
 
         let numel = out_shape_s.elem_count();
@@ -1291,9 +1308,9 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         launch_kernel!(
             kernel,
             cfg,
-            tensor.storage.as_slice(),
-            indices.storage.as_slice(),
-            output.storage.as_slice(),
+            tensor.storage.try_as_slice_f32()?,
+            indices.storage.try_as_slice_f32()?,
+            output.storage.try_as_slice_f32()?,
             ndim,
             &d_in_dims,
             &d_out_dims,
@@ -1332,7 +1349,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let d_starts = unsafe { self.device.alloc::<i32>(starts.len()) }?; self.device.htod_copy_into(starts.clone(), &mut {let mut x = d_starts.clone(); x})?;
 
         let kernel = self.kernels.get("slice_kernel")
-            .ok_or_else(|| FlameError::KernelError("slice_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("slice_kernel not found".into()))?
             .clone();
         let numel = out_s.elem_count();
         let block = 256usize; let grid = (numel + block - 1)/block;
@@ -1341,8 +1358,8 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         launch_kernel!(
             kernel,
             cfg,
-            tensor.storage.as_slice(),
-            output.storage.as_slice(),
+            tensor.storage.try_as_slice_f32()?,
+            output.storage.try_as_slice_f32()?,
             shape.len() as i32,
             &d_in_strides,
             &d_out_strides,
@@ -1441,7 +1458,7 @@ pub fn scatter_add(
 /// This is used by other modules that generating custom kernels
 pub fn compile_kernel(kernel_name: &str, kernel_code: &str) -> Result<Vec<u8>> {
     let ptx = compile_ptx(kernel_code)
-        .map_err(|e| FlameError::KernelError(format!("Failed to compile {}: {:?}", kernel_name, e)))?;
+        .map_err(|e| FlameError::Cuda(format!("Failed to compile {}: {:?}", kernel_name, e)))?;
     // PTX is already a compiled binary, we can't extract bytes from it
     // For now, return an error as this function isn't used
     Err(FlameError::InvalidOperation("Cannot extract bytes from compiled PTX".into()))

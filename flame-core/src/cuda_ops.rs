@@ -20,7 +20,9 @@ impl GpuOps {
     /// Get or create CudaKernels instance for a device
     fn get_kernels(device: &Arc<cudarc::driver::CudaDevice>) -> Result<Arc<CudaKernels>> {
         let device_id = Arc::as_ptr(device) as usize;
-        let mut cache = KERNELS_CACHE.lock().unwrap();
+        let mut cache = KERNELS_CACHE
+            .lock()
+            .map_err(|_| FlameError::Training("kernels cache mutex poisoned".into()))?;
         
         if let Some(kernels) = cache.get(&device_id) {
             Ok(kernels.clone())
@@ -33,54 +35,34 @@ impl GpuOps {
     
     /// Element-wise addition
     pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        // Handle broadcasting if shapes don't match
+        let kernels = Self::get_kernels(&a.device)?;
         if a.shape != b.shape {
-            let target_shape = a.shape.broadcast_shape_binary_op(&b.shape)?;
-            
-            let a_broadcast = if a.shape != target_shape {
-                Self::broadcast(a, &target_shape)?
-            } else {
-                a.clone()?
-            };
-            
-            let b_broadcast = if b.shape != target_shape {
-                Self::broadcast(b, &target_shape)?
-            } else {
-                b.clone()?
-            };
-            
-            let kernels = Self::get_kernels(&a.device)?;
-            kernels.add(&a_broadcast, &b_broadcast)
-        } else {
-            let kernels = Self::get_kernels(&a.device)?;
-            kernels.add(a, b)
+            if std::env::var("FLAME_BC_TRACE").ok().map(|v| v == "1").unwrap_or(false) {
+                eprintln!(
+                    "[bc-trace] add lhs={:?} rhs={:?}",
+                    a.shape().dims().to_vec(),
+                    b.shape().dims().to_vec()
+                );
+            }
+            return kernels.add_bc(a, b);
         }
+        kernels.add(a, b)
     }
     
     /// Element-wise multiplication  
     pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        // Handle broadcasting if shapes don't match
+        let kernels = Self::get_kernels(&a.device)?;
         if a.shape != b.shape {
-            let target_shape = a.shape.broadcast_shape_binary_op(&b.shape)?;
-            
-            let a_broadcast = if a.shape != target_shape {
-                Self::broadcast(a, &target_shape)?
-            } else {
-                a.clone()?
-            };
-            
-            let b_broadcast = if b.shape != target_shape {
-                Self::broadcast(b, &target_shape)?
-            } else {
-                b.clone()?
-            };
-            
-            let kernels = Self::get_kernels(&a.device)?;
-            kernels.mul(&a_broadcast, &b_broadcast)
-        } else {
-            let kernels = Self::get_kernels(&a.device)?;
-            kernels.mul(a, b)
+            if std::env::var("FLAME_BC_TRACE").ok().map(|v| v == "1").unwrap_or(false) {
+                eprintln!(
+                    "[bc-trace] mul lhs={:?} rhs={:?}",
+                    a.shape().dims().to_vec(),
+                    b.shape().dims().to_vec()
+                );
+            }
+            return kernels.mul_bc(a, b);
         }
+        kernels.mul(a, b)
     }
     
     /// Scalar multiplication
@@ -307,7 +289,7 @@ impl GpuOps {
             .map_err(|_| FlameError::CudaDriver)?;
         
         unsafe {
-            blas.gemm(cfg, b.storage.as_slice(), a.storage.as_slice(), &mut output_data)
+            blas.gemm(cfg, b.storage.try_as_slice_f32()?, a.storage.try_as_slice_f32()?, &mut output_data)
                 .map_err(|_| FlameError::CuBlas)?;
         }
         

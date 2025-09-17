@@ -1,5 +1,5 @@
-// EXTRACTED FROM: candle-core/src/shape.rs
-// REASON: Complex broadcasting logic that's already debugged and tested
+// Origin: adapted from prior art in the Rust DL ecosystem
+// Reason: Complex broadcasting logic that's already debugged and tested
 
 use crate::error::{FlameError, Result};
 

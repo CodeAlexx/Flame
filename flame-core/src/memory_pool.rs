@@ -9,6 +9,10 @@ use cudarc::driver::{CudaDevice, CudaSlice};
 use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, VecDeque};
 
+fn poison<T>(_: std::sync::PoisonError<T>) -> FlameError {
+    FlameError::Training("memory pool mutex poisoned".into())
+}
+
 /// Memory block information
 #[derive(Clone, Debug)]
 struct MemoryBlock {
@@ -231,7 +235,7 @@ impl MemoryPoolManager {
     /// Get or create pool for a device
     pub fn get_pool(&self, device: &Arc<CudaDevice>) -> Result<Arc<Mutex<DeviceMemoryPool>>> {
         let ordinal = device.ordinal();
-        let mut pools = self.pools.lock().unwrap();
+        let mut pools = self.pools.lock().map_err(poison)?;
         
         let pool = pools.entry(ordinal as i32)
             .or_insert_with(|| {
@@ -244,7 +248,7 @@ impl MemoryPoolManager {
     
     /// Clear all caches
     pub fn clear_all_caches(&self) {
-        let pools = self.pools.lock().unwrap();
+        let pools = match self.pools.lock() { Ok(g) => g, Err(_) => return, };
         for pool in pools.values() {
             if let Ok(mut pool_guard) = pool.lock() {
                 pool_guard.clear_cache();
@@ -254,7 +258,7 @@ impl MemoryPoolManager {
     
     /// Get total memory usage across all devices
     pub fn total_memory_usage(&self) -> MemoryUsage {
-        let pools = self.pools.lock().unwrap();
+        let pools = match self.pools.lock() { Ok(g) => g, Err(_) => return MemoryUsage { in_use: 0, cached: 0, total: 0 }, };
         let mut total = MemoryUsage {
             in_use: 0,
             cached: 0,
@@ -271,6 +275,24 @@ impl MemoryPoolManager {
         }
         
         total
+    }
+
+    /// Aggregate counters across all device pools.
+    pub fn global_counters(&self) -> (usize, usize, f32) {
+        let pools = match self.pools.lock() { Ok(g) => g, Err(_) => return (0, 0, 0.0) };
+        let mut allocations = 0usize;
+        let mut reuses = 0usize;
+        let mut peak_bytes = 0usize;
+        for pool in pools.values() {
+            if let Ok(pg) = pool.lock() {
+                let st = pg.stats();
+                allocations += st.allocations;
+                reuses += st.reuses;
+                peak_bytes = peak_bytes.max(st.peak_memory);
+            }
+        }
+        let reuse_pct = if allocations > 0 { (reuses as f32) * 100.0 / (allocations as f32) } else { 0.0 };
+        (allocations, peak_bytes, reuse_pct)
     }
 }
 
@@ -305,7 +327,7 @@ pub fn allocate_pooled(
     let pool = MEMORY_POOL.get_pool(&device)?;
     
     let size = shape.elem_count();
-    let data = pool.lock().unwrap().allocate(size)?;
+    let data = pool.lock().map_err(poison)?.allocate(size)?;
     
     Ok(PooledTensor {
         data,
@@ -336,7 +358,7 @@ impl Workspace {
     pub fn get_buffer(&mut self, size: usize) -> Result<&CudaSlice<f32>> {
         let buffer = self.pool.allocate(size)?;
         self.buffers.push(buffer);
-        Ok(self.buffers.last().unwrap())
+        self.buffers.last().ok_or_else(|| FlameError::Training("memory pool empty".into()))
     }
     
     /// Clear all buffers
@@ -382,5 +404,21 @@ mod tests {
         assert_eq!(DeviceMemoryPool::next_power_of_2(2), 2);
         assert_eq!(DeviceMemoryPool::next_power_of_2(3), 4);
         assert_eq!(DeviceMemoryPool::next_power_of_2(1000), 1024);
+    }
+
+    #[test]
+    fn test_global_counters_monotonic() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let pool = MEMORY_POOL.get_pool(&device)?;
+        let before = MEMORY_POOL.global_counters();
+        {
+            let mut p = pool.lock().map_err(super::poison)?;
+            let _a = p.allocate(256)?;
+            let _b = p.allocate(512)?;
+        }
+        let after = MEMORY_POOL.global_counters();
+        assert!(after.0 >= before.0);
+        assert!(after.1 >= before.1);
+        Ok(())
     }
 }

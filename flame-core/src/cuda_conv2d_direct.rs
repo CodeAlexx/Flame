@@ -254,7 +254,7 @@ extern "C" __global__ void im2col_3x3_optimized(
         
         unsafe {
             kernel.launch(cfg, (
-                input.storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
                 col_buffer,
                 batch_size as i32,
                 channels as i32,

@@ -105,9 +105,9 @@ fn test_training_loop_compatibility() -> Result<()> {
     
     // Create parameters (in real usage, would collect all model parameters)
     let params = vec![
-        Parameter::new(model.conv1.weight.clone()?),
-        Parameter::new(model.conv2.weight.clone()?),
-        Parameter::new(model.time_emb.weight.clone()?),
+        Parameter::new(model.conv1.weight.clone_result()?),
+        Parameter::new(model.conv2.weight.clone_result()?),
+        Parameter::new(model.time_emb.weight.clone_result()?),
     ];
     
     // Create optimizer

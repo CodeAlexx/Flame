@@ -102,17 +102,17 @@ pub fn flash_attention_forward(
     
     // Record for autograd if needed
     if query.requires_grad || key.requires_grad || value.requires_grad {
-        let mut output_with_grad = output.clone()?;
+        let mut output_with_grad = output.clone_result()?;
         output_with_grad.requires_grad = true;
         
         let mut saved_tensors = vec![
-            (query.id, query.clone()?),
-            (key.id, key.clone()?),
-            (value.id, value.clone()?),
+            (query.id, query.clone_result()?),
+            (key.id, key.clone_result()?),
+            (value.id, value.clone_result()?),
         ];
         
         if let Some(mask) = attention_mask {
-            saved_tensors.push((mask.id, mask.clone()?));
+            saved_tensors.push((mask.id, mask.clone_result()?));
         }
         
         AutogradContext::record_op(
@@ -152,7 +152,7 @@ fn flash_attention_forward_kernel_small(
     CudaKernels::ensure_kernel(&query.device, "flash_attn_fwd_small", kernel_code)?;
     
     let f = query.device.get_func("flash_attn_fwd_small", "flash_attn_fwd_small")
-        .ok_or_else(|| FlameError::Cuda("Failed to get flash attention kernel".into()))?;
+        .ok_or_else(|| FlameError::Cuda("missing kernel: flash_attn_fwd_small".into()))?;
     
     // Allocate output
     let output_shape = Shape::from_dims(&[batch_size, num_heads, seq_len_q, head_dim]);
@@ -177,9 +177,7 @@ fn flash_attention_forward_kernel_small(
     
     // Handle optional mask
     let dummy = alloc_zeros_from_pool(&query.device, 1)?;
-    let mask_ptr = attention_mask
-        .map(|m| m.storage.as_slice())
-        .unwrap_or(&dummy);
+    let mask_ptr = if let Some(m) = attention_mask { m.storage.try_as_slice_f32()? } else { &dummy };
     
     // Pack dimensions to reduce parameter count
     let dims1 = ((batch_size as i32) << 16) | (num_heads as i32);
@@ -188,9 +186,9 @@ fn flash_attention_forward_kernel_small(
     
     unsafe {
         f.launch(cfg, (
-            query.storage.as_slice(),
-            key.storage.as_slice(),
-            value.storage.as_slice(),
+            query.storage.try_as_slice_f32()?,
+            key.storage.try_as_slice_f32()?,
+            value.storage.try_as_slice_f32()?,
             mask_ptr,
             &output_data,
             &m_data,
@@ -200,7 +198,7 @@ fn flash_attention_forward_kernel_small(
             head_dim as i32,
             scale,
             flags,
-        ))?;
+        )).map_err(|e| FlameError::Training(e.to_string()))?;
     }
     
     Ok(Tensor {
@@ -231,7 +229,7 @@ fn flash_attention_forward_kernel_medium(
     CudaKernels::ensure_kernel(&query.device, "flash_attn_fwd_medium", kernel_code)?;
     
     let f = query.device.get_func("flash_attn_fwd_medium", "flash_attn_fwd_medium")
-        .ok_or_else(|| FlameError::Cuda("Failed to get flash attention kernel".into()))?;
+        .ok_or_else(|| FlameError::Cuda("missing kernel: flash_attn_fwd_medium".into()))?;
     
     let output_shape = Shape::from_dims(&[batch_size, num_heads, seq_len_q, head_dim]);
     let output_data = alloc_zeros_from_pool(&query.device, output_shape.elem_count())?;
@@ -251,9 +249,7 @@ fn flash_attention_forward_kernel_medium(
     };
     
     let dummy = alloc_zeros_from_pool(&query.device, 1)?;
-    let mask_ptr = attention_mask
-        .map(|m| m.storage.as_slice())
-        .unwrap_or(&dummy);
+    let mask_ptr = if let Some(m) = attention_mask { m.storage.try_as_slice_f32()? } else { &dummy };
     
     // Pack dimensions to reduce parameter count
     let dims1 = ((batch_size as i32) << 16) | (num_heads as i32);
@@ -262,9 +258,9 @@ fn flash_attention_forward_kernel_medium(
     
     unsafe {
         f.launch(cfg, (
-            query.storage.as_slice(),
-            key.storage.as_slice(),
-            value.storage.as_slice(),
+            query.storage.try_as_slice_f32()?,
+            key.storage.try_as_slice_f32()?,
+            value.storage.try_as_slice_f32()?,
             mask_ptr,
             &output_data,
             &m_data,
@@ -274,7 +270,7 @@ fn flash_attention_forward_kernel_medium(
             head_dim as i32,
             scale,
             flags,
-        ))?;
+        )).map_err(|e| FlameError::Training(e.to_string()))?;
     }
     
     Ok(Tensor {
@@ -318,7 +314,7 @@ pub fn chunked_attention_forward(
     CudaKernels::ensure_kernel(&query.device, "chunked_attn_fwd", kernel_code)?;
     
     let f = query.device.get_func("chunked_attn_fwd", "chunked_attn_fwd")
-        .ok_or_else(|| FlameError::Cuda("Failed to get chunked attention kernel".into()))?;
+        .ok_or_else(|| FlameError::Cuda("missing kernel: chunked_attn_fwd".into()))?;
     
     let shape = query.shape().dims();
     let (batch_size, num_heads, seq_len_q, head_dim) = 
@@ -342,9 +338,7 @@ pub fn chunked_attention_forward(
     };
     
     let dummy = alloc_zeros_from_pool(&query.device, 1)?;
-    let mask_ptr = attention_mask
-        .map(|m| m.storage.as_slice())
-        .unwrap_or(&dummy);
+    let mask_ptr = if let Some(m) = attention_mask { m.storage.try_as_slice_f32()? } else { &dummy };
     
     // Pack dimensions to reduce parameter count
     let dims1 = ((batch_size as i32) << 16) | (num_heads as i32);
@@ -354,9 +348,9 @@ pub fn chunked_attention_forward(
     
     unsafe {
         f.launch(cfg, (
-            query.storage.as_slice(),
-            key.storage.as_slice(),
-            value.storage.as_slice(),
+            query.storage.try_as_slice_f32()?,
+            key.storage.try_as_slice_f32()?,
+            value.storage.try_as_slice_f32()?,
             mask_ptr,
             &output_data,
             dims1,
@@ -365,7 +359,7 @@ pub fn chunked_attention_forward(
             dims3,
             scale,
             flags,
-        ))?;
+        )).map_err(|e| FlameError::Training(e.to_string()))?;
     }
     
     Ok(Tensor {

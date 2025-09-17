@@ -73,7 +73,7 @@ impl SageAttention {
         let (key_smoothed, value_smoothed) = if self.quantize_kv {
             self.apply_smoothing(key, value)?
         } else {
-            (key.clone()?, value.clone()?)
+            (key.clone_result()?, value.clone_result()?)
         };
         
         // Quantize K and V to 8-bit
@@ -81,8 +81,8 @@ impl SageAttention {
             self.quantize_kv_tensors(&key_smoothed, &value_smoothed)?
         } else {
             // Skip quantization
-            (key_smoothed.clone()?, Tensor::ones(Shape::from_dims(&[batch_size, num_heads, seq_len_k, 1]), key.device.clone())?,
-             value_smoothed.clone()?, Tensor::ones(Shape::from_dims(&[batch_size, num_heads, seq_len_k, 1]), value.device.clone())?)
+            (key_smoothed.clone_result()?, Tensor::ones(Shape::from_dims(&[batch_size, num_heads, seq_len_k, 1]), key.device.clone())?,
+             value_smoothed.clone_result()?, Tensor::ones(Shape::from_dims(&[batch_size, num_heads, seq_len_k, 1]), value.device.clone())?)
         };
         
         // Compute attention scores with 8-bit K
@@ -123,10 +123,10 @@ impl SageAttention {
         // Record for autograd if needed
         if query.requires_grad() || key.requires_grad() || value.requires_grad() {
             let mut saved_tensors = vec![
-                (query.id, query.clone()?),
+                (query.id, query.clone_result()?),
                 (key.id, key_smoothed),
                 (value.id, value_smoothed),
-                (attention_weights.id, attention_weights.clone()?),
+                (attention_weights.id, attention_weights.clone_result()?),
             ];
             
             if self.quantize_kv {
@@ -207,9 +207,9 @@ impl SageAttention {
         let cfg = cudarc::driver::LaunchConfig::for_num_elems((num_rows * head_dim) as u32);
         unsafe {
             f.clone().launch(cfg, (
-                key.storage.as_slice(),
-                key_quantized.storage.as_slice(),
-                key_scales.storage.as_slice(),
+                key.storage.try_as_slice_f32()?,
+                key_quantized.storage.try_as_slice_f32()?,
+                key_scales.storage.try_as_slice_f32()?,
                 num_rows as i32,
                 head_dim as i32,
             ))?;
@@ -225,9 +225,9 @@ impl SageAttention {
         
         unsafe {
             f.launch(cfg, (
-                value.storage.as_slice(),
-                value_quantized.storage.as_slice(),
-                value_scales.storage.as_slice(),
+                value.storage.try_as_slice_f32()?,
+                value_quantized.storage.try_as_slice_f32()?,
+                value_scales.storage.try_as_slice_f32()?,
                 num_rows as i32,
                 head_dim as i32,
             ))?;
@@ -275,10 +275,10 @@ impl SageAttention {
         
         unsafe {
             f.launch(cfg, (
-                query.storage.as_slice(),
-                key_int8.storage.as_slice(),
-                key_scales.storage.as_slice(),
-                output.storage.as_slice(),
+                query.storage.try_as_slice_f32()?,
+                key_int8.storage.try_as_slice_f32()?,
+                key_scales.storage.try_as_slice_f32()?,
+                output.storage.try_as_slice_f32()?,
                 batch_size as i32,
                 num_heads as i32,
                 seq_len_q as i32,
@@ -330,10 +330,10 @@ impl SageAttention {
         
         unsafe {
             f.launch(cfg, (
-                attn_weights.storage.as_slice(),
-                value_int8.storage.as_slice(),
-                value_scales.storage.as_slice(),
-                output.storage.as_slice(),
+                attn_weights.storage.try_as_slice_f32()?,
+                value_int8.storage.try_as_slice_f32()?,
+                value_scales.storage.try_as_slice_f32()?,
+                output.storage.try_as_slice_f32()?,
                 batch_size as i32,
                 num_heads as i32,
                 seq_len_q as i32,
@@ -374,7 +374,7 @@ extern "C" __global__ void causal_mask(float* mask, int seq_len_q, int seq_len_k
         let cfg = cudarc::driver::LaunchConfig::for_num_elems((seq_len_q * seq_len_k) as u32);
         unsafe {
             f.launch(cfg, (
-                mask.storage.as_slice(),
+                mask.storage.try_as_slice_f32()?,
                 seq_len_q as i32,
                 seq_len_k as i32,
             ))?;
@@ -555,4 +555,3 @@ extern "C" __global__ void sage_attn_v_matmul(
 }
 "#
 }
-

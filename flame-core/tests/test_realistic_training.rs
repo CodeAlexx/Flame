@@ -261,7 +261,7 @@ fn test_gradient_accumulation() -> Result<()> {
         // Accumulate gradients
         if let Some(grad) = grad_map.get(&linear.weight.id) {
             match &mut accumulated_weight_grad {
-                None => accumulated_weight_grad = Some(grad.clone()?),
+                None => accumulated_weight_grad = Some(grad.clone_result()?),
                 Some(acc) => *acc = acc.add(grad)?,
             }
         }
@@ -269,7 +269,7 @@ fn test_gradient_accumulation() -> Result<()> {
         if let Some(bias) = &linear.bias {
             if let Some(grad) = grad_map.get(&bias.id) {
                 match &mut accumulated_bias_grad {
-                    None => accumulated_bias_grad = Some(grad.clone()?),
+                    None => accumulated_bias_grad = Some(grad.clone_result()?),
                     Some(acc) => *acc = acc.add(grad)?,
                 }
             }

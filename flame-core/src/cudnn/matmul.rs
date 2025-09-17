@@ -89,7 +89,7 @@ pub fn cudnn_matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     
     // Get cuDNN handle
     let handle = get_cudnn_handle()?;
-    let handle_guard = handle.lock().unwrap();
+    let handle_guard = handle.lock().map_err(|_| FlameError::Training("cudnn handle mutex poisoned".into()))?;
     
     // Create output tensor
     let output_shape = if a_shape.dims().len() == 3 || b_shape.dims().len() == 3 {

@@ -256,9 +256,9 @@ extern "C" __global__ void conv2d_3x3_s1_p1(
         };
         
         let bias_slice = if let Some(b) = bias {
-            b.storage.as_slice()
+            b.storage.try_as_slice_f32()?
         } else {
-            zero_bias.as_ref().unwrap()
+            zero_bias.as_ref().ok_or_else(|| FlameError::Training("conv2d_fast: failed to allocate zero bias".into()))?
         };
         
         // Create parameter struct
@@ -288,8 +288,8 @@ extern "C" __global__ void conv2d_3x3_s1_p1(
         // Launch kernel with packed parameters
         unsafe {
             kernel_func.launch(cfg, (
-                input.storage.as_slice(),
-                weight.storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
+                weight.storage.try_as_slice_f32()?,
                 bias_slice,
                 &output_data,
                 &params_slice,

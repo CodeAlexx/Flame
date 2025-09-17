@@ -67,8 +67,8 @@ impl CudaKernelsV2 {
         let config = launch_configs::elementwise(numel);
         launch_kernel!(f, config,
             &output,
-            a.storage.as_slice(),
-            b.storage.as_slice(),
+            a.storage.try_as_slice_f32()?,
+            b.storage.try_as_slice_f32()?,
             numel as i32
         )?;
         
@@ -97,8 +97,8 @@ impl CudaKernelsV2 {
         let config = launch_configs::elementwise(numel);
         launch_kernel!(f, config,
             &output,
-            a.storage.as_slice(),
-            b.storage.as_slice(),
+            a.storage.try_as_slice_f32()?,
+            b.storage.try_as_slice_f32()?,
             numel as i32
         )?;
         
@@ -120,7 +120,7 @@ impl CudaKernelsV2 {
         let config = launch_configs::elementwise(numel);
         launch_kernel!(f, config,
             &output,
-            input.storage.as_slice(),
+            input.storage.try_as_slice_f32()?,
             numel as i32
         )?;
         
@@ -145,7 +145,7 @@ impl CudaKernelsV2 {
         let config = launch_configs::elementwise(numel);
         launch_kernel!(f, config,
             &output,
-            input.storage.as_slice(),
+            input.storage.try_as_slice_f32()?,
             numel as i32
         )?;
         
@@ -222,8 +222,8 @@ extern "C" __global__ void matmul_kernel(
         let config = launch_configs::grid_2d(m, n, 16);
         launch_kernel!(f, config,
             &output,
-            a.storage.as_slice(),
-            b.storage.as_slice(),
+            a.storage.try_as_slice_f32()?,
+            b.storage.try_as_slice_f32()?,
             params.m,
             params.n,
             params.k
@@ -246,7 +246,7 @@ extern "C" __global__ void matmul_kernel(
         let config = launch_configs::reduction(input.shape.elem_count());
         launch_kernel!(f, config,
             &output,
-            input.storage.as_slice(),
+            input.storage.try_as_slice_f32()?,
             input.shape.elem_count() as i32
         )?;
         

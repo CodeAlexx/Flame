@@ -27,7 +27,7 @@ fn softmax_forward_backward_stability() -> Result<()> {
     // Simple scalar loss to trigger backward: mean of KL(probs || uniform)
     let uni = Tensor::full(Shape::from_dims(&[n, classes]), 1.0f32 / classes as f32, dev.clone())?;
     // KL = sum p * (log p - log u)
-    let loss = probs.clone()?.mul(&probs.log()?)?.sub(&probs.mul(&uni.log()?)?)?.mean()?;
+    let loss = probs.clone_result()?.mul(&probs.log()?)?.sub(&probs.mul(&uni.log()?)?)?.mean()?;
     let grads = AutogradContext::backward(&loss)?;
 
     // Grads finite?
@@ -36,4 +36,3 @@ fn softmax_forward_backward_stability() -> Result<()> {
     assert!(vv.iter().all(|v| v.is_finite()));
     Ok(())
 }
-

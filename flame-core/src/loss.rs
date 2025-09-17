@@ -4,6 +4,7 @@
 //! with full backward pass implementations for autograd.
 
 use crate::{Tensor, Result, FlameError, AutogradContext, Op, TensorId, Shape};
+use crate::DType;
 
 /// Mean Squared Error (MSE) loss
 /// 
@@ -25,7 +26,7 @@ pub fn mse_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
     
     // Record for autograd if needed
     if predictions.requires_grad || targets.requires_grad {
-        let mut loss_with_grad = loss.clone()?;
+        let mut loss_with_grad = loss.clone_result()?;
         loss_with_grad.requires_grad = true;
         
         AutogradContext::record_op(
@@ -36,8 +37,8 @@ pub fn mse_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
                 num_elements: predictions.shape.elem_count()
             },
             vec![
-                (predictions.id, predictions.clone()?),
-                (targets.id, targets.clone()?)
+                (predictions.id, predictions.clone_result()?),
+                (targets.id, targets.clone_result()?)
             ]
         );
         
@@ -45,6 +46,33 @@ pub fn mse_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
     } else {
         Ok(loss)
     }
+}
+
+/// Mean Squared Error loss specialized for BF16 inputs with FP32 reduction.
+///
+/// Requirements:
+/// - `pred` and `target` must have identical shapes and both be BF16 tensors.
+/// - Computes mean((pred - target)^2) in FP32 and returns a scalar FP32 tensor.
+/// - Gradients propagate w.r.t. `pred` (and `target` if it requires grad) via cast ops.
+pub fn mse_loss_bf16(pred: &Tensor, target: &Tensor) -> Result<Tensor> {
+    // Shape check
+    if pred.shape() != target.shape() {
+        return Err(FlameError::ShapeMismatch { expected: pred.shape().clone(), got: target.shape().clone() });
+    }
+    // DType check
+    if pred.dtype() != DType::BF16 || target.dtype() != DType::BF16 {
+        return Err(FlameError::InvalidInput("mse_loss_bf16 expects BF16 inputs".into()));
+    }
+
+    // Upcast to FP32 for numerics while preserving autograd via Cast ops
+    let pred32 = pred.to_dtype(DType::F32)?;
+    let target32 = target.to_dtype(DType::F32)?;
+
+    // Compute mean((pred - target)^2) in FP32
+    let diff = pred32.sub(&target32)?;
+    let squared = diff.square()?;
+    let loss = squared.mean()?; // scalar FP32
+    Ok(loss)
 }
 
 /// L1 loss (Mean Absolute Error)
@@ -67,7 +95,7 @@ pub fn l1_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
     
     // Record for autograd if needed
     if predictions.requires_grad || targets.requires_grad {
-        let mut loss_with_grad = loss.clone()?;
+        let mut loss_with_grad = loss.clone_result()?;
         loss_with_grad.requires_grad = true;
         
         AutogradContext::record_op(
@@ -78,8 +106,8 @@ pub fn l1_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
                 num_elements: predictions.shape.elem_count()
             },
             vec![
-                (predictions.id, predictions.clone()?),
-                (targets.id, targets.clone()?)
+                (predictions.id, predictions.clone_result()?),
+                (targets.id, targets.clone_result()?)
             ]
         );
         
@@ -132,7 +160,7 @@ pub fn huber_loss(predictions: &Tensor, targets: &Tensor, delta: f32) -> Result<
     
     // Record for autograd if needed
     if predictions.requires_grad || targets.requires_grad {
-        let mut loss_with_grad = loss.clone()?;
+        let mut loss_with_grad = loss.clone_result()?;
         loss_with_grad.requires_grad = true;
         
         AutogradContext::record_op(
@@ -144,8 +172,8 @@ pub fn huber_loss(predictions: &Tensor, targets: &Tensor, delta: f32) -> Result<
                 num_elements: predictions.shape.elem_count()
             },
             vec![
-                (predictions.id, predictions.clone()?),
-                (targets.id, targets.clone()?)
+                (predictions.id, predictions.clone_result()?),
+                (targets.id, targets.clone_result()?)
             ]
         );
         
@@ -185,7 +213,7 @@ pub fn binary_cross_entropy(predictions: &Tensor, targets: &Tensor) -> Result<Te
     
     // Record for autograd if needed
     if predictions.requires_grad || targets.requires_grad {
-        let mut loss_with_grad = loss.clone()?;
+        let mut loss_with_grad = loss.clone_result()?;
         loss_with_grad.requires_grad = true;
         
         AutogradContext::record_op(
@@ -196,8 +224,8 @@ pub fn binary_cross_entropy(predictions: &Tensor, targets: &Tensor) -> Result<Te
                 num_elements: predictions.shape.elem_count()
             },
             vec![
-                (predictions.id, predictions.clone()?),
-                (targets.id, targets.clone()?)
+                (predictions.id, predictions.clone_result()?),
+                (targets.id, targets.clone_result()?)
             ]
         );
         
@@ -254,7 +282,7 @@ pub fn nll_loss(log_probs: &Tensor, targets: &Tensor) -> Result<Tensor> {
     
     // Record for autograd if needed
     if log_probs.requires_grad {
-        let mut loss_with_grad = loss.clone()?;
+        let mut loss_with_grad = loss.clone_result()?;
         loss_with_grad.requires_grad = true;
         
         AutogradContext::record_op(
@@ -265,8 +293,8 @@ pub fn nll_loss(log_probs: &Tensor, targets: &Tensor) -> Result<Tensor> {
                 batch_size
             },
             vec![
-                (log_probs.id, log_probs.clone()?),
-                (targets.id, targets.clone()?)
+                (log_probs.id, log_probs.clone_result()?),
+                (targets.id, targets.clone_result()?)
             ]
         );
         

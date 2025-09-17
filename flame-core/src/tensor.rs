@@ -6,6 +6,8 @@ use crate::tensor_storage::TensorStorage;
 use crate::cuda_memory_alignment::alloc_aligned_f32;
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, LaunchConfig, LaunchAsync, DeviceSlice, CudaFunction};
 use cudarc::cublas::CudaBlas;
+// Fix cublas op imports to stable sys enums
+use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
 use std::sync::Arc;
 use crate::cuda_ops::GpuOps;
 use crate::cuda_kernels::CudaKernels;
@@ -97,6 +99,12 @@ impl fmt::Debug for Tensor {
 // that returns Result<Tensor> for consistency with other operations
 
 impl Tensor {
+    // Mixed-precision policy (reminder):
+    // - Parameters and activations: store as BF16; do math in FP32 inside kernels.
+    // - Intermediates/temps/activations created here (zeros/new outputs): prefer BF16 storage directly.
+    // - Masks: prefer Bool/u8, not F32 (convert to FP32 only at the last moment before math).
+    // - Gradients/optimizer states/scalars/reductions: use FP32 for numerical stability.
+    // - RNG/init: generate FP32 in registers inside kernels, write BF16 elements directly; avoid full FP32 tensors.
     /// Create a causal mask tensor
     pub fn causal_mask(seq_len: usize, device: &Arc<CudaDevice>) -> Result<Self> {
         // Create a lower triangular mask
@@ -148,15 +156,21 @@ extern "C" __global__ void masked_fill_kernel(
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(n as u32);
         
         crate::launch_kernel!(f, cfg,
-            self.storage.as_slice(),
-            mask.storage.as_slice(),
+            self.storage.try_as_slice_f32()?,
+            mask.storage.try_as_slice_f32()?,
             &output_data,
             value,
             n as i32
         );
         
+        // Preserve input dtype for output when feasible (F32/BF16); otherwise fall back to F32
+        let storage = match self.dtype() {
+            DType::BF16 => TensorStorage::BF16 { data: output_data, numel: n },
+            DType::F32 => TensorStorage::F32 { data: output_data, numel: n },
+            _ => TensorStorage::F32 { data: output_data, numel: n },
+        };
         Ok(Self {
-            storage: TensorStorage::F32 { data: output_data, numel: n },
+            storage,
             shape: self.shape.clone(),
             device: self.device.clone(),
             id: TensorId::new(),
@@ -166,11 +180,25 @@ extern "C" __global__ void masked_fill_kernel(
     
     /// Create a new tensor filled with zeros (defaults to global default dtype)
     pub fn zeros(shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
-        Self::zeros_dtype(shape, default_dtype(), device)
+        let dtype = default_dtype();
+        let numel = shape.elem_count();
+        if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+            let bytes = numel * dtype.size_in_bytes();
+            if bytes >= (8 << 20) {
+                eprintln!("[alloc] tag=zeros dtype={:?} shape={:?} bytes={}", dtype, shape.dims(), bytes);
+            }
+        }
+        Self::zeros_dtype(shape, dtype, device)
     }
     
     /// Create tensor with specific dtype
     pub fn zeros_dtype(shape: Shape, dtype: DType, device: Arc<CudaDevice>) -> Result<Self> {
+        if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+            let bytes = shape.elem_count() * dtype.size_in_bytes();
+            if bytes >= (8 << 20) {
+                eprintln!("[alloc] tag=zeros_dtype dtype={:?} shape={:?} bytes={}", dtype, shape.dims(), bytes);
+            }
+        }
         let storage = TensorStorage::zeros(&shape, dtype, &device)?;
         Ok(Self {
             storage,
@@ -179,6 +207,156 @@ extern "C" __global__ void masked_fill_kernel(
             id: TensorId::new(),
             requires_grad: false,
         })
+    }
+
+    /// BF16-tagged matmul: returns BF16-typed result while computing in F32.
+    /// Preconditions (debug): inputs on CUDA and logically BF16.
+    #[cfg(not(feature = "bf16_u16"))]
+    pub fn matmul_bf16(&self, other: &Tensor) -> Result<Tensor> {
+        debug_assert_eq!(self.device.ordinal(), other.device.ordinal());
+        debug_assert!(matches!(self.dtype(), DType::BF16) && matches!(other.dtype(), DType::BF16), "matmul_bf16 expects BF16 inputs");
+
+        // 2D only (keep simple for FC layers)
+        let self_shape = self.shape.dims();
+        let other_shape = other.shape.dims();
+        if self_shape.len() != 2 || other_shape.len() != 2 {
+            return Err(FlameError::InvalidOperation(
+                format!("matmul_bf16 requires 2D tensors, got {:?} and {:?}", self_shape, other_shape)
+            ));
+        }
+        let (m, k) = (self_shape[0], self_shape[1]);
+        let (k2, n) = (other_shape[0], other_shape[1]);
+        if k != k2 {
+            return Err(FlameError::InvalidOperation(
+                format!("matmul_bf16: incompatible matrix dimensions {} vs {}", k, k2)
+            ));
+        }
+
+        let out_shape = Shape::from_dims(&[m, n]);
+
+        // Use cuBLAS gemm in F32 (storage is F32-backed), tag alloc log if enabled
+        let blas = CudaBlas::new(self.device.clone()).map_err(|_| FlameError::CuBlas)?;
+        use cudarc::cublas::{GemmConfig, Gemm};
+        let cfg = GemmConfig {
+            transa: CUBLAS_OP_N,
+            transb: CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: 1.0f32,
+            lda: n as i32,
+            ldb: k as i32,
+            beta: 0.0f32,
+            ldc: n as i32,
+        };
+        if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+            let bytes = m * n * std::mem::size_of::<f32>();
+            if bytes >= (8 << 20) {
+                eprintln!("[alloc] tag=gemm/out(bf16) shape=[{},{}] bytes={}", m, n, bytes);
+            }
+        }
+        let mut output_data = alloc_aligned_f32(&self.device, m * n)?;
+        let self_data = self.storage.try_as_slice_f32()?;
+        let other_data = other.storage.try_as_slice_f32()?;
+        unsafe {
+            blas.gemm(cfg, &*other_data, &*self_data, &mut output_data)
+                .map_err(|_| FlameError::CuBlas)?;
+        }
+
+        let mut output = Tensor {
+            storage: TensorStorage::BF16 { data: output_data, numel: m * n },
+            shape: out_shape,
+            device: self.device.clone(),
+            id: TensorId::new(),
+            requires_grad: false,
+        };
+        if self.requires_grad || other.requires_grad {
+            output.requires_grad = true;
+            AutogradContext::record_op(
+                output.id,
+                Op::MatMul { lhs: self.id, rhs: other.id },
+                vec![ (self.id, self.clone_result()?), (other.id, other.clone_result()?) ]
+            );
+        }
+        Ok(output)
+    }
+
+    /// BF16 matmul using cublasGemmEx with BF16 in/out and FP32 compute (feature-gated).
+    #[cfg(feature = "bf16_u16")]
+    pub fn matmul_bf16(&self, other: &Tensor) -> Result<Tensor> {
+        use cudarc::cublas::CudaBlas;
+        // shape checks
+        let self_shape = self.shape.dims();
+        let other_shape = other.shape.dims();
+        if self_shape.len() != 2 || other_shape.len() != 2 {
+            return Err(FlameError::InvalidOperation(
+                format!("matmul_bf16 requires 2D tensors, got {:?} and {:?}", self_shape, other_shape)
+            ));
+        }
+        let (m, k) = (self_shape[0], self_shape[1]);
+        let (k2, n) = (other_shape[0], other_shape[1]);
+        if k != k2 {
+            return Err(FlameError::InvalidOperation(
+                format!("matmul_bf16: incompatible matrix dimensions {} vs {}", k, k2)
+            ));
+        }
+        debug_assert!(matches!(self.dtype(), DType::BF16) && matches!(other.dtype(), DType::BF16));
+
+        // Allocate BF16(u16) output
+        if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+            let bytes = m * n * DType::BF16.size_in_bytes();
+            if bytes >= (8 << 20) {
+                eprintln!("[alloc] tag=gemm/out(bf16) shape=[{},{}] bytes={}", m, n, bytes);
+            }
+        }
+        let mut out_data = cudarc::driver::CudaSlice::<u16>::alloc(&self.device, m * n)
+            .map_err(|e| FlameError::Cuda(format!("alloc bf16 out: {}", e)))?;
+
+        // cuBLAS handle
+        let blas = CudaBlas::new(self.device.clone()).map_err(|_| FlameError::CuBlas)?;
+        let h = blas.handle();
+
+        // Row-major mapping consistent with F32 path: C = B @ A
+        let a = match &other.storage {
+            TensorStorage::BF16 { data, .. } => data,
+            _ => return Err(FlameError::InvalidOperation("rhs not BF16".into())),
+        };
+        let b = match &self.storage {
+            TensorStorage::BF16 { data, .. } => data,
+            _ => return Err(FlameError::InvalidOperation("lhs not BF16".into())),
+        };
+        let a_ptr = a.as_device_ptr().as_raw() as *const std::ffi::c_void;
+        let b_ptr = b.as_device_ptr().as_raw() as *const std::ffi::c_void;
+        let c_ptr = out_data.as_device_ptr().as_raw() as *mut std::ffi::c_void;
+
+        crate::blas::gemm_bf16_fp32(
+            h,
+            cudarc::cublas::sys::CUBLAS_OP_N,
+            cudarc::cublas::sys::CUBLAS_OP_N,
+            n as i32, m as i32, k as i32,
+            1.0,
+            a_ptr, n as i32,
+            b_ptr, k as i32,
+            0.0,
+            c_ptr, n as i32,
+        )?;
+
+        let mut output = Tensor {
+            storage: TensorStorage::BF16 { data: out_data, numel: m * n },
+            shape: Shape::from_dims(&[m, n]),
+            device: self.device.clone(),
+            id: TensorId::new(),
+            requires_grad: false,
+        };
+        if self.requires_grad || other.requires_grad {
+            output.requires_grad = true;
+            AutogradContext::record_op(
+                output.id,
+                Op::MatMul { lhs: self.id, rhs: other.id },
+                vec![ (self.id, self.clone_result()?), (other.id, other.clone_result()?) ]
+            );
+        }
+        Ok(output)
     }
     
     /// Get dtype
@@ -202,9 +380,13 @@ extern "C" __global__ void masked_fill_kernel(
     pub fn cuda_ptr(&self) -> *const f32 {
         use cudarc::driver::DevicePtr;
         use std::ffi::c_void;
-        let ptr_addr = *self.storage.as_slice().device_ptr();
-        // Cast u64 GPU address to pointer
-        ptr_addr as *const c_void as *const f32
+        match self.storage.try_as_slice_f32() {
+            Ok(slice) => {
+                let ptr_addr = *slice.device_ptr();
+                ptr_addr as *const c_void as *const f32
+            }
+            Err(_) => std::ptr::null(),
+        }
     }
     
     /// Get mutable raw CUDA pointer for cuDNN operations
@@ -216,8 +398,13 @@ extern "C" __global__ void masked_fill_kernel(
         let slice = match &mut self.storage {
             TensorStorage::F32 { data, .. } |
             TensorStorage::F16 { data, .. } |
-            TensorStorage::BF16 { data, .. } => data,
-            TensorStorage::I8 { .. } => panic!("Cannot get f32 pointer from I8 storage"),
+            TensorStorage::BF16 { data, .. } |
+            TensorStorage::I32 { data, .. } |
+            TensorStorage::Bool { data, .. } => data,
+            TensorStorage::I8 { .. } => {
+                // Return null pointer for unsupported I8 storage in this path
+                return std::ptr::null_mut();
+            }
         };
         let ptr_addr = *slice.device_ptr();
         // Cast u64 GPU address to pointer
@@ -227,7 +414,7 @@ extern "C" __global__ void masked_fill_kernel(
     /// Cast to different dtype
     pub fn to_dtype(&self, dtype: DType) -> Result<Tensor> {
         if self.dtype() == dtype {
-            return self.clone();
+            return Ok(self.clone());
         }
         
         // For now, we store everything as F32 but track the dtype
@@ -256,13 +443,22 @@ extern "C" __global__ void masked_fill_kernel(
             )),
         };
         
-        Ok(Tensor {
+        let mut out = Tensor {
             storage,
             shape: self.shape.clone(),
             device: self.device.clone(),
             id: TensorId::new(),
-            requires_grad: false,
-        })
+            requires_grad: self.requires_grad,
+        };
+        if self.requires_grad {
+            // Record autograd Cast op so gradients flow across dtype boundaries
+            AutogradContext::record_op(
+                out.id,
+                Op::Cast { input: self.id, from: self.dtype(), to: dtype },
+                vec![(self.id, self.clone_result()?)]
+            );
+        }
+        Ok(out)
     }
 
     /// Gather rows from a 2D table along axis 0 using I32 indices; supports ids with arbitrary leading dims
@@ -284,7 +480,7 @@ extern "C" __global__ void masked_fill_kernel(
             out[dst..dst+d].copy_from_slice(&table[src..src+d]);
         }
         let mut out_dims = ids_dims.clone(); out_dims.push(d);
-        let t = Tensor::from_vec(out, Shape::from(out_dims), self.device.clone())?;
+        let t = Tensor::from_vec(out, Shape::from_dims(&out_dims), self.device.clone())?;
         match self.dtype() {
             DType::BF16 => t.to_dtype(DType::BF16),
             DType::F16 => t.to_dtype(DType::F16),
@@ -292,16 +488,7 @@ extern "C" __global__ void masked_fill_kernel(
         }
     }
 
-    /// Elementwise equality returning Bool tensor (stored as F32 0.0/1.0)
-    pub fn eq(&self, rhs: &Tensor) -> Result<Tensor> {
-        let a = self.to_dtype(DType::F32)?.to_vec()?;
-        let b = rhs.to_dtype(DType::F32)?.to_vec()?;
-        if a.len() != b.len() { return Err(FlameError::InvalidOperation("eq: size mismatch".into())); }
-        let mut out = Vec::with_capacity(a.len());
-        for i in 0..a.len() { out.push(if a[i] == b[i] { 1.0 } else { 0.0 }); }
-        let t = Tensor::from_vec(out, self.shape.clone(), self.device.clone())?;
-        t.to_dtype(DType::Bool)
-    }
+    // eq implemented in tensor_ops_extended.rs
 
     /// Where: out = mask ? a : b; mask Bool (0/1)
     pub fn where_mask(mask: &Tensor, a: &Tensor, b: &Tensor) -> Result<Tensor> {
@@ -435,7 +622,8 @@ extern "C" __global__ void masked_fill_kernel(
         let size = shape.elem_count();
         use rand_distr::{Distribution, Normal};
         let mut rng = rand::thread_rng();
-        let normal = Normal::new(mean, std).unwrap();
+        let normal = Normal::new(mean, std)
+            .map_err(|e| FlameError::InvalidInput(format!("invalid normal params: {e}")))?;
         
         let cpu_data: Vec<f32> = (0..size)
             .map(|_| normal.sample(&mut rng))
@@ -480,13 +668,13 @@ extern "C" __global__ void masked_fill_kernel(
         if self.dtype() != DType::BF16 {
             return Err(FlameError::InvalidOperation("Not a BF16 tensor".to_string()));
         }
-        Ok(self.storage.as_slice())
+        Ok(self.storage.try_as_slice_f32()?)
     }
     
     /// Convert tensor to BF16
     pub fn to_bf16(&self) -> Result<Self> {
         if self.dtype() == DType::BF16 {
-            return Ok(self.clone()?);
+            return Ok(self.clone_result()?);
         }
         
         // Convert to F32 first if needed
@@ -603,10 +791,16 @@ extern "C" __global__ void masked_fill_kernel(
         };
         
         // Allocate output data using aligned allocation
+        if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+            let bytes = m * n * std::mem::size_of::<f32>();
+            if bytes >= (8 << 20) {
+                eprintln!("[alloc] tag=gemm/out shape=[{},{}] bytes={}", m, n, bytes);
+            }
+        }
         let mut output_data = alloc_aligned_f32(&self.device, m * n)?;
         
-        let self_data = self.storage.as_slice();
-        let other_data = other.storage.as_slice();
+        let self_data = self.storage.try_as_slice_f32()?;
+        let other_data = other.storage.try_as_slice_f32()?;
         
         unsafe {
             blas.gemm(cfg, &*other_data, &*self_data, &mut output_data)
@@ -633,8 +827,8 @@ extern "C" __global__ void masked_fill_kernel(
                     rhs: other.id
                 },
                 vec![
-                    (self.id, self.clone()?),
-                    (other.id, other.clone()?)
+                    (self.id, self.clone_result()?),
+                    (other.id, other.clone_result()?)
                 ]
             );
         }
@@ -776,8 +970,8 @@ extern "C" __global__ void masked_fill_kernel(
                     rhs: other.id
                 },
                 vec![
-                    (self.id, self.clone()?),
-                    (other.id, other.clone()?)
+                    (self.id, self.clone_result()?),
+                    (other.id, other.clone_result()?)
                 ]
             );
         }
@@ -865,7 +1059,7 @@ extern "C" __global__ void slice_kernel(
         
         launch_kernel!(f, cfg,
             &slice_data,
-            self.storage.as_slice(),
+            self.storage.try_as_slice_f32()?,
             start as i32,
             len as i32
         )?;
@@ -895,8 +1089,8 @@ extern "C" __global__ void slice_kernel(
                     rhs: other.id
                 },
                 vec![
-                    (self.id, self.clone()?),
-                    (other.id, other.clone()?)
+                    (self.id, self.clone_result()?),
+                    (other.id, other.clone_result()?)
                 ]
             );
         }
@@ -922,8 +1116,8 @@ extern "C" __global__ void slice_kernel(
                     rhs: other.id
                 },
                 vec![
-                    (self.id, self.clone()?),
-                    (other.id, other.clone()?)
+                    (self.id, self.clone_result()?),
+                    (other.id, other.clone_result()?)
                 ]
             );
         }
@@ -947,8 +1141,8 @@ extern "C" __global__ void slice_kernel(
                     rhs: other.id
                 },
                 vec![
-                    (self.id, self.clone()?),
-                    (other.id, other.clone()?)
+                    (self.id, self.clone_result()?),
+                    (other.id, other.clone_result()?)
                 ]
             );
         }
@@ -971,7 +1165,7 @@ extern "C" __global__ void slice_kernel(
                     input: self.id,
                     scalar
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         
@@ -998,7 +1192,7 @@ extern "C" __global__ void slice_kernel(
                     input: self.id,
                     scalar
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         
@@ -1019,7 +1213,7 @@ extern "C" __global__ void slice_kernel(
                 Op::ReLU { 
                     input: self.id
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         
@@ -1040,7 +1234,7 @@ extern "C" __global__ void slice_kernel(
                 Op::GELU { 
                     input: self.id
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         
@@ -1061,7 +1255,7 @@ extern "C" __global__ void slice_kernel(
                 Op::SiLU { 
                     input: self.id
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         
@@ -1082,7 +1276,7 @@ extern "C" __global__ void slice_kernel(
                 Op::Tanh { 
                     input: self.id
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         
@@ -1103,7 +1297,7 @@ extern "C" __global__ void slice_kernel(
                 Op::Sigmoid { 
                     input: self.id
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         
@@ -1158,34 +1352,33 @@ extern "C" __global__ void slice_kernel(
                 Op::Square { 
                     input: self.id
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         
         Ok(output)
     }
 
-    /// Mean reduction
+    /// Mean reduction (reduce in FP32 for stability, then downcast if needed)
     pub fn mean(&self) -> Result<Tensor> {
-        let sum = self.sum()?;
+        // Upcast to F32 for numerically stable reduction
+        let x32 = if matches!(self.dtype(), DType::F32) { self.clone_result()? } else { self.to_dtype(DType::F32)? };
+        let sum32 = x32.sum()?;
         let count = self.shape.elem_count() as f32;
-        let mut output = sum.mul_scalar(1.0 / count)?;
-        
-        // Record mean operation if needed
+        let mut out32 = sum32.mul_scalar(1.0 / count)?;
+
+        // Record mean operation if needed (attach grad to original input)
         if self.requires_grad {
-            output.requires_grad = true;
-            
+            out32.requires_grad = true;
             AutogradContext::record_op(
-                output.id,
-                Op::Mean { 
-                    input: self.id,
-                    input_shape: self.shape.clone()
-                },
-                vec![(self.id, self.clone()?)]
+                out32.id,
+                Op::Mean { input: self.id, input_shape: self.shape.clone() },
+                vec![(self.id, self.clone_result()?)]
             );
         }
-        
-        Ok(output)
+
+        // Downcast to original dtype when appropriate
+        if matches!(self.dtype(), DType::F32) { Ok(out32) } else { out32.to_dtype(self.dtype()) }
     }
 
     /// Sum reduction 
@@ -1203,7 +1396,7 @@ extern "C" __global__ void slice_kernel(
                     input: self.id,
                     input_shape: self.shape.clone()
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         
@@ -1213,13 +1406,13 @@ extern "C" __global__ void slice_kernel(
     /// Sum along specific dimensions
     pub fn sum_dims(&self, dims: &[usize]) -> Result<Tensor> {
         // Reduce iteratively in descending order to avoid index shifts
-        if dims.is_empty() { return self.clone(); }
+        if dims.is_empty() { return Ok(self.clone()); }
         let mut dims_sorted: Vec<usize> = dims.iter().copied().collect();
         dims_sorted.sort_unstable();
         dims_sorted.dedup();
 
         // Perform reductions without recording intermediate ops
-        let mut current = self.clone()?;
+        let mut current = self.clone_result()?;
         for &d in dims_sorted.iter().rev() {
             let keep = GpuOps::sum_dim_keepdim(&current, d)?;
             // Build new shape without dimension d
@@ -1235,7 +1428,7 @@ extern "C" __global__ void slice_kernel(
             AutogradContext::record_op(
                 out.id,
                 Op::SumDims { input: self.id, dims: dims_sorted.clone() },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
             Ok(out)
         } else {
@@ -1273,7 +1466,7 @@ extern "C" __global__ void slice_kernel(
                     input: self.id,
                     dim
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
 
@@ -1294,14 +1487,23 @@ extern "C" __global__ void slice_kernel(
                 got: self.shape.clone(),
             });
         }
-        
-        Ok(Tensor {
+        // Create view tensor (shares storage) with new shape
+        let out = Tensor {
             id: TensorId::new(),
             storage: self.storage.clone(),
-            shape: new_shape,
+            shape: new_shape.clone(),
             device: self.device.clone(),
             requires_grad: self.requires_grad,
-        })
+        };
+        // Record autograd op so gradients flow through reshape
+        if self.requires_grad {
+            AutogradContext::record_op(
+                out.id,
+                Op::Reshape { input: self.id, new_shape: new_shape.dims().to_vec() },
+                vec![(self.id, self.clone_result()?)]
+            );
+        }
+        Ok(out)
     }
     
     /// Get device
@@ -1321,7 +1523,9 @@ extern "C" __global__ void slice_kernel(
 
     /// Copy to CPU
     pub fn to_vec(&self) -> Result<Vec<f32>> {
-        Ok(self.device.dtoh_sync_copy(self.storage.as_slice())
+        Ok(self
+            .device
+            .dtoh_sync_copy(self.storage.try_as_slice_f32()?)
             .map_err(|_| FlameError::CudaDriver)?)
     }
 
@@ -1347,7 +1551,7 @@ extern "C" __global__ void slice_kernel(
                 Op::Transpose { 
                     input: self.id
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         
@@ -1384,7 +1588,7 @@ extern "C" __global__ void slice_kernel(
         
         // If shapes are equal, just clone
         if &padded_src[..] == dst_shape {
-            return self.clone();
+            return Ok(self.clone());
         }
         
         // Use CUDA kernel for efficient broadcasting
@@ -1411,14 +1615,16 @@ extern "C" __global__ void slice_kernel(
     
     /// Convert tensor to a Vec<f32> on CPU
     pub fn to_vec_f32(&self) -> Result<Vec<f32>> {
-        let cpu_data = self.device.dtoh_sync_copy(self.storage.as_slice())
+        let cpu_data = self.device.dtoh_sync_copy(self.storage.try_as_slice_f32()?)
             .map_err(|_| FlameError::CudaDriver)?;
         
         Ok(cpu_data)
     }
     
     /// Clone the tensor (creates a new tensor with copied data)
-    pub fn clone(&self) -> Result<Tensor> {
+    /// Fallible deep/device clone. Prefer `clone_result()` in internal code
+    /// and the `Clone` trait (`.clone()`) for infallible API.
+    pub fn clone_result(&self) -> Result<Tensor> {
         // Commented out for performance
         // println!("CLONE DEBUG: Cloning tensor with shape {:?}, dtype {:?}, elem_count: {}", 
         //          self.shape, self.dtype(), self.shape.elem_count());
@@ -1450,6 +1656,18 @@ extern "C" __global__ void slice_kernel(
                     .map_err(|_| FlameError::CudaDriver)?;
                 TensorStorage::I8 { data: new_data, numel: *numel }
             }
+            TensorStorage::I32 { data, numel } => {
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
+                self.device.dtod_copy(data, &mut new_data)
+                    .map_err(|_| FlameError::CudaDriver)?;
+                TensorStorage::I32 { data: new_data, numel: *numel }
+            }
+            TensorStorage::Bool { data, numel } => {
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
+                self.device.dtod_copy(data, &mut new_data)
+                    .map_err(|_| FlameError::CudaDriver)?;
+                TensorStorage::Bool { data: new_data, numel: *numel }
+            }
         };
         
         Ok(Tensor {
@@ -1460,6 +1678,8 @@ extern "C" __global__ void slice_kernel(
             requires_grad: self.requires_grad,
         })
     }
+
+    // NOTE: Keep any additional tensor methods below.
     
     /// Detach from computation graph
     pub fn detach(&self) -> Result<Tensor> {
@@ -1489,6 +1709,18 @@ extern "C" __global__ void slice_kernel(
                 self.device.dtod_copy(data, &mut new_data)
                     .map_err(|_| FlameError::CudaDriver)?;
                 TensorStorage::I8 { data: new_data, numel: *numel }
+            }
+            TensorStorage::I32 { data, numel } => {
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
+                self.device.dtod_copy(data, &mut new_data)
+                    .map_err(|_| FlameError::CudaDriver)?;
+                TensorStorage::I32 { data: new_data, numel: *numel }
+            }
+            TensorStorage::Bool { data, numel } => {
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
+                self.device.dtod_copy(data, &mut new_data)
+                    .map_err(|_| FlameError::CudaDriver)?;
+                TensorStorage::Bool { data: new_data, numel: *numel }
             }
         };
             
@@ -1632,7 +1864,7 @@ extern "C" __global__ void slice_kernel(
                     input: self.id,
                     dims: dims.to_vec()
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         
@@ -1676,7 +1908,7 @@ extern "C" __global__ void slice_kernel(
                     input: self.id,
                     dim: dim as isize
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         
@@ -1791,8 +2023,8 @@ extern "C" __global__ void slice_kernel(
                     bias: bias.id
                 },
                 vec![
-                    (self.id, self.clone()?),
-                    (bias.id, bias.clone()?)
+                    (self.id, self.clone_result()?),
+                    (bias.id, bias.clone_result()?)
                 ]
             );
         }
@@ -1820,7 +2052,7 @@ extern "C" __global__ void slice_kernel(
     
     /// Get a CUDA slice reference to the tensor data
     pub fn to_cuda_slice(&self) -> Result<&CudaSlice<f32>> {
-        Ok(self.storage.as_slice())
+        Ok(self.storage.try_as_slice_f32()?)
     }
     
     /// Transpose the last two dimensions (for batch operations)
@@ -1873,14 +2105,24 @@ extern "C" __global__ void slice_kernel(
         }
         
         // Implement using regular matmul on flattened batches
-        // Future optimization: Use cuBLAS batched GEMM when available
+        // Fast-path: if effective batch_size == 1, collapse to 2D GEMM (cuBLAS)
         let batch_size: usize = self_dims[..self_dims.len()-2].iter().product();
+        if batch_size == 1 {
+            let a2d = self.reshape(&[m, k1])?;
+            let b2d = other.reshape(&[k2, n])?;
+            let out2d = a2d.matmul(&b2d)?;
+            let mut out_dims = self_dims[..self_dims.len()-2].to_vec();
+            if out_dims.is_empty() { out_dims.push(1); }
+            out_dims.push(m);
+            out_dims.push(n);
+            return out2d.reshape(&out_dims);
+        }
         
         // Reshape to [batch_size, m, k] and [batch_size, k, n]
         let self_3d = self.reshape(&[batch_size, m, k1])?;
         let other_3d = other.reshape(&[batch_size, k2, n])?;
         
-        // Perform matmul for each batch element
+        // General path (small batches): perform per-batch GEMM; TODO: switch to strided batched GEMM
         let mut results = Vec::new();
         for b in 0..batch_size {
             // Get slice for this batch
@@ -2019,7 +2261,7 @@ extern "C" __global__ void slice_kernel(
         
         // Get the narrow kernel
         let kernel = cuda_kernels.kernels.get("narrow_kernel")
-            .ok_or_else(|| FlameError::KernelError("narrow_kernel not found".into()))?
+            .ok_or_else(|| FlameError::Cuda("narrow_kernel not found".into()))?
             .clone();
         
         // Launch kernel
@@ -2035,8 +2277,8 @@ extern "C" __global__ void slice_kernel(
         
         unsafe {
             kernel.launch(config, (
-                self.storage.as_slice(),
-                output.storage.as_slice(),
+                self.storage.try_as_slice_f32()?,
+                output.storage.try_as_slice_f32()?,
                 input_size[0] as i32, input_size[1] as i32, input_size[2] as i32, input_size[3] as i32,
                 output_size[0] as i32, output_size[1] as i32, output_size[2] as i32, output_size[3] as i32,
                 dim as i32, start as i32
@@ -2081,13 +2323,31 @@ impl TensorGradExt for Tensor {
 }
 
 /// Allocate memory from the pool for internal use
-pub(crate) fn alloc_from_pool(device: &Arc<CudaDevice>, size: usize) -> Result<CudaSlice<f32>> {
-    // Use aligned allocation to avoid CUDA alignment issues
-    alloc_aligned_f32(device, size)
-}
+    pub(crate) fn alloc_from_pool(device: &Arc<CudaDevice>, size: usize) -> Result<CudaSlice<f32>> {
+        if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+            let bytes = size * std::mem::size_of::<f32>();
+            if bytes >= (8 << 20) {
+                eprintln!("[alloc] tag=pool_alloc_f32 size={} bytes={}", size, bytes);
+                if bytes >= 9_437_184 {
+                    eprintln!("[sentry] FP32_ALLOC bytes={} shape_hint=[?,?]", bytes);
+                }
+            }
+        }
+        // Use aligned allocation to avoid CUDA alignment issues
+        alloc_aligned_f32(device, size)
+    }
 
 /// Allocate zeroed memory from the pool for internal use
-pub(crate) fn alloc_zeros_from_pool(device: &Arc<CudaDevice>, size: usize) -> Result<CudaSlice<f32>> {
+    pub(crate) fn alloc_zeros_from_pool(device: &Arc<CudaDevice>, size: usize) -> Result<CudaSlice<f32>> {
+        if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+            let bytes = size * std::mem::size_of::<f32>();
+            if bytes >= (8 << 20) {
+                eprintln!("[alloc] tag=pool_zeros_f32 size={} bytes={}", size, bytes);
+                if bytes >= 9_437_184 {
+                    eprintln!("[sentry] FP32_ALLOC bytes={} shape_hint=[?,?]", bytes);
+                }
+            }
+        }
     let mut data = alloc_from_pool(device, size)?;
     device.memset_zeros(&mut data)?;
     Ok(data)
@@ -2103,6 +2363,8 @@ impl Drop for Tensor {
                     TensorStorage::F32 { data, .. } => pool_guard.deallocate(data.clone()),
                     TensorStorage::F16 { data, .. } => pool_guard.deallocate(data.clone()),
                     TensorStorage::BF16 { data, .. } => pool_guard.deallocate(data.clone()),
+                    TensorStorage::I32 { data, .. } => pool_guard.deallocate(data.clone()),
+                    TensorStorage::Bool { data, .. } => pool_guard.deallocate(data.clone()),
                     TensorStorage::I8 { .. } => {
                         // I8 storage is not pooled (for now)
                         // It will be cleaned up automatically by cudarc
@@ -2110,5 +2372,24 @@ impl Drop for Tensor {
                 }
             }
         }
+    }
+}
+
+// --- Unsafe external device pointer construction (placeholder) ---
+impl Tensor {
+    /// Unsafe constructor to wrap an external device pointer as a Tensor.
+    /// Placeholder stub: returns an error until proper external storage support lands.
+    ///
+    /// Safety: `ptr` must be a valid device buffer on `device` with at least
+    /// `dtype.size_in_bytes() * shape.elem_count()` bytes of accessible memory.
+    pub unsafe fn from_device_ptr_unsafe(
+        _ptr: *mut u8,
+        _shape: Shape,
+        _dtype: DType,
+        _device: Arc<CudaDevice>,
+    ) -> Result<Self> {
+        Err(FlameError::InvalidOperation(
+            "from_device_ptr_unsafe not yet implemented".to_string(),
+        ))
     }
 }

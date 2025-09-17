@@ -24,7 +24,7 @@ impl Dropout {
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
         if !self.training || self.p == 0.0 {
             // During evaluation or with p=0, return input unchanged
-            return input.clone();
+            return Ok(input.clone());
         }
         
         if self.p == 1.0 {
@@ -75,7 +75,7 @@ impl Dropout2d {
     /// Input shape: [batch, channels, height, width]
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
         if !self.training || self.p == 0.0 {
-            return input.clone();
+            return Ok(input.clone());
         }
         
         let shape = input.shape().dims();
@@ -243,7 +243,7 @@ impl AlphaDropout {
     /// Apply alpha dropout
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
         if !self.training || self.p == 0.0 {
-            return input.clone();
+            return Ok(input.clone());
         }
         
         let mut rng = rand::thread_rng();
@@ -313,7 +313,10 @@ impl SpectralNorm {
         
         // Power iteration to find largest singular value
         for _ in 0..self.n_power_iterations {
-            let u = self.u.as_ref().unwrap();
+            let u = match self.u.as_ref() {
+                Some(u) => u,
+                None => return Err(FlameError::Training("spectral norm state 'u' missing".into())),
+            };
             // v = W^T @ u
             let v = weight_2d.transpose()?.matmul(u)?;
             let v_norm = self.vector_norm(&v)?;
@@ -326,7 +329,10 @@ impl SpectralNorm {
         }
         
         // Compute spectral norm: sigma = u^T @ W @ v
-        let u = self.u.as_ref().unwrap();
+        let u = match self.u.as_ref() {
+            Some(u) => u,
+            None => return Err(FlameError::Training("spectral norm state 'u' missing".into())),
+        };
         let v = weight_2d.transpose()?.matmul(u)?;
         let v_norm = self.vector_norm(&v)?;
         let v = v.mul_scalar(1.0 / (v_norm + self.eps))?;
@@ -370,7 +376,7 @@ impl WeightStandardization {
     pub fn forward(&self, weight: &Tensor) -> Result<Tensor> {
         let shape = weight.shape().dims();
         if shape.len() < 2 {
-            return weight.clone();
+            return Ok(weight.clone());
         }
         
         let out_features = shape[0];

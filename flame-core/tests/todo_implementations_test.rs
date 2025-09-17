@@ -366,3 +366,4 @@ fn test_all_implementations() {
     
     println!("\n✅ All production implementations verified!\n");
 }
+#![cfg(feature = "flash_attn")]

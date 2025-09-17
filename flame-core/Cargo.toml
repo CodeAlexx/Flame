@@ -31,73 +31,118 @@ cudnn = []        # Opt-in only
 legacy = []
 cuda = []
 capi = []
+# Developer-only examples; never built unless explicitly enabled.
+dev-examples = []
+# Experimental: true BF16 GPU storage and BF16 GEMM
+bf16_u16 = []
 
 [lib]
 crate-type = ["rlib", "cdylib"]
 
 [build-dependencies]
 cbindgen = "0.26"
+cc = "1.0"
 
 [[example]]
 name = "test_cudnn_conv2d"
 required-features = ["cudnn"]
+path = "examples/_placeholder.rs"
 
 [[example]]
 name = "weight_update"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "autograd_demo"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "conv2d_demo"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "norm_demo"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "cuda_kernel_test"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "transpose_test"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "autograd_training"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "conv2d_cuda_test"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "activation_test"
+path = "examples/activation_test.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "optimizer_test"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "attention_test"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "serialization_test"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "bmm_test"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "regularization_test"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "mixed_precision_test"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "gradient_clip_test"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "autograd_test"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "autograd_v2_test"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 
 [[example]]
 name = "kernel_launcher_example"
+path = "examples/_placeholder.rs"
+required-features = ["dev-examples"]
 [[example]]
 name = "test_cudnn_simple"
 required-features = ["cudnn"]
+path = "examples/_placeholder.rs"

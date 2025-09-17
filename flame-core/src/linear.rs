@@ -79,14 +79,14 @@ impl Linear {
                 use crate::autograd::{AutogradContext, Op};
                 
                 let mut saved = vec![
-                    (input.id(), input.clone()?),
-                    (self.weight.id(), self.weight.clone()?),
+                    (input.id(), input.clone_result()?),
+                    (self.weight.id(), self.weight.clone_result()?),
                 ];
                 
                 // Save bias if it exists and requires grad
                 let bias_id = if let Some(bias) = &self.bias {
                     if bias.requires_grad() {
-                        saved.push((bias.id(), bias.clone()?));
+                        saved.push((bias.id(), bias.clone_result()?));
                         Some(bias.id())
                     } else {
                         None
@@ -131,14 +131,14 @@ impl Linear {
             use crate::autograd::{AutogradContext, Op};
             
             let mut saved = vec![
-                (input.id(), input.clone()?),
-                (self.weight.id(), self.weight.clone()?),
+                (input.id(), input.clone_result()?),
+                (self.weight.id(), self.weight.clone_result()?),
             ];
             
             // Save bias if it exists and requires grad
             let bias_id = if let Some(bias) = &self.bias {
                 if bias.requires_grad() {
-                    saved.push((bias.id(), bias.clone()?));
+                    saved.push((bias.id(), bias.clone_result()?));
                 }
                 Some(bias.id())
             } else {

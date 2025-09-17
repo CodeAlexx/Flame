@@ -44,7 +44,7 @@ impl KernelLauncher {
         let cache_key = format!("{}-{}", self.device.ordinal(), kernel_name);
         
         {
-            let cache = KERNEL_CACHE.lock().unwrap();
+            let cache = KERNEL_CACHE.lock().map_err(|_| crate::FlameError::Training("kernel launcher cache mutex poisoned".into()))?;
             if let Some(kernel) = cache.get(&cache_key) {
                 return Ok(kernel.clone());
             }
@@ -69,7 +69,7 @@ impl KernelLauncher {
         
         // Cache the compiled kernel
         {
-            let mut cache = KERNEL_CACHE.lock().unwrap();
+            let mut cache = KERNEL_CACHE.lock().map_err(|_| crate::FlameError::Training("kernel launcher cache mutex poisoned".into()))?;
             cache.insert(cache_key, kernel.clone());
         }
         

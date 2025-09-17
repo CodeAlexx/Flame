@@ -1,6 +1,6 @@
 # FLAME (Fast Learning Accelerated Matrix Engine)
 
-A pure Rust tensor computation framework designed for GPU-accelerated deep learning with full gradient support. FLAME is being developed to replace Candle in EriDiffusion, as Candle's architecture fundamentally prevents gradient modification necessary for training.
+A pure Rust tensor computation framework designed for GPU-accelerated deep learning with full gradient support. FLAME is being developed to replace a legacy backend in EriDiffusion to enable full gradient flexibility necessary for training.
 
 ## Features
 
@@ -12,8 +12,8 @@ A pure Rust tensor computation framework designed for GPU-accelerated deep learn
 
 ## Why FLAME?
 
-### The Candle Problem
-Despite extensive efforts to modify Candle for training support, its fundamental architecture prevents gradient modification. Candle's `VarBuilder` returns immutable tensors, making it impossible to implement proper backpropagation for training neural networks.
+### Motivation
+Legacy backends in Rust often assumed immutable tensors in key APIs, making it difficult to implement full backpropagation and gradient modification required for training.
 
 ### FLAME Solution
 - **Native Gradient Support**: Built from the ground up with mutable gradients and autograd
@@ -146,7 +146,7 @@ for epoch in 0..num_epochs {
 
 ## Integration with EriDiffusion
 
-FLAME is being developed as the tensor backend for EriDiffusion, replacing the Candle fork. The integration will enable:
+FLAME is being developed as the tensor backend for EriDiffusion. The integration will enable:
 
 - Full training support for diffusion models (SDXL, SD3.5, Flux, etc.)
 - LoRA, DoRA, and other adapter training

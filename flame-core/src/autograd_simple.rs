@@ -97,7 +97,7 @@ impl AutogradEngine {
         for entry in self.tape.iter().rev() {
             // Skip if no gradient flowing to this output
             let grad_output = match self.gradients.get(&entry.output_id) {
-                Some(g) => g.clone()?,
+                Some(g) => g.clone_result()?,
                 None => continue,
             };
             
@@ -323,7 +323,7 @@ impl AutogradEngine {
                     if let Some(bias_tensor) = entry.saved_tensors.get(bias) {
                         // Sum over all dimensions except the last one
                         let grad_shape = grad_output.shape().dims();
-                        let mut grad_bias = grad_output.clone()?;
+                        let mut grad_bias = grad_output.clone_result()?;
                         
                         // Sum over batch dimensions
                         for i in 0..grad_shape.len() - 1 {
@@ -343,7 +343,7 @@ impl AutogradEngine {
                         // For now, only support dim=0
                         if *dim == 0 {
                             let batch_size = input_shape[0];
-                            let mut expanded_grad = grad_output.clone()?;
+                            let mut expanded_grad = grad_output.clone_result()?;
                             
                             // Repeat the gradient batch_size times
                             for _ in 1..batch_size {
@@ -352,7 +352,7 @@ impl AutogradEngine {
                             
                             // Reshape to match input
                             let grad_input = expanded_grad.unsqueeze(0)?;
-                            let mut final_grad = grad_input.clone()?;
+                            let mut final_grad = grad_input.clone_result()?;
                             
                             // Replicate along batch dimension
                             for _ in 1..batch_size {

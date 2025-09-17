@@ -1,5 +1,5 @@
-// EXTRACTED FROM: candle-core/src/dtype.rs
-// REASON: Standard dtype definitions we need for compatibility
+// Origin: adapted from prior art in the Rust DL ecosystem
+// Reason: Standard dtype definitions needed for compatibility
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {

@@ -445,7 +445,7 @@ fn test_gradient_clipping() -> Result<()> {
     let clipped_grad = if grad_norm_val > max_norm {
         grad.mul_scalar(max_norm / grad_norm_val)?
     } else {
-        grad.clone()?
+        grad.clone_result()?
     };
     
     // Verify clipped norm
@@ -514,7 +514,7 @@ fn test_memory_efficient_gradient_accumulation() -> Result<()> {
         
         // Accumulate
         accumulated_grad = match accumulated_grad {
-            None => Some(grad.clone()?),
+            None => Some(grad.clone_result()?),
             Some(acc) => Some(acc.add(&grad)?),
         };
         

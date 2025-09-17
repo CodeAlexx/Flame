@@ -6,14 +6,14 @@ pub struct BackwardOps;
 impl BackwardOps {
     /// Backward for addition: grad flows unchanged to both inputs
     pub fn add_backward(grad_output: &Tensor) -> Result<(Tensor, Tensor)> {
-        let grad_lhs = grad_output.clone()?;
-        let grad_rhs = grad_output.clone()?;
+        let grad_lhs = grad_output.clone_result()?;
+        let grad_rhs = grad_output.clone_result()?;
         Ok((grad_lhs, grad_rhs))
     }
     
     /// Backward for subtraction: grad flows to lhs, -grad to rhs
     pub fn sub_backward(grad_output: &Tensor) -> Result<(Tensor, Tensor)> {
-        let grad_lhs = grad_output.clone()?;
+        let grad_lhs = grad_output.clone_result()?;
         let grad_rhs = grad_output.mul_scalar(-1.0)?;
         Ok((grad_lhs, grad_rhs))
     }
@@ -155,6 +155,53 @@ impl BackwardOps {
         }
         
         Tensor::from_vec(result, grad_output.shape().clone(), grad_output.device().clone())
+    }
+
+    /// Scaled dot-product attention backward via recomputation path.
+    /// Shapes follow [B, H, S, D] convention for Q,K,V and [B, H, S_q, D] for dO.
+    /// mask is an optional additive mask broadcastable to [B,H,S_q,S_k].
+    pub fn attention_backward_recompute(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        dout: &Tensor,
+        mask: Option<&Tensor>,
+        scale: f32,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        // 1) logits = (Q K^T) * scale [+ mask]
+        let kt = k.transpose_dims(2, 3)?;           // [B,H,D,Sk]
+        let mut logits = q.bmm(&kt)?;               // [B,H,Sq,Sk]
+        logits = logits.mul_scalar(scale)?;
+        if let Some(m) = mask { logits = logits.add(m)?; }
+
+        // 2) attn = softmax(logits)
+        let attn = logits.softmax(-1)?;             // [B,H,Sq,Sk]
+
+        // 3) dV = attn^T @ dO
+        let attn_t = attn.transpose_dims(2, 3)?;    // [B,H,Sk,Sq]
+        let d_v = attn_t.bmm(dout)?;                // [B,H,Sk,D]
+
+        // 4) dAttn = dO @ V^T
+        let vt = v.transpose_dims(2, 3)?;           // [B,H,D,Sk]
+        let d_attn = dout.bmm(&vt)?;                // [B,H,Sq,Sk]
+
+        // 5) Softmax backward: dLogits = (dAttn - sum(dAttn*attn, -1, keepdim)) * attn
+        let dattn_times_attn = d_attn.mul(&attn)?;  // [B,H,Sq,Sk]
+        let sum_term = dattn_times_attn.sum_dim_keepdim(3)?; // [B,H,Sq,1]
+        let d_logits = d_attn.sub(&sum_term)?.mul(&attn)?;   // [B,H,Sq,Sk]
+
+        // 6) Optional: if caller passes a 0/1 binary mask, multiply to stop grads.
+        // For additive -inf masks, softmax already zeros masked probs, so this is usually unnecessary.
+        let d_logits = if let Some(_m) = mask { d_logits } else { d_logits };
+
+        // 7) dQ = dLogits @ K
+        let d_q = d_logits.bmm(k)?;                 // [B,H,Sq,D]
+
+        // 8) dK = dLogits^T @ Q
+        let d_logits_t = d_logits.transpose_dims(2, 3)?; // [B,H,Sk,Sq]
+        let d_k = d_logits_t.bmm(q)?;               // [B,H,Sk,D]
+
+        Ok((d_q, d_k, d_v))
     }
 }
 

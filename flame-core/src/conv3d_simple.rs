@@ -275,8 +275,8 @@ extern "C" __global__ void conv3d_forward(
         
         launch_kernel!(f, cfg,
             &output_data,
-            input.storage.as_slice(),
-            self.weight.storage.as_slice(),
+            input.storage.try_as_slice_f32()?,
+            self.weight.storage.try_as_slice_f32()?,
             &input_dims_gpu,
             &output_dims_gpu,
             &kernel_dims_gpu,
@@ -442,22 +442,22 @@ extern "C" __global__ void batchnorm3d_forward(
         // Use running stats if available, otherwise compute batch stats
         let (batch_mean, batch_var);
         let (mean, var) = if let (Some(rm), Some(rv)) = (&self.running_mean, &self.running_var) {
-            (rm.storage.as_slice(), rv.storage.as_slice())
+            (rm.storage.try_as_slice_f32()?, rv.storage.try_as_slice_f32()?)
         } else {
             // Compute batch statistics
             batch_mean = self.compute_batch_mean(input)?;
             batch_var = self.compute_batch_var(input, &batch_mean)?;
-            (batch_mean.storage.as_slice(), batch_var.storage.as_slice())
+            (batch_mean.storage.try_as_slice_f32()?, batch_var.storage.try_as_slice_f32()?)
         };
         
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(f, cfg,
             &output_data,
-            input.storage.as_slice(),
+            input.storage.try_as_slice_f32()?,
             mean,
             var,
-            self.weight.as_ref().map(|w| w.storage.as_slice()).unwrap_or(mean), // Use mean as dummy for null pointer
-            self.bias.as_ref().map(|b| b.storage.as_slice()).unwrap_or(mean),   // Use mean as dummy for null pointer
+            self.weight.as_ref().map(|w| w.storage.try_as_slice_f32()).transpose()?.unwrap_or(mean), // Use mean as dummy for null pointer
+            self.bias.as_ref().map(|b| b.storage.try_as_slice_f32()).transpose()?.unwrap_or(mean),   // Use mean as dummy for null pointer
             self.eps,
             dims[0] as i32,
             self.num_features as i32,

@@ -228,7 +228,7 @@ fn test_gradient_checkpointing_memory() -> Result<()> {
         let x = Tensor::randn(Shape::from_dims(&[128, 512]), 0.0, 1.0, device.clone())?.requires_grad();
         
         // Deep network
-        let mut h = x.clone()?;
+        let mut h = x.clone_result()?;
         let mut weights = Vec::new();
         
         for i in 0..10 {

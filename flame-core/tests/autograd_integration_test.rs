@@ -125,8 +125,8 @@ fn test_attention_forward_backward() -> Result<()> {
         device.clone()
     )?.requires_grad_(true);
     
-    let key = query.clone()?;
-    let value = query.clone()?;
+    let key = query.clone_result()?;
+    let value = query.clone_result()?;
     
     // Forward pass
     let output = attention.forward(&query, &key, &value, None)?;
@@ -164,7 +164,7 @@ fn test_adam_optimizer() -> Result<()> {
     };
     
     // Store initial weights
-    let initial_weight = linear.weight.clone()?;
+    let initial_weight = linear.weight.clone_result()?;
     let initial_bias = linear.bias.as_ref().map(|b| b.clone().unwrap());
     
     // Create optimizer
@@ -214,7 +214,7 @@ fn test_sgd_optimizer_with_momentum() -> Result<()> {
     let mut optimizer = SGD::new(config);
     
     // Store initial value
-    let initial = param.clone()?;
+    let initial = param.clone_result()?;
     
     // Take multiple steps to see momentum effect
     for _ in 0..3 {

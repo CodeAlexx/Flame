@@ -207,7 +207,7 @@ These documented features don't exist:
 4. **Simplify device management examples** to match reality
 5. **Add proper error handling examples** throughout
 6. **Document actual memory patterns** used by EriDiffusion
-7. **Add migration guide** from Candle to FLAME APIs
+7. **Ensure migration guide** for FLAME APIs is complete and current
 
 ## 8. Better Usage Patterns for EriDiffusion
 

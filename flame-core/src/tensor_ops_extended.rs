@@ -10,6 +10,12 @@ use crate::DType;
 use cudarc::driver::CudaDevice;
 
 impl Tensor {
+    // NOTE [Factories & BF16 policy]
+    // These high-level factory helpers currently build host-side FP32 vectors then upload.
+    // Do NOT use them on hot training paths. Prefer BF16-specialized GPU kernels that:
+    //   - generate FP32 in registers per element; and
+    //   - immediately convert and store as BF16 (no full FP32 buffers).
+    // See: bf16_ops + bf16_convert modules and bf16_u16 feature.
     /// Random uniform tensor
     pub fn rand(shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
         let size = shape.elem_count();
@@ -69,7 +75,7 @@ impl Tensor {
                 ));
             }
             if dims[d] != 1 {
-                return Ok(self.clone()?);
+                return Ok(self.clone_result()?);
             }
             dims.iter().enumerate()
                 .filter(|(i, _)| *i != d)
@@ -99,84 +105,51 @@ impl Tensor {
         self.reshape(&new_dims)
     }
     
-    /// Greater than comparison
+    /// Greater than comparison (broadcast-safe)
     pub fn gt(&self, other: &Tensor) -> Result<Tensor> {
-        if self.shape != other.shape {
-            return Err(FlameError::ShapeMismatch {
-                expected: self.shape.clone(),
-                got: other.shape.clone(),
-            });
-        }
-        
-        let self_data = self.to_vec()?;
-        let other_data = other.to_vec()?;
-        
-        let result: Vec<f32> = self_data.iter()
-            .zip(other_data.iter())
-            .map(|(a, b)| if a > b { 1.0 } else { 0.0 })
-            .collect();
-        
-        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+        // Compute target broadcast shape
+        let target = self.shape.broadcast_shape_binary_op(&other.shape)?;
+        // Broadcast both to target if needed (use CPU-safe broadcast to avoid GPU rank issues)
+        let a = if &self.shape != &target { crate::cuda_kernels::CudaKernels::broadcast(self, &target)? } else { self.clone_result()? };
+        let b = if &other.shape != &target { crate::cuda_kernels::CudaKernels::broadcast(other, &target)? } else { other.clone_result()? };
+
+        let a_data = a.to_vec()?;
+        let b_data = b.to_vec()?;
+        let result: Vec<f32> = a_data.iter().zip(b_data.iter()).map(|(x,y)| if x > y {1.0} else {0.0}).collect();
+        Tensor::from_vec(result, target, self.device.clone())
     }
     
-    /// Greater than or equal comparison
+    /// Greater than or equal comparison (broadcast-safe)
     pub fn ge(&self, other: &Tensor) -> Result<Tensor> {
-        if self.shape != other.shape {
-            return Err(FlameError::ShapeMismatch {
-                expected: self.shape.clone(),
-                got: other.shape.clone(),
-            });
-        }
-        
-        let self_data = self.to_vec()?;
-        let other_data = other.to_vec()?;
-        
-        let result: Vec<f32> = self_data.iter()
-            .zip(other_data.iter())
-            .map(|(a, b)| if a >= b { 1.0 } else { 0.0 })
-            .collect();
-        
-        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+        let target = self.shape.broadcast_shape_binary_op(&other.shape)?;
+        let a = if &self.shape != &target { crate::cuda_kernels::CudaKernels::broadcast(self, &target)? } else { self.clone_result()? };
+        let b = if &other.shape != &target { crate::cuda_kernels::CudaKernels::broadcast(other, &target)? } else { other.clone_result()? };
+        let a_data = a.to_vec()?;
+        let b_data = b.to_vec()?;
+        let result: Vec<f32> = a_data.iter().zip(b_data.iter()).map(|(x,y)| if x >= y {1.0} else {0.0}).collect();
+        Tensor::from_vec(result, target, self.device.clone())
     }
     
-    /// Less than comparison
+    /// Less than comparison (broadcast-safe)
     pub fn lt(&self, other: &Tensor) -> Result<Tensor> {
-        if self.shape != other.shape {
-            return Err(FlameError::ShapeMismatch {
-                expected: self.shape.clone(),
-                got: other.shape.clone(),
-            });
-        }
-        
-        let self_data = self.to_vec()?;
-        let other_data = other.to_vec()?;
-        
-        let result: Vec<f32> = self_data.iter()
-            .zip(other_data.iter())
-            .map(|(a, b)| if a < b { 1.0 } else { 0.0 })
-            .collect();
-        
-        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+        let target = self.shape.broadcast_shape_binary_op(&other.shape)?;
+        let a = if &self.shape != &target { crate::cuda_kernels::CudaKernels::broadcast(self, &target)? } else { self.clone_result()? };
+        let b = if &other.shape != &target { crate::cuda_kernels::CudaKernels::broadcast(other, &target)? } else { other.clone_result()? };
+        let a_data = a.to_vec()?;
+        let b_data = b.to_vec()?;
+        let result: Vec<f32> = a_data.iter().zip(b_data.iter()).map(|(x,y)| if x < y {1.0} else {0.0}).collect();
+        Tensor::from_vec(result, target, self.device.clone())
     }
     
-    /// Not equal comparison
+    /// Not equal comparison (broadcast-safe)
     pub fn ne(&self, other: &Tensor) -> Result<Tensor> {
-        if self.shape != other.shape {
-            return Err(FlameError::ShapeMismatch {
-                expected: self.shape.clone(),
-                got: other.shape.clone(),
-            });
-        }
-        
-        let self_data = self.to_vec()?;
-        let other_data = other.to_vec()?;
-        
-        let result: Vec<f32> = self_data.iter()
-            .zip(other_data.iter())
-            .map(|(a, b)| if a != b { 1.0 } else { 0.0 })
-            .collect();
-        
-        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+        let target = self.shape.broadcast_shape_binary_op(&other.shape)?;
+        let a = if &self.shape != &target { crate::cuda_kernels::CudaKernels::broadcast(self, &target)? } else { self.clone_result()? };
+        let b = if &other.shape != &target { crate::cuda_kernels::CudaKernels::broadcast(other, &target)? } else { other.clone_result()? };
+        let a_data = a.to_vec()?;
+        let b_data = b.to_vec()?;
+        let result: Vec<f32> = a_data.iter().zip(b_data.iter()).map(|(x,y)| if x != y {1.0} else {0.0}).collect();
+        Tensor::from_vec(result, target, self.device.clone())
     }
     
     /// Conditional where operation
@@ -213,7 +186,7 @@ impl Tensor {
     /// Compute mean along dimensions
     pub fn mean_along_dims(&self, dims: &[usize], keepdim: bool) -> Result<Tensor> {
         // Sum along dimensions
-        let mut result = self.clone()?;
+        let mut result = self.clone_result()?;
         for &dim in dims {
             result = result.sum_dim(dim)?;
         }
@@ -311,7 +284,7 @@ impl Tensor {
             AutogradContext::record_op(
                 output.id,
                 Op::Slice { input: self.id, ranges: ranges.to_vec(), input_shape: self.shape.clone() },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         Ok(output)
@@ -426,7 +399,7 @@ impl Tensor {
             
             for tensor in tensors {
                 let id = tensor.id;
-                saved_tensors.push((id, (*tensor).clone()?));
+                saved_tensors.push((id, (*tensor).clone_result()?));
                 input_ids.push(id);
             }
             
@@ -468,8 +441,8 @@ impl Tensor {
                 output.id,
                 Op::IndexSelect { input: self.id, indices: indices.id(), dim },
                 vec![
-                    (self.id, self.clone()?),
-                    (indices.id(), indices.clone()?)
+                    (self.id, self.clone_result()?),
+                    (indices.id(), indices.clone_result()?)
                 ]
             );
         }
@@ -543,10 +516,10 @@ impl Tensor {
         // Broadcast to common shape
         let a = if self.shape().dims() != &broadcast_shape {
             self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-        } else { self.clone()? };
+        } else { self.clone_result()? };
         let b = if other.shape().dims() != &broadcast_shape {
             other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-        } else { other.clone()? };
+        } else { other.clone_result()? };
 
         // GPU elementwise max
         let mut out = crate::cuda_ops::GpuOps::max_elemwise(&a, &b)?;
@@ -557,7 +530,7 @@ impl Tensor {
             AutogradContext::record_op(
                 out.id,
                 Op::Maximum { a: self.id, b: other.id },
-                vec![ (self.id, self.clone()?), (other.id, other.clone()?) ]
+                vec![ (self.id, self.clone_result()?), (other.id, other.clone_result()?) ]
             );
         }
         Ok(out)
@@ -572,13 +545,13 @@ impl Tensor {
         let a = if self.shape().dims() != &broadcast_shape {
             self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
         } else {
-            self.clone()?
+            self.clone_result()?
         };
         
         let b = if other.shape().dims() != &broadcast_shape {
             other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
         } else {
-            other.clone()?
+            other.clone_result()?
         };
         
         // Compute minimum
@@ -593,7 +566,7 @@ impl Tensor {
             AutogradContext::record_op(
                 out.id,
                 Op::Minimum { a: self.id, b: other.id },
-                vec![ (self.id, self.clone()?), (other.id, other.clone()?) ]
+                vec![ (self.id, self.clone_result()?), (other.id, other.clone_result()?) ]
             );
         }
         Ok(out)
@@ -688,8 +661,8 @@ impl Tensor {
                         rhs: other.id
                     },
                     vec![
-                        (self.id, self.clone()?),
-                        (other.id, other.clone()?)
+                        (self.id, self.clone_result()?),
+                        (other.id, other.clone_result()?)
                     ]
                 );
             }
@@ -701,13 +674,13 @@ impl Tensor {
             
             // Broadcast both tensors to the target shape
             let self_broadcast = if self.shape().dims() == &broadcast_shape {
-                self.clone()?
+                self.clone_result()?
             } else {
                 self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
             };
             
             let other_broadcast = if other.shape().dims() == &broadcast_shape {
-                other.clone()?
+                other.clone_result()?
             } else {
                 other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
             };
@@ -966,7 +939,7 @@ impl Tensor {
                     input: self.id,
                     dim: dim as isize
                 },
-                vec![(self.id, self.clone()?)]
+                vec![(self.id, self.clone_result()?)]
             );
         }
         
@@ -1094,7 +1067,7 @@ impl Tensor {
                         sizes: sizes.to_vec(),
                         dim
                     },
-                    vec![(self.id, self.clone()?)]
+                    vec![(self.id, self.clone_result()?)]
                 );
             }
         }

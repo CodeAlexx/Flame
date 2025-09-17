@@ -65,7 +65,7 @@ impl AutogradContext {
         saved_tensors: Vec<(TensorId, Tensor)>,
     ) {
         println!("AUTOGRAD: record_op called for {:?}", op);
-        let mut ctx = AUTOGRAD_CONTEXT.lock().unwrap();
+        let mut ctx = AUTOGRAD_CONTEXT.lock().map_err(|_| crate::FlameError::Training("autograd context mutex poisoned".into()))?;
         
         let mut saved = HashMap::new();
         for (id, tensor) in saved_tensors {
@@ -101,7 +101,7 @@ impl AutogradContext {
         println!("AUTOGRAD: Initialized gradients for loss tensor");
         
         {
-            let mut ctx = AUTOGRAD_CONTEXT.lock().unwrap();
+            let mut ctx = AUTOGRAD_CONTEXT.lock().map_err(|_| crate::FlameError::Training("autograd context mutex poisoned".into()))?;
             println!("AUTOGRAD: Processing {} tape entries", ctx.tape.len());
             
             let prev_enabled = ctx.enabled;
@@ -112,14 +112,14 @@ impl AutogradContext {
                 
                 if let Some(output_grad) = gradients.get(entry.output_id) {
                     println!("AUTOGRAD: Found gradient for output {:?}", entry.output_id);
-                    let output_grad = output_grad.clone()?;
+                    let output_grad = output_grad.clone_result()?;
                     
                     // Compute input gradients
                     let input_grads = match &entry.op {
                         Op::Add { lhs, rhs } => {
                             vec![
-                                (*lhs, output_grad.clone()?),
-                                (*rhs, output_grad.clone()?),
+                                (*lhs, output_grad.clone_result()?),
+                                (*rhs, output_grad.clone_result()?),
                             ]
                         }
                         Op::Mul { lhs, rhs } => {

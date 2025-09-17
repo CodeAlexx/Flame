@@ -321,7 +321,7 @@ fn test_training_components() -> Result<()> {
         let decay = 0.999;
         
         let param = Tensor::randn(Shape::from_dims(&[10, 10]), 0.0, 1.0, device.clone())?;
-        let mut ema_param = param.clone()?;
+        let mut ema_param = param.clone_result()?;
         
         // Simulate updates
         for _ in 0..10 {

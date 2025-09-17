@@ -5,6 +5,14 @@ pub type Result<T> = std::result::Result<T, FlameError>;
 
 #[derive(Error, Debug)]
 pub enum FlameError {
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
+    #[error("Unsupported: {0}")]
+    Unsupported(String),
+
+    #[error("Training/runtime error: {0}")]
+    Training(String),
     #[error("CUDA error: {0}")]
     Cuda(String),
     

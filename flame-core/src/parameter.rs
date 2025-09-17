@@ -49,7 +49,7 @@ impl Parameter {
     
     /// Get a clone of the current tensor value
     pub fn tensor(&self) -> Result<Tensor> {
-        self.data.lock().unwrap().clone()
+        Ok(self.data.lock().map_err(|_| FlameError::Training("parameter data mutex poisoned".into()))?.clone())
     }
     
     /// Get a reference to the tensor (as_tensor compatibility)
@@ -59,36 +59,40 @@ impl Parameter {
     
     /// Set the parameter data directly
     pub fn set_data(&self, tensor: Tensor) -> Result<()> {
-        let mut data_lock = self.data.lock().unwrap();
+        let mut data_lock = self.data.lock().map_err(|_| FlameError::Training("parameter data mutex poisoned".into()))?;
         *data_lock = tensor;
         Ok(())
     }
     
     /// Set gradient for this parameter
     pub fn set_grad(&self, grad: Tensor) -> Result<()> {
-        let mut grad_lock = self.grad.lock().unwrap();
+        let mut grad_lock = self.grad.lock().map_err(|_| FlameError::Training("parameter grad mutex poisoned".into()))?;
         *grad_lock = Some(grad);
         Ok(())
     }
     
     /// Get current gradient (if any)
     pub fn grad(&self) -> Option<Tensor> {
-        let grad_lock = self.grad.lock().unwrap();
-        grad_lock.as_ref().map(|g| g.clone().unwrap())
+        if let Ok(grad_lock) = self.grad.lock() {
+            grad_lock.as_ref().map(|g| g.clone())
+        } else {
+            None
+        }
     }
     
     /// Clear gradient
     pub fn zero_grad(&self) {
-        let mut grad_lock = self.grad.lock().unwrap();
-        *grad_lock = None;
+        if let Ok(mut grad_lock) = self.grad.lock() {
+            *grad_lock = None;
+        }
     }
     
     /// Update parameter in-place with gradient descent
     /// param = param - learning_rate * grad
     pub fn update(&self, learning_rate: f32) -> Result<()> {
-        let grad_lock = self.grad.lock().unwrap();
+        let grad_lock = self.grad.lock().map_err(|_| FlameError::Training("parameter grad mutex poisoned".into()))?;
         if let Some(grad) = grad_lock.as_ref() {
-            let mut data_lock = self.data.lock().unwrap();
+            let mut data_lock = self.data.lock().map_err(|_| FlameError::Training("parameter data mutex poisoned".into()))?;
             
             // Compute update: param = param - lr * grad
             let update = grad.mul_scalar(learning_rate)?;
@@ -102,7 +106,7 @@ impl Parameter {
     
     /// Apply an arbitrary update tensor
     pub fn apply_update(&self, update: &Tensor) -> Result<()> {
-        let mut data_lock = self.data.lock().unwrap();
+        let mut data_lock = self.data.lock().map_err(|_| FlameError::Training("parameter data mutex poisoned".into()))?;
         let new_data = data_lock.sub(update)?;
         *data_lock = new_data;
         Ok(())
@@ -110,7 +114,11 @@ impl Parameter {
     
     /// Get shape of the parameter
     pub fn shape(&self) -> Shape {
-        self.data.lock().unwrap().shape.clone()
+        if let Ok(lock) = self.data.lock() {
+            lock.shape.clone()
+        } else {
+            Shape::from_dims(&[])
+        }
     }
     
     /// Check if parameter requires grad
@@ -121,8 +129,9 @@ impl Parameter {
     /// Set requires_grad flag
     pub fn set_requires_grad(&mut self, requires_grad: bool) {
         self.requires_grad = requires_grad;
-        let mut data_lock = self.data.lock().unwrap();
-        data_lock.requires_grad = requires_grad;
+        if let Ok(mut data_lock) = self.data.lock() {
+            data_lock.requires_grad = requires_grad;
+        }
     }
 }
 

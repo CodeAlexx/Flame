@@ -227,7 +227,7 @@ impl CudaGradientOps {
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
         launch_kernel!(f, cfg,
-            grad.storage.as_slice(),
+            grad.storage.try_as_slice_f32()?,
             clip_value,
             n as i32
         )?;
@@ -273,7 +273,7 @@ impl CudaGradientOps {
         };
         
         launch_kernel!(f1, cfg1,
-            tensor.storage.as_slice(),
+            tensor.storage.try_as_slice_f32()?,
             &partial_sums,
             n as i32
         )?;
@@ -317,8 +317,8 @@ impl CudaGradientOps {
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
         launch_kernel!(f, cfg,
-            grad.storage.as_slice(),
-            noise.storage.as_slice(),
+            grad.storage.try_as_slice_f32()?,
+            noise.storage.try_as_slice_f32()?,
             noise_scale,
             n as i32
         )?;
@@ -336,7 +336,7 @@ impl CudaGradientOps {
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
         launch_kernel!(f, cfg,
-            grad.storage.as_slice(),
+            grad.storage.try_as_slice_f32()?,
             scale,
             n as i32
         )?;
@@ -354,7 +354,7 @@ impl CudaGradientOps {
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
         launch_kernel!(f, cfg,
-            tensor.storage.as_slice(),
+            tensor.storage.try_as_slice_f32()?,
             min_val,
             max_val,
             n as i32
@@ -389,10 +389,10 @@ impl CudaGradientOps {
         
         let cfg = LaunchConfig::for_num_elems(n as u32);
         launch_kernel!(f, cfg,
-            param.storage.as_slice(),
-            m.storage.as_slice(),
-            v.storage.as_slice(),
-            grad.storage.as_slice(),
+            param.storage.try_as_slice_f32()?,
+            m.storage.try_as_slice_f32()?,
+            v.storage.try_as_slice_f32()?,
+            grad.storage.try_as_slice_f32()?,
             lr,
             beta1,
             beta2,

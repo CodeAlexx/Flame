@@ -184,7 +184,7 @@ fn test_conv2d_gradients() -> Result<()> {
     let mut conv = Conv2d::new(1, 1, 2, 1, 0, device.clone())?;
     
     // Replace weight with our kernel (keep reference for gradient check)
-    let kernel_ref = kernel.clone()?;
+    let kernel_ref = kernel.clone_result()?;
     conv.weight = kernel;
     let output = conv.forward(&input)?;
     

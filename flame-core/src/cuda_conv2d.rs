@@ -229,7 +229,7 @@ impl CudaConv2d {
             // Launch with explicit synchronization
             unsafe {
                 f.launch(cfg, (
-                    input.storage.as_slice(),
+                    input.storage.try_as_slice_f32()?,
                     &col_buffer,
                     batch_size as i32,
                     in_channels as i32,
@@ -292,7 +292,7 @@ impl CudaConv2d {
                 .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel v2".into()))?;
             
             launch_kernel!(f, cfg,
-                input.storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
                 &col_buffer,
                 &dims_gpu,
                 &params_gpu
@@ -330,16 +330,16 @@ impl CudaConv2d {
         }
         
         // Record operation for autograd
-        if input.requires_grad || weight.requires_grad || (bias.is_some() && bias.unwrap().requires_grad) {
+        if input.requires_grad || weight.requires_grad || bias.map(|b| b.requires_grad).unwrap_or(false) {
             output.requires_grad = true;
             
             let mut saved_tensors = vec![
-                (input.id, input.clone()?),
-                (weight.id, weight.clone()?),
+                (input.id, input.clone_result()?),
+                (weight.id, weight.clone_result()?),
             ];
             
             let _bias_id = if let Some(b) = bias {
-                saved_tensors.push((b.id, b.clone()?));
+                saved_tensors.push((b.id, b.clone_result()?));
                 Some(b.id)
             } else {
                 None
@@ -389,7 +389,7 @@ impl CudaConv2d {
 
         // Record NHWC op for autograd so backward converts appropriately
         if input_nhwc.requires_grad || weight_khwkicoc.requires_grad || bias.map(|b| b.requires_grad).unwrap_or(false) {
-            let mut out = y_nhwc.clone()?;
+            let mut out = y_nhwc.clone_result()?;
             out.requires_grad = true;
             crate::autograd::AutogradContext::record_op(
                 out.id(),
@@ -413,7 +413,7 @@ impl CudaConv2d {
         let channels = output_dims[1];
         let spatial_size = output_dims[2] * output_dims[3];
         
-        let mut result = output.clone()?;
+        let mut result = output.clone_result()?;
         
         let f = device.get_func("conv2d_ops", "add_bias_nchw_kernel")
             .ok_or_else(|| FlameError::Cuda("Failed to get add_bias kernel".into()))?;
@@ -421,8 +421,8 @@ impl CudaConv2d {
         let cfg = LaunchConfig::for_num_elems((batch_size * channels * spatial_size) as u32);
         
         launch_kernel!(f, cfg,
-            result.storage.as_slice(),
-            bias.storage.as_slice(),
+            result.storage.try_as_slice_f32()?,
+            bias.storage.try_as_slice_f32()?,
             batch_size as i32,
             channels as i32,
             spatial_size as i32
@@ -480,7 +480,7 @@ impl CudaConv2d {
                 .ok_or_else(|| FlameError::Cuda("Failed to get im2col_kernel_simple".into()))?;
             
             launch_kernel!(f_im2col, cfg,
-                input.storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
                 &input_col_buffer,
                 batch_size as i32,
                 in_channels as i32,
@@ -517,7 +517,7 @@ impl CudaConv2d {
                 .ok_or_else(|| FlameError::Cuda("Failed to get im2col kernel v2".into()))?;
             
             launch_kernel!(f_im2col, cfg,
-                input.storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
                 &input_col_buffer,
                 &dims_gpu,
                 &params_gpu
@@ -577,7 +577,7 @@ impl CudaConv2d {
                 .ok_or_else(|| FlameError::Cuda("Failed to get col2im kernel v2".into()))?;
             
             launch_kernel!(f_col2im, cfg,
-                grad_input_col.storage.as_slice(),
+                grad_input_col.storage.try_as_slice_f32()?,
                 &grad_input_data,
                 &dims_gpu,
                 &params_gpu
@@ -603,7 +603,7 @@ impl CudaConv2d {
             
             let cfg = LaunchConfig::for_num_elems(out_channels as u32);
             launch_kernel!(f_bias_grad, cfg,
-                grad_output.storage.as_slice(),
+                grad_output.storage.try_as_slice_f32()?,
                 &grad_bias_data,
                 batch_size as i32,
                 out_channels as i32,
@@ -671,9 +671,9 @@ impl CudaConv2d {
             // Copy input to padded tensor (currently uses input as-is)
             // In a real implementation, we'd copy the input into the center of padded
             // For now, we'll use a simpler approach
-            input.clone()?
+            input.clone_result()?
         } else {
-            input.clone()?
+            input.clone_result()?
         };
         
         // Step 2: Perform convolution using matrix multiplication

@@ -19,8 +19,8 @@ impl AutogradEngine {
     /// Register a tensor with the autograd system
     pub fn register_tensor(&mut self, tensor: Arc<Mutex<Tensor>>, op: Option<Op>) -> TensorId {
         GRAPH.with(|graph| {
-            let mut graph = graph.lock().unwrap();
-            let tensor_ref = tensor.lock().unwrap();
+            let mut graph = graph.lock().map_err(|_| crate::FlameError::Training("autograd graph mutex poisoned".into()))?;
+            let tensor_ref = tensor.lock().map_err(|_| crate::FlameError::Training("autograd tensor mutex poisoned".into()))?;
             let id = graph.register_tensor(&*tensor_ref, op);
             drop(tensor_ref);
             
@@ -55,14 +55,14 @@ impl AutogradEngine {
         
         // Compute gradients
         let gradients = GRAPH.with(|graph| {
-            let graph = graph.lock().unwrap();
+            let graph = graph.lock().map_err(|_| crate::FlameError::Training("autograd graph mutex poisoned".into()))?;
             graph.backward(loss_id, &tensor_map)
         })?;
         
         // Apply gradients to tensors
         for (tensor_id, grad) in gradients {
             if let Some(tensor_arc) = tensor_map.get(&tensor_id) {
-                let mut tensor = tensor_arc.lock().unwrap();
+                let mut tensor = tensor_arc.lock().map_err(|_| crate::FlameError::Training("autograd tensor mutex poisoned".into()))?;
                 if tensor.requires_grad {
                     // In the new architecture, gradients are stored separately
                     // This is handled by the GradientMap, not by accumulating on tensor
@@ -77,7 +77,7 @@ impl AutogradEngine {
     pub fn clear_graph(&mut self) {
         self.tensors.clear();
         GRAPH.with(|graph| {
-            let mut graph = graph.lock().unwrap();
+            let mut graph = graph.lock().map_err(|_| crate::FlameError::Training("autograd graph mutex poisoned".into()))?;
             *graph = ComputationGraph::new();
         });
     }
@@ -99,9 +99,9 @@ pub mod ops {
         
         if lhs.requires_grad || rhs.requires_grad {
             ENGINE.with(|engine| {
-                let mut engine = engine.lock().unwrap();
-                let mut result_mut = result.clone()?;
-                let result_arc = Arc::new(Mutex::new(result_mut.clone()?));
+                let mut engine = engine.lock().map_err(|_| crate::FlameError::Training("autograd engine mutex poisoned".into()))?;
+                let mut result_mut = result.clone_result()?;
+                let result_arc = Arc::new(Mutex::new(result_mut.clone_result()?));
                 let id = engine.register_tensor(
                     result_arc,
                     Some(Op::Add { lhs: lhs.id, rhs: rhs.id })
@@ -123,9 +123,9 @@ pub mod ops {
         
         if lhs.requires_grad || rhs.requires_grad {
             ENGINE.with(|engine| {
-                let mut engine = engine.lock().unwrap();
-                let mut result_mut = result.clone()?;
-                let result_arc = Arc::new(Mutex::new(result_mut.clone()?));
+                let mut engine = engine.lock().map_err(|_| crate::FlameError::Training("autograd engine mutex poisoned".into()))?;
+                let mut result_mut = result.clone_result()?;
+                let result_arc = Arc::new(Mutex::new(result_mut.clone_result()?));
                 let id = engine.register_tensor(
                     result_arc,
                     Some(Op::Mul { lhs: lhs.id, rhs: rhs.id })
@@ -146,9 +146,9 @@ pub mod ops {
         
         if lhs.requires_grad || rhs.requires_grad {
             ENGINE.with(|engine| {
-                let mut engine = engine.lock().unwrap();
-                let mut result_mut = result.clone()?;
-                let result_arc = Arc::new(Mutex::new(result_mut.clone()?));
+                let mut engine = engine.lock().map_err(|_| crate::FlameError::Training("autograd engine mutex poisoned".into()))?;
+                let mut result_mut = result.clone_result()?;
+                let result_arc = Arc::new(Mutex::new(result_mut.clone_result()?));
                 let id = engine.register_tensor(
                     result_arc,
                     Some(Op::MatMul { lhs: lhs.id, rhs: rhs.id })
@@ -170,9 +170,9 @@ pub mod ops {
         if input.requires_grad {
             let input_id = input.id;
             ENGINE.with(|engine| {
-                let mut engine = engine.lock().unwrap();
-                let mut result_mut = result.clone()?;
-                let result_arc = Arc::new(Mutex::new(result_mut.clone()?));
+                let mut engine = engine.lock().map_err(|_| crate::FlameError::Training("autograd engine mutex poisoned".into()))?;
+                let mut result_mut = result.clone_result()?;
+                let result_arc = Arc::new(Mutex::new(result_mut.clone_result()?));
                 let id = engine.register_tensor(
                     result_arc,
                     Some(Op::Mean { input: input_id })
@@ -194,8 +194,8 @@ pub mod ops {
         
         if requires_grad {
             ENGINE.with(|engine| {
-                let mut engine = engine.lock().unwrap();
-                let tensor_arc = Arc::new(Mutex::new(tensor.clone()?));
+                let mut engine = engine.lock().map_err(|_| crate::FlameError::Training("autograd engine mutex poisoned".into()))?;
+                let tensor_arc = Arc::new(Mutex::new(tensor.clone_result()?));
                 let id = engine.register_tensor(tensor_arc, None);
                 // ID is already set when tensor is created
                 Ok(tensor)
@@ -225,7 +225,7 @@ mod tests {
         
         // Backward pass
         let gradients = ENGINE.with(|engine| {
-            let engine = engine.lock().unwrap();
+            let engine = engine.lock().map_err(|_| crate::FlameError::Training("autograd engine mutex poisoned".into()))?;
             engine.backward(&loss)
         })?;
         

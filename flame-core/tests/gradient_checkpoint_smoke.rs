@@ -26,8 +26,8 @@ fn gradient_checkpoint_smoke() -> flame_core::Result<()> {
     let y = mlp_forward(&x, &w1, &b1, &w2, &b2)?;
     let loss = y.square()?.mean()?;
     let grads0 = AutogradContext::backward(&loss)?;
-    let gw1_0 = grads0.get(w1.id()).unwrap().clone()?;
-    let gw2_0 = grads0.get(w2.id()).unwrap().clone()?;
+    let gw1_0 = grads0.get(w1.id()).unwrap().clone_result()?;
+    let gw2_0 = grads0.get(w2.id()).unwrap().clone_result()?;
 
     // Enable CPU offload policy
     {
@@ -39,8 +39,8 @@ fn gradient_checkpoint_smoke() -> flame_core::Result<()> {
     let y1 = mlp_forward(&x, &w1, &b1, &w2, &b2)?;
     let loss1 = y1.square()?.mean()?;
     let grads1 = AutogradContext::backward(&loss1)?;
-    let gw1_1 = grads1.get(w1.id()).unwrap().clone()?;
-    let gw2_1 = grads1.get(w2.id()).unwrap().clone()?;
+    let gw1_1 = grads1.get(w1.id()).unwrap().clone_result()?;
+    let gw2_1 = grads1.get(w2.id()).unwrap().clone_result()?;
 
     // Compare gradients
     let a = gw1_0.to_vec()?; let b = gw1_1.to_vec()?;

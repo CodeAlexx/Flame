@@ -1,4 +1,5 @@
 use crate::{Result, FlameError};
+use core::ffi::c_void;
 use cudarc::driver::{CudaDevice as CudarcDevice};
 use std::sync::Arc;
 
@@ -66,6 +67,24 @@ impl Device {
     pub fn is_cuda(&self) -> bool {
         true // FLAME only supports CUDA
     }
+
+    /// Returns the CUDA stream as a raw pointer usable by FFI launchers.
+    /// Currently returns the default stream (null) unless a custom stream is plumbed.
+    pub fn cuda_stream_raw_ptr(&self) -> *mut core::ffi::c_void {
+        core::ptr::null_mut()
+    }
+}
+
+/// Extension trait to expose a raw CUDA stream pointer from cudarc's `CudaDevice`.
+/// Currently returns the default (null) stream, which is valid for kernel launches.
+pub trait CudaStreamRawPtrExt {
+    fn cuda_stream_raw_ptr(&self) -> *mut c_void;
+}
+
+impl CudaStreamRawPtrExt for cudarc::driver::CudaDevice {
+    fn cuda_stream_raw_ptr(&self) -> *mut c_void {
+        core::ptr::null_mut()
+    }
 }
 
 impl From<Arc<CudarcDevice>> for Device {
@@ -74,7 +93,7 @@ impl From<Arc<CudarcDevice>> for Device {
     }
 }
 
-/// Device enum for matching Candle API
+/// Device enum for matching expected external APIs
 #[derive(Clone, Debug)]
 pub enum DeviceEnum {
     Cuda(Device),

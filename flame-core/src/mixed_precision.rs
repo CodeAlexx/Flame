@@ -95,7 +95,7 @@ impl AMPContext {
         if self.enabled {
             loss.mul_scalar(self.loss_scale)
         } else {
-            loss.clone()
+            Ok(loss.clone())
         }
     }
     
@@ -104,7 +104,7 @@ impl AMPContext {
         if self.enabled {
             grad.mul_scalar(1.0 / self.loss_scale)
         } else {
-            grad.clone()
+            Ok(grad.clone())
         }
     }
 }
@@ -148,7 +148,7 @@ impl MixedPrecisionTensor {
     
     /// Update master weights from optimizer
     pub fn update_master(&mut self, update: &Tensor) -> Result<()> {
-        self.master = update.clone()?;
+        self.master = update.clone_result()?;
         
         // Update half precision copy if AMP enabled
         if self.amp_context.enabled {
@@ -338,7 +338,7 @@ pub mod utils {
     pub fn auto_cast(tensor: &Tensor, _target_dtype: DType, _device: &Arc<CudaDevice>) -> Result<Tensor> {
         // For now, just return a clone since we're using f32 throughout
         // Full implementation would do actual dtype conversion
-        tensor.clone()
+        Ok(tensor.clone())
     }
     
     /// Create a tensor directly in half precision

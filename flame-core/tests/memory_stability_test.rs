@@ -97,7 +97,7 @@ fn test_memory_stability() -> Result<()> {
         device.clone()
     )?;
     
-    let mut result = base.clone()?;
+    let mut result = base.clone_result()?;
     for i in 0..100 {
         // Chain of operations
         result = result.add(&base)?;
@@ -172,7 +172,7 @@ fn test_gradient_memory() -> Result<()> {
     }
     
     // Perform operations that would accumulate gradients
-    let mut result = tensors[0].clone()?;
+    let mut result = tensors[0].clone_result()?;
     for i in 1..tensors.len() {
         result = result.add(&tensors[i])?;
     }

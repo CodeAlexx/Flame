@@ -255,9 +255,11 @@ fn save_tensor_safetensors(tensor: &Tensor, path: &Path) -> Result<()> {
 
 fn load_tensor_safetensors(path: &Path, device: Arc<CudaDevice>) -> Result<Tensor> {
     let tensors = load_tensors_safetensors(path, device)?;
-    tensors.get("tensor")
-        .ok_or_else(|| FlameError::InvalidOperation("No 'tensor' key found".to_string()))?
-        .clone()
+    Ok(
+        tensors.get("tensor")
+            .ok_or_else(|| FlameError::InvalidOperation("No 'tensor' key found".to_string()))?
+            .clone()
+    )
 }
 
 fn save_tensors_safetensors<T: AsRef<Tensor>>(tensors: &HashMap<String, T>, path: &Path) -> Result<()> {
@@ -338,7 +340,7 @@ fn load_tensors_safetensors(path: &Path, device: Arc<CudaDevice>) -> Result<Hash
         .map_err(|e| FlameError::Io(format!("Failed to parse metadata: {}", e)))?;
     
     let metadata_obj = metadata.as_object()
-        .ok_or_else(|| FlameError::InvalidOperation("Invalid metadata format".to_string()))?;
+        .ok_or_else(|| FlameError::InvalidInput("Invalid metadata format".to_string()))?;
     
     // Read all remaining data
     let mut all_data = Vec::new();
@@ -349,15 +351,15 @@ fn load_tensors_safetensors(path: &Path, device: Arc<CudaDevice>) -> Result<Hash
     
     for (name, info) in metadata_obj {
         let shape = info["shape"].as_array()
-            .ok_or_else(|| FlameError::InvalidOperation("Missing shape".to_string()))?
+            .ok_or_else(|| FlameError::InvalidInput("Missing shape".to_string()))?
             .iter()
-            .map(|v| v.as_u64().unwrap() as usize)
-            .collect::<Vec<_>>();
+            .map(|v| v.as_u64().ok_or_else(|| FlameError::InvalidInput("invalid shape entry".into())).map(|u| u as usize))
+            .collect::<Result<Vec<_>>>()?;
         
         let offsets = info["data_offsets"].as_array()
-            .ok_or_else(|| FlameError::InvalidOperation("Missing data_offsets".to_string()))?;
-        let start = offsets[0].as_u64().unwrap() as usize;
-        let end = offsets[1].as_u64().unwrap() as usize;
+            .ok_or_else(|| FlameError::InvalidInput("Missing data_offsets".to_string()))?;
+        let start = offsets.get(0).and_then(|v| v.as_u64()).ok_or_else(|| FlameError::InvalidInput("invalid start offset".into()))? as usize;
+        let end = offsets.get(1).and_then(|v| v.as_u64()).ok_or_else(|| FlameError::InvalidInput("invalid end offset".into()))? as usize;
         
         // Extract tensor data
         let num_floats = (end - start) / 4;

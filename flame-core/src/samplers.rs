@@ -121,7 +121,7 @@ impl EulerSampler {
             }
             PredictionType::Sample => {
                 // Model directly predicts x0
-                Ok(model_output.clone()?)
+                Ok(model_output.clone_result()?)
             }
         }
     }
@@ -238,7 +238,7 @@ impl DPMPlusPlus2MSampler {
                 scaled_sample.sub(&scaled_velocity)
             }
             PredictionType::Sample => {
-                Ok(model_output.clone()?)
+                Ok(model_output.clone_result()?)
             }
         }
     }

@@ -24,11 +24,10 @@ fn exp_log_max_gpu_smoke() -> Result<()> {
     let mmax = a.maximum(&b)?;
     let loss = mmax.mean()?;
     let grads = AutogradContext::backward(&loss)?;
-    let ga = grads.get(a.id()).unwrap().clone()?;
-    let gb = grads.get(b.id()).unwrap().clone()?;
+    let ga = grads.get(a.id()).unwrap().clone_result()?;
+    let gb = grads.get(b.id()).unwrap().clone_result()?;
     assert!(ga.to_vec()?.iter().all(|v| v.is_finite()));
     assert!(gb.to_vec()?.iter().all(|v| v.is_finite()));
 
     Ok(())
 }
-

@@ -12,7 +12,7 @@ fn softmax_backward_gpu() -> Result<()> {
     let loss = y.sum()?;
     let grads = AutogradContext::backward(&loss)?;
     // Check gradient exists and is finite
-    let gx = grads.get(x.id()).unwrap().clone()?;
+    let gx = grads.get(x.id()).unwrap().clone_result()?;
     let nans = gx.to_vec()?.iter().any(|v| !v.is_finite());
     assert!(!nans, "softmax backward produced NaNs");
     Ok(())
@@ -27,7 +27,7 @@ fn layernorm_backward_gpu() -> Result<()> {
     let y = ln.forward(&x)?;
     let loss = y.sum()?;
     let grads = AutogradContext::backward(&loss)?;
-    let gx = grads.get(x.id()).unwrap().clone()?;
+    let gx = grads.get(x.id()).unwrap().clone_result()?;
     assert!(gx.shape().dims() == &[3,8]);
     Ok(())
 }
@@ -41,7 +41,7 @@ fn groupnorm_backward_gpu() -> Result<()> {
     let y = group_norm(&x, 2, None, None)?;
     let loss = y.sum()?;
     let grads = AutogradContext::backward(&loss)?;
-    let gx = grads.get(x.id()).unwrap().clone()?;
+    let gx = grads.get(x.id()).unwrap().clone_result()?;
     assert!(gx.shape().dims() == &[2,4,2,2]);
     Ok(())
 }
@@ -68,4 +68,3 @@ fn conv2d_layout_asserts() {
     let err = cuda_conv2d::CudaConv2d::conv2d_forward(&x, &w, None, (1,1), (1,1), 1).unwrap_err();
     if let FlameError::InvalidOperation(msg) = err { assert!(msg.contains("NHWC")); } else { panic!("unexpected error"); }
 }
-

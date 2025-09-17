@@ -265,11 +265,12 @@ pub fn layer_norm(
         };
         
         // Create launch parameters based on whether weight/bias exist
-        if has_weight && has_bias {
+        match (weight, bias) {
+        (Some(w), Some(b)) => {
             launch_kernel!(f, cfg,
-                input.storage.as_slice(),
-                weight.unwrap().storage.as_slice(),
-                bias.unwrap().storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
+                w.storage.try_as_slice_f32()?,
+                b.storage.try_as_slice_f32()?,
                 &output_data,
                 &mean_data,
                 &rstd_data,
@@ -277,10 +278,11 @@ pub fn layer_norm(
                 norm_size as i32,
                 eps
             )?;
-        } else if has_weight {
+        }
+        (Some(w), None) => {
             launch_kernel!(f, cfg,
-                input.storage.as_slice(),
-                weight.unwrap().storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
+                w.storage.try_as_slice_f32()?,
                 0usize, // null pointer for bias
                 &output_data,
                 &mean_data,
@@ -289,11 +291,12 @@ pub fn layer_norm(
                 norm_size as i32,
                 eps
             )?;
-        } else if has_bias {
+        }
+        (None, Some(b)) => {
             launch_kernel!(f, cfg,
-                input.storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
                 0usize, // null pointer for weight
-                bias.unwrap().storage.as_slice(),
+                b.storage.try_as_slice_f32()?,
                 &output_data,
                 &mean_data,
                 &rstd_data,
@@ -301,9 +304,10 @@ pub fn layer_norm(
                 norm_size as i32,
                 eps
             )?;
-        } else {
+        }
+        (None, None) => {
             launch_kernel!(f, cfg,
-                input.storage.as_slice(),
+                input.storage.try_as_slice_f32()?,
                 0usize, // null pointer for weight
                 0usize, // null pointer for bias
                 &output_data,
@@ -313,6 +317,7 @@ pub fn layer_norm(
                 norm_size as i32,
                 eps
             )?;
+        }
         }
     }
     
@@ -325,17 +330,15 @@ pub fn layer_norm(
     };
     
     // Record operation for autograd
-    if input.requires_grad || 
-       (weight.is_some() && weight.unwrap().requires_grad) ||
-       (bias.is_some() && bias.unwrap().requires_grad) {
+    if input.requires_grad || weight.map(|w| w.requires_grad).unwrap_or(false) || bias.map(|b| b.requires_grad).unwrap_or(false) {
         output.requires_grad = true;
         
-        let mut saved_tensors = vec![(input.id, input.clone()?)];
+        let mut saved_tensors = vec![(input.id, input.clone_result()?)];
         if let Some(w) = weight {
-            saved_tensors.push((w.id, w.clone()?));
+            saved_tensors.push((w.id, w.clone_result()?));
         }
         if let Some(b) = bias {
-            saved_tensors.push((b.id, b.clone()?));
+            saved_tensors.push((b.id, b.clone_result()?));
         }
         
         // Save mean and rstd for backward pass
@@ -375,7 +378,7 @@ pub fn layer_norm(
         let mut out = output.to_dtype(dt)?;
         // Preserve autograd flag
         // Note: we didn't record a new op here; this is a dtype cast for numerics
-        if input.requires_grad || (weight.is_some() && weight.unwrap().requires_grad) || (bias.is_some() && bias.unwrap().requires_grad) {
+        if input.requires_grad || weight.map(|w| w.requires_grad).unwrap_or(false) || bias.map(|b| b.requires_grad).unwrap_or(false) {
             out.requires_grad = true;
         }
         Ok(out)

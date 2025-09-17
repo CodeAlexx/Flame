@@ -140,7 +140,7 @@ impl AutogradEngine {
             
             if let Some(output_grad) = gradients.get(entry.output_id) {
                 println!("  Output grad shape: {:?}", output_grad.shape());
-                let output_grad = output_grad.clone()?;
+                let output_grad = output_grad.clone_result()?;
                 
                 // Compute input gradients with error handling
                 match self.compute_gradients(entry, &output_grad) {
@@ -200,7 +200,7 @@ impl AutogradEngine {
         // Process tape in reverse - no mutation of self!
         for entry in self.tape.iter().rev() {
             if let Some(output_grad) = gradients.get(entry.output_id) {
-                let output_grad = output_grad.clone()?;
+                let output_grad = output_grad.clone_result()?;
                 // Compute input gradients - pure functions
                 let input_grads = self.compute_gradients(entry, &output_grad)?;
                 
@@ -222,8 +222,8 @@ impl AutogradEngine {
             Op::Add { lhs, rhs } => {
                 // Gradient flows unchanged to both inputs
                 Ok(vec![
-                    (*lhs, output_grad.clone()?),
-                    (*rhs, output_grad.clone()?),
+                    (*lhs, output_grad.clone_result()?),
+                    (*rhs, output_grad.clone_result()?),
                 ])
             }
             
@@ -231,7 +231,7 @@ impl AutogradEngine {
                 // d/dx(x-y) = 1, d/dy(x-y) = -1
                 let neg_grad = output_grad.mul_scalar(-1.0)?;
                 Ok(vec![
-                    (*lhs, output_grad.clone()?),
+                    (*lhs, output_grad.clone_result()?),
                     (*rhs, neg_grad),
                 ])
             }
@@ -323,11 +323,11 @@ impl AutogradEngine {
             
             Op::AddBias { input, bias } => {
                 // Input gradient passes through unchanged
-                let input_grad = output_grad.clone()?;
+                let input_grad = output_grad.clone_result()?;
                 
                 // Bias gradient is sum over all dimensions except the last
                 let grad_shape = output_grad.shape().dims();
-                let mut grad_bias = output_grad.clone()?;
+                let mut grad_bias = output_grad.clone_result()?;
                 
                 // Sum over batch dimensions
                 for i in 0..grad_shape.len() - 1 {
@@ -391,7 +391,10 @@ extern "C" __global__ void relu_backward_kernel(
         
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(f, cfg,
-            &grad_in, grad_out.storage.as_slice(), input.storage.as_slice(), numel as i32
+            &grad_in,
+            grad_out.storage.try_as_slice_f32()?,
+            input.storage.try_as_slice_f32()?,
+            numel as i32
         )?;
         
         Ok(crate::cuda_kernels::create_output_tensor(
