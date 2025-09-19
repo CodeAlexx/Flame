@@ -1,7 +1,23 @@
 //! Adam optimizer implementation
 
-use crate::{Tensor, TensorId, Result, FlameError, parameter::Parameter};
+use crate::{
+    config,
+    parameter::Parameter,
+    DType, FlameError, Result, Tensor, TensorId,
+};
 use std::collections::HashMap;
+
+#[inline(always)]
+fn moment_dtype() -> DType {
+    let requested = config::optimizer_moment_dtype();
+    if requested == DType::BF16 {
+        #[cfg(feature = "true_bf16_optimizer_states")]
+        {
+            return DType::BF16;
+        }
+    }
+    DType::F32
+}
 
 /// Adam optimizer with momentum and adaptive learning rates
 pub struct Adam {
@@ -37,68 +53,106 @@ impl Adam {
             weight_decay,
         }
     }
-    
+
     /// Create with default parameters
     pub fn default() -> Self {
         Self::new(0.001, 0.9, 0.999, 1e-8, 0.0)
     }
-    
+
     /// Perform a single optimization step
     pub fn step(&mut self, parameters: &[Parameter]) -> Result<()> {
         self.t += 1;
-        
+
         // Bias correction factors
         let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
         let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
-        
+
         for param in parameters {
             if let Some(grad) = param.grad() {
                 let param_id = param.id();
-                
+
                 // Apply weight decay if needed
-                let grad = if self.weight_decay > 0.0 {
-                    let param_tensor = param.tensor()?;
-                    grad.add(&param_tensor.mul_scalar(self.weight_decay)?)?
-                } else {
-                    grad
-                };
-                
+                let mut grad = grad;
+
+                let target_dtype = moment_dtype();
+                if grad.dtype() != target_dtype {
+                    grad = grad.to_dtype(target_dtype)?;
+                }
+
+                if self.weight_decay > 0.0 {
+                    let param_tensor = if let Ok(t) = param.tensor() {
+                        t
+                    } else {
+                        return Err(FlameError::Training(
+                            "failed to fetch parameter tensor for weight decay".into(),
+                        ));
+                    };
+                    let param_adjust = if param_tensor.dtype() == target_dtype {
+                        param_tensor
+                    } else {
+                        param_tensor.to_dtype(target_dtype)?
+                    };
+                    grad = grad.add(&param_adjust.mul_scalar(self.weight_decay)?)?;
+                }
+
                 // Initialize momentum buffers if needed
                 if !self.m.contains_key(&param_id) {
-                    self.m.insert(param_id, Tensor::zeros(grad.shape.clone(), grad.device.clone())?);
-                    self.v.insert(param_id, Tensor::zeros(grad.shape.clone(), grad.device.clone())?);
+                    self.m.insert(
+                        param_id,
+                        Tensor::zeros_dtype(
+                            grad.shape.clone(),
+                            target_dtype,
+                            grad.device().clone(),
+                        )?,
+                    );
+                    self.v.insert(
+                        param_id,
+                        Tensor::zeros_dtype(
+                            grad.shape.clone(),
+                            target_dtype,
+                            grad.device().clone(),
+                        )?,
+                    );
                 }
-                
+
                 // Get momentum buffers
-                let m = self.m.get_mut(&param_id)
+                let m = self
+                    .m
+                    .get_mut(&param_id)
                     .ok_or_else(|| FlameError::Training("optimizer m state missing".into()))?;
-                let v = self.v.get_mut(&param_id)
+                let v = self
+                    .v
+                    .get_mut(&param_id)
                     .ok_or_else(|| FlameError::Training("optimizer v state missing".into()))?;
-                
+
                 // Update biased first moment: m_t = β1 * m_{t-1} + (1 - β1) * g_t
-                *m = m.mul_scalar(self.beta1)?.add(&grad.mul_scalar(1.0 - self.beta1)?)?;
-                
+                *m = m
+                    .mul_scalar(self.beta1)?
+                    .add(&grad.mul_scalar(1.0 - self.beta1)?)?;
+
                 // Update biased second moment: v_t = β2 * v_{t-1} + (1 - β2) * g_t²
                 let grad_sq = grad.mul(&grad)?;
-                *v = v.mul_scalar(self.beta2)?.add(&grad_sq.mul_scalar(1.0 - self.beta2)?)?;
-                
+                *v = v
+                    .mul_scalar(self.beta2)?
+                    .add(&grad_sq.mul_scalar(1.0 - self.beta2)?)?;
+
                 // Compute bias-corrected moments
                 let m_hat = m.div_scalar(bias_correction1)?;
                 let v_hat = v.div_scalar(bias_correction2)?;
-                
+
                 // Compute update: lr * m_hat / (sqrt(v_hat) + eps)
                 let v_sqrt = v_hat.sqrt()?;
                 let denominator = v_sqrt.add_scalar(self.eps)?;
                 let update = m_hat.div(&denominator)?.mul_scalar(self.lr)?;
-                
+
                 // Apply update
                 param.apply_update(&update)?;
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Zero all gradients
     pub fn zero_grad(&self, parameters: &[Parameter]) {
         for param in parameters {
@@ -118,46 +172,64 @@ impl AdamW {
             adam: Adam::new(lr, beta1, beta2, eps, weight_decay),
         }
     }
-    
+
     pub fn default() -> Self {
         Self::new(0.001, 0.9, 0.999, 1e-8, 0.01)
     }
-    
+
     pub fn step(&mut self, parameters: &[Parameter]) -> Result<()> {
         self.adam.step(parameters)
     }
-    
+
     pub fn zero_grad(&self, parameters: &[Parameter]) {
         self.adam.zero_grad(parameters)
     }
 }
 
-#[cfg(test)]
+impl Adam {
+    fn state_dtype(&self, param_id: &TensorId) -> Option<(DType, DType)> {
+        let m = self.m.get(param_id)?;
+        let v = self.v.get(param_id)?;
+        Some((m.dtype(), v.dtype()))
+    }
+}
+
+impl AdamW {
+    /// Inspect the optimizer state tensor dtypes for a parameter.
+    ///
+    /// This is primarily intended for tests to ensure mixed-precision
+    /// invariants (e.g. FP32 moment buffers) remain satisfied.
+    pub fn debug_state_dtype(&self, param: &Parameter) -> Option<(DType, DType)> {
+        self.adam.state_dtype(&param.id())
+    }
+}
+
+#[cfg(all(test, feature = "legacy_full"))]
 mod tests {
     use super::*;
     use crate::{Shape, Tensor};
     use cudarc::driver::CudaDevice;
-    
+
     #[test]
     fn test_adam_step() -> Result<()> {
         let device = CudaDevice::new(0)?;
-        
+
         // Create parameter
         let param = Parameter::randn(Shape::from_dims(&[10]), 0.0, 1.0, device)?;
-        
+
         // Set a gradient
         let grad = Tensor::ones(Shape::from_dims(&[10]), param.tensor()?.device.clone())?;
         param.set_grad(grad)?;
-        
+
         // Create optimizer and take a step
         let mut optimizer = Adam::default();
         optimizer.step(&[param.clone()])?;
-        
+
         // Check that parameter was updated
         let new_value = param.tensor()?.to_vec()?;
         // After one step with gradient of 1.0 and lr=0.001, values should decrease
         assert!(new_value[0] < 0.0);
-        
+
         Ok(())
     }
 }

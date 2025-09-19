@@ -1,12 +1,12 @@
+use crate::DType;
 /// FLAME Configuration
 /// Controls global behavior and optimization settings
-
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use crate::DType;
 
 /// Global flag to force cuDNN usage
-static FORCE_CUDNN: AtomicBool = AtomicBool::new(false);  // Default to not force cuDNN
+static FORCE_CUDNN: AtomicBool = AtomicBool::new(false); // Default to not force cuDNN
 static DEFAULT_DTYPE: AtomicU8 = AtomicU8::new(2); // 0=F32,1=F16,2=BF16 (default BF16)
+static OPTIMIZER_MOMENT_DTYPE: AtomicU8 = AtomicU8::new(0); // 0=F32,1=BF16
 
 /// Check if cuDNN should be forced
 pub fn should_use_cudnn() -> bool {
@@ -30,21 +30,53 @@ pub fn default_dtype() -> DType {
 
 /// Set the global default dtype
 pub fn set_default_dtype(dtype: DType) {
-    let v = match dtype { DType::F32 => 0, DType::F16 => 1, _ => 2 };
+    let v = match dtype {
+        DType::F32 => 0,
+        DType::F16 => 1,
+        _ => 2,
+    };
     DEFAULT_DTYPE.store(v, Ordering::Relaxed);
+}
+
+/// Get the global dtype used for optimizer moment buffers (defaults to FP32).
+pub fn optimizer_moment_dtype() -> DType {
+    match OPTIMIZER_MOMENT_DTYPE.load(Ordering::Relaxed) {
+        1 => DType::BF16,
+        _ => DType::F32,
+    }
+}
+
+/// Set the global optimizer moment dtype.
+/// Only `DType::F32` and `DType::BF16` are supported; other values default to FP32.
+/// When the `true_bf16_optimizer_states` feature is disabled, BF16 requests are ignored.
+pub fn set_optimizer_moment_dtype(dtype: DType) {
+    let value = match dtype {
+        DType::BF16 => {
+            if cfg!(feature = "true_bf16_optimizer_states") {
+                1
+            } else {
+                eprintln!(
+                    "[flame-config] BF16 optimizer states requested but feature `true_bf16_optimizer_states` is disabled; staying on FP32"
+                );
+                0
+            }
+        }
+        _ => 0,
+    };
+    OPTIMIZER_MOMENT_DTYPE.store(value, Ordering::Relaxed);
 }
 
 /// FLAME optimization settings
 pub struct FlameConfig {
     /// Always use cuDNN when available (default: true)
     pub force_cudnn: bool,
-    
-    /// Enable memory pooling (default: true) 
+
+    /// Enable memory pooling (default: true)
     pub enable_memory_pool: bool,
-    
+
     /// Enable kernel fusion (default: true)
     pub enable_fusion: bool,
-    
+
     /// Maximum batch size for operations
     pub max_batch_size: usize,
 }
@@ -52,7 +84,7 @@ pub struct FlameConfig {
 impl Default for FlameConfig {
     fn default() -> Self {
         Self {
-            force_cudnn: false,       // Do not force cuDNN by default
+            force_cudnn: false, // Do not force cuDNN by default
             enable_memory_pool: true,
             enable_fusion: true,
             max_batch_size: 1024,
@@ -65,9 +97,30 @@ impl FlameConfig {
     pub fn apply(&self) {
         set_force_cudnn(self.force_cudnn);
         println!("FLAME Configuration Applied:");
-        println!("  - cuDNN: {}", if self.force_cudnn { "FORCED ON" } else { "auto" });
-        println!("  - Memory Pool: {}", if self.enable_memory_pool { "enabled" } else { "disabled" });
-        println!("  - Kernel Fusion: {}", if self.enable_fusion { "enabled" } else { "disabled" });
+        println!(
+            "  - cuDNN: {}",
+            if self.force_cudnn {
+                "FORCED ON"
+            } else {
+                "auto"
+            }
+        );
+        println!(
+            "  - Memory Pool: {}",
+            if self.enable_memory_pool {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        println!(
+            "  - Kernel Fusion: {}",
+            if self.enable_fusion {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
         println!("  - Max Batch Size: {}", self.max_batch_size);
     }
 }
