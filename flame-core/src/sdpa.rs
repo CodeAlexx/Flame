@@ -61,8 +61,8 @@ pub fn forward(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Sdp
     scores = scores.mul_scalar(scale)?;
 
     if let Some(mask_raw) = mask {
-        let target_dims = scores.shape().dims().clone();
-        let expanded = if mask_raw.shape().dims() != &target_dims {
+        let target_dims = scores.shape().dims().to_vec();
+        let expanded = if mask_raw.shape().dims() != target_dims.as_slice() {
             mask_raw.broadcast_to(&Shape::from_dims(&target_dims))?
         } else {
             mask_raw.clone_result()?
