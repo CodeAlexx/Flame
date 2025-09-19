@@ -22,6 +22,6 @@ fn sdpa_smoke_runs() {
     let k = randn_on(&[b, h, k_len, d], &device);
     let v = randn_on(&[b, h, k_len, d], &device);
 
-    let out = attention::attention(&q, &k, &v, None).expect("sdpa attention should run");
+    let out = attention::attend(&q, &k, &v, None).expect("sdpa attention should run");
     assert_eq!(out.shape().dims(), &vec![b, h, q_len, d]);
 }

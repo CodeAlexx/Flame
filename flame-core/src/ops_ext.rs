@@ -1,7 +1,10 @@
-use crate::{Tensor, DType, Error, Result, Shape};
+use crate::{Tensor, DType, Error, Shape};
+use std::result::Result as StdResult;
+
+type OpResult<T> = StdResult<T, Error>;
 
 /// Return the 4D shape tuple if the tensor has exactly four dimensions.
-pub fn shape4(t: &Tensor) -> Result<(usize, usize, usize, usize)> {
+pub fn shape4(t: &Tensor) -> OpResult<(usize, usize, usize, usize)> {
     let dims = t.shape().dims();
     if dims.len() != 4 {
         return Err(Error::InvalidInput(format!(
@@ -13,7 +16,7 @@ pub fn shape4(t: &Tensor) -> Result<(usize, usize, usize, usize)> {
 }
 
 /// Transpose the last two dimensions of a tensor.
-pub fn transpose_last2(t: &Tensor) -> Result<Tensor> {
+pub fn transpose_last2(t: &Tensor) -> OpResult<Tensor> {
     let ndim = t.shape().dims().len();
     if ndim < 2 {
         return Err(Error::InvalidInput("transpose_last2 requires >=2 dims".into()));
@@ -28,13 +31,13 @@ pub fn transpose_last2(t: &Tensor) -> Result<Tensor> {
 }
 
 /// Batched matrix multiplication with the second operand transposed on its last two dims.
-pub fn matmul_tt(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+pub fn matmul_tt(a: &Tensor, b: &Tensor) -> OpResult<Tensor> {
     let bt = transpose_last2(b)?;
     a.bmm(&bt)
 }
 
 /// Allocate a zero tensor with the same shape/dtype/device as the input tensor.
-pub fn zeros_like(t: &Tensor) -> Result<Tensor> {
+pub fn zeros_like(t: &Tensor) -> OpResult<Tensor> {
     let zeros = t.zeros_like()?;
     if zeros.dtype() == t.dtype() {
         Ok(zeros)
@@ -44,7 +47,7 @@ pub fn zeros_like(t: &Tensor) -> Result<Tensor> {
 }
 
 /// Allocate a tensor filled with `value` matching the input tensor layout.
-pub fn full_like(t: &Tensor, value: f32) -> Result<Tensor> {
+pub fn full_like(t: &Tensor, value: f32) -> OpResult<Tensor> {
     let filled = t.full_like(value)?;
     if filled.dtype() == t.dtype() {
         Ok(filled)
@@ -54,7 +57,7 @@ pub fn full_like(t: &Tensor, value: f32) -> Result<Tensor> {
 }
 
 /// Elementwise selection using a mask (mask != 0 selects `a`).
-pub fn where_mask(mask: &Tensor, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+pub fn where_mask(mask: &Tensor, a: &Tensor, b: &Tensor) -> OpResult<Tensor> {
     if a.shape() != b.shape() {
         return Err(Error::InvalidInput(format!(
             "where_mask expects matching tensors, got {:?} and {:?}",
@@ -73,7 +76,7 @@ pub fn where_mask(mask: &Tensor, a: &Tensor, b: &Tensor) -> Result<Tensor> {
 }
 
 /// Compute the mean over all elements in FP32.
-pub fn mean_all_f32(t: &Tensor) -> Result<f32> {
+pub fn mean_all_f32(t: &Tensor) -> OpResult<f32> {
     let count = t.shape().elem_count();
     if count == 0 {
         return Err(Error::InvalidInput("mean_all_f32 on empty tensor".into()));

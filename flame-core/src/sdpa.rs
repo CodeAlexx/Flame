@@ -1,8 +1,11 @@
-use crate::{ops_ext::{full_like, shape4, transpose_last2}, Tensor, DType, Error, Result, Shape};
+use crate::{ops_ext::{full_like, shape4, transpose_last2}, Tensor, DType, Error, Shape};
+use std::result::Result as StdResult;
+
+type SdpaResult<T> = StdResult<T, Error>;
 
 const NEG_INF: f32 = -1.0e9;
 
-pub fn forward(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+pub fn forward(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> SdpaResult<Tensor> {
     let (bq, hq, q_len, d_q) = shape4(q)?;
     let (bk, hk, k_len, d_k) = shape4(k)?;
     let (bv, hv, v_len, d_v) = shape4(v)?;
