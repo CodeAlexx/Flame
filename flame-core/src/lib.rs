@@ -13,6 +13,8 @@ pub mod error;
 pub mod shape;
 pub mod tensor_storage;
 pub mod tensor;
+pub mod ops_ext;
+pub mod devtensor;
 pub mod tensor_narrow;
 pub mod gradient;
 pub mod memory_pool;
@@ -62,6 +64,7 @@ pub mod autograd_v3;  // This is used
 pub mod autograd_simple;  // legacy
 pub mod optimizers;
 pub mod attention;
+pub mod sdpa;
 pub mod serialization;
 pub mod regularization;
 pub mod mixed_precision;

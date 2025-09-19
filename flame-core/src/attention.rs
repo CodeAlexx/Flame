@@ -294,28 +294,7 @@ fn maybe_downcast_to_input_dtype(y: &Tensor, reference: &Tensor) -> Result<Tenso
 
 /// Scaled dot-product attention with FP32 softmax/reductions. Accepts [B,H,S,D] tensors.
 pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
-    let (b, h, q_len, k_len, _d) = validate_qkv_shapes(q, k, v)?;
-    if let Some(m) = mask { validate_mask_shape(m, b, h, q_len, k_len)?; }
-    // Upcast compute to FP32 when inputs are BF16
-    let q32 = ensure_fp32_compute(q)?;
-    let k32 = ensure_fp32_compute(k)?;
-    let v32 = ensure_fp32_compute(v)?;
-    // logits = Q @ K^T / sqrt(D)
-    let kt = k32.transpose_dims(2, 3)?;
-    let mut logits = q32.bmm(&kt)?;
-    let d = q.shape().dims()[3] as f32;
-    logits = logits.mul_scalar(1.0 / d.sqrt())?;
-    // Build additive mask if provided
-    if let Some(m) = mask {
-        let add_mask = if matches!(m.dtype(), DType::Bool) {
-            m.to_dtype(DType::F32)?.mul_scalar(MASK_NEG)?
-        } else { ensure_fp32_compute(m)? };
-        logits = logits.add(&add_mask)?;
-    }
-    // Softmax along last dim
-    let attn = logits.softmax(-1)?;
-    let y = attn.bmm(&v32)?;
-    maybe_downcast_to_input_dtype(&y, q)
+    crate::sdpa::forward(q, k, v, mask)
 }
 
 /// FlashAttention wrapper; computes in FP32 and casts to match Q input when needed.
