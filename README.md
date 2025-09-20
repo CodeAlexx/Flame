@@ -1,183 +1,138 @@
-# FLAME (Fast Learning Accelerated Matrix Engine)
+# FLAME (Fast Learning Accelerated Matrix Engine) Version 2
 
-A pure Rust tensor computation framework designed for GPU-accelerated deep learning with full gradient support. FLAME is being developed to replace a legacy backend in EriDiffusion to enable full gradient flexibility necessary for training.
+A pure Rust tensor framework built for GPU-accelerated deep learning with full gradient support. FLAME targets NVIDIA GPUs only and is evolving to replace EriDiffusion’s legacy backend so the training pipeline can mutate gradients freely.
 
-## Features
+## Highlights
 
-- **GPU-Only Design**: Built from the ground up for NVIDIA GPUs with no CPU fallbacks
-- **Training Support**: Full autograd system with gradient tracking and automatic differentiation
-- **Runtime Kernel Compilation**: Uses NVRTC for JIT compilation of CUDA kernels
-- **Memory Efficient**: Arc-based tensor memory management with zero-copy operations
-- **Pure Rust**: No Python dependencies or bindings required
+- **GPU-first design** – assumes CUDA; there is no CPU fallback.
+- **Training-ready autograd** – tensors carry mutable gradients; full backward pass works.
+- **Runtime kernel compilation** – NVRTC JITs CUDA kernels on demand.
+- **Zero-copy tensors** – `Arc`-based device buffers keep clones cheap.
+- **Pure Rust** – no Python, no bindings; just `cargo build`.
 
 ## Why FLAME?
 
-### Motivation
-Legacy backends in Rust often assumed immutable tensors in key APIs, making it difficult to implement full backpropagation and gradient modification required for training.
+Legacy Rust tensor stacks often assumed immutable tensors, making backprop hacks painful. Diffusion training needs to tweak gradients, clip them, add noise, etc. FLAME starts from a training use case:
 
-### FLAME Solution
-- **Native Gradient Support**: Built from the ground up with mutable gradients and autograd
-- **Training Ready**: Designed specifically for training diffusion models in EriDiffusion
-- **Drop-in Replacement**: Will integrate seamlessly into EriDiffusion's training pipeline
-- **Custom Kernels**: Easy to add custom CUDA kernels via NVRTC
-- **Type Safe**: Leverages Rust's type system for safe GPU programming
+- Gradients are first-class (`requires_grad`, mutable hooks).
+- CUDA buffer layout matches training workflows (no implicit CPU syncs).
+- Kernel seams are explicit, so EriDiffusion can bolt on new ops.
+- Safety via Rust types without giving up raw CUDA performance.
 
-## Current Status
+## Current State
 
-### ✅ Working
-- Basic tensor operations (add, mul, matmul, etc.)
-- Activation functions (ReLU, Sigmoid, GELU, SiLU, Tanh, LeakyReLU)
-- Gradient tracking with `requires_grad`
-- Manual gradient computation
-- CUDA memory management
-- NVRTC kernel compilation
-- Conv2D forward and backward pass with CUDA kernels
-- Advanced gradient modifications:
-  - Gradient clipping (value and norm)
-  - Gradient normalization
-  - Gradient noise injection
-  - Per-layer gradient statistics tracking
-- Tensor methods: min_all(), max_all(), sum_all(), floor(), ceil(), round()
-- Tensor manipulation: triu(), flip(), sub_scalar()
-- Device management with Arc<CudaDevice> pattern
-- anyhow::Error integration for better error handling
-- Debug trait implementation for tensors
+### ✅ Works today
+- Core math: add/mul/matmul, reductions, broadcast helpers.
+- Activations: ReLU/Sigmoid/GELU/SiLU/Tanh/LeakyReLU.
+- Autograd engine, tensor `requires_grad`, manual grad edits.
+- CUDA memory manager, NVRTC JIT for custom kernels.
+- Conv2D (NHWC + NCHW variants) forward/backward on GPU.
+- Gradient tooling: clipping, normalization, noise, stats.
+- Tensor utilities: `min_all`, `max_all`, `sum_all`, `floor`, `ceil`, `round`, `triu`, `flip`, `sub_scalar`.
+- Device management via shared `CudaDevice` handles.
+- `anyhow::Error` integration, Debug formatting for inspection.
 
-### 🚧 In Progress
-- Automatic differentiation API improvements
-- Layer normalization (required for transformers)
-- Batch normalization
-- Full model migration examples
-- Integration with EriDiffusion Flux model
+### 🚧 In progress
+- Autograd ergonomics (fewer manual hooks).
+- LayerNorm / BatchNorm kernels.
+- Example migrations for real models.
+- Full EriDiffusion Flux integration.
 
-### ❌ Not Working Yet
-- Distributed training
-- Mixed precision (FP16/BF16) - planned but not implemented
-- Flash Attention - planned for future
-- CPU fallback (by design - GPU only)
+### ❌ Not yet
+- Distributed training.
+- Mixed precision (FP16/BF16) – planned.
+- FlashAttention kernels – planned.
+- CPU execution – out of scope.
 
-## Quick Start
+## Quick start
 
 ```rust
-use flame_core::{Tensor, Shape, CudaDevice};
-use std::sync::Arc;
+use flame_core::{Tensor, Shape};
+use cudarc::driver::CudaDevice;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize CUDA device
+fn main() -> anyhow::Result<()> {
     let device = CudaDevice::new(0)?;
-    
-    // Create tensors
     let a = Tensor::randn(Shape::from_dims(&[2, 3]), 0.0, 1.0, device.clone())?;
     let b = Tensor::randn(Shape::from_dims(&[2, 3]), 0.0, 1.0, device.clone())?;
-    
-    // Perform operations
-    let c = a.add(&b)?;
-    let d = c.relu()?;
-    
-    println!("Result shape: {:?}", d.shape().dims());
+    let c = a.add(&b)?.relu()?;
+    println!("result shape = {:?}", c.shape().dims());
     Ok(())
 }
 ```
 
-## Building
+## Build & test
 
-### Prerequisites
-- Rust 1.70+
-- CUDA Toolkit 11.0+
-- NVIDIA GPU with compute capability 7.0+
+Requirements: Rust 1.70+, CUDA 11+, NVIDIA GPU (SM 7.0+).
 
-### Build Commands
 ```bash
-# Build the library
 cargo build --release
-
-# Run tests
-cargo test --release
-
-# Run examples
-cargo run --bin test_basic_ops --release
+cargo test  --release
+# examples are opt-in via feature flag
+cargo run -p flame-core --example simple_training_test \
+  --features legacy_examples
 ```
 
-## Architecture
+## Architecture at a glance
 
-FLAME consists of several key components:
+- `flame-core` – tensor API, autograd, kernels, CUDA plumbing.
+- NVRTC kernels – JIT compiled per device.
+- Gradient store – separate buffers for clean APIs.
+- Autograd tape – records ops, drives backward.
 
-- **flame-core**: Core tensor operations and autograd engine
-- **CUDA Kernels**: GPU kernels compiled via NVRTC
-- **Gradient System**: Separate gradient storage for clean API
-- **Autograd Engine**: Tracks operations and computes gradients
+## Example snippets
 
-## Examples
-
-### Basic Operations
 ```rust
-// Matrix multiplication
 let x = Tensor::randn(Shape::from_dims(&[32, 64]), 0.0, 1.0, device.clone())?;
 let w = Tensor::randn(Shape::from_dims(&[64, 128]), 0.0, 0.02, device.clone())?;
-let y = x.matmul(&w)?;
-
-// Activation function
-let activated = y.relu()?;
-
-// Reduction
-let sum = activated.sum()?;
+let y = x.matmul(&w)?.relu()?;
+let loss = y.sum()?;
 ```
 
-### Training Simulation
 ```rust
-// Initialize parameters
 let mut weight = Tensor::randn(Shape::from_dims(&[10, 5]), 0.0, 0.02, device.clone())?;
-
-// Training loop
-for epoch in 0..num_epochs {
-    // Forward pass
+for _ in 0..epochs {
     let output = input.matmul(&weight)?;
-    
-    // Compute loss
     let loss = compute_mse_loss(&output, &target)?;
-    
-    // Manual gradient computation (autograd API in progress)
-    let grad_weight = compute_gradients(&loss, &weight)?;
-    
-    // Update weights
-    weight = weight.sub(&grad_weight.mul_scalar(learning_rate)?)?;
+    let grad = compute_gradients(&loss, &weight)?; // via autograd API
+    weight = weight.sub(&grad.mul_scalar(lr)?)?;
 }
 ```
 
-## Integration with EriDiffusion
+## EriDiffusion integration
 
-FLAME is being developed as the tensor backend for EriDiffusion. The integration will enable:
-
-- Full training support for diffusion models (SDXL, SD3.5, Flux, etc.)
-- LoRA, DoRA, and other adapter training
-- Gradient checkpointing for memory efficiency
-- Custom CUDA kernels for diffusion-specific operations
+FLAME will power EriDiffusion’s training backends:
+- Enables gradient edits (LoRA, DoRA, adapters).
+- Supports gradient checkpointing for big UNets/DiTs.
+- Custom CUDA kernels for diffusion-only ops.
 
 ## Roadmap
 
-### Immediate (for EriDiffusion integration)
-- [ ] Improve autograd API for easier usage
-- [ ] Implement conv2d operations (required for UNet/DiT)
-- [ ] Add layer normalization (required for transformers)
-- [ ] Migrate EriDiffusion inference pipeline
-- [ ] Migrate EriDiffusion training code
+### Near term
+- Friendlier autograd surface.
+- Finish Conv2D + LayerNorm coverage for UNet/DiT.
+- Port Flux / SDXL training loops.
 
 ### Future
-- [ ] Optimize kernel performance
-- [ ] Add mixed precision (FP16) support
-- [ ] Implement Flash Attention
-- [ ] Add distributed training support
+- Kernel perf passes.
+- Mixed precision (FP16/BF16).
+- FlashAttention kernels.
+- Multi-GPU / distributed support.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues and pull requests.
+Issue reports and PRs are welcome. Please run the clippy/cuda smoke gates before submitting:
+
+```bash
+cargo clippy -p flame-core --lib --bins --tests \
+  -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity
+bash ci/smoke_cuda.sh
+```
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT License. See `LICENSE`.
 
-## Acknowledgments
+## Credits
 
-Built with:
-- [cudarc](https://github.com/coreylowman/cudarc) - Rust CUDA bindings
+- [cudarc](https://github.com/coreylowman/cudarc)
 - NVIDIA CUDA Toolkit
