@@ -1,3 +1,15 @@
+#![cfg(feature = "legacy_examples")]
+#![allow(unused_imports, unused_variables, unused_mut, dead_code)]
+#![cfg_attr(
+    clippy,
+    allow(
+        clippy::unused_imports,
+        clippy::useless_vec,
+        clippy::needless_borrow,
+        clippy::needless_clone
+    )
+)]
+
 use cudarc::driver::CudaDevice;
 use std::sync::Arc;
 
@@ -71,14 +83,15 @@ done:
 
     // Load and run kernel
     device.load_ptx(ptx.into(), "add_one_module", &["add_one_kernel"])?;
-    let kernel = device.get_func("add_one_module", "add_one_kernel")
+    let kernel = device
+        .get_func("add_one_module", "add_one_kernel")
         .ok_or("Failed to get kernel")?;
 
     let mut test_data = device.htod_sync_copy(&vec![5.0f32; 256])?;
-    
+
     let block_size = 256;
     let grid_size = 1;
-    
+
     unsafe {
         kernel.launch(
             cudarc::driver::LaunchConfig {
@@ -89,15 +102,18 @@ done:
             (&mut test_data, 256u32),
         )?;
     }
-    
+
     device.synchronize()?;
-    
+
     let mut result = vec![0.0f32; 256];
     device.dtoh_sync_copy_into(&test_data, &mut result)?;
-    
+
     println!("✓ PTX kernel executed");
     println!("  Input: 5.0, Output: {}", result[0]);
-    println!("  Verification: {}", if result[0] == 6.0 { "PASSED" } else { "FAILED" });
+    println!(
+        "  Verification: {}",
+        if result[0] == 6.0 { "PASSED" } else { "FAILED" }
+    );
 
     println!("\n=== All tests completed successfully! ===");
     Ok(())

@@ -1,10 +1,6 @@
 //! Adam optimizer implementation
 
-use crate::{
-    config,
-    parameter::Parameter,
-    DType, FlameError, Result, Tensor, TensorId,
-};
+use crate::{config, parameter::Parameter, DType, FlameError, Result, Tensor, TensorId};
 use std::collections::HashMap;
 
 #[inline(always)]
@@ -52,11 +48,6 @@ impl Adam {
             v: HashMap::new(),
             weight_decay,
         }
-    }
-
-    /// Create with default parameters
-    pub fn default() -> Self {
-        Self::new(0.001, 0.9, 0.999, 1e-8, 0.0)
     }
 
     /// Perform a single optimization step
@@ -161,6 +152,12 @@ impl Adam {
     }
 }
 
+impl Default for Adam {
+    fn default() -> Self {
+        Self::new(0.001, 0.9, 0.999, 1e-8, 0.0)
+    }
+}
+
 /// AdamW optimizer (Adam with decoupled weight decay)
 pub struct AdamW {
     adam: Adam,
@@ -173,10 +170,6 @@ impl AdamW {
         }
     }
 
-    pub fn default() -> Self {
-        Self::new(0.001, 0.9, 0.999, 1e-8, 0.01)
-    }
-
     pub fn step(&mut self, parameters: &[Parameter]) -> Result<()> {
         self.adam.step(parameters)
     }
@@ -186,11 +179,37 @@ impl AdamW {
     }
 }
 
+impl Default for AdamW {
+    fn default() -> Self {
+        Self::new(0.001, 0.9, 0.999, 1e-8, 0.01)
+    }
+}
+
 impl Adam {
     fn state_dtype(&self, param_id: &TensorId) -> Option<(DType, DType)> {
         let m = self.m.get(param_id)?;
         let v = self.v.get(param_id)?;
         Some((m.dtype(), v.dtype()))
+    }
+
+    /// Return the total bytes consumed by optimizer state tensors.
+    pub fn state_memory_bytes(&self) -> usize {
+        let m_bytes: usize = self
+            .m
+            .values()
+            .map(|tensor| tensor.shape().elem_count() * tensor.dtype().size_in_bytes())
+            .sum();
+        let v_bytes: usize = self
+            .v
+            .values()
+            .map(|tensor| tensor.shape().elem_count() * tensor.dtype().size_in_bytes())
+            .sum();
+        m_bytes + v_bytes
+    }
+
+    /// Alias for compatibility with layout checks.
+    pub fn state_bytes(&self) -> usize {
+        self.state_memory_bytes()
     }
 }
 
@@ -201,6 +220,16 @@ impl AdamW {
     /// invariants (e.g. FP32 moment buffers) remain satisfied.
     pub fn debug_state_dtype(&self, param: &Parameter) -> Option<(DType, DType)> {
         self.adam.state_dtype(&param.id())
+    }
+
+    /// Return the total bytes consumed by optimizer state tensors.
+    pub fn state_memory_bytes(&self) -> usize {
+        self.adam.state_memory_bytes()
+    }
+
+    /// Alias matching the stabilization docs terminology.
+    pub fn state_bytes(&self) -> usize {
+        self.state_memory_bytes()
     }
 }
 

@@ -1,12 +1,24 @@
+#![cfg(all(feature = "legacy_examples", feature = "cudnn"))]
+#![allow(unused_imports, unused_variables, unused_mut, dead_code)]
+#![cfg_attr(
+    clippy,
+    allow(
+        clippy::unused_imports,
+        clippy::useless_vec,
+        clippy::needless_borrow,
+        clippy::needless_clone
+    )
+)]
+
 fn main() {
     println!("\n=== Testing cuDNN is Enabled ===");
-    
+
     // Check if cuDNN feature is enabled
     #[cfg(feature = "cudnn")]
     {
         println!("✅ cuDNN feature is ENABLED!");
         println!("✅ cuDNN is the default feature!");
-        
+
         // Check if cuDNN is available
         if flame_core::cudnn::is_cudnn_available() {
             println!("✅ cuDNN runtime is AVAILABLE!");
@@ -15,13 +27,13 @@ fn main() {
             println!("❌ cuDNN runtime check failed");
         }
     }
-    
+
     #[cfg(not(feature = "cudnn"))]
     {
         println!("❌ cuDNN feature is DISABLED - this should never happen!");
         panic!("cuDNN must always be enabled!");
     }
-    
+
     println!("\n🔥 FLAME is configured to ALWAYS use cuDNN!");
     println!("💪 The world's best Rust-only trainer!");
 }

@@ -1,4 +1,16 @@
-use flame_core::{Tensor, CudaDevice, Shape};
+#![cfg(feature = "legacy_examples")]
+#![allow(unused_imports, unused_variables, unused_mut, dead_code)]
+#![cfg_attr(
+    clippy,
+    allow(
+        clippy::unused_imports,
+        clippy::useless_vec,
+        clippy::needless_borrow,
+        clippy::needless_clone
+    )
+)]
+
+use flame_core::{CudaDevice, Shape, Tensor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize CUDA - CudaDevice::new already returns Arc<CudaDevice>
@@ -6,21 +18,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("CUDA device initialized");
 
     // Create a weight tensor
-    let mut weight = Tensor::randn(
-        Shape::from_dims(&[128, 64]), 
-        0.0, 
-        0.02, 
-        device.clone()
-    )?;
+    let mut weight = Tensor::randn(Shape::from_dims(&[128, 64]), 0.0, 0.02, device.clone())?;
     println!("Created weight tensor: {:?}", weight.shape());
 
     // Create a gradient tensor
-    let gradient = Tensor::randn(
-        Shape::from_dims(&[128, 64]), 
-        0.0, 
-        0.01, 
-        device.clone()
-    )?;
+    let gradient = Tensor::randn(Shape::from_dims(&[128, 64]), 0.0, 0.01, device.clone())?;
     println!("Created gradient tensor: {:?}", gradient.shape());
 
     // Get initial weight values
@@ -35,18 +37,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Verify weights changed
     let updated_weights = weight.to_vec()?;
     println!("Updated weight[0]: {}", updated_weights[0]);
-    
+
     let diff = updated_weights[0] - initial_weights[0];
     println!("Difference: {}", diff);
 
     // Test matmul
-    let input = Tensor::randn(
-        Shape::from_dims(&[32, 128]), 
-        0.0, 
-        1.0, 
-        device.clone()
-    )?;
-    
+    let input = Tensor::randn(Shape::from_dims(&[32, 128]), 0.0, 1.0, device.clone())?;
+
     let output = input.matmul(&weight)?;
     println!("Matmul output shape: {:?}", output.shape());
 

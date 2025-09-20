@@ -1,32 +1,44 @@
-use flame_core::{Tensor, Shape, autograd::AutogradContext, gradient::TensorGradExt};
+#![cfg(feature = "legacy_examples")]
+#![allow(unused_imports, unused_variables, unused_mut, dead_code)]
+#![cfg_attr(
+    clippy,
+    allow(
+        clippy::unused_imports,
+        clippy::useless_vec,
+        clippy::needless_borrow,
+        clippy::needless_clone
+    )
+)]
+
 use cudarc::driver::CudaDevice;
+use flame_core::{autograd::AutogradContext, gradient::TensorGradExt, Shape, Tensor};
 use std::sync::Arc;
 
 fn main() -> flame_core::Result<()> {
     let device = CudaDevice::new(0)?;
-    
+
     // Create input tensor with requires_grad
     let x = Tensor::from_vec(vec![2.0, 3.0], Shape::from_dims(&[2]), device.clone())?;
     println!("x.requires_grad before: {}", x.requires_grad());
-    
+
     let x = x.requires_grad_(true);
     println!("x.requires_grad after: {}", x.requires_grad());
     println!("x.id: {:?}", x.id());
-    
+
     // Multiply by itself
     let y = x.mul(&x)?;
     println!("y.requires_grad: {}", y.requires_grad());
     println!("y.id: {:?}", y.id());
-    
+
     // Sum
     let loss = y.sum()?;
     println!("loss.requires_grad: {}", loss.requires_grad());
     println!("loss.id: {:?}", loss.id());
-    
+
     // Backward
     let grads = AutogradContext::backward(&loss)?;
     println!("Number of gradients: {}", grads.len());
-    
+
     // Check gradients
     if let Some(x_grad) = x.grad(&grads) {
         println!("x gradient found: {:?}", x_grad.to_vec()?);
@@ -37,6 +49,6 @@ fn main() -> flame_core::Result<()> {
             println!("  {:?}", id);
         }
     }
-    
+
     Ok(())
 }

@@ -1,9 +1,9 @@
-use flame_core::{Tensor, Shape};
 use cudarc::driver::CudaDevice;
+use flame_core::{Shape, Tensor};
 
 fn main() -> flame_core::Result<()> {
     println!("=== FLAME Minimal Functionality Test ===\n");
-    
+
     // Device creation
     let device = match CudaDevice::new(0) {
         Ok(d) => {
@@ -15,7 +15,7 @@ fn main() -> flame_core::Result<()> {
             return Ok(());
         }
     };
-    
+
     // Basic tensor creation
     let x = match Tensor::randn(Shape::from_dims(&[10, 5]), 0.0, 1.0, device.clone()) {
         Ok(t) => {
@@ -27,11 +27,12 @@ fn main() -> flame_core::Result<()> {
             return Ok(());
         }
     };
-    
+
     // Basic arithmetic
-    let y = match x.add(&x) {
+    let _y = match x.add(&x) {
         Ok(t) => {
             println!("✅ PASS: Tensor addition");
+            println!("   Addition result shape: {:?}", t.shape().dims());
             t
         }
         Err(e) => {
@@ -39,7 +40,7 @@ fn main() -> flame_core::Result<()> {
             return Ok(());
         }
     };
-    
+
     // Matrix multiplication test
     let w = match Tensor::randn(Shape::from_dims(&[5, 8]), 0.0, 0.1, device.clone()) {
         Ok(t) => t,
@@ -48,7 +49,7 @@ fn main() -> flame_core::Result<()> {
             return Ok(());
         }
     };
-    
+
     let z = match x.matmul(&w) {
         Ok(t) => {
             println!("✅ PASS: Matrix multiplication");
@@ -59,11 +60,12 @@ fn main() -> flame_core::Result<()> {
             return Ok(());
         }
     };
-    
+
     // Reduction test
-    let sum_result = match z.sum() {
+    let _sum_result = match z.sum() {
         Ok(t) => {
             println!("✅ PASS: Sum reduction");
+            println!("   Sum output shape: {:?}", t.shape().dims());
             t
         }
         Err(e) => {
@@ -71,12 +73,14 @@ fn main() -> flame_core::Result<()> {
             return Ok(());
         }
     };
-    
+
     // Autograd test
     println!("\n--- Testing Autograd ---");
-    let x_grad = Tensor::randn(Shape::from_dims(&[3, 4]), 0.0, 1.0, device.clone())?.requires_grad_(true);
-    let w_grad = Tensor::randn(Shape::from_dims(&[4, 2]), 0.0, 0.1, device.clone())?.requires_grad_(true);
-    
+    let x_grad =
+        Tensor::randn(Shape::from_dims(&[3, 4]), 0.0, 1.0, device.clone())?.requires_grad_(true);
+    let w_grad =
+        Tensor::randn(Shape::from_dims(&[4, 2]), 0.0, 0.1, device.clone())?.requires_grad_(true);
+
     let y_grad = match x_grad.matmul(&w_grad) {
         Ok(t) => t,
         Err(e) => {
@@ -84,7 +88,7 @@ fn main() -> flame_core::Result<()> {
             return Ok(());
         }
     };
-    
+
     let loss = match y_grad.sum() {
         Ok(t) => t,
         Err(e) => {
@@ -92,7 +96,7 @@ fn main() -> flame_core::Result<()> {
             return Ok(());
         }
     };
-    
+
     // Try backward pass
     match loss.backward() {
         Ok(grads) => {
@@ -106,21 +110,21 @@ fn main() -> flame_core::Result<()> {
             println!("❌ CRITICAL: Backward pass fails - {:?}", e);
         }
     }
-    
+
     // Test activation functions
     println!("\n--- Testing Activations ---");
     let test_tensor = Tensor::randn(Shape::from_dims(&[10]), -1.0, 1.0, device.clone())?;
-    
+
     match test_tensor.relu() {
         Ok(_) => println!("✅ PASS: ReLU activation"),
         Err(e) => println!("❌ FAIL: ReLU fails - {:?}", e),
     }
-    
+
     match test_tensor.tanh() {
         Ok(_) => println!("✅ PASS: Tanh activation"),
         Err(e) => println!("❌ FAIL: Tanh fails - {:?}", e),
     }
-    
+
     // Summary
     println!("\n=== Test Complete ===");
     Ok(())

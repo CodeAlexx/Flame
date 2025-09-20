@@ -1,4 +1,4 @@
-use flame_core::{devtensor, Device, DType, Shape};
+use flame_core::{devtensor, DType, Device};
 
 fn cuda_device() -> Option<Device> {
     Device::cuda(0).ok()
