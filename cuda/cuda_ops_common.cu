@@ -83,3 +83,20 @@ extern "C" fc_status_t fc_ws_ensure_capacity(fc_workspace_t* arena, size_t bytes
     arena->bytes = required;
     return FC_OK;
 }
+
+extern "C" fc_status_t fc_bf16_memcpy_async(void* dst,
+                                            const void* src,
+                                            size_t bytes,
+                                            cudaStream_t stream) {
+    if (!dst || !src) {
+        return FC_ERR_INVALID_ARGUMENT;
+    }
+    if (bytes == 0) {
+        return FC_OK;
+    }
+    cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream);
+    if (err != cudaSuccess) {
+        return FC_ERR_LAUNCH;
+    }
+    return FC_OK;
+}

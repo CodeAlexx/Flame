@@ -1,17 +1,82 @@
-[workspace]
-members = ["flame-core", "flame-test"]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "flame-core"
 version = "0.1.0"
 authors = ["Alex"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/CodeAlexx/Flame"
-description = "Fast Learning Accelerated Matrix Engine - GPU tensor framework for deep learning"
+description = "Core tensor operations and autograd for FLAME"
 
-[workspace.dependencies]
-cudarc = "0.9"
-half = "2.3"
+[dependencies]
+cudarc = { version = "0.11.9", default-features = false, features = ["driver", "cublas", "cublaslt", "nvrtc", "cuda-12050", "f16"] }
+half = { version = "2.3", features = ["num-traits"] }
 num-traits = "0.2"
 thiserror = "1.0"
+anyhow = "1.0"
+rand = "0.8"
+rand_distr = "0.4"
+lazy_static = "1.4"
+once_cell = "1.19"
+serde_json = "1.0"
+image = "0.24"
+ctor = "0.2"
+cfg-if = "1.0"
+libloading = "0.8"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false }
+smallvec = "1.11"
+cuda-runtime-sys = "0.3.0-alpha.1"
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+numpy = { version = "0.22", optional = true }
+
+
+[features]
+# CUDA is required for all default builds; disable at your own risk.
+default = ["cuda", "bf16_u16"]
+legacy_examples = []
+nvrtc = []
+flash_attn = []   # Opt-in only (not enabled by default)
+cudnn = []        # Opt-in only
+dtype_trace = []
+# Phase 3 attention oracle gate
+attn_oracle = []
+# Phase 2 optional oracles
+norm_oracle = []
+layout_checks = []
+# Retain legacy/cuda toggles for compatibility
+legacy = []
+legacy_cpu_autograd = []
+legacy_full = []
+cuda = []
+heavy_kernels = ["cuda"]   # Opt-in for big custom kernels/NVRTC/cuDNN
+capi = []
+# Developer-only examples; never built unless explicitly enabled.
+dev-examples = []
+# Experimental: true BF16 GPU storage and BF16 GEMM
+bf16_u16 = []
+# Experimental: fused BF16 CUDA kernels (LayerNorm/AdaLN, etc.). Requires bf16_u16 + CUDA.
+bf16_kernels = ["cuda", "bf16_u16"]
+bf16_conv = ["cudnn", "bf16_u16"]
+# Experimental: store Adam moment buffers in BF16 and skip automatic FP32 grad upcast.
+true_bf16_optimizer_states = []
+# Experimental: allow borrowed BF16 device views + Lt matmul wrappers.
+borrowed_weights = ["cuda", "bf16_u16"]
+strict_bf16 = []         # Telemetry guards; safe to combine with or without CUDA/autograd features
+autograd_v4 = []
+sdpa = []                # Optional gating for attention helpers; leave off for minimal builds
+sdpa_debug = []
+shared_storage = []
+python = ["pyo3", "numpy"]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[build-dependencies]
+cbindgen = "0.26"
+cc = "1.0"
+
+[dev-dependencies]
+approx = "0.5"
+libm = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

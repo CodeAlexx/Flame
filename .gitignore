@@ -1,24 +1,9 @@
-# Rust
-target/
-Cargo.lock
-**/*.rs.bk
-*.pdb
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Test outputs
-*.log
-*.tmp
-
-# CUDA
-*.ptx
-*.cubin
+/target/
+*.o
+*.so
+*.dylib
+.planning/
+*.bak
+*.bak_*
+inference-test/
+unused/

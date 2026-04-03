@@ -1,0 +1,136 @@
+use crate::{Error, Result};
+use core::ffi::c_void;
+use cudarc::driver::CudaDevice as CudarcDevice;
+use std::sync::{Arc, OnceLock};
+
+static GLOBAL_DEV: OnceLock<Arc<CudarcDevice>> = OnceLock::new();
+
+/// Get a global CUDA device (device 0). GPU-only; panics if CUDA init fails.
+pub fn global_cuda_device() -> Arc<CudarcDevice> {
+    GLOBAL_DEV
+        .get_or_init(|| {
+            CudarcDevice::new(0).expect(
+                "CUDA GPU required. Set CUDA_HOME=/usr/local/cuda and export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH.",
+            )
+        })
+        .clone()
+}
+
+/// Device management for FLAME
+#[derive(Clone)]
+pub struct Device {
+    inner: Arc<CudarcDevice>,
+}
+
+impl std::fmt::Debug for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Device")
+            .field("ordinal", &self.ordinal())
+            .finish()
+    }
+}
+
+impl Device {
+    /// Wrap an existing Arc<CudaDevice> in a Device.
+    pub fn from_arc(device: Arc<CudarcDevice>) -> Self {
+        Self { inner: device }
+    }
+
+    /// Create a new device for the given GPU ordinal
+    pub fn cuda(ordinal: usize) -> Result<Self> {
+        let device = CudarcDevice::new(ordinal)
+            .map_err(|e| Error::Cuda(format!("Failed to create CUDA device: {}", e)))?;
+        Ok(Self { inner: device })
+    }
+
+    /// Get the underlying CUDA device
+    pub fn cuda_device(&self) -> &Arc<CudarcDevice> {
+        &self.inner
+    }
+
+    /// Get a clone of the underlying CUDA device Arc
+    pub fn cuda_device_arc(&self) -> Arc<CudarcDevice> {
+        self.inner.clone()
+    }
+
+    /// Get device ordinal
+    pub fn ordinal(&self) -> usize {
+        self.inner.ordinal()
+    }
+
+    /// Synchronize the device
+    pub fn synchronize(&self) -> Result<()> {
+        self.inner.synchronize().map_err(|_| Error::CudaDriver)
+    }
+
+    /// Set random seed for the device
+    pub fn set_seed(&self, _seed: u64) -> Result<()> {
+        // For now, this is a no-op as FLAME doesn't have a global RNG state
+        // In the future, we might want to integrate with cuRAND
+        Ok(())
+    }
+
+    /// Create a CPU device (not supported in FLAME)
+    pub fn cpu() -> Result<Self> {
+        Err(Error::InvalidOperation(
+            "FLAME only supports CUDA devices".into(),
+        ))
+    }
+
+    /// Check if this is a CPU device
+    pub fn is_cpu(&self) -> bool {
+        false // FLAME only supports CUDA
+    }
+
+    /// Check if this is a CUDA device
+    pub fn is_cuda(&self) -> bool {
+        true // FLAME only supports CUDA
+    }
+
+    /// Returns the CUDA stream as a raw pointer usable by FFI launchers.
+    /// Currently returns the default stream (null) unless a custom stream is plumbed.
+    pub fn cuda_stream_raw_ptr(&self) -> *mut core::ffi::c_void {
+        core::ptr::null_mut()
+    }
+}
+
+/// Extension trait to expose a raw CUDA stream pointer from cudarc's `CudaDevice`.
+/// Currently returns the default (null) stream, which is valid for kernel launches.
+pub trait CudaStreamRawPtrExt {
+    fn cuda_stream_raw_ptr(&self) -> *mut c_void;
+}
+
+impl CudaStreamRawPtrExt for cudarc::driver::CudaDevice {
+    fn cuda_stream_raw_ptr(&self) -> *mut c_void {
+        core::ptr::null_mut()
+    }
+}
+
+impl From<Arc<CudarcDevice>> for Device {
+    fn from(device: Arc<CudarcDevice>) -> Self {
+        Self { inner: device }
+    }
+}
+
+/// Device enum for matching expected external APIs
+#[derive(Clone, Debug)]
+pub enum DeviceEnum {
+    Cuda(Device),
+}
+
+impl DeviceEnum {
+    /// Create a CUDA device
+    pub fn cuda(ordinal: usize) -> Result<Self> {
+        Ok(DeviceEnum::Cuda(Device::cuda(ordinal)?))
+    }
+
+    /// Check if CPU device
+    pub fn is_cpu(&self) -> bool {
+        false
+    }
+
+    /// Check if CUDA device  
+    pub fn is_cuda(&self) -> bool {
+        true
+    }
+}

@@ -1,0 +1,3296 @@
+pub mod contracts;
+
+use crate::autograd::{AutogradContext, Op};
+#[cfg(feature = "cuda")]
+use crate::bf16_ops;
+use crate::config::default_dtype;
+use crate::cuda_memory_alignment::alloc_aligned_f32;
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+use crate::cuda_ops_bf16;
+use crate::cuda_ops_ffi::CudaStream;
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+use crate::device::CudaStreamRawPtrExt;
+use crate::gradient::{GradientMap, TensorGradExt};
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+use crate::staging::bf16_copy_async;
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+use crate::staging::ArenaLease;
+use crate::tensor_ext::to_owning_fp32_strong;
+use crate::tensor_storage::{ensure_unique_slice, slice_ref, wrap_slice, TensorStorage};
+use crate::{DType, Error, Result, Shape};
+use cudarc::driver::{
+    CudaDevice, CudaSlice, DevicePtr, DevicePtrMut, DeviceSlice, LaunchAsync, LaunchConfig,
+};
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+// Fix cublas op imports to stable sys enums
+use crate::cuda_kernels::CudaKernels;
+use crate::cuda_ops::GpuOps;
+use crate::rng;
+use crate::tensor::contracts::assert_nhwc_bf16_public;
+use std::fmt;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+#[cfg(feature = "bf16_u16")]
+use half::bf16;
+
+// Helper macro for kernel launches
+macro_rules! launch_kernel {
+    ($func:expr, $cfg:expr, $($args:expr),* $(,)?) => {{
+        unsafe { $func.launch($cfg, ($($args,)*)) }
+    }};
+}
+
+/// Global tensor ID counter
+static TENSOR_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Unique tensor identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TensorId(pub usize);
+
+impl TensorId {
+    pub fn new() -> Self {
+        TensorId(TENSOR_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for TensorId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Helper function to broadcast two shape arrays
+#[allow(dead_code)]
+fn broadcast_shapes(shape1: &[usize], shape2: &[usize]) -> Result<Vec<usize>> {
+    let max_len = shape1.len().max(shape2.len());
+    let mut result = vec![1; max_len];
+
+    // Right-align shapes
+    let offset1 = max_len - shape1.len();
+    let offset2 = max_len - shape2.len();
+
+    for i in 0..max_len {
+        let dim1 = if i >= offset1 { shape1[i - offset1] } else { 1 };
+        let dim2 = if i >= offset2 { shape2[i - offset2] } else { 1 };
+
+        if dim1 == dim2 {
+            result[i] = dim1;
+        } else if dim1 == 1 {
+            result[i] = dim2;
+        } else if dim2 == 1 {
+            result[i] = dim1;
+        } else {
+            return Err(Error::InvalidOperation(format!(
+                "Cannot broadcast dimensions {} and {}",
+                dim1, dim2
+            )));
+        }
+    }
+
+    Ok(result)
+}
+
+/// The core tensor type with GPU-accelerated operations
+#[derive(Clone)]
+pub struct Tensor {
+    /// GPU memory storage with dtype support
+    pub(crate) storage: TensorStorage,
+
+    /// Shape of this tensor
+    pub(crate) shape: Shape,
+
+    /// Device this tensor lives on
+    pub(crate) device: Arc<CudaDevice>,
+
+    /// Unique identifier for gradient tracking
+    pub(crate) id: TensorId,
+
+    /// Whether gradients should be computed
+    pub(crate) requires_grad: bool,
+}
+
+impl AsRef<Tensor> for Tensor {
+    fn as_ref(&self) -> &Tensor {
+        self
+    }
+}
+
+impl fmt::Debug for Tensor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Tensor {{ shape: {:?}, dtype: {:?}, device: cuda:{}, id: {} }}",
+            self.shape,
+            self.storage.dtype(),
+            self.device.ordinal(),
+            self.id.0
+        )
+    }
+}
+
+// Note: We don't implement the standard Clone trait because we have a custom clone() method
+// that returns Result<Tensor> for consistency with other operations
+
+impl Tensor {
+    pub(crate) fn storage_ref(&self) -> &TensorStorage {
+        &self.storage
+    }
+
+    pub(crate) fn storage_mut(&mut self) -> &mut TensorStorage {
+        &mut self.storage
+    }
+
+    // Mixed-precision policy (reminder):
+    // - Parameters and activations: store as BF16; do math in FP32 inside kernels.
+    // - Intermediates/temps/activations created here (zeros/new outputs): prefer BF16 storage directly.
+    // - Masks: prefer Bool/u8, not F32 (convert to FP32 only at the last moment before math).
+    // - Gradients/optimizer states/scalars/reductions: use FP32 for numerical stability.
+    // - RNG/init: generate FP32 in registers inside kernels, write BF16 elements directly; avoid full FP32 tensors.
+    /// Create a causal mask tensor
+    pub fn causal_mask(seq_len: usize, device: &Arc<CudaDevice>) -> Result<Self> {
+        // Create a lower triangular mask
+        let mut mask_data = vec![0f32; seq_len * seq_len];
+        for i in 0..seq_len {
+            for j in 0..=i {
+                mask_data[i * seq_len + j] = 1.0;
+            }
+        }
+
+        // Convert to tensor
+        let shape = Shape::from_dims(&[seq_len, seq_len]);
+        Self::from_vec(mask_data, shape, device.clone())
+    }
+
+    /// Apply a mask to tensor (set masked positions to value)
+    pub fn masked_fill(&self, mask: &Tensor, value: f32) -> Result<Self> {
+        if self.shape != mask.shape {
+            return Err(Error::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: mask.shape.clone(),
+            });
+        }
+
+        // Use CUDA kernel for masked fill
+        let kernel_code = r#"
+extern "C" __global__ void masked_fill_kernel(
+    const float* input,
+    const float* mask,
+    float* output,
+    float value,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = mask[idx] > 0.5f ? value : input[idx];
+    }
+}
+"#;
+
+        crate::cuda_kernels::CudaKernels::ensure_kernel(
+            &self.device,
+            "masked_fill_kernel",
+            kernel_code,
+        )?;
+
+        let f = self
+            .device
+            .get_func("masked_fill_kernel", "masked_fill_kernel")
+            .ok_or_else(|| Error::Cuda("Failed to get masked_fill_kernel".into()))?;
+
+        let n = self.shape.elem_count();
+        let output_data = alloc_zeros_from_pool(&self.device, n)?;
+
+        let cfg = cudarc::driver::LaunchConfig::for_num_elems(n as u32);
+
+        crate::launch_kernel!(
+            f,
+            cfg,
+            self.storage.try_as_slice_f32()?,
+            mask.storage.try_as_slice_f32()?,
+            &output_data,
+            value,
+            n as i32
+        );
+
+        // Preserve input dtype for output when feasible (F32/BF16); otherwise fall back to F32
+        let storage = match self.dtype() {
+            DType::BF16 => {
+                #[cfg(not(feature = "bf16_u16"))]
+                {
+                    TensorStorage::BF16 {
+                        data: output_data,
+                        numel: n,
+                    }
+                }
+                #[cfg(feature = "bf16_u16")]
+                {
+                    use cudarc::driver::DevicePtr;
+                    let mut bf = unsafe { self.device.alloc::<u16>(n) }
+                        .map_err(|e| Error::Cuda(format!("alloc masked_fill bf16: {}", e)))?;
+                    crate::bf16_convert::f32_to_bf16_u16(
+                        self.device.clone(),
+                        &output_data,
+                        *bf.device_ptr(),
+                        n,
+                    )?;
+                    TensorStorage::BF16 {
+                        data: bf.into(),
+                        numel: n,
+                    }
+                }
+            }
+            DType::F32 => TensorStorage::F32 {
+                data: output_data.into(),
+                numel: n,
+            },
+            _ => TensorStorage::F32 {
+                data: output_data.into(),
+                numel: n,
+            },
+        };
+        Ok(Self {
+            storage,
+            shape: self.shape.clone(),
+            device: self.device.clone(),
+            id: TensorId::new(),
+            requires_grad: false,
+        })
+    }
+
+    /// Create a new tensor filled with zeros (defaults to global default dtype)
+    pub fn zeros(shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
+        let dtype = default_dtype();
+        let numel = shape.elem_count();
+        if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+            let bytes = numel * dtype.size_in_bytes();
+            if bytes >= (8 << 20) {
+                eprintln!(
+                    "[alloc] tag=zeros dtype={:?} shape={:?} bytes={}",
+                    dtype,
+                    shape.dims(),
+                    bytes
+                );
+            }
+        }
+        Self::zeros_dtype(shape, dtype, device)
+    }
+
+    /// Create tensor with specific dtype
+    pub fn zeros_dtype(shape: Shape, dtype: DType, device: Arc<CudaDevice>) -> Result<Self> {
+        if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+            let bytes = shape.elem_count() * dtype.size_in_bytes();
+            if bytes >= (8 << 20) {
+                eprintln!(
+                    "[alloc] tag=zeros_dtype dtype={:?} shape={:?} bytes={}",
+                    dtype,
+                    shape.dims(),
+                    bytes
+                );
+            }
+        }
+        let storage = TensorStorage::zeros(&shape, dtype, &device)?;
+        Ok(Self {
+            storage,
+            shape,
+            device,
+            id: TensorId::new(),
+            requires_grad: false,
+        })
+    }
+
+    /// Update the tensor's logical shape without touching storage. Element count must match.
+    pub fn reshape_inplace(&mut self, dims: &[usize]) -> Result<()> {
+        let new_shape = Shape::from_dims(dims);
+        if new_shape.elem_count() != self.shape.elem_count() {
+            return Err(Error::ShapeMismatch {
+                expected: new_shape,
+                got: self.shape.clone(),
+            });
+        }
+        self.shape = new_shape;
+        Ok(())
+    }
+
+    /// Return a non-owning view that shares the underlying storage.
+    #[inline]
+    pub fn alias(&self) -> Tensor {
+        Tensor {
+            storage: self.storage.clone(),
+            shape: self.shape.clone(),
+            device: self.device.clone(),
+            id: TensorId::new(),
+            requires_grad: self.requires_grad,
+        }
+    }
+
+    /// Create a zeros tensor that matches the receiver's shape/device but uses an explicit dtype.
+    #[inline]
+    pub fn zeros_like_with_dtype(&self, dtype: DType) -> Result<Self> {
+        Self::zeros_dtype(self.shape.clone(), dtype, self.device.clone())
+    }
+
+    /// BF16 matmul helper for legacy callers.
+    #[cfg(not(feature = "bf16_u16"))]
+    pub fn matmul_bf16(&self, other: &Tensor) -> Result<Tensor> {
+        let mut output = crate::ops::gemm::launch_gemm(self, other)?;
+        if self.requires_grad || other.requires_grad {
+            output.requires_grad = true;
+            AutogradContext::record_op(
+                output.id,
+                Op::MatMul {
+                    lhs: self.id,
+                    rhs: other.id,
+                },
+                vec![
+                    (self.id, self.clone_result()?),
+                    (other.id, other.clone_result()?),
+                ],
+            );
+        }
+        Ok(output)
+    }
+
+    /// BF16 matmul helper for true BF16 storage.
+    #[cfg(feature = "bf16_u16")]
+    pub fn matmul_bf16(&self, other: &Tensor) -> Result<Tensor> {
+        let mut output = crate::ops::gemm::launch_gemm(self, other)?;
+        if self.requires_grad || other.requires_grad {
+            output.requires_grad = true;
+            AutogradContext::record_op(
+                output.id,
+                Op::MatMul {
+                    lhs: self.id,
+                    rhs: other.id,
+                },
+                vec![
+                    (self.id, self.clone_result()?),
+                    (other.id, other.clone_result()?),
+                ],
+            );
+        }
+        Ok(output)
+    }
+
+    /// Get dtype
+    pub fn dtype(&self) -> DType {
+        self.storage.dtype()
+    }
+
+    /// Get data as F32 (converting if necessary)
+    /// This is for backward compatibility - prefer using storage directly
+    pub fn data(&self) -> Result<Arc<CudaSlice<f32>>> {
+        match &self.storage {
+            TensorStorage::F32 { data, .. } => {
+                #[cfg(feature = "shared_storage")]
+                {
+                    Ok(data.clone())
+                }
+                #[cfg(not(feature = "shared_storage"))]
+                {
+                    Ok(Arc::new(data.clone()))
+                }
+            }
+            _ => {
+                let f32_data = self.storage.to_f32(&self.device)?;
+                Ok(Arc::new(f32_data))
+            }
+        }
+    }
+
+    /// Get raw CUDA pointer for cuDNN operations (read-only)
+    pub fn cuda_ptr(&self) -> *const f32 {
+        use cudarc::driver::DevicePtr;
+        use std::ffi::c_void;
+        match self.storage.try_as_slice_f32() {
+            Ok(slice) => {
+                let ptr_addr = *slice.device_ptr();
+                ptr_addr as *const c_void as *const f32
+            }
+            Err(_) => std::ptr::null(),
+        }
+    }
+
+    /// Get mutable raw CUDA pointer for cuDNN operations
+    pub fn cuda_ptr_mut(&mut self) -> *mut f32 {
+        use cudarc::driver::DevicePtr;
+        use std::ffi::c_void;
+        // We need to get a mutable reference to the storage
+        // This is safe because we're the only owner of this tensor
+        let ptr_addr = match &mut self.storage {
+            TensorStorage::F32 { data, .. } => *data.device_ptr(),
+            TensorStorage::F16 { data, .. } => *data.device_ptr(),
+            #[cfg(not(feature = "bf16_u16"))]
+            TensorStorage::BF16 { data, .. } => *data.device_ptr(),
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16 { .. } => return std::ptr::null_mut(),
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16Arena { .. } => return std::ptr::null_mut(),
+            TensorStorage::I32 { data, .. } => *data.device_ptr(),
+            TensorStorage::Bool { data, .. } => *data.device_ptr(),
+            TensorStorage::I8 { .. } => {
+                return std::ptr::null_mut();
+            }
+        };
+        // Cast u64 GPU address to pointer
+        ptr_addr as *mut c_void as *mut f32
+    }
+
+    /// Returns the raw BF16 device pointer if BF16(u16) storage is enabled.
+    #[cfg(feature = "bf16_u16")]
+    pub fn as_device_ptr_bf16(&self, tag: &str) -> Result<*const u16> {
+        if self.dtype() != DType::BF16 || self.storage_dtype() != DType::BF16 {
+            return Err(Error::InvalidOperation(format!(
+                "[{tag}] expected BF16 tensor, got logical {:?} / storage {:?}",
+                self.dtype(),
+                self.storage_dtype()
+            )));
+        }
+        match self.storage_ref() {
+            TensorStorage::BF16 { data, .. } => Ok((*data.device_ptr()) as *const u16),
+            TensorStorage::BF16Arena { ptr, .. } => Ok(ptr.as_ptr()),
+            _ => Err(Error::InvalidOperation(format!(
+                "[{tag}] expected BF16(u16) backing storage"
+            ))),
+        }
+    }
+
+    /// Returns the read-only device slice for F32 tensors.
+    pub fn as_slice_f32(&self, tag: &str) -> Result<&CudaSlice<f32>> {
+        if self.dtype() != DType::F32 || self.storage_dtype() != DType::F32 {
+            return Err(Error::InvalidOperation(format!(
+                "[{tag}] expected F32 tensor, got logical {:?} / storage {:?}",
+                self.dtype(),
+                self.storage_dtype()
+            )));
+        }
+        self.storage
+            .try_as_slice_f32()
+            .map_err(|_| Error::InvalidOperation(format!("[{tag}] expected F32 backing storage")))
+    }
+
+    /// Returns the writable device slice for F32 tensors.
+    pub fn as_mut_slice_f32(&mut self, tag: &str) -> Result<&mut CudaSlice<f32>> {
+        if self.dtype() != DType::F32 || self.storage_dtype() != DType::F32 {
+            return Err(Error::InvalidOperation(format!(
+                "[{tag}] expected F32 tensor, got logical {:?} / storage {:?}",
+                self.dtype(),
+                self.storage_dtype()
+            )));
+        }
+        self.storage_mut()
+            .try_as_mut_slice_f32()
+            .map_err(|_| Error::InvalidOperation(format!("[{tag}] expected F32 backing storage")))
+    }
+
+    /// Copy full tensor contents from another F32 tensor of identical shape.
+    pub fn copy_f32_from(&mut self, src: &Tensor) -> Result<()> {
+        if self.shape != src.shape {
+            return Err(Error::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: src.shape.clone(),
+            });
+        }
+        if self.dtype() != DType::F32 || self.storage_dtype() != DType::F32 {
+            return Err(Error::InvalidOperation(
+                "copy_f32_from destination must be F32".into(),
+            ));
+        }
+        if src.dtype() != DType::F32 || src.storage_dtype() != DType::F32 {
+            return Err(Error::InvalidOperation(
+                "copy_f32_from source must be F32".into(),
+            ));
+        }
+
+        let device = self.device.clone();
+        let dst_slice = self.as_mut_slice_f32("copy_f32_from.dst")?;
+        let src_slice = src.as_slice_f32("copy_f32_from.src")?;
+        device
+            .dtod_copy(src_slice, dst_slice)
+            .map_err(|e| Error::Cuda(format!("copy_f32_from failed: {e}")))
+    }
+
+    /// Returns the mutable BF16 device pointer if BF16(u16) storage is enabled.
+    #[cfg(feature = "bf16_u16")]
+    pub fn as_mut_device_ptr_bf16(&mut self, tag: &str) -> Result<*mut u16> {
+        if self.dtype() != DType::BF16 || self.storage_dtype() != DType::BF16 {
+            return Err(Error::InvalidOperation(format!(
+                "[{tag}] expected BF16 tensor, got logical {:?} / storage {:?}",
+                self.dtype(),
+                self.storage_dtype()
+            )));
+        }
+        match self.storage_mut() {
+            TensorStorage::BF16 { ref mut data, .. } => {
+                let data = ensure_unique_slice(data)?;
+                Ok((*data.device_ptr_mut()) as *mut u16)
+            }
+            TensorStorage::BF16Arena { ptr, .. } => Ok(ptr.as_ptr()),
+            _ => Err(Error::InvalidOperation(format!(
+                "[{tag}] expected BF16(u16) backing storage"
+            ))),
+        }
+    }
+
+    /// Copy a contiguous BF16 region (measured in BF16 elements) from `src` into `self`.
+    /// Offsets and lengths are expressed in BF16 elements. Both tensors must be BF16 with BF16 backing storage.
+    pub fn copy_bf16_region_from(
+        &mut self,
+        dst_offset_elems: usize,
+        src: &Tensor,
+        src_offset_elems: usize,
+        elem_count: usize,
+    ) -> Result<()> {
+        if elem_count == 0 {
+            return Ok(());
+        }
+        if self.dtype() != DType::BF16 || self.storage_dtype() != DType::BF16 {
+            return Err(Error::InvalidOperation(
+                "copy_bf16_region_from destination must be BF16".into(),
+            ));
+        }
+        if src.dtype() != DType::BF16 || src.storage_dtype() != DType::BF16 {
+            return Err(Error::InvalidOperation(
+                "copy_bf16_region_from source must be BF16".into(),
+            ));
+        }
+
+        let device = self.device.clone();
+        let dst_slice = self
+            .storage_mut()
+            .try_as_mut_slice_u16()
+            .map_err(|_| Error::InvalidOperation("destination storage is not BF16".into()))?;
+        let src_slice = src
+            .storage_ref()
+            .try_as_slice_u16()
+            .map_err(|_| Error::InvalidOperation("source storage is not BF16".into()))?;
+
+        let dst_end = dst_offset_elems + elem_count;
+        let src_end = src_offset_elems + elem_count;
+        if dst_end > dst_slice.len() {
+            return Err(Error::InvalidOperation(format!(
+                "destination copy range {}..{} exceeds length {}",
+                dst_offset_elems,
+                dst_end,
+                dst_slice.len()
+            )));
+        }
+        if src_end > src_slice.len() {
+            return Err(Error::InvalidOperation(format!(
+                "source copy range {}..{} exceeds length {}",
+                src_offset_elems,
+                src_end,
+                src_slice.len()
+            )));
+        }
+
+        let mut dst_view = dst_slice.slice_mut(dst_offset_elems..dst_end);
+        let src_view = src_slice.slice(src_offset_elems..src_end);
+        device
+            .dtod_copy(&src_view, &mut dst_view)
+            .map_err(|e| Error::Cuda(format!("bf16 region copy failed: {e}")))?;
+        Ok(())
+    }
+
+    /// BF16 pointer helpers are unavailable without the bf16_u16 feature.
+    #[cfg(not(feature = "bf16_u16"))]
+    #[allow(unused_variables)]
+    pub fn as_device_ptr_bf16(&self, tag: &str) -> Result<*const u16> {
+        Err(Error::InvalidOperation(
+            "Tensor::as_device_ptr_bf16 requires the bf16_u16 feature".into(),
+        ))
+    }
+
+    /// BF16 pointer helpers are unavailable without the bf16_u16 feature.
+    #[cfg(not(feature = "bf16_u16"))]
+    #[allow(unused_variables)]
+    pub fn as_mut_device_ptr_bf16(&mut self, tag: &str) -> Result<*mut u16> {
+        Err(Error::InvalidOperation(
+            "Tensor::as_mut_device_ptr_bf16 requires the bf16_u16 feature".into(),
+        ))
+    }
+
+    /// Cast to different dtype
+    pub fn to_dtype(&self, dtype: DType) -> Result<Tensor> {
+        if self.dtype() == dtype && self.storage.dtype() == dtype {
+            return Ok(self.clone());
+        }
+
+        // For now, we store everything as F32 but track the dtype
+        // Use aligned allocation for the new tensor to avoid CUDA issues
+        let numel = self.shape.elem_count();
+
+        // Debug large allocations
+        // Commented out for cleaner training output
+        // if numel > 100000 {
+        //     eprintln!("to_dtype: converting {} elements from {:?} to {:?}", numel, self.dtype(), dtype);
+        // }
+
+        // Use aligned allocation and convert via f32 staging
+        let mut f32_data = alloc_aligned_f32(&self.device, numel)?;
+        let src_f32 = self.storage.to_f32(&self.device)?;
+        self.device.dtod_copy(&src_f32, &mut f32_data)?;
+
+        let storage = match dtype {
+            DType::F32 => TensorStorage::F32 {
+                data: f32_data.into(),
+                numel,
+            },
+            DType::F16 => TensorStorage::F16 {
+                data: f32_data.into(),
+                numel,
+                scale: 1.0,
+            },
+            DType::BF16 => {
+                #[cfg(not(feature = "bf16_u16"))]
+                {
+                    TensorStorage::BF16 {
+                        data: f32_data,
+                        numel,
+                    }
+                }
+                #[cfg(feature = "bf16_u16")]
+                {
+                    use cudarc::driver::DevicePtr;
+                    let mut bf_data = unsafe { self.device.alloc::<u16>(numel) }
+                        .map_err(|e| Error::Cuda(format!("alloc bf16 cast: {}", e)))?;
+                    crate::bf16_convert::f32_to_bf16_u16(
+                        self.device.clone(),
+                        &f32_data,
+                        *bf_data.device_ptr(),
+                        numel,
+                    )?;
+                    TensorStorage::BF16 {
+                        data: bf_data.into(),
+                        numel,
+                    }
+                }
+            }
+            DType::I32 => TensorStorage::I32 {
+                data: f32_data.into(),
+                numel,
+            },
+            DType::Bool => {
+                Self::convert_f32_buffer_to_bool(&self.device, &mut f32_data, numel)?;
+                TensorStorage::Bool {
+                    data: f32_data.into(),
+                    numel,
+                }
+            }
+            _ => {
+                return Err(Error::InvalidOperation(format!(
+                    "Unsupported dtype: {:?}",
+                    dtype
+                )))
+            }
+        };
+
+        let out = Tensor {
+            storage,
+            shape: self.shape.clone(),
+            device: self.device.clone(),
+            id: TensorId::new(),
+            requires_grad: self.requires_grad,
+        };
+        if self.requires_grad {
+            // Record autograd Cast op so gradients flow across dtype boundaries
+            AutogradContext::record_op(
+                out.id,
+                Op::Cast {
+                    input: self.id,
+                    from: self.dtype(),
+                    to: dtype,
+                },
+                vec![(self.id, self.clone_result()?)],
+            );
+        }
+        Ok(out)
+    }
+
+    /// Gather rows from a 2D table along axis 0 using I32 indices; supports ids with arbitrary leading dims
+    pub fn index_select0(&self, ids: &Tensor) -> Result<Tensor> {
+        if self.shape.dims().len() != 2 {
+            return Err(Error::InvalidOperation(
+                "index_select0 expects table [V,D]".into(),
+            ));
+        }
+        if ids.dtype() != DType::I32 {
+            return Err(Error::InvalidOperation(
+                "index_select0 ids must be I32".into(),
+            ));
+        }
+        let gathered = crate::cuda_kernels::gather_rows(self, ids, 0)?;
+
+        if self.requires_grad {
+            let mut tracked = gathered.clone_result()?;
+            tracked.requires_grad = true;
+            AutogradContext::record_op(
+                tracked.id,
+                Op::IndexSelect {
+                    input: self.id,
+                    indices: ids.id,
+                    dim: 0,
+                },
+                vec![
+                    (self.id, self.clone_result()?),
+                    (ids.id, ids.clone_result()?),
+                ],
+            );
+            Ok(tracked)
+        } else {
+            Ok(gathered)
+        }
+    }
+
+    // eq implemented in tensor_ops_extended.rs
+
+    /// Where: out = mask ? a : b; mask Bool (0/1)
+    pub fn where_mask(mask: &Tensor, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        crate::ops_ext::where_mask(mask, a, b)
+    }
+
+    /// Create a new tensor filled with ones (defaults to F32)
+    pub fn ones(shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
+        let size = shape.elem_count();
+        let ones_vec = vec![1.0f32; size];
+        Self::from_vec(ones_vec, shape, device)
+    }
+
+    /// Create a new tensor filled with ones with specific dtype
+    pub fn ones_dtype(shape: Shape, dtype: DType, device: Arc<CudaDevice>) -> Result<Self> {
+        let size = shape.elem_count();
+        let ones_vec = vec![1.0f32; size];
+        Self::from_vec_dtype(ones_vec, shape, device, dtype)
+    }
+
+    /// Create a new tensor from a Vec
+    pub fn from_vec(data: Vec<f32>, shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
+        if data.len() != shape.elem_count() {
+            return Err(Error::ShapeMismatch {
+                expected: shape.clone(),
+                got: Shape::from_dims(&[data.len()]),
+            });
+        }
+        // Allocate from memory pool
+        let numel = data.len();
+        let mut cuda_data = alloc_from_pool(&device, numel)?;
+
+        // If the allocated size is larger than our data, we need to handle it carefully
+        if cuda_data.len() > numel {
+            // Pad the data to match the allocated size
+            let mut padded_data = data;
+            padded_data.resize(cuda_data.len(), 0.0);
+            device
+                .htod_copy_into(padded_data, &mut cuda_data)
+                .map_err(|_| Error::CudaDriver)?;
+        } else {
+            // Normal case - sizes match
+            device
+                .htod_copy_into(data, &mut cuda_data)
+                .map_err(|_| Error::CudaDriver)?;
+        }
+        Ok(Self {
+            storage: TensorStorage::F32 {
+                data: cuda_data.into(),
+                numel,
+            },
+            shape,
+            device,
+            id: TensorId::new(),
+            requires_grad: false,
+        })
+    }
+
+    /// Create a new tensor from a Vec with specific dtype
+    pub fn from_vec_dtype(
+        data: Vec<f32>,
+        shape: Shape,
+        device: Arc<CudaDevice>,
+        dtype: DType,
+    ) -> Result<Self> {
+        if data.len() != shape.elem_count() {
+            return Err(Error::ShapeMismatch {
+                expected: shape.clone(),
+                got: Shape::from_dims(&[data.len()]),
+            });
+        }
+        // Allocate from memory pool
+        let numel = data.len();
+        let mut cuda_data = alloc_from_pool(&device, numel)?;
+
+        // If the allocated size is larger than our data, we need to handle it carefully
+        if cuda_data.len() > numel {
+            // Pad the data to match the allocated size
+            let mut padded_data = data;
+            padded_data.resize(cuda_data.len(), 0.0);
+            device
+                .htod_copy_into(padded_data, &mut cuda_data)
+                .map_err(|_| Error::CudaDriver)?;
+        } else {
+            // Normal case - sizes match
+            device
+                .htod_copy_into(data, &mut cuda_data)
+                .map_err(|_| Error::CudaDriver)?;
+        }
+
+        // Create storage with specified dtype
+        let storage = match dtype {
+            DType::F32 => TensorStorage::F32 {
+                data: cuda_data.into(),
+                numel,
+            },
+            DType::F16 => TensorStorage::F16 {
+                data: cuda_data.into(),
+                numel,
+                scale: 1.0,
+            },
+            DType::BF16 => {
+                #[cfg(not(feature = "bf16_u16"))]
+                {
+                    TensorStorage::BF16 {
+                        data: cuda_data,
+                        numel,
+                    }
+                }
+                #[cfg(feature = "bf16_u16")]
+                {
+                    use cudarc::driver::DevicePtr;
+                    let mut bf = unsafe { device.alloc::<u16>(numel) }
+                        .map_err(|e| Error::Cuda(format!("alloc from_vec bf16: {}", e)))?;
+                    crate::bf16_convert::f32_to_bf16_u16(
+                        device.clone(),
+                        &cuda_data,
+                        *bf.device_ptr(),
+                        numel,
+                    )?;
+                    TensorStorage::BF16 {
+                        data: bf.into(),
+                        numel,
+                    }
+                }
+            }
+            _ => {
+                return Err(Error::InvalidOperation(format!(
+                    "Unsupported dtype for from_vec_dtype: {:?}",
+                    dtype
+                )))
+            }
+        };
+
+        Ok(Self {
+            storage,
+            shape,
+            device,
+            id: TensorId::new(),
+            requires_grad: false,
+        })
+    }
+
+    /// Create tensor from raw GPU data
+    pub fn from_raw(
+        data: Arc<CudaSlice<f32>>,
+        shape: Shape,
+        device: Arc<CudaDevice>,
+        requires_grad: bool,
+    ) -> Result<Self> {
+        if data.len() != shape.elem_count() {
+            return Err(Error::ShapeMismatch {
+                expected: shape.clone(),
+                got: Shape::from_dims(&[data.len()]),
+            });
+        }
+        Ok(Self {
+            storage: TensorStorage::F32 {
+                data: (*data).clone().into(),
+                numel: shape.elem_count(),
+            },
+            shape,
+            device,
+            id: TensorId::new(),
+            requires_grad,
+        })
+    }
+
+    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+    pub(crate) fn from_bf16_arena(
+        shape: Shape,
+        device: Arc<CudaDevice>,
+        ptr: NonNull<u16>,
+        lease: ArenaLease,
+    ) -> Result<Self> {
+        let numel = shape.elem_count();
+        if numel == 0 {
+            return Err(Error::InvalidInput(
+                "from_bf16_arena: zero-element tensors are not supported".into(),
+            ));
+        }
+        Ok(Self {
+            storage: TensorStorage::BF16Arena {
+                ptr,
+                numel,
+                device: device.clone(),
+                lease,
+            },
+            shape,
+            device,
+            id: TensorId::new(),
+            requires_grad: false,
+        })
+    }
+
+    /// Create random tensor
+    pub fn randn(shape: Shape, mean: f32, std: f32, device: Arc<CudaDevice>) -> Result<Self> {
+        let size = shape.elem_count();
+        let cpu_data = rng::sample_normal(size, mean, std)?;
+        let t = Self::from_vec(cpu_data, shape, device)?;
+        let dd = default_dtype();
+        if dd != DType::F32 {
+            t.to_dtype(dd)
+        } else {
+            Ok(t)
+        }
+    }
+
+    /// Create a tensor with random values like another tensor
+    pub fn rand_like(tensor: &Tensor) -> Result<Self> {
+        Self::randn(tensor.shape.clone(), 0.0, 1.0, tensor.device.clone())
+    }
+
+    /// Create a BF16 tensor from F32 data (stored as F32 internally)
+    pub fn from_bf16_slice(
+        data: CudaSlice<f32>,
+        shape: Shape,
+        device: Arc<CudaDevice>,
+    ) -> Result<Self> {
+        let numel = shape.elem_count();
+        if data.len() != numel {
+            return Err(Error::ShapeMismatch {
+                expected: shape.clone(),
+                got: Shape::from_dims(&[data.len()]),
+            });
+        }
+
+        #[cfg(not(feature = "bf16_u16"))]
+        {
+            Ok(Self {
+                storage: TensorStorage::BF16 { data, numel },
+                shape,
+                device,
+                id: TensorId::new(),
+                requires_grad: false,
+            })
+        }
+        #[cfg(feature = "bf16_u16")]
+        {
+            use cudarc::driver::DevicePtr;
+            let mut bf = unsafe { device.alloc::<u16>(numel) }
+                .map_err(|e| Error::Cuda(format!("alloc from_bf16_slice: {}", e)))?;
+            crate::bf16_convert::f32_to_bf16_u16(device.clone(), &data, *bf.device_ptr(), numel)?;
+            Ok(Self {
+                storage: TensorStorage::BF16 {
+                    data: bf.into(),
+                    numel,
+                },
+                shape,
+                device,
+                id: TensorId::new(),
+                requires_grad: false,
+            })
+        }
+    }
+
+    /// Create a BF16 tensor from F32 data
+    pub fn from_f32_to_bf16(data: Vec<f32>, shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
+        use crate::bf16_support::BF16Ops;
+        BF16Ops::from_f32(data, shape, device)
+    }
+
+    /// Get F32 slice for BF16 tensor (stored as F32 internally)
+    pub fn as_bf16_slice(&self) -> Result<&CudaSlice<f32>> {
+        if self.dtype() != DType::BF16 {
+            return Err(Error::InvalidOperation("Not a BF16 tensor".to_string()));
+        }
+        #[cfg(not(feature = "bf16_u16"))]
+        {
+            self.storage.try_as_slice_f32()
+        }
+        #[cfg(feature = "bf16_u16")]
+        {
+            Err(Error::InvalidOperation(
+                "BF16 storage uses u16 backing under bf16_u16".into(),
+            ))
+        }
+    }
+
+    /// Convert tensor to BF16
+    pub fn to_bf16(&self) -> Result<Self> {
+        if self.dtype() == DType::BF16 {
+            return self.clone_result();
+        }
+        self.to_dtype(DType::BF16)
+    }
+
+    /// Create a BF16 tensor from CUDA slice (stored as F32)
+    pub fn from_cuda_bf16(
+        data: CudaSlice<f32>,
+        shape: Shape,
+        device: Arc<CudaDevice>,
+    ) -> Result<Self> {
+        Self::from_bf16_slice(data, shape, device)
+    }
+
+    /// Enable gradient computation
+    pub fn requires_grad_(mut self, requires_grad: bool) -> Self {
+        self.requires_grad = requires_grad;
+        self
+    }
+
+    /// Create tensor from slice
+    pub fn from_slice(data: &[f32], shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
+        if data.len() != shape.elem_count() {
+            return Err(Error::ShapeMismatch {
+                expected: shape.clone(),
+                got: Shape::from_dims(&[data.len()]),
+            });
+        }
+        Self::from_vec(data.to_vec(), shape, device)
+    }
+
+    pub fn from_slice_dtype(
+        data: &[f32],
+        shape: Shape,
+        device: Arc<CudaDevice>,
+        dtype: DType,
+    ) -> Result<Self> {
+        if data.len() != shape.elem_count() {
+            return Err(Error::ShapeMismatch {
+                expected: shape.clone(),
+                got: Shape::from_dims(&[data.len()]),
+            });
+        }
+        Self::from_vec_dtype(data.to_vec(), shape, device, dtype)
+    }
+
+    /// Compute gradients via automatic differentiation
+    pub fn backward(&self) -> Result<GradientMap> {
+        AutogradContext::backward(self)
+    }
+
+    /// Compute gradients with debug information
+    pub fn backward_debug(&self) -> Result<GradientMap> {
+        AutogradContext::backward_debug(self)
+    }
+
+    /// Set data from slice (useful for initialization)
+    /// This creates a new tensor with the provided data
+    pub fn set_data(&self, data: &[f32]) -> Result<Tensor> {
+        if data.len() != self.shape.elem_count() {
+            return Err(Error::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: Shape::from_dims(&[data.len()]),
+            });
+        }
+        // Create new tensor with the provided data
+        Self::from_slice(data, self.shape.clone(), self.device.clone())
+    }
+
+    /// Functional weight update - returns new tensor
+    pub fn update_weights(&self, gradient: &Tensor, lr: f32) -> Result<Tensor> {
+        if self.shape != gradient.shape {
+            return Err(Error::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: gradient.shape.clone(),
+            });
+        }
+
+        // w = w - lr * grad (functional style)
+        let grad_scaled = gradient.mul_scalar(lr)?;
+        self.sub(&grad_scaled)
+    }
+
+    /// Matrix multiplication routed through the shared GEMM backend.
+    pub fn matmul(&self, other: &Tensor) -> Result<Tensor> {
+        if std::env::var("FLAME_TRACE_DTYPE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[tensor.matmul] lhs dtype {:?} storage {:?} shape {:?}; rhs dtype {:?} storage {:?} shape {:?}",
+                self.dtype(),
+                self.storage_dtype(),
+                self.shape().dims(),
+                other.dtype(),
+                other.storage_dtype(),
+                other.shape().dims()
+            );
+        }
+        if self.dtype() != other.dtype() {
+            return Err(Error::InvalidInput(format!(
+                "matmul dtype mismatch: lhs {:?} rhs {:?}",
+                self.dtype(),
+                other.dtype()
+            )));
+        }
+        let rhs_tensor = other;
+
+        let mut output = crate::ops::gemm::launch_gemm(self, rhs_tensor)?;
+
+        if self.requires_grad || other.requires_grad {
+            output.requires_grad = true;
+            AutogradContext::record_op(
+                output.id,
+                Op::MatMul {
+                    lhs: self.id,
+                    rhs: other.id,
+                },
+                vec![(self.id, self.clone()), (other.id, other.clone())],
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Batch matrix multiplication
+    /// For tensors with 3+ dimensions, applies matmul to the last 2 dimensions
+    /// Broadcasting is supported for batch dimensions
+    pub fn bmm(&self, other: &Tensor) -> Result<Tensor> {
+        let self_shape = self.shape.dims();
+        let other_shape = other.shape.dims();
+
+        if self_shape.len() < 2 || other_shape.len() < 2 {
+            return Err(Error::InvalidOperation(
+                "bmm requires tensors with at least 2 dimensions".into(),
+            ));
+        }
+
+        match (self_shape.len(), other_shape.len()) {
+            (3, 3) => {
+                let (batch, m, k1) = (self_shape[0], self_shape[1], self_shape[2]);
+                let (batch2, k2, n) = (other_shape[0], other_shape[1], other_shape[2]);
+
+                if batch != batch2 {
+                    Err(Error::InvalidOperation(format!(
+                        "bmm: batch size mismatch {} vs {}",
+                        batch, batch2
+                    )))
+                } else if k1 != k2 {
+                    Err(Error::InvalidOperation(format!(
+                        "bmm: incompatible matrix dimensions {} vs {}",
+                        k1, k2
+                    )))
+                } else {
+                    self.bmm_3d(batch, m, k1, n, other)
+                }
+            }
+            (4, 4) => {
+                let (batch, heads, m, k1) =
+                    (self_shape[0], self_shape[1], self_shape[2], self_shape[3]);
+                let (batch2, heads2, k2, n) = (
+                    other_shape[0],
+                    other_shape[1],
+                    other_shape[2],
+                    other_shape[3],
+                );
+
+                if batch != batch2 || heads != heads2 {
+                    Err(Error::InvalidOperation(format!(
+                        "bmm: batch/heads mismatch: [{}, {}] vs [{}, {}]",
+                        batch, heads, batch2, heads2
+                    )))
+                } else if k1 != k2 {
+                    Err(Error::InvalidOperation(format!(
+                        "bmm: incompatible matrix dimensions {} vs {}",
+                        k1, k2
+                    )))
+                } else {
+                    let total_batch = batch * heads;
+                    let self_3d = self.reshape(&[total_batch, m, k1])?;
+                    let other_3d = other.reshape(&[total_batch, k2, n])?;
+                    let result_3d = self_3d.bmm_3d(total_batch, m, k1, n, &other_3d)?;
+                    result_3d.reshape(&[batch, heads, m, n])
+                }
+            }
+            _ => Err(Error::InvalidOperation(format!(
+                "bmm: unsupported tensor shapes {:?} @ {:?}",
+                self_shape, other_shape
+            ))),
+        }
+    }
+
+    /// Helper for 3D batch matrix multiplication
+    fn bmm_3d(&self, batch: usize, m: usize, k: usize, n: usize, other: &Tensor) -> Result<Tensor> {
+        let mut output = match self.dtype() {
+            DType::F32 => {
+                let mut out = Tensor::zeros_dtype(
+                    Shape::from_dims(&[batch, m, n]),
+                    DType::F32,
+                    self.device.clone(),
+                )?;
+                crate::ops::gemm::launch_gemm_strided_batched(self, other, &mut out)?;
+                out
+            }
+            DType::BF16 => {
+                let mut out = Tensor::zeros_dtype(
+                    Shape::from_dims(&[batch, m, n]),
+                    DType::BF16,
+                    self.device.clone(),
+                )?;
+                crate::ops::gemm_bf16::bmm_bf16_fp32acc_out(self, other, &mut out, false, false)?;
+                out
+            }
+            _ => return self.bmm_3d_cpu(batch, m, k, n, other),
+        };
+
+        if self.requires_grad || other.requires_grad {
+            output.requires_grad = true;
+            AutogradContext::record_op(
+                output.id,
+                Op::BatchMatMul {
+                    lhs: self.id,
+                    rhs: other.id,
+                },
+                vec![
+                    (self.id, self.clone_result()?),
+                    (other.id, other.clone_result()?),
+                ],
+            );
+        }
+
+        Ok(output)
+    }
+
+    #[allow(clippy::manual_memcpy, clippy::needless_range_loop)]
+    fn bmm_3d_cpu(
+        &self,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        other: &Tensor,
+    ) -> Result<Tensor> {
+        // Prepare output shape [batch, m, n]
+        let output_shape = vec![batch, m, n];
+        let self_data = self.to_vec()?;
+        let other_data = other.to_vec()?;
+        let mut output_data = vec![0.0f32; batch * m * n];
+
+        for b in 0..batch {
+            let self_offset = b * m * k;
+            let other_offset = b * k * n;
+            let output_offset = b * m * n;
+
+            let self_slice = self_data[self_offset..self_offset + m * k].to_vec();
+            let other_slice = other_data[other_offset..other_offset + k * n].to_vec();
+
+            let self_batch =
+                Tensor::from_vec(self_slice, Shape::from_dims(&[m, k]), self.device.clone())?;
+
+            let other_batch =
+                Tensor::from_vec(other_slice, Shape::from_dims(&[k, n]), self.device.clone())?;
+
+            let batch_result = self_batch.matmul(&other_batch)?;
+            let batch_result_data = batch_result.to_vec()?;
+            output_data[output_offset..output_offset + m * n].copy_from_slice(&batch_result_data);
+        }
+
+        let mut output = Tensor::from_vec(
+            output_data,
+            Shape::from_dims(&output_shape),
+            self.device.clone(),
+        )?;
+
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad || other.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::BatchMatMul {
+                    lhs: self.id,
+                    rhs: other.id,
+                },
+                vec![
+                    (self.id, self.clone_result()?),
+                    (other.id, other.clone_result()?),
+                ],
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Helper to reshape tensor for batch matrix multiplication
+    #[allow(dead_code)]
+    fn reshape_for_bmm(&self, target_batch: &[usize], m: usize, n: usize) -> Result<Tensor> {
+        let self_shape = self.shape.dims();
+        let self_batch = &self_shape[..self_shape.len() - 2];
+
+        // If shapes match, just flatten batch dimensions
+        if self_batch == target_batch {
+            let batch_size: usize = target_batch.iter().product();
+            return self.reshape(&[batch_size, m, n]);
+        }
+
+        // Otherwise, need to broadcast
+        // Check if we can broadcast
+        let self_batch_prod: usize = self_batch.iter().product();
+        let target_batch_prod: usize = target_batch.iter().product();
+
+        if self_batch_prod == 1 {
+            // Broadcast single batch to target batch size
+            let expanded = self.broadcast_to(&Shape::from_dims(&[target_batch_prod, m, n]))?;
+            Ok(expanded)
+        } else if target_batch_prod % self_batch_prod == 0 {
+            // Can broadcast if target is multiple of self
+            let repeat_factor = target_batch_prod / self_batch_prod;
+            let self_flat = self.reshape(&[self_batch_prod, m, n])?;
+
+            match self.dtype() {
+                DType::F32 => {
+                    let mut repeated = Tensor::zeros_dtype(
+                        Shape::from_dims(&[target_batch_prod, m, n]),
+                        DType::F32,
+                        self.device.clone(),
+                    )?;
+                    let src = self_flat.storage_ref().try_as_slice_f32()?;
+                    let dst = repeated.storage_mut().try_as_mut_slice_f32()?;
+                    let chunk = src.len();
+                    for r in 0..repeat_factor {
+                        let start = r * chunk;
+                        let end = start + chunk;
+                        let mut dst_view = dst.slice_mut(start..end);
+                        self.device
+                            .dtod_copy(src, &mut dst_view)
+                            .map_err(|e| Error::Cuda(format!("repeat copy failed: {e}")))?;
+                    }
+                    repeated.requires_grad = self.requires_grad;
+                    Ok(repeated)
+                }
+                DType::BF16 => {
+                    #[cfg(feature = "bf16_u16")]
+                    {
+                        let mut repeated = Tensor::zeros_dtype(
+                            Shape::from_dims(&[target_batch_prod, m, n]),
+                            DType::BF16,
+                            self.device.clone(),
+                        )?;
+                        let src = self_flat.storage_ref().try_as_slice_u16().map_err(|_| {
+                            Error::InvalidOperation("repeat: expected BF16 storage".into())
+                        })?;
+                        let dst = repeated.storage_mut().try_as_mut_slice_u16().map_err(|_| {
+                            Error::InvalidOperation("repeat: expected BF16 storage".into())
+                        })?;
+                        let chunk = src.len();
+                        for r in 0..repeat_factor {
+                            let start = r * chunk;
+                            let end = start + chunk;
+                            let mut dst_view = dst.slice_mut(start..end);
+                            self.device
+                                .dtod_copy(src, &mut dst_view)
+                                .map_err(|e| Error::Cuda(format!("repeat copy failed: {e}")))?;
+                        }
+                        repeated.requires_grad = self.requires_grad;
+                        Ok(repeated)
+                    }
+                    #[cfg(not(feature = "bf16_u16"))]
+                    {
+                        let mut repeated_data = Vec::new();
+                        for _ in 0..repeat_factor {
+                            let self_data = self_flat.to_vec()?;
+                            repeated_data.extend_from_slice(&self_data);
+                        }
+                        let mut tensor = Tensor::from_vec(
+                            repeated_data,
+                            Shape::from_dims(&[target_batch_prod, m, n]),
+                            self.device.clone(),
+                        )?;
+                        tensor.requires_grad = self.requires_grad;
+                        Ok(tensor)
+                    }
+                }
+                _ => {
+                    // Fallback to CPU repeat for unsupported dtypes.
+                    let mut repeated_data = Vec::new();
+                    for _ in 0..repeat_factor {
+                        let self_data = self_flat.to_vec()?;
+                        repeated_data.extend_from_slice(&self_data);
+                    }
+                    let mut tensor = Tensor::from_vec(
+                        repeated_data,
+                        Shape::from_dims(&[target_batch_prod, m, n]),
+                        self.device.clone(),
+                    )?;
+                    tensor.requires_grad = self.requires_grad;
+                    Ok(tensor)
+                }
+            }
+        } else {
+            Err(Error::InvalidOperation(format!(
+                "Cannot broadcast batch dimensions {:?} to {:?}",
+                self_batch, target_batch
+            )))
+        }
+    }
+
+    /// Create a slice view of the tensor (internal use)
+    #[allow(dead_code)]
+    fn slice_internal(&self, start: usize, len: usize) -> Result<Tensor> {
+        // Slice implementation for contiguous memory
+        // Non-contiguous tensors would require stride handling
+        if start + len > self.shape.elem_count() {
+            return Err(Error::InvalidOperation("Slice out of bounds".into()));
+        }
+
+        // Now actually tries GPU-to-GPU slice copy
+        let kernel_code = r#"
+extern "C" __global__ void slice_kernel(
+    float* output,
+    const float* input,
+    int start,
+    int len
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        output[idx] = input[start + idx];
+    }
+}
+"#;
+
+        CudaKernels::ensure_kernel(&self.device, "slice_kernel", kernel_code)?;
+
+        let f = self
+            .device
+            .get_func("slice_kernel", "slice_kernel")
+            .ok_or_else(|| Error::Cuda("Failed to get slice_kernel".into()))?;
+
+        let slice_data = alloc_zeros_from_pool(&self.device, len)?;
+
+        let cfg = cudarc::driver::LaunchConfig::for_num_elems(len as u32);
+
+        launch_kernel!(
+            f,
+            cfg,
+            &slice_data,
+            self.storage.try_as_slice_f32()?,
+            start as i32,
+            len as i32
+        )?;
+
+        Ok(Tensor {
+            storage: TensorStorage::F32 {
+                data: slice_data.into(),
+                numel: len,
+            },
+            shape: Shape::from_dims(&[len]),
+            device: self.device.clone(),
+            id: TensorId::new(),
+            requires_grad: false,
+        })
+    }
+
+    fn convert_f32_buffer_to_bool(
+        device: &Arc<CudaDevice>,
+        buffer: &mut CudaSlice<f32>,
+        numel: usize,
+    ) -> Result<()> {
+        const MODULE: &str = "f32_to_bool_module";
+        const KERNEL: &str = "f32_to_bool_kernel";
+        if device.get_func(MODULE, KERNEL).is_none() {
+            let source = r#"
+extern "C" __global__ void f32_to_bool_kernel(
+    float* data,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        data[idx] = (data[idx] != 0.0f) ? 1.0f : 0.0f;
+    }
+}
+"#;
+
+            let include_path = std::env::var("CUDA_HOME")
+                .map(|p| format!("{}/include", p))
+                .unwrap_or_else(|_| "/usr/local/cuda/include".to_string());
+            let mut opts = CompileOptions::default();
+            opts.include_paths.push(include_path);
+
+            let ptx = compile_ptx_with_opts(source, opts)
+                .map_err(|e| Error::Cuda(format!("nvrtc f32_to_bool_kernel: {:?}", e)))?;
+            device
+                .load_ptx(ptx, MODULE, &[KERNEL])
+                .map_err(|e| Error::Cuda(format!("load f32_to_bool_kernel: {}", e)))?;
+        }
+
+        let func = device
+            .get_func(MODULE, KERNEL)
+            .ok_or_else(|| Error::Cuda("f32_to_bool_kernel missing".into()))?;
+        let cfg = LaunchConfig::for_num_elems(numel as u32);
+        unsafe {
+            func.launch(cfg, (buffer, numel as i32))
+                .map_err(|e| Error::Cuda(format!("launch f32_to_bool_kernel failed: {}", e)))?
+        };
+        Ok(())
+    }
+
+    /// Element-wise addition
+    pub fn add(&self, other: &Tensor) -> Result<Tensor> {
+        // Use BF16 elementwise kernels when available to avoid F32 staging.
+        let mut output = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
+            crate::bf16_elementwise::add_bf16(self, other)?
+        } else {
+            GpuOps::add(self, other)?
+        };
+
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad || other.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::Add {
+                    lhs: self.id,
+                    rhs: other.id,
+                    lhs_shape: self.shape.clone(),
+                    rhs_shape: other.shape.clone(),
+                },
+                Vec::new(),
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Subtract another tensor
+    pub fn sub(&self, other: &Tensor) -> Result<Tensor> {
+        // Implement as self + (-1 * other)
+        // This automatically handles broadcasting through the add operation
+        let neg_other = other.mul_scalar(-1.0)?;
+        let output = self.add(&neg_other)?;
+
+        // Record subtraction operation if needed
+        if self.requires_grad || other.requires_grad {
+            // Record as subtraction
+            AutogradContext::record_op(
+                output.id,
+                Op::Sub {
+                    lhs: self.id,
+                    rhs: other.id,
+                },
+                Vec::new(),
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Element-wise multiplication (Hadamard product)
+    pub fn mul(&self, other: &Tensor) -> Result<Tensor> {
+        // Use BF16 elementwise kernels when available to avoid F32 staging.
+        let mut output = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
+            crate::bf16_elementwise::mul_bf16(self, other)?
+        } else {
+            GpuOps::mul(self, other)?
+        };
+
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad || other.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::Mul {
+                    lhs: self.id,
+                    rhs: other.id,
+                },
+                vec![(self.id, self.clone()), (other.id, other.clone())],
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Scalar multiplication
+    pub fn mul_scalar(&self, scalar: f32) -> Result<Tensor> {
+        // Use CUDA kernel for GPU-accelerated scalar multiplication
+        let mut output = GpuOps::mul_scalar(self, scalar)?;
+
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::MulScalar {
+                    input: self.id,
+                    scalar,
+                },
+                Vec::new(),
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Scale tensor by a scalar (alias for mul_scalar)
+    pub fn scale(&self, scalar: f32) -> Result<Tensor> {
+        self.mul_scalar(scalar)
+    }
+
+    /// Add scalar to all elements
+    pub fn add_scalar(&self, scalar: f32) -> Result<Tensor> {
+        // Use CUDA kernel for GPU-accelerated scalar addition
+        let mut output = GpuOps::add_scalar(self, scalar)?;
+
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::AddScalar {
+                    input: self.id,
+                    scalar,
+                },
+                Vec::new(),
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// ReLU activation
+    pub fn relu(&self) -> Result<Tensor> {
+        // Use CUDA kernel for GPU-accelerated ReLU
+        let mut output = GpuOps::relu(self)?;
+
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::ReLU { input: self.id },
+                vec![(self.id, self.clone_result()?)],
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// GELU activation
+    pub fn gelu(&self) -> Result<Tensor> {
+        let mut output = if self.dtype() == DType::BF16 {
+            #[cfg(feature = "cuda")]
+            {
+                bf16_ops::gelu_bf16(self)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                GpuOps::gelu(self)?.to_dtype(DType::BF16)?
+            }
+        } else {
+            GpuOps::gelu(self)?
+        };
+
+        if self.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::GELU { input: self.id },
+                vec![(self.id, self.clone_result()?)],
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// SiLU (Swish) activation
+    pub fn silu(&self) -> Result<Tensor> {
+        let mut output = if self.dtype() == DType::BF16 {
+            #[cfg(feature = "cuda")]
+            {
+                bf16_ops::silu_bf16(self)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                GpuOps::silu(self)?.to_dtype(DType::BF16)?
+            }
+        } else {
+            GpuOps::silu(self)?
+        };
+
+        if self.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::SiLU { input: self.id },
+                vec![(self.id, self.clone_result()?)],
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Tanh activation
+    pub fn tanh(&self) -> Result<Tensor> {
+        // Use CUDA kernel for GPU-accelerated Tanh
+        let mut output = GpuOps::tanh(self)?;
+
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::Tanh { input: self.id },
+                vec![(self.id, self.clone_result()?)],
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Sigmoid activation
+    pub fn sigmoid(&self) -> Result<Tensor> {
+        // Use CUDA kernel for GPU-accelerated sigmoid
+        let mut output = GpuOps::sigmoid(self)?;
+
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::Sigmoid { input: self.id },
+                vec![(self.id, self.clone_result()?)],
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Error function (erf) - needed for GELU
+    pub fn erf(&self) -> Result<Tensor> {
+        let data = self.to_vec()?;
+        let result: Vec<f32> = data
+            .iter()
+            .map(|&x| {
+                // Approximation of erf using a series expansion
+                // This is good for |x| < 3.7
+                let a1 = 0.254_829_6;
+                let a2 = -0.284_496_72;
+                let a3 = 1.421_413_8;
+                let a4 = -1.453_152_1;
+                let a5 = 1.061_405_4;
+                let p = 0.3275911;
+
+                let sign = if x < 0.0 { -1.0 } else { 1.0 };
+                let x = x.abs();
+
+                let t = 1.0 / (1.0 + p * x);
+                let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp();
+
+                sign * y
+            })
+            .collect();
+
+        Tensor::from_vec(result, self.shape.clone(), self.device.clone())
+    }
+
+    /// Exponential function (GPU)
+    pub fn exp(&self) -> Result<Tensor> {
+        GpuOps::exp(self)
+    }
+
+    /// Square all elements
+    pub fn square(&self) -> Result<Tensor> {
+        // Use GpuOps directly to avoid recording during backward
+        let mut output = GpuOps::mul(self, self)?;
+
+        // Set requires_grad if input requires grad
+        if self.requires_grad {
+            output.requires_grad = true;
+
+            // Record as square operation
+            AutogradContext::record_op(
+                output.id,
+                Op::Square { input: self.id },
+                vec![(self.id, self.clone_result()?)],
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Mean reduction (reduce in FP32 for stability, then downcast if needed)
+    pub fn mean(&self) -> Result<Tensor> {
+        // Upcast to F32 for numerically stable reduction
+        let x32 = if matches!(self.dtype(), DType::F32) {
+            self.clone_result()?
+        } else {
+            self.to_dtype(DType::F32)?
+        };
+        let sum32 = x32.sum()?;
+        let count = self.shape.elem_count() as f32;
+        let mut out32 = sum32.mul_scalar(1.0 / count)?;
+
+        // Record mean operation if needed (attach grad to original input)
+        if self.requires_grad {
+            out32.requires_grad = true;
+            AutogradContext::record_op(
+                out32.id,
+                Op::Mean {
+                    input: self.id,
+                    input_shape: self.shape.clone(),
+                },
+                vec![(self.id, self.clone_result()?)],
+            );
+        }
+
+        // Downcast to original dtype when appropriate
+        if matches!(self.dtype(), DType::F32) {
+            Ok(out32)
+        } else {
+            out32.to_dtype(self.dtype())
+        }
+    }
+
+    /// Sum reduction
+    pub fn sum(&self) -> Result<Tensor> {
+        // Use CUDA kernel for GPU-accelerated sum reduction
+        let mut output = GpuOps::sum(self)?;
+
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::Sum {
+                    input: self.id,
+                    input_shape: self.shape.clone(),
+                },
+                vec![(self.id, self.clone_result()?)],
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Sum along specific dimensions
+    pub fn sum_dims(&self, dims: &[usize]) -> Result<Tensor> {
+        // Reduce iteratively in descending order to avoid index shifts
+        if dims.is_empty() {
+            return Ok(self.clone());
+        }
+        let mut dims_sorted: Vec<usize> = dims.to_vec();
+        dims_sorted.sort_unstable();
+        dims_sorted.dedup();
+
+        // Perform reductions without recording intermediate ops
+        let mut current = self.clone_result()?;
+        for &d in dims_sorted.iter().rev() {
+            let keep = GpuOps::sum_dim_keepdim(&current, d)?;
+            // Build new shape without dimension d
+            let mut new_shape = current.shape().dims().to_vec();
+            new_shape.remove(d);
+            current = keep.reshape(&new_shape)?;
+        }
+
+        // Record as a single multi-dim reduction for autograd clarity
+        if self.requires_grad {
+            let mut out = current;
+            out.requires_grad = true;
+            AutogradContext::record_op(
+                out.id,
+                Op::SumDims {
+                    input: self.id,
+                    dims: dims_sorted.clone(),
+                },
+                vec![(self.id, self.clone_result()?)],
+            );
+            Ok(out)
+        } else {
+            Ok(current)
+        }
+    }
+
+    /// Sum along a specific dimension
+    pub fn sum_dim(&self, dim: usize) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        if dim >= dims.len() {
+            return Err(Error::InvalidOperation(format!(
+                "Dimension {} out of range for tensor with {} dimensions",
+                dim,
+                dims.len()
+            )));
+        }
+
+        // Compute sum keeping the dimension, then squeeze it away for the final shape
+        let summed_keepdim = GpuOps::sum_dim_keepdim(self, dim)?;
+
+        // Build output shape without the reduced dimension
+        let mut out_dims = Vec::with_capacity(dims.len() - 1);
+        for (i, &d) in dims.iter().enumerate() {
+            if i != dim {
+                out_dims.push(d);
+            }
+        }
+
+        let mut output = summed_keepdim.reshape(&out_dims)?;
+
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::SumDim {
+                    input: self.id,
+                    dim,
+                },
+                vec![(self.id, self.clone_result()?)],
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Get shape
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+
+    /// Return the tensor rank (number of dimensions).
+    #[inline]
+    pub fn rank(&self) -> usize {
+        self.shape.rank()
+    }
+
+    /// Return true when the tensor adheres to NHWC semantics at the public boundary.
+    #[inline]
+    pub fn is_nhwc(&self) -> bool {
+        if self.rank() != 4 {
+            return false;
+        }
+        true
+    }
+
+    /// Borrow the raw shape dimensions as a slice.
+    pub fn dims(&self) -> &[usize] {
+        self.shape.dims()
+    }
+
+    /// Expect a 1D tensor and return its single dimension.
+    pub fn dims1(&self) -> [usize; 1] {
+        self.shape
+            .dims()
+            .try_into()
+            .expect("Tensor::dims1 expects a 1D tensor")
+    }
+
+    /// Expect a 2D tensor and return its dimensions.
+    pub fn dims2(&self) -> [usize; 2] {
+        self.shape
+            .dims()
+            .try_into()
+            .expect("Tensor::dims2 expects a 2D tensor")
+    }
+
+    /// Expect a 3D tensor and return its dimensions.
+    pub fn dims3(&self) -> [usize; 3] {
+        self.shape
+            .dims()
+            .try_into()
+            .expect("Tensor::dims3 expects a 3D tensor")
+    }
+
+    /// Expect a 4D tensor and return its dimensions.
+    pub fn dims4(&self) -> [usize; 4] {
+        self.shape
+            .dims()
+            .try_into()
+            .expect("Tensor::dims4 expects a 4D tensor")
+    }
+
+    /// Reshape tensor to new shape
+    pub fn reshape(&self, shape: &[usize]) -> Result<Tensor> {
+        let new_shape = Shape::from_dims(shape);
+        if self.shape.elem_count() != new_shape.elem_count() {
+            return Err(Error::ShapeMismatch {
+                expected: new_shape,
+                got: self.shape.clone(),
+            });
+        }
+        // Create view tensor (shares storage) with new shape
+        let out = Tensor {
+            id: TensorId::new(),
+            storage: self.storage.clone(),
+            shape: new_shape.clone(),
+            device: self.device.clone(),
+            requires_grad: self.requires_grad,
+        };
+        // Record autograd op so gradients flow through reshape
+        if self.requires_grad {
+            AutogradContext::record_op(
+                out.id,
+                Op::Reshape {
+                    input: self.id,
+                    new_shape: new_shape.dims().to_vec(),
+                },
+                vec![(self.id, self.clone())],
+            );
+        }
+        Ok(out)
+    }
+
+    /// Get device
+    pub fn device(&self) -> &Arc<CudaDevice> {
+        &self.device
+    }
+
+    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+    pub fn slice_1d_device(&self, axis: usize, start: usize, len: usize) -> Result<Tensor> {
+        cuda_ops_bf16::slice_axis_bf16(self, axis, start, len)
+    }
+
+    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+    pub fn broadcast_to_device(&self, shape: &[usize]) -> Result<Tensor> {
+        cuda_ops_bf16::broadcast_to_bf16(self, shape)
+    }
+
+    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+    pub fn repeat_axis_device(&self, axis: usize, repeats: usize) -> Result<Tensor> {
+        cuda_ops_bf16::repeat_axis_bf16(self, axis, repeats)
+    }
+
+    /// Get tensor ID for gradient tracking
+    pub fn id(&self) -> TensorId {
+        self.id
+    }
+
+    /// Check if this tensor requires gradients
+    pub fn requires_grad(&self) -> bool {
+        self.requires_grad
+    }
+
+    /// Copy to CPU
+    pub fn to_vec(&self) -> Result<Vec<f32>> {
+        if std::env::var("FLAME_DTYPE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[dtype-trace] to_vec dtype={:?} shape={:?}",
+                self.dtype(),
+                self.shape.dims()
+            );
+        }
+        match self.storage.try_as_slice_f32() {
+            Ok(slice) => self
+                .device
+                .dtoh_sync_copy(slice)
+                .map_err(|_| Error::CudaDriver),
+            Err(_) => {
+                #[cfg(feature = "bf16_u16")]
+                {
+                    if self.dtype() == DType::BF16 && self.storage_dtype() == DType::BF16 {
+                        let raw = self.to_vec_bf16()?;
+                        let mut out = Vec::with_capacity(raw.len());
+                        for bits in raw {
+                            out.push(bf16::from_bits(bits).to_f32());
+                        }
+                        return Ok(out);
+                    }
+                }
+                // Fallback: explicit cast to F32 when no direct path exists.
+                let tmp = self.to_dtype(DType::F32)?;
+                tmp.device
+                    .dtoh_sync_copy(tmp.storage.try_as_slice_f32()?)
+                    .map_err(|_| Error::CudaDriver)
+            }
+        }
+    }
+
+    /// Get single value
+    pub fn item(&self) -> Result<f32> {
+        if self.shape.elem_count() != 1 {
+            return Err(Error::InvalidOperation(
+                "item() requires tensor with single element".into(),
+            ));
+        }
+        Ok(self.to_vec()?[0])
+    }
+
+    /// Check for exact tensor equality (shape, dtype, and element values)
+    pub fn equal(&self, other: &Tensor) -> Result<bool> {
+        if self.shape != other.shape {
+            return Ok(false);
+        }
+        if self.dtype() != other.dtype() {
+            return Ok(false);
+        }
+
+        let lhs = self.to_vec()?;
+        let rhs = other.to_vec()?;
+
+        Ok(lhs
+            .iter()
+            .zip(rhs.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits()))
+    }
+
+    /// Transpose a 2D tensor
+    pub fn transpose(&self) -> Result<Tensor> {
+        // Use BF16 kernel when available to avoid F32 staging.
+        let mut output = if self.dtype() == DType::BF16 {
+            crate::bf16_elementwise::transpose2d_bf16(self)?
+        } else {
+            GpuOps::transpose(self)?
+        };
+
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::Transpose { input: self.id },
+                vec![(self.id, self.clone_result()?)],
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Transpose two dimensions of a tensor
+    ///
+    /// Broadcast tensor to a new shape
+    pub fn broadcast_to(&self, target_shape: &Shape) -> Result<Tensor> {
+        let src_shape = self.shape.dims();
+        let dst_shape = target_shape.dims();
+
+        // Check if broadcast is valid
+        if src_shape.len() > dst_shape.len() {
+            return Err(Error::InvalidOperation(format!(
+                "Cannot broadcast from {:?} to {:?}: source has more dimensions",
+                src_shape, dst_shape
+            )));
+        }
+
+        // Pad source shape with ones on the left
+        let mut padded_src: Vec<usize> = vec![1; dst_shape.len() - src_shape.len()];
+        padded_src.extend_from_slice(src_shape);
+
+        // Check compatibility
+        for (i, (&src_dim, &dst_dim)) in padded_src.iter().zip(dst_shape.iter()).enumerate() {
+            if src_dim != dst_dim && src_dim != 1 {
+                return Err(Error::InvalidOperation(format!(
+                    "Cannot broadcast dimension {} from {} to {}",
+                    i, src_dim, dst_dim
+                )));
+            }
+        }
+
+        // If shapes are equal after padding, reshape if rank differs.
+        if &padded_src[..] == dst_shape {
+            if src_shape.len() != dst_shape.len() {
+                return self.reshape(dst_shape);
+            }
+            return Ok(self.clone());
+        }
+
+        let target_i64: Vec<i64> = dst_shape.iter().map(|&d| d as i64).collect();
+        crate::ops::broadcast::broadcast_to_impl(self, &target_i64)
+    }
+
+    /// Get the strides of this tensor
+    /// Assumes C-contiguous (row-major) layout
+    pub fn stride(&self) -> Vec<usize> {
+        let dims = self.shape.dims();
+        let ndim = dims.len();
+        if ndim == 0 {
+            return vec![];
+        }
+
+        let mut strides = vec![1; ndim];
+        for i in (0..ndim - 1).rev() {
+            strides[i] = strides[i + 1] * dims[i + 1];
+        }
+        strides
+    }
+
+    /// Debug helper: inspect underlying storage dtype (no guarantee about views).
+    pub fn storage_dtype(&self) -> DType {
+        self.storage.dtype()
+    }
+
+    /// Run the experimental autograd v4 backward pass.
+    #[cfg(feature = "autograd_v4")]
+    pub fn backward_v4(&self) -> crate::Result<crate::autograd_v4::Gradients> {
+        crate::autograd_v4::backward_v4(self)
+    }
+
+    /// Convert tensor to a Vec<f32> on CPU
+    pub fn to_vec_f32(&self) -> Result<Vec<f32>> {
+        let tmp = self.storage.to_f32(&self.device)?;
+        let cpu_data = self
+            .device
+            .dtoh_sync_copy(&tmp)
+            .map_err(|_| Error::CudaDriver)?;
+        Ok(cpu_data)
+    }
+
+    #[cfg(feature = "bf16_u16")]
+    pub fn to_vec_bf16(&self) -> Result<Vec<u16>> {
+        if self.dtype() != DType::BF16 {
+            return Err(Error::InvalidOperation(
+                "to_vec_bf16: tensor dtype is not BF16".into(),
+            ));
+        }
+        self.storage.to_vec_bf16(&self.device)
+    }
+
+    #[cfg(not(feature = "bf16_u16"))]
+    #[allow(unused_variables)]
+    pub fn to_vec_bf16(&self) -> Result<Vec<u16>> {
+        Err(Error::InvalidOperation(
+            "to_vec_bf16 requires the bf16_u16 feature".into(),
+        ))
+    }
+
+    /// Convert tensor to raw bytes (copies from GPU)
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        match self.dtype() {
+            DType::F32 => {
+                let vec = self.to_vec_f32()?;
+                Ok(unsafe {
+                    std::slice::from_raw_parts(
+                        vec.as_ptr() as *const u8,
+                        vec.len() * std::mem::size_of::<f32>(),
+                    )
+                }
+                .to_vec())
+            }
+            DType::BF16 => {
+                let vec = self.to_vec_bf16()?;
+                Ok(unsafe {
+                    std::slice::from_raw_parts(
+                        vec.as_ptr() as *const u8,
+                        vec.len() * std::mem::size_of::<u16>(),
+                    )
+                }
+                .to_vec())
+            }
+            _ => Err(Error::InvalidOperation(
+                "to_bytes not implemented for this dtype".into(),
+            )),
+        }
+    }
+
+    /// Clone the tensor (creates a new tensor with copied data)
+    /// Fallible deep/device clone. Prefer `clone_result()` in internal code
+    /// and the `Clone` trait (`.clone()`) for infallible API.
+    pub fn clone_result(&self) -> Result<Tensor> {
+        // Commented out for performance
+        // println!("CLONE DEBUG: Cloning tensor with shape {:?}, dtype {:?}, elem_count: {}",
+        //          self.shape, self.dtype(), self.shape.elem_count());
+
+        // Clone the storage while preserving dtype
+        let storage = match &self.storage {
+            TensorStorage::F32 { data, numel } => {
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
+                self.device
+                    .dtod_copy(slice_ref(data), &mut new_data)
+                    .map_err(|_| Error::CudaDriver)?;
+                TensorStorage::F32 {
+                    data: wrap_slice(new_data),
+                    numel: *numel,
+                }
+            }
+            TensorStorage::F16 { data, numel, scale } => {
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
+                self.device
+                    .dtod_copy(slice_ref(data), &mut new_data)
+                    .map_err(|_| Error::CudaDriver)?;
+                TensorStorage::F16 {
+                    data: wrap_slice(new_data),
+                    numel: *numel,
+                    scale: *scale,
+                }
+            }
+            TensorStorage::BF16 { data, numel } => {
+                #[cfg(not(feature = "bf16_u16"))]
+                {
+                    let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
+                    self.device
+                        .dtod_copy(slice_ref(data), &mut new_data)
+                        .map_err(|_| Error::CudaDriver)?;
+                    TensorStorage::BF16 {
+                        data: wrap_slice(new_data),
+                        numel: *numel,
+                    }
+                }
+                #[cfg(feature = "bf16_u16")]
+                {
+                    let mut new_data = unsafe { self.device.alloc::<u16>(*numel) }
+                        .map_err(|_| Error::CudaDriver)?;
+                    self.device
+                        .dtod_copy(slice_ref(data), &mut new_data)
+                        .map_err(|_| Error::CudaDriver)?;
+                    TensorStorage::BF16 {
+                        data: wrap_slice(new_data),
+                        numel: *numel,
+                    }
+                }
+            }
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16Arena { ptr, numel, .. } => {
+                use cudarc::driver::DevicePtrMut;
+                let mut new_data =
+                    unsafe { self.device.alloc::<u16>(*numel) }.map_err(|_| Error::CudaDriver)?;
+                let stream = CudaStream::from_raw(self.device.cuda_stream_raw_ptr());
+                bf16_copy_async(
+                    (*new_data.device_ptr_mut()) as *mut std::ffi::c_void,
+                    ptr.as_ptr() as *const std::ffi::c_void,
+                    *numel,
+                    &stream,
+                )?;
+                TensorStorage::BF16 {
+                    data: wrap_slice(new_data),
+                    numel: *numel,
+                }
+            }
+            TensorStorage::I8 { data, numel } => {
+                let mut new_data =
+                    unsafe { self.device.alloc::<i8>(*numel) }.map_err(|_| Error::CudaDriver)?;
+                self.device
+                    .dtod_copy(slice_ref(data), &mut new_data)
+                    .map_err(|_| Error::CudaDriver)?;
+                TensorStorage::I8 {
+                    data: wrap_slice(new_data),
+                    numel: *numel,
+                }
+            }
+            TensorStorage::I32 { data, numel } => {
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
+                self.device
+                    .dtod_copy(slice_ref(data), &mut new_data)
+                    .map_err(|_| Error::CudaDriver)?;
+                TensorStorage::I32 {
+                    data: wrap_slice(new_data),
+                    numel: *numel,
+                }
+            }
+            TensorStorage::Bool { data, numel } => {
+                let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
+                self.device
+                    .dtod_copy(slice_ref(data), &mut new_data)
+                    .map_err(|_| Error::CudaDriver)?;
+                TensorStorage::Bool {
+                    data: wrap_slice(new_data),
+                    numel: *numel,
+                }
+            }
+        };
+
+        Ok(Tensor {
+            storage,
+            shape: self.shape.clone(),
+            device: self.device.clone(),
+            id: TensorId::new(),
+            requires_grad: self.requires_grad,
+        })
+    }
+
+    // NOTE: Keep any additional tensor methods below.
+
+    /// Detach from computation graph
+    pub fn detach(&self) -> Result<Tensor> {
+        let mut tensor = self.clone_result()?;
+        tensor.requires_grad = false;
+        Ok(tensor)
+    }
+
+    /// 2D Convolution
+    pub fn conv2d(
+        &self,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        stride: usize,
+        padding: usize,
+    ) -> Result<Tensor> {
+        assert_nhwc_bf16_public("Tensor::conv2d in", self)?;
+        assert_nhwc_bf16_public("Tensor::conv2d in(weight)", weight)?;
+        if let Some(b) = bias {
+            assert_nhwc_bf16_public("Tensor::conv2d in(bias)", b)?;
+        }
+
+        let mut out = crate::cuda_conv2d::conv2d(self, weight, bias, stride, padding)?;
+        if out.dtype() != DType::BF16 {
+            out = out.to_dtype(DType::BF16)?;
+        }
+        assert_nhwc_bf16_public("Tensor::conv2d out", &out)?;
+        Ok(out)
+    }
+
+    /// Create a view of the tensor with new shape (shares data)
+    pub fn view(&self, new_shape: &[usize]) -> Result<Tensor> {
+        // For now, view is the same as reshape since we clone the data pointer
+        // In a full implementation, view would share the underlying data
+        self.reshape(new_shape)
+    }
+
+    /// Flatten tensor to 2D: [batch_size, -1]
+    pub fn flatten(&self, start_dim: usize) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        if start_dim >= dims.len() {
+            return Err(Error::InvalidOperation(format!(
+                "start_dim {} out of range for tensor with {} dims",
+                start_dim,
+                dims.len()
+            )));
+        }
+
+        let batch_size: usize = dims[..start_dim].iter().product();
+        let feature_size: usize = dims[start_dim..].iter().product();
+
+        self.reshape(&[batch_size, feature_size])
+    }
+
+    /// Permute/transpose dimensions
+    pub fn permute(&self, dims: &[usize]) -> Result<Tensor> {
+        let shape = self.shape.dims();
+        if dims.len() != shape.len() {
+            return Err(Error::InvalidOperation(format!(
+                "Permute dims {:?} doesn't match tensor dims {:?}",
+                dims, shape
+            )));
+        }
+
+        // Check for valid permutation
+        let mut seen = vec![false; dims.len()];
+        for &d in dims {
+            if d >= dims.len() {
+                return Err(Error::InvalidOperation(format!(
+                    "Invalid permutation dimension: {}",
+                    d
+                )));
+            }
+            if seen[d] {
+                return Err(Error::InvalidOperation(format!(
+                    "Duplicate dimension in permutation: {}",
+                    d
+                )));
+            }
+            seen[d] = true;
+        }
+
+        // Optimized special-cases
+        let mut output = if shape.len() == 2 && dims == [1, 0] {
+            // Simple 2D transpose
+            self.transpose()?
+        } else if shape.len() == 3 && dims == [0, 2, 1] {
+            // Attention reshapes hit this constantly; keep it on GPU.
+            GpuOps::permute_021(self)?
+        } else if shape.len() == 4 && dims == [0, 2, 1, 3] {
+            // Hot path for Flux attention.  Keep this on GPU so BF16 tensors
+            // never bounce through CPU or get silently retyped.
+            GpuOps::permute_0213(self)?
+        } else if shape.len() == 4 && dims == [0, 1, 3, 2] {
+            // [batch, num_heads, seq_len, head_dim] -> [batch, num_heads, head_dim, seq_len]
+            self.permute_0132()?
+        } else {
+            // General permutation fallback (CPU copy for now)
+            let src_dims = shape;
+            let dst_dims: Vec<usize> = dims.iter().map(|&i| src_dims[i]).collect();
+
+            // Compute strides for source (row-major)
+            let mut src_strides = vec![1; src_dims.len()];
+            for i in (0..src_dims.len().saturating_sub(1)).rev() {
+                src_strides[i] = src_strides[i + 1] * src_dims[i + 1];
+            }
+
+            // Compute strides for destination
+            let mut dst_strides = vec![1; dst_dims.len()];
+            for i in (0..dst_dims.len().saturating_sub(1)).rev() {
+                dst_strides[i] = dst_strides[i + 1] * dst_dims[i + 1];
+            }
+
+            // Map each destination linear index to source linear index
+            let total: usize = dst_dims.iter().product();
+            let src_data = self.to_vec()?;
+            let mut dst_data = vec![0.0f32; total];
+
+            for (dst_idx, dst_val) in dst_data.iter_mut().enumerate() {
+                // Decompose destination index to coordinates
+                let mut remaining = dst_idx;
+                let mut dst_coords = vec![0usize; dst_dims.len()];
+                for (axis, stride) in dst_strides.iter().enumerate() {
+                    dst_coords[axis] = remaining / stride;
+                    remaining %= stride;
+                }
+
+                // Build source coordinates by inverting permutation: src_coord[p] = dst_coord[idx]
+                let mut src_coords = vec![0usize; src_dims.len()];
+                for (dst_axis, &src_axis) in dims.iter().enumerate() {
+                    src_coords[src_axis] = dst_coords[dst_axis];
+                }
+
+                // Convert source coordinates to linear index
+                let mut src_idx = 0usize;
+                for (coord, stride) in src_coords.into_iter().zip(src_strides.iter()) {
+                    src_idx += coord * *stride;
+                }
+                *dst_val = src_data[src_idx];
+            }
+
+            let tmp = Tensor::from_vec_dtype(
+                dst_data,
+                Shape::from_dims(&dst_dims),
+                self.device.clone(),
+                crate::DType::F32,
+            )?;
+            if self.dtype() == crate::DType::F32 {
+                tmp
+            } else {
+                tmp.to_dtype(self.dtype())?
+            }
+        };
+
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::Permute {
+                    input: self.id,
+                    dims: dims.to_vec(),
+                },
+                vec![(self.id, self.clone_result()?)],
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// Compute softmax along a dimension
+    pub fn softmax(&self, dim: isize) -> Result<Tensor> {
+        let shape = self.shape().dims();
+        let ndim = shape.len() as isize;
+
+        // Handle negative dimension
+        let dim = if dim < 0 { ndim + dim } else { dim } as usize;
+
+        if dim >= shape.len() {
+            return Err(Error::InvalidOperation(format!(
+                "Dimension {} out of bounds for tensor with {} dimensions",
+                dim,
+                shape.len()
+            )));
+        }
+
+        // Compute max along dimension for numerical stability
+        let mut max_vals = GpuOps::max_dim(self, dim, true)?;
+        if max_vals.dtype() != self.dtype() {
+            max_vals = max_vals.to_dtype(self.dtype())?;
+        }
+        let shifted = self.sub(&max_vals)?;
+
+        // Compute exp
+        let exp_vals = shifted.exp()?;
+
+        // Sum along dimension
+        let mut sum_exp = GpuOps::sum_dim_keepdim(&exp_vals, dim)?;
+        if sum_exp.dtype() != exp_vals.dtype() {
+            sum_exp = sum_exp.to_dtype(exp_vals.dtype())?;
+        }
+
+        // Divide by sum (compute in F32, cast back to default dtype if needed)
+        let mut output = exp_vals.div(&sum_exp)?;
+
+        // AUTOGRAD: Record operation if needed
+        if self.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::Softmax {
+                    input: self.id,
+                    dim: dim as isize,
+                },
+                vec![(self.id, self.clone_result()?)],
+            );
+        }
+
+        // Cast to default dtype if not F32
+        match crate::config::default_dtype() {
+            DType::F32 => Ok(output),
+            dt => output.to_dtype(dt),
+        }
+    }
+
+    /// Specific permutation: [batch, num_heads, seq_len, head_dim] -> [batch, num_heads, head_dim, seq_len]
+    fn permute_0132(&self) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        if dims.len() != 4 {
+            return Err(Error::InvalidOperation(
+                "permute_0132 requires 4D tensor".into(),
+            ));
+        }
+
+        let (d0, d1, d2, d3) = (dims[0], dims[1], dims[2], dims[3]);
+        let data = self.to_vec()?;
+        let mut result = vec![0.0f32; data.len()];
+
+        for i0 in 0..d0 {
+            for i1 in 0..d1 {
+                for i2 in 0..d2 {
+                    for i3 in 0..d3 {
+                        let src_idx = i0 * d1 * d2 * d3 + i1 * d2 * d3 + i2 * d3 + i3;
+                        let dst_idx = i0 * d1 * d3 * d2 + i1 * d3 * d2 + i3 * d2 + i2;
+                        result[dst_idx] = data[src_idx];
+                    }
+                }
+            }
+        }
+
+        let mut output = Tensor::from_vec(
+            result,
+            Shape::from_dims(&[d0, d1, d3, d2]),
+            self.device.clone(),
+        )?;
+
+        // Inherit gradient tracking
+        if self.requires_grad {
+            output.requires_grad = true;
+        }
+
+        Ok(output)
+    }
+
+    /// Add bias (broadcasting over batch dimensions)
+    pub fn add_bias(&self, bias: &Tensor) -> Result<Tensor> {
+        let shape = self.shape.dims();
+        let bias_shape = bias.shape.dims();
+
+        if bias_shape.len() != 1 || bias_shape[0] != shape[shape.len() - 1] {
+            return Err(Error::InvalidOperation(format!(
+                "Bias shape {:?} incompatible with tensor shape {:?}",
+                bias_shape, shape
+            )));
+        }
+
+        let target_dtype = self.dtype();
+        let bias_cast = if bias.dtype() == target_dtype {
+            bias.clone_result()?
+        } else {
+            bias.to_dtype(target_dtype)?
+        };
+
+        let bias_broadcast = bias_cast.broadcast_to(self.shape())?;
+        self.add(&bias_broadcast)
+    }
+
+    /// Flatten tensor from a given dimension
+    pub fn flatten_from(&self, from_dim: usize) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        if from_dim >= dims.len() {
+            return Err(Error::InvalidOperation(format!(
+                "flatten_from: dimension {} out of range for tensor with {} dimensions",
+                from_dim,
+                dims.len()
+            )));
+        }
+
+        // Calculate new shape
+        let mut new_dims = dims[..from_dim].to_vec();
+        let flattened_size: usize = dims[from_dim..].iter().product();
+        new_dims.push(flattened_size);
+
+        // Data remains the same, just reshape
+        self.reshape(&new_dims)
+    }
+
+    /// Get a CUDA slice reference to the tensor data
+    pub fn to_cuda_slice(&self) -> Result<&CudaSlice<f32>> {
+        self.storage.try_as_slice_f32()
+    }
+
+    /// Transpose the last two dimensions (for batch operations)
+    pub fn transpose_batch(&self) -> Result<Tensor> {
+        let ndim = self.shape.dims().len();
+        if ndim < 2 {
+            return Err(Error::InvalidOperation(
+                "Transpose batch requires at least 2 dimensions".into(),
+            ));
+        }
+
+        // Swap last two dimensions
+        let mut perm: Vec<usize> = (0..ndim).collect();
+        perm[ndim - 2] = ndim - 1;
+        perm[ndim - 1] = ndim - 2;
+
+        self.permute(&perm)
+    }
+
+    /// Batch matrix multiplication
+    pub fn batch_matmul(&self, other: &Tensor) -> Result<Tensor> {
+        let self_dims = self.shape.dims();
+        let other_dims = other.shape.dims();
+
+        if self_dims.len() < 2 || other_dims.len() < 2 {
+            return Err(Error::InvalidOperation(
+                "Batch matmul requires at least 2D tensors".into(),
+            ));
+        }
+
+        // Check batch dimensions match
+        if self_dims[..self_dims.len() - 2] != other_dims[..other_dims.len() - 2] {
+            return Err(Error::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: other.shape.clone(),
+            });
+        }
+
+        // Check matrix dimensions are compatible
+        let m = self_dims[self_dims.len() - 2];
+        let k1 = self_dims[self_dims.len() - 1];
+        let k2 = other_dims[other_dims.len() - 2];
+        let n = other_dims[other_dims.len() - 1];
+
+        if k1 != k2 {
+            return Err(Error::InvalidOperation(format!(
+                "Matrix dimensions incompatible for matmul: ({}, {}) @ ({}, {})",
+                m, k1, k2, n
+            )));
+        }
+
+        // Implement using regular matmul on flattened batches
+        // Fast-path: if effective batch_size == 1, collapse to 2D GEMM (cuBLAS)
+        let batch_size: usize = self_dims[..self_dims.len() - 2].iter().product();
+        if batch_size == 1 {
+            let a2d = self.reshape(&[m, k1])?;
+            let b2d = other.reshape(&[k2, n])?;
+            let out2d = a2d.matmul(&b2d)?;
+            let mut out_dims = self_dims[..self_dims.len() - 2].to_vec();
+            if out_dims.is_empty() {
+                out_dims.push(1);
+            }
+            out_dims.push(m);
+            out_dims.push(n);
+            return out2d.reshape(&out_dims);
+        }
+
+        // Reshape to [batch_size, m, k] and [batch_size, k, n]
+        let self_3d = self.reshape(&[batch_size, m, k1])?;
+        let other_3d = other.reshape(&[batch_size, k2, n])?;
+
+        // General path (small batches): perform per-batch GEMM; TODO: switch to strided batched GEMM
+        let mut results = Vec::new();
+        for b in 0..batch_size {
+            // Get slice for this batch
+            let self_2d = self_3d
+                .slice_1d(b * m * k1, (b + 1) * m * k1)?
+                .reshape(&[m, k1])?;
+            let other_2d = other_3d
+                .slice_1d(b * k2 * n, (b + 1) * k2 * n)?
+                .reshape(&[k2, n])?;
+
+            let result = self_2d.matmul(&other_2d)?;
+            results.push(result);
+        }
+
+        // Stack results
+        let stacked = Self::stack(&results, 0)?;
+
+        // Reshape back to original batch dimensions
+        let mut output_shape = self_dims[..self_dims.len() - 2].to_vec();
+        output_shape.push(m);
+        output_shape.push(n);
+
+        stacked.reshape(&output_shape)
+    }
+
+    /// Stack tensors along a new dimension
+    pub fn stack(tensors: &[Tensor], axis: usize) -> Result<Tensor> {
+        if tensors.is_empty() {
+            return Err(Error::InvalidOperation(
+                "Cannot stack empty tensor list".into(),
+            ));
+        }
+
+        // Verify all tensors have the same shape
+        let first_shape = &tensors[0].shape;
+        for t in &tensors[1..] {
+            if t.shape != *first_shape {
+                return Err(Error::ShapeMismatch {
+                    expected: first_shape.clone(),
+                    got: t.shape.clone(),
+                });
+            }
+        }
+        let mut expanded = Vec::with_capacity(tensors.len());
+        for t in tensors {
+            expanded.push(t.unsqueeze(axis)?);
+        }
+        let refs: Vec<&Tensor> = expanded.iter().collect();
+        Tensor::cat(&refs, axis)
+    }
+
+    /// Slice tensor data (renamed to avoid conflict)
+    pub fn slice_1d(&self, start: usize, end: usize) -> Result<Tensor> {
+        if end > self.shape.elem_count() || start > end {
+            return Err(Error::InvalidOperation(format!(
+                "Invalid slice range {}..{} for tensor with {} elements",
+                start,
+                end,
+                self.shape.elem_count()
+            )));
+        }
+
+        let data = self.to_vec()?;
+        let slice_data = data[start..end].to_vec();
+
+        // Calculate shape of slice
+        let slice_len = end - start;
+        Tensor::from_vec(
+            slice_data,
+            Shape::from_dims(&[slice_len]),
+            self.device.clone(),
+        )
+    }
+
+    /// Squeeze dimension (renamed to avoid conflict)
+    pub fn squeeze_dim(&self, dim: usize) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        if dim >= dims.len() {
+            return Err(Error::InvalidOperation(format!(
+                "Dimension {} out of range for tensor with {} dimensions",
+                dim,
+                dims.len()
+            )));
+        }
+
+        if dims[dim] != 1 {
+            return Err(Error::InvalidOperation(format!(
+                "Cannot squeeze dimension {} with size {}",
+                dim, dims[dim]
+            )));
+        }
+
+        let mut new_dims = dims.to_vec();
+        new_dims.remove(dim);
+
+        self.reshape(&new_dims)
+    }
+
+    /// Narrow (slice) a tensor along a dimension - CUDA only implementation
+    pub fn narrow(&self, dim: usize, start: usize, length: usize) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        if dim >= dims.len() {
+            return Err(Error::InvalidOperation(format!(
+                "Dimension {} out of range for tensor with {} dimensions",
+                dim,
+                dims.len()
+            )));
+        }
+
+        if start + length > dims[dim] {
+            return Err(Error::InvalidOperation(format!(
+                "Slice [{}, {}) out of range for dimension {} of size {}",
+                start,
+                start + length,
+                dim,
+                dims[dim]
+            )));
+        }
+
+        // Create output shape
+        let mut output_dims = dims.to_vec();
+        output_dims[dim] = length;
+        let output_shape = Shape::from_dims(&output_dims);
+
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        if self.dtype() == DType::BF16 && self.storage_dtype() == DType::BF16 {
+            return cuda_ops_bf16::slice_axis_bf16(self, dim, start, length);
+        }
+
+        // For now, only support up to 4D tensors
+        if dims.len() > 4 {
+            return Err(Error::InvalidOperation(format!(
+                "narrow operation currently supports up to 4D tensors, got {}D",
+                dims.len()
+            )));
+        }
+
+        // Pad dimensions to 4D for kernel
+        let mut input_size = [1, 1, 1, 1];
+        let mut output_size = [1, 1, 1, 1];
+        for (i, &d) in dims.iter().enumerate() {
+            input_size[i] = d;
+        }
+        for (i, &d) in output_dims.iter().enumerate() {
+            output_size[i] = d;
+        }
+
+        // Prepare F32 views for the CUDA kernel (kernels currently assume F32 storage)
+        use crate::cuda_kernels::CudaKernels;
+        let input_f32 = to_owning_fp32_strong(self)?;
+        if std::env::var("SDXL_DEBUG_SHAPES").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[narrow] input logical={:?} storage={:?} dims={:?}",
+                input_f32.dtype(),
+                input_f32.storage_dtype(),
+                input_f32.shape().dims()
+            );
+        }
+        let cuda_kernels = CudaKernels::new(self.device.clone())?;
+
+        // Allocate FP32 output buffer for the kernel
+        let output = Tensor::zeros_dtype(output_shape.clone(), DType::F32, self.device.clone())?;
+
+        // Get the narrow kernel
+        let kernel = cuda_kernels
+            .kernels
+            .get("narrow_kernel")
+            .ok_or_else(|| Error::Cuda("narrow_kernel not found".into()))?
+            .clone();
+
+        // Launch kernel
+        let n = output.shape.elem_count();
+        let block_size = 256;
+        let grid_size = n.div_ceil(block_size);
+
+        let config = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_size as u32, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        unsafe {
+            kernel.launch(
+                config,
+                (
+                    input_f32.storage.try_as_slice_f32()?,
+                    output.storage.try_as_slice_f32()?,
+                    input_size[0] as i32,
+                    input_size[1] as i32,
+                    input_size[2] as i32,
+                    input_size[3] as i32,
+                    output_size[0] as i32,
+                    output_size[1] as i32,
+                    output_size[2] as i32,
+                    output_size[3] as i32,
+                    dim as i32,
+                    start as i32,
+                ),
+            )?;
+        }
+
+        self.device.synchronize()?;
+
+        if self.dtype() == DType::F32 {
+            Ok(output)
+        } else {
+            output.to_dtype(self.dtype())
+        }
+    }
+
+    /// Copy data from another tensor
+    pub fn copy_(&mut self, other: &Tensor) -> Result<()> {
+        if self.shape != other.shape {
+            return Err(Error::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: other.shape.clone(),
+            });
+        }
+        self.storage = other.storage.clone();
+        Ok(())
+    }
+}
+
+/// Implementation of gradient access trait
+impl TensorGradExt for Tensor {
+    fn grad<'a>(&self, gradients: &'a GradientMap) -> Option<&'a Tensor> {
+        gradients.get(self.id)
+    }
+
+    fn grad_mut<'a>(&self, gradients: &'a mut GradientMap) -> Option<&'a mut Tensor> {
+        gradients.get_mut(self.id)
+    }
+
+    fn take_grad(&self, gradients: &mut GradientMap) -> Option<Tensor> {
+        gradients.take(self.id)
+    }
+
+    fn has_grad(&self, gradients: &GradientMap) -> bool {
+        gradients.contains(self.id)
+    }
+}
+
+/// Allocate memory from the pool for internal use
+const MAX_FP32_ALLOC_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+pub fn guard_fp32_alloc(bytes: usize, tag: &str) {
+    if bytes > MAX_FP32_ALLOC_BYTES {
+        panic!("[alloc] {tag} requested {bytes} bytes (FP32) — exceeds 1GB cap");
+    }
+}
+
+pub(crate) fn alloc_from_pool(device: &Arc<CudaDevice>, size: usize) -> Result<CudaSlice<f32>> {
+    if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+        let bytes = size * std::mem::size_of::<f32>();
+        if bytes >= (8 << 20) {
+            eprintln!("[alloc] tag=pool_alloc_f32 size={} bytes={}", size, bytes);
+            if bytes >= 9_437_184 {
+                eprintln!("[sentry] FP32_ALLOC bytes={} shape_hint=[?,?]", bytes);
+            }
+        }
+        guard_fp32_alloc(bytes, "pool_alloc_f32");
+    } else {
+        guard_fp32_alloc(size * std::mem::size_of::<f32>(), "pool_alloc_f32");
+    }
+    // Use aligned allocation to avoid CUDA alignment issues
+    alloc_aligned_f32(device, size)
+}
+
+/// Allocate zeroed memory from the pool for internal use
+pub(crate) fn alloc_zeros_from_pool(
+    device: &Arc<CudaDevice>,
+    size: usize,
+) -> Result<CudaSlice<f32>> {
+    if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+        let bytes = size * std::mem::size_of::<f32>();
+        if bytes >= (8 << 20) {
+            eprintln!("[alloc] tag=pool_zeros_f32 size={} bytes={}", size, bytes);
+            if bytes >= 9_437_184 {
+                eprintln!("[sentry] FP32_ALLOC bytes={} shape_hint=[?,?]", bytes);
+            }
+        }
+        guard_fp32_alloc(bytes, "pool_zeros_f32");
+    } else {
+        guard_fp32_alloc(size * std::mem::size_of::<f32>(), "pool_zeros_f32");
+    }
+    let mut data = alloc_from_pool(device, size)?;
+    device.memset_zeros(&mut data)?;
+    Ok(data)
+}
+
+/// Drop implementation to return memory to pool
+impl Drop for Tensor {
+    fn drop(&mut self) {
+        // NOTE: Memory pooling currently relies on cloning `CudaSlice`, which performs a fresh
+        // device allocation in cudarc. Until the pool is refactored to recycle the existing
+        // allocation without cloning, simply allow the underlying `CudaSlice` to drop normally.
+    }
+}
+
+// --- Unsafe external device pointer construction (placeholder) ---
+impl Tensor {
+    /// Unsafe constructor to wrap an external device pointer as a Tensor.
+    /// Placeholder stub: returns an error until proper external storage support lands.
+    ///
+    /// # Safety
+    /// - `ptr` must reference `shape.elem_count()` contiguous elements of `dtype`
+    ///   on `device`.
+    /// - The allocation must be correctly aligned for the target dtype and not
+    ///   alias any other mutable reference.
+    /// - Caller must ensure the pointer remains valid for the lifetime of the
+    ///   returned tensor value.
+    pub unsafe fn from_device_ptr_unsafe(
+        _ptr: *mut u8,
+        _shape: Shape,
+        _dtype: DType,
+        _device: Arc<CudaDevice>,
+    ) -> Result<Self> {
+        Err(Error::InvalidOperation(
+            "from_device_ptr_unsafe not yet implemented".to_string(),
+        ))
+    }
+}
+
+// --- Missing BF16 helper methods for compatibility ---
+impl Tensor {
+    /// Copy data from a host BF16 slice (u16) into this tensor.
+    /// The tensor must be BF16.
+    pub fn copy_from_bf16_slice(&mut self, data: &[u16]) -> Result<()> {
+        if self.dtype() != DType::BF16 {
+            return Err(Error::InvalidOperation(
+                "copy_from_bf16_slice requires BF16 tensor".into(),
+            ));
+        }
+        if data.len() != self.shape.elem_count() {
+            return Err(Error::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: Shape::from_dims(&[data.len()]),
+            });
+        }
+
+        let device = self.device.clone();
+        match self.storage_mut() {
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16 {
+                data: device_data, ..
+            } => {
+                device
+                    .htod_sync_copy_into(data, ensure_unique_slice(device_data)?)
+                    .map_err(|_| Error::CudaDriver)?;
+                Ok(())
+            }
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16Arena { ptr, .. } => {
+                use cudarc::driver::DevicePtrMut;
+
+                // Using a staging buffer is safest and easiest with current APIs
+                let mut staging = unsafe { device.alloc::<u16>(data.len()) }
+                    .map_err(|e| Error::Cuda(format!("alloc staging: {}", e)))?;
+                device
+                    .htod_sync_copy_into(data, &mut staging)
+                    .map_err(|_| Error::CudaDriver)?;
+
+                let stream = CudaStream::from_raw(device.cuda_stream_raw_ptr());
+                bf16_copy_async(
+                    ptr.as_ptr() as *mut std::ffi::c_void,
+                    (*staging.device_ptr()) as *const std::ffi::c_void,
+                    data.len(),
+                    &stream,
+                )?;
+                Ok(())
+            }
+            #[cfg(not(feature = "bf16_u16"))]
+            TensorStorage::BF16 {
+                data: device_data, ..
+            } => {
+                // Convert u16 to f32 on host, then copy
+                let mut f32_data = Vec::with_capacity(data.len());
+                for &bits in data {
+                    let u = (bits as u32) << 16;
+                    f32_data.push(f32::from_bits(u));
+                }
+                device
+                    .htod_copy_into(f32_data, device_data)
+                    .map_err(|_| Error::CudaDriver)?;
+                Ok(())
+            }
+            _ => Err(Error::InvalidOperation(
+                "copy_from_bf16_slice: storage mismatch".into(),
+            )),
+        }
+    }
+
+    /// Create a new BF16 tensor from a host slice of u16 (BF16 bits).
+    /// Renamed to avoid conflict with existing from_bf16_slice(CudaSlice).
+    pub fn from_bf16_u16_slice(
+        data: &[u16],
+        shape: Shape,
+        device: Arc<CudaDevice>,
+    ) -> Result<Self> {
+        if data.len() != shape.elem_count() {
+            return Err(Error::ShapeMismatch {
+                expected: shape.clone(),
+                got: Shape::from_dims(&[data.len()]),
+            });
+        }
+
+        // Allocate storage
+        let mut tensor = Tensor::zeros_dtype(shape, DType::BF16, device)?;
+        tensor.copy_from_bf16_slice(data)?;
+        Ok(tensor)
+    }
+
+    /// Create a new BF16 tensor from a host slice of bytes (interpreted as BF16).
+    pub fn from_bf16_bytes(data: &[u8], shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
+        if data.len() % 2 != 0 {
+            return Err(Error::InvalidInput(
+                "from_bf16_bytes: data length must be even".into(),
+            ));
+        }
+        let u16_len = data.len() / 2;
+        if u16_len != shape.elem_count() {
+            return Err(Error::ShapeMismatch {
+                expected: shape.clone(),
+                got: Shape::from_dims(&[u16_len]),
+            });
+        }
+
+        // Cast bytes to u16
+        let u16_data = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, u16_len) };
+
+        Self::from_bf16_u16_slice(u16_data, shape, device)
+    }
+
+    /// Create a BF16 tensor by loading chunks via a closure.
+    pub fn from_bf16_chunks<F>(shape: Shape, device: Arc<CudaDevice>, mut loader: F) -> Result<Self>
+    where
+        F: FnMut(usize, &mut [u16]) -> Result<()>,
+    {
+        let numel = shape.elem_count();
+        let mut tensor = Tensor::zeros_dtype(shape, DType::BF16, device.clone())?;
+
+        const CHUNK_SIZE: usize = 1024 * 1024 * 16; // 32MB chunks
+        let mut host_buf = vec![0u16; CHUNK_SIZE.min(numel)];
+
+        let mut offset = 0;
+        while offset < numel {
+            let len = (numel - offset).min(host_buf.len());
+            let chunk_view = &mut host_buf[0..len];
+
+            // Load data into host buffer
+            loader(offset, chunk_view)?;
+
+            // Clone device for closure/match scope
+            let device_ref = device.clone();
+
+            match tensor.storage_mut() {
+                #[cfg(feature = "bf16_u16")]
+                TensorStorage::BF16 { data, .. } => {
+                    let mut sub_slice = ensure_unique_slice(data)?.slice_mut(offset..offset + len);
+                    device_ref
+                        .htod_sync_copy_into(chunk_view, &mut sub_slice)
+                        .map_err(|_| Error::CudaDriver)?;
+                }
+                #[cfg(feature = "bf16_u16")]
+                TensorStorage::BF16Arena { ptr, .. } => {
+                    // Copy via staging
+                    let mut staging = unsafe { device_ref.alloc::<u16>(len) }
+                        .map_err(|e| Error::Cuda(format!("alloc staging: {}", e)))?;
+                    device_ref
+                        .htod_sync_copy_into(chunk_view, &mut staging)
+                        .map_err(|_| Error::CudaDriver)?;
+
+                    let stream = CudaStream::from_raw(device_ref.cuda_stream_raw_ptr());
+                    // Calculate dest ptr
+                    let dst_ptr = unsafe { ptr.as_ptr().add(offset) };
+
+                    bf16_copy_async(
+                        dst_ptr as *mut std::ffi::c_void,
+                        (*staging.device_ptr()) as *const std::ffi::c_void,
+                        len,
+                        &stream,
+                    )?;
+                }
+                #[cfg(not(feature = "bf16_u16"))]
+                TensorStorage::BF16 { data, .. } => {
+                    // Convert and copy
+                    let mut f32_chunk = Vec::with_capacity(len);
+                    for &bits in chunk_view.iter() {
+                        let u = (bits as u32) << 16;
+                        f32_chunk.push(f32::from_bits(u));
+                    }
+                    let mut sub_slice = data.slice_mut(offset..offset + len);
+                    device_ref
+                        .htod_sync_copy_into(&f32_chunk, &mut sub_slice)
+                        .map_err(|_| Error::CudaDriver)?;
+                }
+                _ => {
+                    return Err(Error::InvalidOperation(
+                        "from_bf16_chunks: storage mismatch".into(),
+                    ))
+                }
+            }
+
+            offset += len;
+        }
+
+        Ok(tensor)
+    }
+}
