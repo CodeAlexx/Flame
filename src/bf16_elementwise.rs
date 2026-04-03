@@ -650,3 +650,202 @@ pub fn lt_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 pub fn ne_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     cmp_bf16(a, b, 4)
 }
+
+// ---------------------------------------------------------------------------
+// Fused patchify / unpatchify — BF16, no 6D permute, no F32 round-trip
+// ---------------------------------------------------------------------------
+
+const CUDA_PATCHIFY_BF16: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void patchify_bf16_kernel(
+    const __nv_bfloat16* __restrict__ input,   // [B, C, H, W]
+    __nv_bfloat16* __restrict__ output,         // [B, N, patch_dim]
+    int B, int C, int H, int W,
+    int ph, int pw, int p,                      // patch grid and size
+    int N, int patch_dim                        // N=ph*pw, patch_dim=p*p*C
+) {
+    long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)B * N * patch_dim;
+    while (tid < total) {
+        // Decompose output index: (b, n, d)
+        int d = (int)(tid % patch_dim);
+        long bn = tid / patch_dim;
+        int n = (int)(bn % N);
+        int b = (int)(bn / N);
+
+        // n -> (h_patch, w_patch)
+        int h_patch = n / pw;
+        int w_patch = n % pw;
+
+        // d -> (p_h, p_w, c)  — layout matches permute(0,2,4,3,5,1)
+        int c = d % C;
+        int p_w = (d / C) % p;
+        int p_h = d / (p * C);
+
+        // Source pixel
+        int h = h_patch * p + p_h;
+        int w = w_patch * p + p_w;
+        long src = (long)b * C * H * W + (long)c * H * W + (long)h * W + w;
+
+        output[tid] = input[src];
+        tid += (long)gridDim.x * blockDim.x;
+    }
+}
+"#;
+
+const CUDA_UNPATCHIFY_BF16: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void unpatchify_bf16_kernel(
+    const __nv_bfloat16* __restrict__ input,   // [B, N, patch_dim]
+    __nv_bfloat16* __restrict__ output,         // [B, C, H, W]
+    int B, int C, int H, int W,
+    int ph, int pw, int p,
+    int N, int patch_dim
+) {
+    long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)B * C * H * W;
+    while (tid < total) {
+        // Decompose output index: (b, c, h, w)
+        int w = (int)(tid % W);
+        long tmp = tid / W;
+        int h = (int)(tmp % H);
+        tmp /= H;
+        int c = (int)(tmp % C);
+        int b = (int)(tmp / C);
+
+        // (h, w) -> patch coords
+        int h_patch = h / p;
+        int w_patch = w / p;
+        int p_h = h % p;
+        int p_w = w % p;
+
+        // Source index in [B, N, patch_dim]
+        int n = h_patch * pw + w_patch;
+        int d = p_h * (p * C) + p_w * C + c;
+        long src = (long)b * N * patch_dim + (long)n * patch_dim + d;
+
+        output[tid] = input[src];
+        tid += (long)gridDim.x * blockDim.x;
+    }
+}
+"#;
+
+/// Fused patchify: [B, C, H, W] → [B, ph*pw, p*p*C] in BF16, no 6D permute.
+///
+/// Returns (patches, ph, pw).
+pub fn patchify_bf16(
+    x: &Tensor,
+    patch_size: usize,
+) -> Result<(Tensor, usize, usize)> {
+    assert_eq!(x.dtype(), DType::BF16, "patchify_bf16: expected BF16");
+    let dims = x.shape().dims();
+    assert_eq!(dims.len(), 4, "patchify_bf16: expected 4D [B,C,H,W]");
+    let (b, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
+    let p = patch_size;
+    let ph = h / p;
+    let pw = w / p;
+    let n = ph * pw;
+    let patch_dim = p * p * c;
+
+    ensure(&x.device, "patchify_bf16_kernel", CUDA_PATCHIFY_BF16)?;
+    let f = x
+        .device
+        .get_func("patchify_bf16_kernel", "patchify_bf16_kernel")
+        .ok_or_else(|| Error::Cuda("missing kernel: patchify_bf16_kernel".into()))?;
+
+    let mut out = Tensor::zeros_dtype(
+        Shape::from_dims(&[b, n, patch_dim]),
+        DType::BF16,
+        x.device.clone(),
+    )?;
+
+    let total = b * n * patch_dim;
+    let cfg = lc(total);
+
+    let input_ptr = x.as_device_ptr_bf16("patchify:input")? as *const u16;
+    let output_ptr = out.as_mut_device_ptr_bf16("patchify:output")? as *mut u16;
+
+    unsafe {
+        f.launch(
+            cfg,
+            (
+                input_ptr as u64,
+                output_ptr as u64,
+                b as i32,
+                c as i32,
+                h as i32,
+                w as i32,
+                ph as i32,
+                pw as i32,
+                p as i32,
+                n as i32,
+                patch_dim as i32,
+            ),
+        )
+        .map_err(|e| Error::Cuda(format!("launch patchify_bf16: {:?}", e)))?;
+    }
+
+    Ok((out, ph, pw))
+}
+
+/// Fused unpatchify: [B, N, patch_dim] → [B, C, H, W] in BF16, no 6D permute.
+pub fn unpatchify_bf16(
+    x: &Tensor,
+    ph: usize,
+    pw: usize,
+    patch_size: usize,
+    in_channels: usize,
+) -> Result<Tensor> {
+    assert_eq!(x.dtype(), DType::BF16, "unpatchify_bf16: expected BF16");
+    let dims = x.shape().dims();
+    assert_eq!(dims.len(), 3, "unpatchify_bf16: expected 3D [B,N,P]");
+    let b = dims[0];
+    let c = in_channels;
+    let p = patch_size;
+    let h = ph * p;
+    let w = pw * p;
+    let n = ph * pw;
+    let patch_dim = p * p * c;
+
+    ensure(&x.device, "unpatchify_bf16_kernel", CUDA_UNPATCHIFY_BF16)?;
+    let f = x
+        .device
+        .get_func("unpatchify_bf16_kernel", "unpatchify_bf16_kernel")
+        .ok_or_else(|| Error::Cuda("missing kernel: unpatchify_bf16_kernel".into()))?;
+
+    let mut out = Tensor::zeros_dtype(
+        Shape::from_dims(&[b, c, h, w]),
+        DType::BF16,
+        x.device.clone(),
+    )?;
+
+    let total = b * c * h * w;
+    let cfg = lc(total);
+
+    let input_ptr = x.as_device_ptr_bf16("unpatchify:input")? as *const u16;
+    let output_ptr = out.as_mut_device_ptr_bf16("unpatchify:output")? as *mut u16;
+
+    unsafe {
+        f.launch(
+            cfg,
+            (
+                input_ptr as u64,
+                output_ptr as u64,
+                b as i32,
+                c as i32,
+                h as i32,
+                w as i32,
+                ph as i32,
+                pw as i32,
+                p as i32,
+                n as i32,
+                patch_dim as i32,
+            ),
+        )
+        .map_err(|e| Error::Cuda(format!("launch unpatchify_bf16: {:?}", e)))?;
+    }
+
+    Ok(out)
+}
