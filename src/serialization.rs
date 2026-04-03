@@ -516,6 +516,104 @@ pub fn load_file<P: AsRef<Path>>(
     )
 }
 
+/// Load only matching keys from a safetensors file (for block-level offloading).
+///
+/// Uses memory-mapping — only the selected tensors' bytes are paged in from
+/// disk. The full file is NOT read into RAM, so this works for 40GB+ files.
+pub fn load_file_filtered<P, F>(
+    path: P,
+    device: &Arc<CudaDevice>,
+    filter: F,
+) -> Result<HashMap<String, Tensor>>
+where
+    P: AsRef<Path>,
+    F: Fn(&str) -> bool,
+{
+    use serde_json::Value;
+
+    let file = File::open(path.as_ref())
+        .map_err(|e| Error::Io(format!("Failed to open file: {}", e)))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| Error::Io(format!("Failed to mmap: {}", e)))?;
+
+    if mmap.len() < 8 {
+        return Err(Error::Io("File too small for safetensors".into()));
+    }
+
+    // Parse header
+    let header_size = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
+    let header_end = 8 + header_size;
+    let data_start = header_end; // tensor data begins right after header
+
+    let metadata: Value = serde_json::from_slice(&mmap[8..header_end])
+        .map_err(|e| Error::Io(format!("Failed to parse metadata: {}", e)))?;
+    let metadata_obj = metadata.as_object()
+        .ok_or_else(|| Error::InvalidInput("Invalid metadata format".to_string()))?;
+
+    let mut tensors = HashMap::new();
+
+    for (name, info) in metadata_obj {
+        if name == "__metadata__" || !filter(name) {
+            continue;
+        }
+
+        let shape = info["shape"].as_array()
+            .ok_or_else(|| Error::InvalidInput("Missing shape".to_string()))?
+            .iter()
+            .map(|v| v.as_u64().ok_or_else(|| Error::InvalidInput("invalid shape".into())).map(|u| u as usize))
+            .collect::<Result<Vec<_>>>()?;
+
+        let offsets = info["data_offsets"].as_array()
+            .ok_or_else(|| Error::InvalidInput("Missing data_offsets".to_string()))?;
+        let start = data_start + offsets.first().and_then(|v| v.as_u64())
+            .ok_or_else(|| Error::InvalidInput("invalid start".into()))? as usize;
+        let end = data_start + offsets.get(1).and_then(|v| v.as_u64())
+            .ok_or_else(|| Error::InvalidInput("invalid end".into()))? as usize;
+
+        let dtype_str = info["dtype"].as_str().unwrap_or("F32");
+        if !matches!(dtype_str, "F32" | "BF16" | "F16") {
+            continue;
+        }
+
+        let data = &mmap[start..end];
+
+        let tensor = match dtype_str {
+            "BF16" => {
+                let num_elems = data.len() / 2;
+                let mut bf16_u16 = vec![0u16; num_elems];
+                for (value, chunk) in bf16_u16.iter_mut().zip(data.chunks_exact(2)) {
+                    *value = u16::from_le_bytes([chunk[0], chunk[1]]);
+                }
+                let mut tensor = Tensor::zeros_dtype(
+                    Shape::from_dims(&shape), DType::BF16, device.clone(),
+                )?;
+                tensor.copy_from_bf16_slice(&bf16_u16)?;
+                tensor
+            }
+            "F16" => {
+                let num_elems = data.len() / 2;
+                let mut f32_data = vec![0.0f32; num_elems];
+                for (value, chunk) in f32_data.iter_mut().zip(data.chunks_exact(2)) {
+                    let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    *value = half::f16::from_bits(bits).to_f32();
+                }
+                Tensor::from_vec(f32_data, Shape::from_dims(&shape), device.clone())?
+            }
+            _ => {
+                let num_floats = data.len() / 4;
+                let mut f32_data = vec![0.0f32; num_floats];
+                for (value, chunk) in f32_data.iter_mut().zip(data.chunks_exact(4)) {
+                    *value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+                Tensor::from_vec(f32_data, Shape::from_dims(&shape), device.clone())?
+            }
+        };
+        tensors.insert(name.clone(), tensor);
+    }
+
+    Ok(tensors)
+}
+
 /// Save a safetensors file (convenience function)  
 pub fn save_file<P: AsRef<Path>>(tensors: &HashMap<String, Tensor>, path: P) -> Result<()> {
     save_tensors(tensors, path.as_ref(), SerializationFormat::SafeTensors)
