@@ -5,13 +5,48 @@ use std::sync::{Arc, OnceLock};
 
 static GLOBAL_DEV: OnceLock<Arc<CudarcDevice>> = OnceLock::new();
 
+// Raw FFI for CUDA mempool APIs (not in cuda_runtime_sys 0.3)
+extern "C" {
+    fn cudaDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
+    fn cudaMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
+}
+
+/// Configure CUDA memory pool to cache aggressively (never release to OS).
+/// This makes cudaMallocAsync/cudaFreeAsync near-zero cost after warmup.
+fn configure_cuda_mempool(device_ordinal: i32) {
+    // cudaMemPoolAttrReleaseThreshold = 4
+    const ATTR_RELEASE_THRESHOLD: i32 = 4;
+    unsafe {
+        let mut pool: *mut c_void = std::ptr::null_mut();
+        let status = cudaDeviceGetDefaultMemPool(&mut pool, device_ordinal);
+        if status != 0 || pool.is_null() {
+            log::warn!("Failed to get default CUDA mempool (status={})", status);
+            return;
+        }
+        // Set release threshold to max — never release cached memory
+        let mut threshold: u64 = u64::MAX;
+        let status = cudaMemPoolSetAttribute(
+            pool,
+            ATTR_RELEASE_THRESHOLD,
+            &mut threshold as *mut u64 as *mut c_void,
+        );
+        if status != 0 {
+            log::warn!("Failed to set mempool release threshold (status={})", status);
+        } else {
+            log::info!("CUDA mempool: release threshold set to MAX (infinite caching)");
+        }
+    }
+}
+
 /// Get a global CUDA device (device 0). GPU-only; panics if CUDA init fails.
 pub fn global_cuda_device() -> Arc<CudarcDevice> {
     GLOBAL_DEV
         .get_or_init(|| {
-            CudarcDevice::new(0).expect(
+            let dev = CudarcDevice::new(0).expect(
                 "CUDA GPU required. Set CUDA_HOME=/usr/local/cuda and export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH.",
-            )
+            );
+            configure_cuda_mempool(0);
+            dev
         })
         .clone()
 }
@@ -39,7 +74,7 @@ impl Device {
     /// Create a new device for the given GPU ordinal
     pub fn cuda(ordinal: usize) -> Result<Self> {
         let device = CudarcDevice::new(ordinal)
-            .map_err(|e| Error::Cuda(format!("Failed to create CUDA device: {}", e)))?;
+            .map_err(|e| Error::Cuda(format!("Failed to create CUDA device: {:?}", e)))?;
         Ok(Self { inner: device })
     }
 

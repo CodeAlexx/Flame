@@ -62,7 +62,7 @@ pub fn load_tensors(
 // Binary format implementation
 fn save_tensor_binary(tensor: &Tensor, path: &Path) -> Result<()> {
     let file =
-        File::create(path).map_err(|e| Error::Io(format!("Failed to create file: {}", e)))?;
+        File::create(path).map_err(|e| Error::Io(format!("Failed to create file: {:?}", e)))?;
     let mut writer = BufWriter::new(file);
 
     // Write magic number
@@ -99,7 +99,7 @@ fn save_tensor_binary(tensor: &Tensor, path: &Path) -> Result<()> {
 }
 
 fn load_tensor_binary(path: &Path, device: Arc<CudaDevice>) -> Result<Tensor> {
-    let file = File::open(path).map_err(|e| Error::Io(format!("Failed to open file: {}", e)))?;
+    let file = File::open(path).map_err(|e| Error::Io(format!("Failed to open file: {:?}", e)))?;
     let mut reader = BufReader::new(file);
 
     // Read and verify magic number
@@ -158,7 +158,7 @@ fn load_tensor_binary(path: &Path, device: Arc<CudaDevice>) -> Result<Tensor> {
 
 fn save_tensors_binary(tensors: &HashMap<String, Tensor>, path: &Path) -> Result<()> {
     let file =
-        File::create(path).map_err(|e| Error::Io(format!("Failed to create file: {}", e)))?;
+        File::create(path).map_err(|e| Error::Io(format!("Failed to create file: {:?}", e)))?;
     let mut writer = BufWriter::new(file);
 
     // Write magic number
@@ -212,7 +212,7 @@ fn save_tensors_binary(tensors: &HashMap<String, Tensor>, path: &Path) -> Result
 }
 
 fn load_tensors_binary(path: &Path, device: Arc<CudaDevice>) -> Result<HashMap<String, Tensor>> {
-    let file = File::open(path).map_err(|e| Error::Io(format!("Failed to open file: {}", e)))?;
+    let file = File::open(path).map_err(|e| Error::Io(format!("Failed to open file: {:?}", e)))?;
     let mut reader = BufReader::new(file);
 
     // Read and verify magic number
@@ -259,7 +259,7 @@ fn load_tensors_binary(path: &Path, device: Arc<CudaDevice>) -> Result<HashMap<S
             .read_exact(&mut name_bytes)
             .map_err(|e| Error::Io(e.to_string()))?;
         let name = String::from_utf8(name_bytes)
-            .map_err(|e| Error::InvalidOperation(format!("Invalid UTF-8 in name: {}", e)))?;
+            .map_err(|e| Error::InvalidOperation(format!("Invalid UTF-8 in name: {:?}", e)))?;
 
         // Read shape
         let mut ndims_bytes = [0u8; 4];
@@ -319,7 +319,7 @@ fn save_tensors_safetensors<T: AsRef<Tensor>>(
     use serde_json::{json, Value};
 
     let file =
-        File::create(path).map_err(|e| Error::Io(format!("Failed to create file: {}", e)))?;
+        File::create(path).map_err(|e| Error::Io(format!("Failed to create file: {:?}", e)))?;
     let mut writer = BufWriter::new(file);
 
     // Create metadata
@@ -347,7 +347,7 @@ fn save_tensors_safetensors<T: AsRef<Tensor>>(
 
     // Convert metadata to JSON
     let metadata_json = serde_json::to_string(&Value::Object(metadata))
-        .map_err(|e| Error::Io(format!("Failed to serialize metadata: {}", e)))?;
+        .map_err(|e| Error::Io(format!("Failed to serialize metadata: {:?}", e)))?;
     let metadata_bytes = metadata_json.as_bytes();
 
     // Write header size (8 bytes, little-endian)
@@ -380,7 +380,7 @@ fn load_tensors_safetensors(
 ) -> Result<HashMap<String, Tensor>> {
     use serde_json::Value;
 
-    let file = File::open(path).map_err(|e| Error::Io(format!("Failed to open file: {}", e)))?;
+    let file = File::open(path).map_err(|e| Error::Io(format!("Failed to open file: {:?}", e)))?;
     let mut reader = BufReader::new(file);
 
     // Read header size
@@ -397,7 +397,7 @@ fn load_tensors_safetensors(
         .map_err(|e| Error::Io(e.to_string()))?;
 
     let metadata: Value = serde_json::from_slice(&metadata_bytes)
-        .map_err(|e| Error::Io(format!("Failed to parse metadata: {}", e)))?;
+        .map_err(|e| Error::Io(format!("Failed to parse metadata: {:?}", e)))?;
 
     let metadata_obj = metadata
         .as_object()
@@ -532,9 +532,9 @@ where
     use serde_json::Value;
 
     let file = File::open(path.as_ref())
-        .map_err(|e| Error::Io(format!("Failed to open file: {}", e)))?;
+        .map_err(|e| Error::Io(format!("Failed to open file: {:?}", e)))?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| Error::Io(format!("Failed to mmap: {}", e)))?;
+        .map_err(|e| Error::Io(format!("Failed to mmap: {:?}", e)))?;
 
     if mmap.len() < 8 {
         return Err(Error::Io("File too small for safetensors".into()));
@@ -546,7 +546,7 @@ where
     let data_start = header_end; // tensor data begins right after header
 
     let metadata: Value = serde_json::from_slice(&mmap[8..header_end])
-        .map_err(|e| Error::Io(format!("Failed to parse metadata: {}", e)))?;
+        .map_err(|e| Error::Io(format!("Failed to parse metadata: {:?}", e)))?;
     let metadata_obj = metadata.as_object()
         .ok_or_else(|| Error::InvalidInput("Invalid metadata format".to_string()))?;
 

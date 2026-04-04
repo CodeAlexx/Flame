@@ -159,7 +159,7 @@ impl TensorStorage {
                 #[cfg(feature = "bf16_u16")]
                 {
                     let mut data = unsafe { device.alloc::<u16>(numel) }
-                        .map_err(|e| Error::Cuda(format!("alloc bf16 u16: {}", e)))?;
+                        .map_err(|e| Error::Cuda(format!("alloc bf16 u16: {:?}", e)))?;
                     device.memset_zeros(&mut data)?;
                     Ok(TensorStorage::BF16 {
                         data: wrap_slice(data),
@@ -260,7 +260,7 @@ impl TensorStorage {
                 {
                     use cudarc::driver::{DevicePtr, DevicePtrMut};
                     let mut staging = unsafe { arena_device.alloc::<u16>(*numel) }
-                        .map_err(|e| Error::Cuda(format!("alloc bf16 arena staging: {}", e)))?;
+                        .map_err(|e| Error::Cuda(format!("alloc bf16 arena staging: {:?}", e)))?;
                     let stream = CudaStream::from_raw(arena_device.cuda_stream_raw_ptr());
                     bf16_copy_async(
                         (*staging.device_ptr_mut()) as *mut c_void,
@@ -472,7 +472,7 @@ impl TensorStorage {
             } => {
                 use cudarc::driver::DevicePtrMut;
                 let mut staging = unsafe { arena_device.alloc::<u16>(*numel) }
-                    .map_err(|e| Error::Cuda(format!("alloc bf16 arena staging: {}", e)))?;
+                    .map_err(|e| Error::Cuda(format!("alloc bf16 arena staging: {:?}", e)))?;
                 let stream = CudaStream::from_raw(arena_device.cuda_stream_raw_ptr());
                 bf16_copy_async(
                     (*staging.device_ptr_mut()) as *mut c_void,

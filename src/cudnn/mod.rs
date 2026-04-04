@@ -31,7 +31,7 @@ pub mod activation;
 
 // Core operations
 #[cfg(feature = "cudnn")]
-pub use conv2d::cudnn_conv2d;
+pub use conv2d::cudnn_conv2d_bf16;
 
 #[cfg(feature = "cudnn")]
 pub use matmul_simple::{cudnn_bmm, cudnn_matmul, is_cudnn_matmul_compatible};

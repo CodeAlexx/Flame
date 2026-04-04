@@ -298,8 +298,12 @@ fn forward_bf16_fallback(
     d_q: usize,
     scale: f32,
 ) -> SdpaResult<Tensor> {
-    // Simple materialized SDPA: two batched GEMMs + softmax.
-    // For LTX-2.3: [32, 768, 128] @ [32, 128, 768] → [32, 768, 768] (75MB FP32).
+    // Materialized SDPA: two batched BF16 GEMMs (FP32 acc) + FP32 softmax.
+    // QK^T logits are upcast to FP32 for softmax to match Flash Attention precision
+    // (avoids BF16 quantization of attention scores → spiky weights → outliers).
+    // VRAM: BH*Q*K*4 bytes for the FP32 logits (temporary).
+    //   SDXL level2: 20*1024*1024*4 = 80MB, level1: 10*4096*4096*4 = 672MB
+    //   LTX-2.3:     32*768*768*4   = 72MB
     let device = q.device().clone();
     let bh = b * h;
     let t0 = std::time::Instant::now();
@@ -314,47 +318,56 @@ fn forward_bf16_fallback(
     let t_transpose = t0.elapsed().as_millis() - t_reshape;
 
     // QK^T → [BH, Q, K] via batched cuBLASLt (FP32 accumulation, tensor cores)
+    // Output is BF16 (cublasLt constraint), but we upcast to FP32 immediately
+    // for scaling + softmax to avoid BF16 quantization of attention logits.
+    // Flash Attention keeps scores in FP32 SRAM; we emulate this by upcasting.
     let logits_shape = Shape::from_dims(&[bh, q_len, k_len]);
-    let mut logits = Tensor::zeros_dtype(logits_shape, DType::BF16, device.clone())?;
-    bmm_bf16_fp32acc_out(&q_flat, &k_t, &mut logits, false, false)?;
+    let mut logits_bf16 = Tensor::zeros_dtype(logits_shape, DType::BF16, device.clone())?;
+    bmm_bf16_fp32acc_out(&q_flat, &k_t, &mut logits_bf16, false, false)?;
     let t_qk = t0.elapsed().as_millis() - t_reshape - t_transpose;
     drop(k_t);
 
-    // Scale
-    let mut scores = logits.mul_scalar(scale)?;
-    let t_scale = t0.elapsed().as_millis() - t_reshape - t_transpose - t_qk;
-    drop(logits);
+    // Upcast to FP32 for scale + softmax (matches Flash Attention precision)
+    let logits_f32 = logits_bf16.to_dtype(DType::F32)?;
+    drop(logits_bf16);
 
-    // Mask (if present)
+    // Scale in FP32
+    let mut scores = logits_f32.mul_scalar(scale)?;
+    let t_scale = t0.elapsed().as_millis() - t_reshape - t_transpose - t_qk;
+
+    // Mask (if present) — apply in FP32
     if let Some(mask_raw) = mask {
-        let mask_bf16 = if mask_raw.dtype() == DType::BF16 {
+        let target_dims = [b, h, q_len, k_len];
+        let mask_f32 = if mask_raw.dtype() == DType::F32 {
             mask_raw.clone_result()?
         } else {
-            mask_raw.to_dtype(DType::BF16)?
+            mask_raw.to_dtype(DType::F32)?
         };
-        let target_dims = [b, h, q_len, k_len];
-        let mask_prepared = if mask_bf16.shape().dims() == target_dims {
-            mask_bf16
+        let mask_prepared = if mask_f32.shape().dims() == target_dims {
+            mask_f32
         } else {
-            record_layout_fix("sdpa.mask_broadcast", mask_bf16.shape());
-            mask_bf16.broadcast_to(&Shape::from_dims(&target_dims))?
+            record_layout_fix("sdpa.mask_broadcast", mask_f32.shape());
+            mask_f32.broadcast_to(&Shape::from_dims(&target_dims))?
         };
         let mask_view = mask_prepared.reshape(&[bh, q_len, k_len])?;
-        let penalty = mask_view.neg()?.add_scalar(1.0)?.mul_scalar(NEG_INF)?;
+        let ones = full_like(&mask_view, 1.0)?;
+        let complement = ones.sub(&mask_view)?;
+        let penalty = complement.mul_scalar(NEG_INF)?;
         scores = scores.add(&penalty)?;
     }
 
     let t_pre_softmax = t0.elapsed().as_millis();
 
-    // Fused softmax over last dim — single kernel instead of 5 (max, sub, exp, sum, div)
-    let attn_bf16 = if scores.dtype() == DType::BF16 {
-        crate::bf16_ops::softmax_last_dim_bf16(&scores)?
+    // Softmax in FP32, then convert to BF16 for V multiplication.
+    // scores is F32 here, so softmax computes entirely in F32.
+    let attn = scores.softmax(-1)?;
+    drop(scores);
+    let attn_bf16 = if attn.dtype() != DType::BF16 {
+        attn.to_dtype(DType::BF16)?
     } else {
-        let attn = scores.softmax(-1)?;
-        if attn.dtype() == DType::BF16 { attn } else { attn.to_dtype(DType::BF16)? }
+        attn
     };
     let t_softmax = t0.elapsed().as_millis() - t_pre_softmax;
-    drop(scores);
 
     let t_pre_pv = t0.elapsed().as_millis();
 

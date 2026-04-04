@@ -192,7 +192,7 @@ fn arena_capacity_bytes() -> u64 {
         {
             return mb.saturating_mul(1024 * 1024);
         }
-        1024 * 1024 * 1024 // default to 1 GiB arena
+        1536 * 1024 * 1024 // default to 1.5 GiB arena
     })
 }
 
@@ -242,7 +242,7 @@ pub fn arena_alloc(
             "flame_arena_alloc",
         )
         .map_err(|e| {
-            eprintln!(
+            log::debug!(
                 "arena_alloc failed: bytes={} align={} error={:?}",
                 bytes, align, e
             );

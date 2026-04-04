@@ -26,7 +26,7 @@ pub fn zeros_bf16(shape: Shape, device: Arc<CudaDevice>) -> Result<Tensor> {
         }
     }
     let mut buf =
-        unsafe { device.alloc::<u16>(n) }.map_err(|e| Error::Cuda(format!("alloc bf16: {}", e)))?;
+        unsafe { device.alloc::<u16>(n) }.map_err(|e| Error::Cuda(format!("alloc bf16: {:?}", e)))?;
     device.memset_zeros(&mut buf)?;
     Ok(Tensor {
         storage: TensorStorage::BF16 {
@@ -84,7 +84,7 @@ pub fn uniform_bf16(
     }
     // Output buffer (BF16)
     let data = unsafe { device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc uniform bf16: {}", e)))?;
+        .map_err(|e| Error::Cuda(format!("alloc uniform bf16: {:?}", e)))?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 {
             data: data.into(),
@@ -107,10 +107,10 @@ pub fn uniform_bf16(
         let mut opts = CompileOptions::default();
         opts.include_paths.push(include_dir.into());
         let ptx = compile_ptx_with_opts(CUDA_UNIFORM_BF16, opts)
-            .map_err(|e| Error::Cuda(format!("nvrtc uniform_bf16: {}", e)))?;
+            .map_err(|e| Error::Cuda(format!("nvrtc uniform_bf16: {:?}", e)))?;
         device
             .load_ptx(ptx, "uniform_bf16_kernel", &["uniform_bf16_kernel"])
-            .map_err(|e| Error::Cuda(format!("load uniform_bf16: {}", e)))?;
+            .map_err(|e| Error::Cuda(format!("load uniform_bf16: {:?}", e)))?;
     }
     let f = device
         .get_func("uniform_bf16_kernel", "uniform_bf16_kernel")

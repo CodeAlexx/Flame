@@ -34,7 +34,7 @@ pub fn clamp_bf16(x: &Tensor, lo: f32, hi: f32) -> Result<Tensor> {
     debug_assert_eq!(x.dtype(), DType::BF16);
     let n = x.shape().elem_count();
     let data = unsafe { x.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc clamp bf16: {}", e)))?;
+        .map_err(|e| Error::Cuda(format!("alloc clamp bf16: {:?}", e)))?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 {
             data: data.into(),
@@ -55,10 +55,10 @@ pub fn clamp_bf16(x: &Tensor, lo: f32, hi: f32) -> Result<Tensor> {
         let mut opts = CompileOptions::default();
         opts.include_paths.push(include_dir.into());
         let ptx = compile_ptx_with_opts(CUDA_CLAMP_BF16, opts)
-            .map_err(|e| Error::Cuda(format!("nvrtc clamp_bf16: {}", e)))?;
+            .map_err(|e| Error::Cuda(format!("nvrtc clamp_bf16: {:?}", e)))?;
         x.device
             .load_ptx(ptx, "clamp_bf16_kernel", &["clamp_bf16_kernel"])
-            .map_err(|e| Error::Cuda(format!("load clamp_bf16: {}", e)))?;
+            .map_err(|e| Error::Cuda(format!("load clamp_bf16: {:?}", e)))?;
     }
     let f = x
         .device

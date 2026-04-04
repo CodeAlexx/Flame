@@ -385,28 +385,6 @@ fn finalize_group_norm(
         || weight.map(|w| w.requires_grad).unwrap_or(false)
         || bias.map(|b| b.requires_grad).unwrap_or(false);
 
-    // Debug: Print mean/var stats for large inputs
-    if num_groups == 32 && input.shape().dims().len() == 4 && input.shape().dims()[2] == 256 {
-        let mean_vec = input
-            .device
-            .dtoh_sync_copy(&artifacts.mean_data)
-            .unwrap_or_default();
-        let var_vec = input
-            .device
-            .dtoh_sync_copy(&artifacts.var_data)
-            .unwrap_or_default();
-        if !mean_vec.is_empty() {
-            println!(
-                "GroupNorm Debug: mean[0..10]={:?}",
-                &mean_vec[0..10.min(mean_vec.len())]
-            );
-            println!(
-                "GroupNorm Debug: var[0..10]={:?}",
-                &var_vec[0..10.min(var_vec.len())]
-            );
-        }
-    }
-
     let mut output = artifacts.output;
 
     if needs_grad {
@@ -716,7 +694,6 @@ impl GroupNorm {
         dtype: DType,
         device: Arc<CudaDevice>,
     ) -> Result<Self> {
-        println!("GroupNorm::new num_channels={}", num_channels);
         if num_channels % num_groups != 0 {
             return Err(Error::InvalidOperation(format!(
                 "num_channels ({}) must be divisible by num_groups ({})",
@@ -733,18 +710,6 @@ impl GroupNorm {
         } else {
             None
         };
-        if let Some(w) = &weight {
-            println!(
-                "GroupNorm::new num_channels={} weight_id={:?}",
-                num_channels,
-                w.id()
-            );
-        } else {
-            println!(
-                "GroupNorm::new num_channels={} weight_id=None",
-                num_channels
-            );
-        }
         let bias = if affine {
             Some(Tensor::zeros_dtype(
                 Shape::from_dims(&[num_channels]),

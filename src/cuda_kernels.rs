@@ -2896,7 +2896,7 @@ pub fn gate_add_bf16_inplace(dst: &Tensor, gate: &Tensor) -> Result<()> {
             ),
         )
     }
-    .map_err(|e| Error::Cuda(format!("gate_add_bf16_inplace launch failed: {}", e)))?;
+    .map_err(|e| Error::Cuda(format!("gate_add_bf16_inplace launch failed: {:?}", e)))?;
 
     Ok(())
 }

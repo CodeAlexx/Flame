@@ -40,9 +40,9 @@ fn ensure(dev: &Arc<CudaDevice>, name: &'static str, code: &'static str) -> Resu
     opts.use_fast_math = Some(false);
     opts.fmad = Some(true);
     let ptx =
-        compile_ptx_with_opts(code, opts).map_err(|e| Error::Cuda(format!("nvrtc: {}", e)))?;
+        compile_ptx_with_opts(code, opts).map_err(|e| Error::Cuda(format!("nvrtc: {:?}", e)))?;
     dev.load_ptx(ptx, name, &[name])
-        .map_err(|e| Error::Cuda(format!("load_ptx {}: {}", name, e)))?;
+        .map_err(|e| Error::Cuda(format!("load_ptx {}: {:?}", name, e)))?;
     Ok(())
 }
 

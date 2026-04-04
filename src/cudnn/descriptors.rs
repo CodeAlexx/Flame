@@ -78,6 +78,7 @@ extern "C" {
     ) -> c_int;
 
     fn cudnnSetConvolutionMathType(desc: *mut c_void, math_type: c_int) -> c_int;
+    fn cudnnSetConvolutionGroupCount(desc: *mut c_void, group_count: c_int) -> c_int;
 }
 
 /// Convert FLAME DType to cuDNN data type
@@ -309,11 +310,52 @@ impl ConvolutionDescriptor {
         Ok(())
     }
 
+    /// Set 2D convolution with asymmetric padding/stride/dilation.
+    pub fn set_2d_asymmetric(
+        &self,
+        padding: (usize, usize),
+        stride: (usize, usize),
+        dilation: (usize, usize),
+        compute_dtype: DType,
+    ) -> Result<()> {
+        let status = unsafe {
+            cudnnSetConvolution2dDescriptor(
+                self.desc,
+                padding.0 as c_int,
+                padding.1 as c_int,
+                stride.0 as c_int,
+                stride.1 as c_int,
+                dilation.0 as c_int,
+                dilation.1 as c_int,
+                CUDNN_CROSS_CORRELATION,
+                dtype_to_cudnn(compute_dtype),
+            )
+        };
+        if status != 0 {
+            return Err(Error::CudaError(format!(
+                "Failed to set asymmetric convolution descriptor: {}",
+                status
+            )));
+        }
+        Ok(())
+    }
+
     pub fn set_math_type(&self, math_type: c_int) -> Result<()> {
         let status = unsafe { cudnnSetConvolutionMathType(self.desc, math_type) };
         if status != 0 {
             return Err(Error::CudaError(format!(
                 "Failed to set convolution math type: {}",
+                status
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn set_group_count(&self, groups: usize) -> Result<()> {
+        let status = unsafe { cudnnSetConvolutionGroupCount(self.desc, groups as c_int) };
+        if status != 0 {
+            return Err(Error::CudaError(format!(
+                "Failed to set convolution group count: {}",
                 status
             )));
         }

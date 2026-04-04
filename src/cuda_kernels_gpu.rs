@@ -555,7 +555,7 @@ extern "C" __global__ void sum_all_bf16_kernel(
         // Load the compiled PTX
         device
             .load_ptx(ptx, module_name_static, &[kernel_name_static])
-            .map_err(|e| Error::Cuda(format!("Failed to load kernel '{}': {}", kernel_name, e)))?;
+            .map_err(|e| Error::Cuda(format!("Failed to load kernel '{}': {:?}", kernel_name, e)))?;
 
         Ok(())
     }

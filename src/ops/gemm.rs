@@ -4,11 +4,49 @@ use crate::tensor::TensorId;
 use crate::tensor_storage::TensorStorage;
 use crate::{DType, Error, Tensor};
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
+use cudarc::driver::CudaDevice;
 use std::convert::TryFrom;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(not(feature = "bf16_u16"))]
 use super::cast;
+
+/// Cached cuBLAS handle with TF32 tensor core math enabled.
+/// Creating a CudaBlas handle calls `cublasCreate` which is expensive (~ms),
+/// so we cache one globally and reuse it under a lock.
+/// CudaBlas is Send+Sync so a global Mutex is safe.
+static CUBLAS_CACHE: OnceLock<std::sync::Mutex<Option<CudaBlas>>> = OnceLock::new();
+
+fn create_cublas_with_tf32(device: &Arc<CudaDevice>) -> Result<CudaBlas, Error> {
+    let blas = CudaBlas::new(device.clone()).map_err(|_| Error::CuBlas)?;
+    // Enable TF32 tensor core math for F32 GEMMs on Ampere+ (sm_80+).
+    // ~8x speedup for F32 matmuls with negligible precision loss.
+    unsafe {
+        let raw = *blas.handle();
+        let status = cudarc::cublas::sys::lib().cublasSetMathMode(
+            raw,
+            cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+        );
+        if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            log::warn!("cublasSetMathMode(TF32) failed with status {:?}", status);
+        }
+    }
+    Ok(blas)
+}
+
+/// Run a closure with a cached cuBLAS handle, creating one on first use.
+fn with_cached_cublas<F, R>(device: &Arc<CudaDevice>, f: F) -> Result<R, Error>
+where
+    F: FnOnce(&CudaBlas) -> Result<R, Error>,
+{
+    let mutex = CUBLAS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = mutex.lock().map_err(|_| Error::CuBlas)?;
+    if guard.is_none() {
+        *guard = Some(create_cublas_with_tf32(device)?);
+    }
+    let blas = guard.as_ref().unwrap();
+    f(blas)
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ComputeType {
@@ -91,7 +129,6 @@ fn gemm_f32(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, Error> {
         return Tensor::zeros_dtype(Shape::from_dims(&[m, n]), lhs.dtype(), lhs.device.clone());
     }
 
-    let blas = CudaBlas::new(lhs.device.clone()).map_err(|_| Error::CuBlas)?;
     let (m_i32, n_i32, k_i32) = (
         i32::try_from(m).map_err(|_| Error::InvalidInput("matrix dimension too large".into()))?,
         i32::try_from(n).map_err(|_| Error::InvalidInput("matrix dimension too large".into()))?,
@@ -124,9 +161,12 @@ fn gemm_f32(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, Error> {
     let mut out = alloc_aligned_f32(&lhs.device, m * n)?;
     let a = lhs.storage.try_as_slice_f32()?;
     let b = rhs.storage.try_as_slice_f32()?;
-    unsafe {
-        blas.gemm(cfg, b, a, &mut out).map_err(|_| Error::CuBlas)?;
-    }
+    with_cached_cublas(&lhs.device, |blas| {
+        unsafe {
+            blas.gemm(cfg, b, a, &mut out).map_err(|_| Error::CuBlas)?;
+        }
+        Ok(())
+    })?;
 
     Ok(Tensor {
         storage: TensorStorage::F32 {
@@ -263,7 +303,6 @@ pub(crate) fn launch_gemm_strided_batched(
         return Ok(());
     }
 
-    let blas = CudaBlas::new(lhs.device.clone()).map_err(|_| Error::CuBlas)?;
     let (m_i32, n_i32, k_i32) = (
         i32::try_from(m).map_err(|_| Error::InvalidInput("matrix dimension too large".into()))?,
         i32::try_from(n).map_err(|_| Error::InvalidInput("matrix dimension too large".into()))?,
@@ -295,10 +334,11 @@ pub(crate) fn launch_gemm_strided_batched(
     let b = lhs.storage.try_as_slice_f32()?;
     let c = out.storage_mut().try_as_mut_slice_f32()?;
 
-    unsafe {
-        blas.gemm_strided_batched(cfg, a, b, c)
-            .map_err(|_| Error::CuBlas)?;
-    }
-
-    Ok(())
+    with_cached_cublas(&lhs.device, |blas| {
+        unsafe {
+            blas.gemm_strided_batched(cfg, a, b, c)
+                .map_err(|_| Error::CuBlas)?;
+        }
+        Ok(())
+    })
 }

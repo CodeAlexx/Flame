@@ -255,7 +255,7 @@ extern "C" __global__ void im2col_3x3_optimized(
 
         device
             .load_ptx(ptx, "im2col_3x3", &["im2col_3x3_optimized"])
-            .map_err(|e| Error::Cuda(format!("Failed to load kernel: {}", e)))?;
+            .map_err(|e| Error::Cuda(format!("Failed to load kernel: {:?}", e)))?;
 
         let kernel = device
             .get_func("im2col_3x3", "im2col_3x3_optimized")

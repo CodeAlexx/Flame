@@ -239,7 +239,7 @@ extern "C" __global__ void conv2d_3x3_s1_p1(
 
         device
             .load_ptx(ptx, "conv2d_fast", &[kernel_name])
-            .map_err(|e| Error::Cuda(format!("Failed to load kernel: {}", e)))?;
+            .map_err(|e| Error::Cuda(format!("Failed to load kernel: {:?}", e)))?;
 
         // Launch configuration
         let threads_per_block = 256;

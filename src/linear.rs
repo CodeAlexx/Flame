@@ -22,6 +22,9 @@ pub fn linear(in_features: usize, out_features: usize, device: &Arc<CudaDevice>)
 pub struct Linear {
     pub weight: Tensor,
     pub bias: Option<Tensor>,
+    /// Cached transposed weight [in_features, out_features] for inference.
+    /// Populated on `copy_weight_from` / `refresh_weight_t_cache`.
+    weight_t_cache: Option<Tensor>,
     in_features: usize,
     out_features: usize,
 }
@@ -67,6 +70,7 @@ impl Linear {
         Ok(Self {
             weight,
             bias,
+            weight_t_cache: None,
             in_features,
             out_features,
         })
@@ -131,11 +135,29 @@ impl Linear {
         Ok(tensor)
     }
 
+    /// Rebuild the cached transposed weight from `self.weight`.
+    /// Called after weight changes (init, copy_weight_from, etc.).
+    fn refresh_weight_t_cache(&mut self) {
+        if self.weight.dtype() == DType::BF16 && self.weight.storage_dtype() == DType::BF16 {
+            let weight_2d = match self.weight.reshape(&[self.out_features, self.in_features]) {
+                Ok(w) => w,
+                Err(_) => { self.weight_t_cache = None; return; }
+            };
+            match crate::bf16_elementwise::transpose2d_bf16(&weight_2d) {
+                Ok(wt) => { self.weight_t_cache = Some(wt.requires_grad_(false)); }
+                Err(_) => { self.weight_t_cache = None; }
+            }
+        } else {
+            self.weight_t_cache = None;
+        }
+    }
+
     /// Copy the weight tensor from an external source (shape/dtype checked).
     pub fn copy_weight_from(&mut self, source: &Tensor) -> Result<()> {
         let requires_grad = self.weight.requires_grad();
         let tensor = Self::convert_param(&self.weight, source, "Linear::copy_weight_from")?;
         self.weight = tensor.requires_grad_(requires_grad);
+        self.refresh_weight_t_cache();
         Ok(())
     }
 
@@ -247,10 +269,14 @@ impl Linear {
 
             let input_2d = input.reshape(&[batch_size, self.in_features])?;
             trap_is_bf16("Linear::forward weight", &self.weight)?;
-            let weight_2d = self
-                .weight
-                .reshape(&[self.out_features, self.in_features])?;
-            let weight_t = crate::bf16_elementwise::transpose2d_bf16(&weight_2d)?;
+            let weight_t = if let Some(ref cached) = self.weight_t_cache {
+                cached.clone()
+            } else {
+                let weight_2d = self
+                    .weight
+                    .reshape(&[self.out_features, self.in_features])?;
+                crate::bf16_elementwise::transpose2d_bf16(&weight_2d)?
+            };
 
             let mut output = if input_2d.storage_dtype() == DType::BF16
                 && weight_t.storage_dtype() == DType::BF16
@@ -359,9 +385,6 @@ impl Linear {
         input_shape: &[usize],
         scratch: &ArenaScratch,
     ) -> Result<Option<Tensor>> {
-        // TEMPORARY FIX: Disable arena fast path due to flame_arena_alloc invalid argument error
-        return Ok(None);
-
         if input.dtype() != DType::BF16 || input.storage_dtype() != DType::BF16 {
             return Ok(None);
         }
@@ -489,8 +512,14 @@ impl Linear {
                 "Linear::forward.output",
             )?;
 
-            let weight_t = crate::bf16_elementwise::transpose2d_bf16(&self.weight)?;
-            let vw = tensor_as_view_bf16(&weight_t, "Linear::forward.weight_t")?;
+            let weight_t_owned;
+            let weight_t_ref = if let Some(ref cached) = self.weight_t_cache {
+                cached
+            } else {
+                weight_t_owned = crate::bf16_elementwise::transpose2d_bf16(&self.weight)?;
+                &weight_t_owned
+            };
+            let vw = tensor_as_view_bf16(weight_t_ref, "Linear::forward.weight_t")?;
             let vb = self
                 .bias
                 .as_ref()

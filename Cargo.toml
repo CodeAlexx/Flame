@@ -33,7 +33,7 @@ numpy = { version = "0.22", optional = true }
 
 [features]
 # CUDA is required for all default builds; disable at your own risk.
-default = ["cuda", "bf16_u16"]
+default = ["cuda", "bf16_u16", "cudnn"]
 legacy_examples = []
 nvrtc = []
 flash_attn = []   # Opt-in only (not enabled by default)

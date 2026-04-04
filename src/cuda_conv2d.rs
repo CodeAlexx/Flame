@@ -68,7 +68,7 @@ impl CudaConv2d {
                     "im2col_optimized_kernel",
                 ],
             )
-            .map_err(|e| Error::Cuda(format!("Failed to load Conv2D kernels: {}", e)))?;
+            .map_err(|e| Error::Cuda(format!("Failed to load Conv2D kernels: {:?}", e)))?;
         Ok(())
     }
 

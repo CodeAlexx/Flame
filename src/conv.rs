@@ -57,10 +57,6 @@ impl Conv2d {
             padding: (padding, padding),
             groups: 1,
         };
-        eprintln!(
-            "Conv2d::new: in={} out={} k={} s={} p={}",
-            in_channels, out_channels, kernel_size, stride, padding
-        );
         Self::from_config(config, device)
     }
 
@@ -307,6 +303,9 @@ impl Conv2d {
     }
 
     /// Forward pass of Conv2d
+    ///
+    /// Input: NCHW BF16. Output: NCHW BF16.
+    /// Tries cuDNN first (if feature enabled), falls back to custom CUDA kernel.
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let dims = input.shape().dims();
         if dims.len() != 4 {
@@ -315,21 +314,36 @@ impl Conv2d {
             ));
         }
         if input.dtype() != DType::BF16 || input.storage_dtype() != DType::BF16 {
-            // println!("Conv2d::forward input not BF16: {:?} {:?}", input.dtype(), input.storage_dtype());
             return Err(Error::InvalidInput(
                 "Conv2d::forward expects BF16 inputs".into(),
             ));
         }
 
+        // Try cuDNN first — native BF16, no format conversion needed
+        #[cfg(feature = "cudnn")]
+        {
+            if std::env::var("FLAME_NO_CUDNN_CONV").is_err() {
+                match crate::cudnn::cudnn_conv2d_bf16(
+                    input,
+                    &self.weight, // OIHW format, cuDNN native
+                    self.bias_bf16.as_ref(),
+                    (self.config.stride.0, self.config.stride.1),
+                    (self.config.padding.0, self.config.padding.1),
+                    self.config.groups,
+                ) {
+                    Ok(output) => return Ok(output),
+                    Err(e) => {
+                        log::warn!("cuDNN conv2d failed, falling back to custom kernel: {:?}", e);
+                    }
+                }
+            }
+        }
+
+        // Fallback: custom NHWC BF16 kernel (requires format permutes)
         let x_nhwc = input.permute(&[0, 2, 3, 1])?;
 
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
         {
-            println!(
-                "Conv2d::forward check: x={:?} w={:?}",
-                x_nhwc.dtype(),
-                self.weight.dtype()
-            );
             if x_nhwc.dtype() == DType::BF16
                 && self.weight.dtype() == DType::BF16
                 && std::env::var("FORCE_F32_CONV").is_err()
@@ -345,46 +359,49 @@ impl Conv2d {
                     crate::cuda_ops_bf16::ConvActivation::None,
                 ) {
                     Ok(y_nhwc) => {
-                        log::info!("Conv2d::forward y_nhwc shape {:?}", y_nhwc.shape());
                         return Ok(y_nhwc.permute(&[0, 3, 1, 2])?);
                     }
                     Err(err) => {
-                        let msg = format!(
-                            "[conv2d-bf16-tripwire] BF16 kernel failed: {err:?} \
-                             shape={:?} weight={:?} stride={:?} pad={:?} groups={}",
+                        return Err(Error::Cuda(format!(
+                            "conv2d_bf16 failed: {err:?} shape={:?} weight={:?}",
                             x_nhwc.shape().dims(),
                             self.weight.shape().dims(),
-                            self.config.stride,
-                            self.config.padding,
-                            self.config.groups,
-                        );
-                        println!("{}", msg);
-                        log::error!("{}", msg);
-                        panic!("{}", msg);
+                        )));
                     }
                 }
-            } else {
-                if std::env::var("FORCE_F32_CONV").is_err() {
-                    let msg = format!(
-                        "[conv2d-bf16-tripwire] BF16 kernel skipped (dtype mismatch): \
-                         x_dtype={:?} w_dtype={:?} \
-                         shape={:?} weight={:?} stride={:?} pad={:?} groups={}",
-                        x_nhwc.dtype(),
-                        self.weight.dtype(),
-                        x_nhwc.shape().dims(),
-                        self.weight.shape().dims(),
-                        self.config.stride,
-                        self.config.padding,
-                        self.config.groups,
-                    );
-                    println!("{}", msg);
-                    log::error!("{}", msg);
-                    panic!("{}", msg);
-                }
-                // Fallback to F32 implementation
-                self.forward_fallback(&x_nhwc)
+            }
+            // Fallback to F32
+            self.forward_fallback(&x_nhwc)
+        }
+    }
+
+    /// Forward pass for NHWC input, returning NHWC output (no format permutes).
+    /// Use this when the caller already has NHWC data to avoid 2 permute ops per conv.
+    pub fn forward_nhwc(&self, input: &Tensor) -> Result<Tensor> {
+        if input.dtype() != DType::BF16 || input.storage_dtype() != DType::BF16 {
+            return Err(Error::InvalidInput(
+                "Conv2d::forward_nhwc expects BF16 inputs".into(),
+            ));
+        }
+
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        {
+            if std::env::var("FORCE_F32_CONV").is_err() {
+                return crate::cuda_ops_bf16::conv2d_bf16(
+                    input,
+                    &self.weight_hwio_bf16,
+                    self.bias_bf16.as_ref(),
+                    (self.config.stride.0 as i32, self.config.stride.1 as i32),
+                    (self.config.padding.0 as i32, self.config.padding.1 as i32),
+                    (1, 1),
+                    self.config.groups as i32,
+                    crate::cuda_ops_bf16::ConvActivation::None,
+                );
             }
         }
+        // Fallback: use the NCHW path
+        let nchw = input.permute(&[0, 3, 1, 2])?;
+        self.forward(&nchw)?.permute(&[0, 2, 3, 1])
     }
 
     fn forward_fallback(&self, x_nhwc: &Tensor) -> Result<Tensor> {

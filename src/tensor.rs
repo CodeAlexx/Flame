@@ -228,7 +228,7 @@ extern "C" __global__ void masked_fill_kernel(
                 {
                     use cudarc::driver::DevicePtr;
                     let mut bf = unsafe { self.device.alloc::<u16>(n) }
-                        .map_err(|e| Error::Cuda(format!("alloc masked_fill bf16: {}", e)))?;
+                        .map_err(|e| Error::Cuda(format!("alloc masked_fill bf16: {:?}", e)))?;
                     crate::bf16_convert::f32_to_bf16_u16(
                         self.device.clone(),
                         &output_data,
@@ -508,7 +508,7 @@ extern "C" __global__ void masked_fill_kernel(
         let src_slice = src.as_slice_f32("copy_f32_from.src")?;
         device
             .dtod_copy(src_slice, dst_slice)
-            .map_err(|e| Error::Cuda(format!("copy_f32_from failed: {e}")))
+            .map_err(|e| Error::Cuda(format!("copy_f32_from failed: {e:?}")))
     }
 
     /// Returns the mutable BF16 device pointer if BF16(u16) storage is enabled.
@@ -589,7 +589,7 @@ extern "C" __global__ void masked_fill_kernel(
         let src_view = src_slice.slice(src_offset_elems..src_end);
         device
             .dtod_copy(&src_view, &mut dst_view)
-            .map_err(|e| Error::Cuda(format!("bf16 region copy failed: {e}")))?;
+            .map_err(|e| Error::Cuda(format!("bf16 region copy failed: {e:?}")))?;
         Ok(())
     }
 
@@ -654,7 +654,7 @@ extern "C" __global__ void masked_fill_kernel(
                 {
                     use cudarc::driver::DevicePtr;
                     let mut bf_data = unsafe { self.device.alloc::<u16>(numel) }
-                        .map_err(|e| Error::Cuda(format!("alloc bf16 cast: {}", e)))?;
+                        .map_err(|e| Error::Cuda(format!("alloc bf16 cast: {:?}", e)))?;
                     crate::bf16_convert::f32_to_bf16_u16(
                         self.device.clone(),
                         &f32_data,
@@ -857,7 +857,7 @@ extern "C" __global__ void masked_fill_kernel(
                 {
                     use cudarc::driver::DevicePtr;
                     let mut bf = unsafe { device.alloc::<u16>(numel) }
-                        .map_err(|e| Error::Cuda(format!("alloc from_vec bf16: {}", e)))?;
+                        .map_err(|e| Error::Cuda(format!("alloc from_vec bf16: {:?}", e)))?;
                     crate::bf16_convert::f32_to_bf16_u16(
                         device.clone(),
                         &cuda_data,
@@ -985,7 +985,7 @@ extern "C" __global__ void masked_fill_kernel(
         {
             use cudarc::driver::DevicePtr;
             let mut bf = unsafe { device.alloc::<u16>(numel) }
-                .map_err(|e| Error::Cuda(format!("alloc from_bf16_slice: {}", e)))?;
+                .map_err(|e| Error::Cuda(format!("alloc from_bf16_slice: {:?}", e)))?;
             crate::bf16_convert::f32_to_bf16_u16(device.clone(), &data, *bf.device_ptr(), numel)?;
             Ok(Self {
                 storage: TensorStorage::BF16 {
@@ -1359,7 +1359,7 @@ extern "C" __global__ void masked_fill_kernel(
                         let mut dst_view = dst.slice_mut(start..end);
                         self.device
                             .dtod_copy(src, &mut dst_view)
-                            .map_err(|e| Error::Cuda(format!("repeat copy failed: {e}")))?;
+                            .map_err(|e| Error::Cuda(format!("repeat copy failed: {e:?}")))?;
                     }
                     repeated.requires_grad = self.requires_grad;
                     Ok(repeated)
@@ -1385,7 +1385,7 @@ extern "C" __global__ void masked_fill_kernel(
                             let mut dst_view = dst.slice_mut(start..end);
                             self.device
                                 .dtod_copy(src, &mut dst_view)
-                                .map_err(|e| Error::Cuda(format!("repeat copy failed: {e}")))?;
+                                .map_err(|e| Error::Cuda(format!("repeat copy failed: {e:?}")))?;
                         }
                         repeated.requires_grad = self.requires_grad;
                         Ok(repeated)
@@ -1516,7 +1516,7 @@ extern "C" __global__ void f32_to_bool_kernel(
                 .map_err(|e| Error::Cuda(format!("nvrtc f32_to_bool_kernel: {:?}", e)))?;
             device
                 .load_ptx(ptx, MODULE, &[KERNEL])
-                .map_err(|e| Error::Cuda(format!("load f32_to_bool_kernel: {}", e)))?;
+                .map_err(|e| Error::Cuda(format!("load f32_to_bool_kernel: {:?}", e)))?;
         }
 
         let func = device
@@ -1525,7 +1525,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         unsafe {
             func.launch(cfg, (buffer, numel as i32))
-                .map_err(|e| Error::Cuda(format!("launch f32_to_bool_kernel failed: {}", e)))?
+                .map_err(|e| Error::Cuda(format!("launch f32_to_bool_kernel failed: {:?}", e)))?
         };
         Ok(())
     }
@@ -3142,7 +3142,7 @@ impl Tensor {
 
                 // Using a staging buffer is safest and easiest with current APIs
                 let mut staging = unsafe { device.alloc::<u16>(data.len()) }
-                    .map_err(|e| Error::Cuda(format!("alloc staging: {}", e)))?;
+                    .map_err(|e| Error::Cuda(format!("alloc staging: {:?}", e)))?;
                 device
                     .htod_sync_copy_into(data, &mut staging)
                     .map_err(|_| Error::CudaDriver)?;
@@ -3252,7 +3252,7 @@ impl Tensor {
                 TensorStorage::BF16Arena { ptr, .. } => {
                     // Copy via staging
                     let mut staging = unsafe { device_ref.alloc::<u16>(len) }
-                        .map_err(|e| Error::Cuda(format!("alloc staging: {}", e)))?;
+                        .map_err(|e| Error::Cuda(format!("alloc staging: {:?}", e)))?;
                     device_ref
                         .htod_sync_copy_into(chunk_view, &mut staging)
                         .map_err(|_| Error::CudaDriver)?;

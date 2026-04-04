@@ -252,10 +252,10 @@ fn ensure_im2col_module(device: &Arc<CudaDevice>) -> Result<()> {
     let mut opts = CompileOptions::default();
     opts.include_paths.push(format!("{cuda_home}/include"));
     let ptx = compile_ptx_with_opts(IM2COL_PTX, opts)
-        .map_err(|e| Error::KernelError(format!("im2col compile failed: {e}")))?;
+        .map_err(|e| Error::KernelError(format!("im2col compile failed: {e:?}")))?;
 
     if let Err(e) = device.load_ptx(ptx, "flame_conv_im2col", &["im2col_f32", "im2col_bf16"]) {
-        let err_msg = e.to_string();
+        let err_msg = format!("{e:?}");
         if !err_msg.contains("already loaded") {
             return Err(Error::KernelError(format!("load_ptx im2col: {err_msg}")));
         }
@@ -277,14 +277,14 @@ fn ensure_nhwc2nchw_module(device: &Arc<CudaDevice>) -> Result<()> {
     let mut opts = CompileOptions::default();
     opts.include_paths.push(format!("{cuda_home}/include"));
     let ptx = compile_ptx_with_opts(NHWC_TO_NCHW_PTX, opts)
-        .map_err(|e| Error::KernelError(format!("nhwc->nchw compile failed: {e}")))?;
+        .map_err(|e| Error::KernelError(format!("nhwc->nchw compile failed: {e:?}")))?;
 
     if let Err(e) = device.load_ptx(
         ptx,
         "flame_conv_nhwc2nchw",
         &["nhwc_to_nchw_f32", "nhwc_to_nchw_bf16"],
     ) {
-        let msg = e.to_string();
+        let msg = format!("{e:?}");
         if !msg.contains("already loaded") {
             return Err(Error::KernelError(format!("load_ptx nhwc->nchw: {msg}")));
         }
@@ -306,14 +306,14 @@ fn ensure_transpose_module(device: &Arc<CudaDevice>) -> Result<()> {
     let mut opts = CompileOptions::default();
     opts.include_paths.push(format!("{cuda_home}/include"));
     let ptx = compile_ptx_with_opts(TRANSPOSE_PTX, opts)
-        .map_err(|e| Error::KernelError(format!("transpose compile failed: {e}")))?;
+        .map_err(|e| Error::KernelError(format!("transpose compile failed: {e:?}")))?;
 
     if let Err(e) = device.load_ptx(
         ptx,
         "flame_conv_transpose",
         &["transpose_f32", "transpose_bf16"],
     ) {
-        let msg = e.to_string();
+        let msg = format!("{e:?}");
         if !msg.contains("already loaded") {
             return Err(Error::KernelError(format!("load_ptx transpose: {msg}")));
         }
@@ -335,14 +335,14 @@ fn ensure_bias_add_module(device: &Arc<CudaDevice>) -> Result<()> {
     let mut opts = CompileOptions::default();
     opts.include_paths.push(format!("{cuda_home}/include"));
     let ptx = compile_ptx_with_opts(BIAS_ADD_PTX, opts)
-        .map_err(|e| Error::KernelError(format!("bias add compile failed: {e}")))?;
+        .map_err(|e| Error::KernelError(format!("bias add compile failed: {e:?}")))?;
 
     if let Err(e) = device.load_ptx(
         ptx,
         "flame_conv_bias",
         &["bias_add_nchw_f32", "bias_add_nchw_bf16"],
     ) {
-        let msg = e.to_string();
+        let msg = format!("{e:?}");
         if !msg.contains("already loaded") {
             return Err(Error::KernelError(format!("load_ptx bias add: {msg}")));
         }
@@ -660,7 +660,7 @@ fn bias_add_nchw_inplace(output: &mut Tensor, bias: &Tensor) -> Result<()> {
             let out_slice = tmp.storage_mut().try_as_mut_slice_f32()?;
             unsafe {
                 func.launch(cfg, (x_slice, bias_slice, out_slice, n, c, h, w))
-                    .map_err(|e| Error::KernelError(e.to_string()))?;
+                    .map_err(|e| Error::KernelError(format!("{e:?}")))?;
             }
         }
         DType::BF16 => {
@@ -674,7 +674,7 @@ fn bias_add_nchw_inplace(output: &mut Tensor, bias: &Tensor) -> Result<()> {
                 let out_ptr = tmp.as_mut_device_ptr_bf16("bias_add:out")? as u64;
                 unsafe {
                     func.launch(cfg, (x_ptr, bias_ptr, out_ptr, n, c, h, w))
-                        .map_err(|e| Error::KernelError(e.to_string()))?;
+                        .map_err(|e| Error::KernelError(format!("{e:?}")))?;
                 }
             }
             #[cfg(not(feature = "bf16_u16"))]
@@ -795,9 +795,9 @@ pub fn conv2d_forward(
 }
 fn copy_i32_to_device(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<i32>> {
     let mut buf = unsafe { device.alloc::<i32>(data.len()) }
-        .map_err(|e| Error::KernelError(format!("alloc i32 buffer: {e}")))?;
+        .map_err(|e| Error::KernelError(format!("alloc i32 buffer: {e:?}")))?;
     device
         .htod_copy_into(data.to_vec(), &mut buf)
-        .map_err(|e| Error::KernelError(format!("copy i32 buffer: {e}")))?;
+        .map_err(|e| Error::KernelError(format!("copy i32 buffer: {e:?}")))?;
     Ok(buf)
 }

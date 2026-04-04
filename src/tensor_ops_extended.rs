@@ -384,7 +384,7 @@ impl Tensor {
                         tensor
                             .device()
                             .dtod_copy(&src_view, &mut dst_view)
-                            .map_err(|e| Error::Cuda(format!("cat F32 copy failed: {e}")))?;
+                            .map_err(|e| Error::Cuda(format!("cat F32 copy failed: {e:?}")))?;
                     }
                     prefix_rows += info.rows;
                 }

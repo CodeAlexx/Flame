@@ -74,7 +74,7 @@ pub fn next_u64() -> u64 {
 
 pub fn sample_normal(len: usize, mean: f32, std: f32) -> Result<Vec<f32>, Error> {
     let normal = Normal::new(mean, std)
-        .map_err(|e| Error::InvalidInput(format!("invalid normal params: {e}")))?;
+        .map_err(|e| Error::InvalidInput(format!("invalid normal params: {e:?}")))?;
     let mut guard = rng_state()
         .lock()
         .map_err(|_| Error::InvalidOperation("RNG mutex poisoned".into()))?;
@@ -92,13 +92,13 @@ fn ensure_module(dev: &Arc<CudaDevice>) -> Result<(), Error> {
         let mut opts = CompileOptions::default();
         opts.include_paths.push(include_path);
         let ptx =
-            compile_ptx_with_opts(CUDA_SRC, opts).map_err(|e| Error::KernelError(e.to_string()))?;
+            compile_ptx_with_opts(CUDA_SRC, opts).map_err(|e| Error::KernelError(format!("{e:?}")))?;
         #[cfg(feature = "bf16_u16")]
         let symbols: &[&str] = &["fill_rand_f32", "fill_rand_bf16"];
         #[cfg(not(feature = "bf16_u16"))]
         let symbols: &[&str] = &["fill_rand_f32"];
         dev.load_ptx(ptx, "flame_rng", symbols)
-            .map_err(|e| Error::KernelError(e.to_string()))?;
+            .map_err(|e| Error::KernelError(format!("{e:?}")))?;
         let _ = MOD_ONCE.set(());
     }
     Ok(())
@@ -127,7 +127,7 @@ pub fn rand_fill_(tensor: &mut Tensor, seed: u32) -> Result<(), Error> {
                     .get_func("flame_rng", "fill_rand_f32")
                     .ok_or_else(|| Error::KernelError("fill_rand_f32 missing".into()))?;
                 func.launch(cfg, (slice, n as u64, actual_seed))
-                    .map_err(|e| Error::KernelError(e.to_string()))?;
+                    .map_err(|e| Error::KernelError(format!("{e:?}")))?;
             }
             DType::BF16 => {
                 #[cfg(feature = "bf16_u16")]
@@ -137,7 +137,7 @@ pub fn rand_fill_(tensor: &mut Tensor, seed: u32) -> Result<(), Error> {
                         .get_func("flame_rng", "fill_rand_bf16")
                         .ok_or_else(|| Error::KernelError("fill_rand_bf16 missing".into()))?;
                     func.launch(cfg, (slice, n as u64, actual_seed))
-                        .map_err(|e| Error::KernelError(e.to_string()))?;
+                        .map_err(|e| Error::KernelError(format!("{e:?}")))?;
                 }
                 #[cfg(not(feature = "bf16_u16"))]
                 {

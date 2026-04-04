@@ -41,13 +41,13 @@ fn ensure_module(dev: &Arc<CudaDevice>) -> Result<()> {
         let mut opts = CompileOptions::default();
         opts.include_paths.push(include_dir.into());
         let ptx =
-            compile_ptx_with_opts(CUDA_SRC, opts).map_err(|e| Error::KernelError(e.to_string()))?;
+            compile_ptx_with_opts(CUDA_SRC, opts).map_err(|e| Error::KernelError(format!("{e:?}")))?;
         #[cfg(feature = "bf16_u16")]
         let symbols: &[&str] = &["sgd_f32", "sgd_bf16"];
         #[cfg(not(feature = "bf16_u16"))]
         let symbols: &[&str] = &["sgd_f32"];
         dev.load_ptx(ptx, "flame_sgd", symbols)
-            .map_err(|e| Error::KernelError(e.to_string()))?;
+            .map_err(|e| Error::KernelError(format!("{e:?}")))?;
         let _ = MOD_ONCE.set(());
     }
     Ok(())
@@ -87,7 +87,7 @@ pub fn step_inplace(param: &mut Tensor, grad: &Tensor, lr: f32) -> Result<()> {
                     .get_func("flame_sgd", "sgd_f32")
                     .ok_or_else(|| Error::KernelError("sgd_f32 missing".into()))?;
                 func.launch(cfg, (p_slice, g_slice, n as u64, lr))
-                    .map_err(|e| Error::KernelError(e.to_string()))?;
+                    .map_err(|e| Error::KernelError(format!("{e:?}")))?;
             }
             DType::BF16 => {
                 #[cfg(feature = "bf16_u16")]
@@ -98,7 +98,7 @@ pub fn step_inplace(param: &mut Tensor, grad: &Tensor, lr: f32) -> Result<()> {
                         .get_func("flame_sgd", "sgd_bf16")
                         .ok_or_else(|| Error::KernelError("sgd_bf16 missing".into()))?;
                     func.launch(cfg, (p_slice, g_slice, n as u64, lr))
-                        .map_err(|e| Error::KernelError(e.to_string()))?;
+                        .map_err(|e| Error::KernelError(format!("{e:?}")))?;
                 }
                 #[cfg(not(feature = "bf16_u16"))]
                 {

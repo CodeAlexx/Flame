@@ -68,10 +68,34 @@ FlameCudaStatus flame_arena_alloc_impl(FlameStreamArena* arena,
     return FLAME_CUDA_OK;
   }
 
+  // Request exceeds total arena capacity — can never fit
+  if (bytes > arena->capacity) {
+    return FLAME_CUDA_ERR_INVALID;
+  }
+
   size_t alignment = align == 0 ? 16 : align;
   size_t offset = round_up(arena->offset, alignment);
   if (offset + bytes > arena->capacity) {
-    return FLAME_CUDA_ERR_INVALID;
+    // Arena full — try to recycle by waiting for the fence and resetting
+    cudaError_t ev = cudaEventQuery(arena->fence);
+    if (ev == cudaSuccess) {
+      // Previous work done — safe to reset
+      arena->offset = 0;
+      offset = 0;
+    } else if (ev == cudaErrorNotReady) {
+      // Previous work still running — must wait
+      FLAME_CUDA_TRY(cudaEventSynchronize(arena->fence));
+      arena->offset = 0;
+      offset = 0;
+    } else {
+      return FLAME_CUDA_ERR_INVALID;
+    }
+
+    // Re-check after reset
+    offset = round_up(arena->offset, alignment);
+    if (offset + bytes > arena->capacity) {
+      return FLAME_CUDA_ERR_INVALID;
+    }
   }
 
   *out_ptr = static_cast<char*>(arena->base) + offset;

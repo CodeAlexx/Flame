@@ -63,7 +63,7 @@ pub fn normal_bf16(
         }
     }
     let data = unsafe { device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc normal bf16: {}", e)))?;
+        .map_err(|e| Error::Cuda(format!("alloc normal bf16: {:?}", e)))?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 {
             data: data.into(),
@@ -84,10 +84,10 @@ pub fn normal_bf16(
         let mut opts = CompileOptions::default();
         opts.include_paths.push(include_dir.into());
         let ptx = compile_ptx_with_opts(CUDA_NORMAL_BF16, opts)
-            .map_err(|e| Error::Cuda(format!("nvrtc normal_bf16: {}", e)))?;
+            .map_err(|e| Error::Cuda(format!("nvrtc normal_bf16: {:?}", e)))?;
         device
             .load_ptx(ptx, "normal_bf16_kernel", &["normal_bf16_kernel"])
-            .map_err(|e| Error::Cuda(format!("load normal_bf16: {}", e)))?;
+            .map_err(|e| Error::Cuda(format!("load normal_bf16: {:?}", e)))?;
     }
     let f = device
         .get_func("normal_bf16_kernel", "normal_bf16_kernel")

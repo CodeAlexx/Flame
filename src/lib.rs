@@ -73,6 +73,8 @@ pub mod trace {
 
 pub mod config;
 pub mod conv;
+pub mod conv3d_bf16;
+pub mod conv3d_simple;
 pub mod cuda;
 pub mod cuda_conv2d;
 pub mod cuda_conv2d_direct;

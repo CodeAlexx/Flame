@@ -13,17 +13,33 @@ __global__ void inplace_binary_kernel(
     }
 }
 
+// Generic add/mul: works for float types.
+// BF16 specializations below compute in FP32 to avoid precision loss.
+template <typename T>
 struct AddOp {
-    template <typename T>
     __device__ static inline T apply(T a, T b) {
         return a + b;
     }
 };
 
+template <>
+struct AddOp<__nv_bfloat16> {
+    __device__ static inline __nv_bfloat16 apply(__nv_bfloat16 a, __nv_bfloat16 b) {
+        return __float2bfloat16(__bfloat162float(a) + __bfloat162float(b));
+    }
+};
+
+template <typename T>
 struct MulOp {
-    template <typename T>
     __device__ static inline T apply(T a, T b) {
         return a * b;
+    }
+};
+
+template <>
+struct MulOp<__nv_bfloat16> {
+    __device__ static inline __nv_bfloat16 apply(__nv_bfloat16 a, __nv_bfloat16 b) {
+        return __float2bfloat16(__bfloat162float(a) * __bfloat162float(b));
     }
 };
 
@@ -43,7 +59,7 @@ extern "C" void launch_add_inplace_f32(
     const float* src,
     long long n,
     cudaStream_t stream) {
-    launch_inplace_impl<float, AddOp>(dst, src, n, stream);
+    launch_inplace_impl<float, AddOp<float>>(dst, src, n, stream);
 }
 
 extern "C" void launch_add_inplace_bf16(
@@ -51,7 +67,7 @@ extern "C" void launch_add_inplace_bf16(
     const void* src,
     long long n,
     cudaStream_t stream) {
-    launch_inplace_impl<__nv_bfloat16, AddOp>(
+    launch_inplace_impl<__nv_bfloat16, AddOp<__nv_bfloat16>>(
         static_cast<__nv_bfloat16*>(dst),
         static_cast<const __nv_bfloat16*>(src),
         n,
@@ -63,7 +79,7 @@ extern "C" void launch_mul_inplace_f32(
     const float* src,
     long long n,
     cudaStream_t stream) {
-    launch_inplace_impl<float, MulOp>(dst, src, n, stream);
+    launch_inplace_impl<float, MulOp<float>>(dst, src, n, stream);
 }
 
 extern "C" void launch_mul_inplace_bf16(
@@ -71,7 +87,7 @@ extern "C" void launch_mul_inplace_bf16(
     const void* src,
     long long n,
     cudaStream_t stream) {
-    launch_inplace_impl<__nv_bfloat16, MulOp>(
+    launch_inplace_impl<__nv_bfloat16, MulOp<__nv_bfloat16>>(
         static_cast<__nv_bfloat16*>(dst),
         static_cast<const __nv_bfloat16*>(src),
         n,

@@ -59,7 +59,7 @@ pub enum Error {
 // Now actually converts cudarc errors
 impl From<cudarc::driver::DriverError> for Error {
     fn from(e: cudarc::driver::DriverError) -> Self {
-        Error::KernelError(e.to_string())
+        Error::KernelError(format!("{e:?}"))
     }
 }
 
@@ -77,7 +77,7 @@ impl From<cudarc::cublaslt::result::CublasError> for Error {
 
 impl From<cudarc::nvrtc::CompileError> for Error {
     fn from(err: cudarc::nvrtc::CompileError) -> Self {
-        Error::KernelError(format!("nvrtc: {err}"))
+        Error::KernelError(format!("nvrtc: {err:?}"))
     }
 }
 

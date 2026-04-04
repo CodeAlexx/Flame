@@ -518,6 +518,10 @@ impl PyTensor {
         }
     }
 
+    fn tanh(&self) -> PyResult<Self> {
+        Ok(Self { inner: self.inner.tanh().map_err(flame_err)? })
+    }
+
     fn clamp(&self, min: f32, max: f32) -> PyResult<Self> {
         // Flame's clamp goes through maximum/minimum which may produce BF16.
         // Fall back to BF16 clamp kernel or manual clamp if needed.

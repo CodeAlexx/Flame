@@ -257,7 +257,7 @@ fn flash_attention_forward_kernel_small(
                 flags,
             ),
         )
-        .map_err(|e| Error::Training(e.to_string()))?;
+        .map_err(|e| Error::Training(format!("{e:?}")))?;
     }
 
     Ok(Tensor {
@@ -342,7 +342,7 @@ fn flash_attention_forward_kernel_medium(
                 flags,
             ),
         )
-        .map_err(|e| Error::Training(e.to_string()))?;
+        .map_err(|e| Error::Training(format!("{e:?}")))?;
     }
 
     Ok(Tensor {
@@ -443,7 +443,7 @@ pub fn chunked_attention_forward(
                 flags,
             ),
         )
-        .map_err(|e| Error::Training(e.to_string()))?;
+        .map_err(|e| Error::Training(format!("{e:?}")))?;
     }
 
     Ok(Tensor {

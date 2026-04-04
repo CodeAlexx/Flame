@@ -7,6 +7,17 @@ use crate::dtype::DType;
 use crate::tensor_storage::TensorStorage;
 use crate::{Error, Result, Shape, Tensor, TensorId};
 
+/// Fast async host-to-device copy for small metadata arrays.
+/// Allocates on device and copies without synchronization.
+/// The data will be ready before any kernel launched after this on the same stream.
+fn htod_async_copy(device: &Arc<CudaDevice>, data: &[i64]) -> std::result::Result<CudaSlice<i64>, Error> {
+    let mut gpu_buf = unsafe { device.alloc::<i64>(data.len()) }
+        .map_err(|e| Error::Cuda(format!("alloc metadata: {:?}", e)))?;
+    device.htod_copy_into(data.to_vec(), &mut gpu_buf)
+        .map_err(|e| Error::Cuda(format!("htod_copy metadata: {:?}", e)))?;
+    Ok(gpu_buf)
+}
+
 #[derive(Debug, Clone)]
 pub struct BcSpec {
     pub out_dims: Vec<i64>,
@@ -71,105 +82,75 @@ pub fn make_broadcast_spec(a_dims: &[usize], b_dims: &[usize]) -> BcSpec {
     }
 }
 
+// V2 kernels: dims/strides passed as scalar params (no GPU pointers, no htod copy).
+// Max 8 dimensions. Unused dims padded to 1, unused strides to 0.
 const CUDA_ADD_MUL_BF16: &str = r#"
 #include <cuda_bf16.h>
+
+// Macro: compute a_off and b_off from flat index using scalar dim/stride params.
+// d0..d7 = output dims, as0..as7 = A strides, bs0..bs7 = B strides.
+#define COMPUTE_OFFSETS(tid, nd, a_off, b_off) \
+  long rem = (tid), a_off = 0, b_off = 0; \
+  { long _d[8] = {d0,d1,d2,d3,d4,d5,d6,d7}; \
+    long _as[8] = {as0,as1,as2,as3,as4,as5,as6,as7}; \
+    long _bs[8] = {bs0,bs1,bs2,bs3,bs4,bs5,bs6,bs7}; \
+    for (int i=(nd)-1; i>=0; --i) { \
+      long idx = rem % _d[i]; rem /= _d[i]; \
+      a_off += idx * _as[i]; \
+      b_off += idx * _bs[i]; \
+    } \
+  }
+
+#define KERNEL_PARAMS \
+  long d0, long d1, long d2, long d3, long d4, long d5, long d6, long d7, \
+  long as0, long as1, long as2, long as3, long as4, long as5, long as6, long as7, \
+  long bs0, long bs1, long bs2, long bs3, long bs4, long bs5, long bs6, long bs7, \
+  int nd, long total
+
 extern "C" __global__
-void add_bf16_kernel(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* O,
-                     const long* out_dims, const long* a_strides, const long* b_strides,
-                     int nd, long total) {
+void add_bf16_kernel(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* O, KERNEL_PARAMS) {
   long tid = blockIdx.x * blockDim.x + threadIdx.x;
   while (tid < total) {
-    long rem = tid, a_off = 0, b_off = 0;
-    #pragma unroll
-    for (int i=nd-1; i>=0; --i) {
-      long d = out_dims[i];
-      long idx = rem % d; rem /= d;
-      a_off += idx * a_strides[i];
-      b_off += idx * b_strides[i];
-    }
-    float a = __bfloat162float(A[a_off]);
-    float b = __bfloat162float(B[b_off]);
-    O[tid]  = __float2bfloat16(a + b);
+    COMPUTE_OFFSETS(tid, nd, a_off, b_off);
+    O[tid] = __float2bfloat16(__bfloat162float(A[a_off]) + __bfloat162float(B[b_off]));
     tid += gridDim.x * blockDim.x;
   }
 }
 extern "C" __global__
-void mul_bf16_kernel(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* O,
-                     const long* out_dims, const long* a_strides, const long* b_strides,
-                     int nd, long total) {
+void mul_bf16_kernel(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* O, KERNEL_PARAMS) {
   long tid = blockIdx.x * blockDim.x + threadIdx.x;
   while (tid < total) {
-    long rem = tid, a_off = 0, b_off = 0;
-    #pragma unroll
-    for (int i=nd-1; i>=0; --i) {
-      long d = out_dims[i];
-      long idx = rem % d; rem /= d;
-      a_off += idx * a_strides[i];
-      b_off += idx * b_strides[i];
-    }
-    float a = __bfloat162float(A[a_off]);
-    float b = __bfloat162float(B[b_off]);
-    O[tid]  = __float2bfloat16(a * b);
+    COMPUTE_OFFSETS(tid, nd, a_off, b_off);
+    O[tid] = __float2bfloat16(__bfloat162float(A[a_off]) * __bfloat162float(B[b_off]));
     tid += gridDim.x * blockDim.x;
   }
 }
 extern "C" __global__
-void div_bf16_kernel(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* O,
-                     const long* out_dims, const long* a_strides, const long* b_strides,
-                     int nd, long total) {
+void div_bf16_kernel(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* O, KERNEL_PARAMS) {
   long tid = blockIdx.x * blockDim.x + threadIdx.x;
   while (tid < total) {
-    long rem = tid, a_off = 0, b_off = 0;
-    #pragma unroll
-    for (int i=nd-1; i>=0; --i) {
-      long d = out_dims[i];
-      long idx = rem % d; rem /= d;
-      a_off += idx * a_strides[i];
-      b_off += idx * b_strides[i];
-    }
-    float a = __bfloat162float(A[a_off]);
-    float b = __bfloat162float(B[b_off]);
-    O[tid]  = __float2bfloat16(a / b);
+    COMPUTE_OFFSETS(tid, nd, a_off, b_off);
+    O[tid] = __float2bfloat16(__bfloat162float(A[a_off]) / __bfloat162float(B[b_off]));
     tid += gridDim.x * blockDim.x;
   }
 }
 extern "C" __global__
-void max_bf16_kernel(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* O,
-                     const long* out_dims, const long* a_strides, const long* b_strides,
-                     int nd, long total) {
+void max_bf16_kernel(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* O, KERNEL_PARAMS) {
   long tid = blockIdx.x * blockDim.x + threadIdx.x;
   while (tid < total) {
-    long rem = tid, a_off = 0, b_off = 0;
-    #pragma unroll
-    for (int i=nd-1; i>=0; --i) {
-      long d = out_dims[i];
-      long idx = rem % d; rem /= d;
-      a_off += idx * a_strides[i];
-      b_off += idx * b_strides[i];
-    }
-    float a = __bfloat162float(A[a_off]);
-    float b = __bfloat162float(B[b_off]);
-    O[tid]  = __float2bfloat16(a > b ? a : b);
+    COMPUTE_OFFSETS(tid, nd, a_off, b_off);
+    float a = __bfloat162float(A[a_off]), b = __bfloat162float(B[b_off]);
+    O[tid] = __float2bfloat16(a > b ? a : b);
     tid += gridDim.x * blockDim.x;
   }
 }
 extern "C" __global__
-void min_bf16_kernel(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* O,
-                     const long* out_dims, const long* a_strides, const long* b_strides,
-                     int nd, long total) {
+void min_bf16_kernel(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* O, KERNEL_PARAMS) {
   long tid = blockIdx.x * blockDim.x + threadIdx.x;
   while (tid < total) {
-    long rem = tid, a_off = 0, b_off = 0;
-    #pragma unroll
-    for (int i=nd-1; i>=0; --i) {
-      long d = out_dims[i];
-      long idx = rem % d; rem /= d;
-      a_off += idx * a_strides[i];
-      b_off += idx * b_strides[i];
-    }
-    float a = __bfloat162float(A[a_off]);
-    float b = __bfloat162float(B[b_off]);
-    O[tid]  = __float2bfloat16(a < b ? a : b);
+    COMPUTE_OFFSETS(tid, nd, a_off, b_off);
+    float a = __bfloat162float(A[a_off]), b = __bfloat162float(B[b_off]);
+    O[tid] = __float2bfloat16(a < b ? a : b);
     tid += gridDim.x * blockDim.x;
   }
 }
@@ -196,18 +177,22 @@ const CUDA_CMP_BF16: &str = r#"
 #include <cuda_bf16.h>
 extern "C" __global__
 void cmp_bf16_kernel(const __nv_bfloat16* A, const __nv_bfloat16* B, unsigned char* O,
-                     const long* out_dims, const long* a_strides, const long* b_strides,
+                     long d0, long d1, long d2, long d3, long d4, long d5, long d6, long d7,
+                     long as0, long as1, long as2, long as3, long as4, long as5, long as6, long as7,
+                     long bs0, long bs1, long bs2, long bs3, long bs4, long bs5, long bs6, long bs7,
                      int nd, long total, int op) {
   // op: 0=ge,1=gt,2=le,3=lt,4=ne
   long tid = blockIdx.x * blockDim.x + threadIdx.x;
   while (tid < total) {
     long rem = tid, a_off = 0, b_off = 0;
-    #pragma unroll
-    for (int i=nd-1; i>=0; --i) {
-      long d = out_dims[i];
-      long idx = rem % d; rem /= d;
-      a_off += idx * a_strides[i];
-      b_off += idx * b_strides[i];
+    { long _d[8] = {d0,d1,d2,d3,d4,d5,d6,d7};
+      long _as[8] = {as0,as1,as2,as3,as4,as5,as6,as7};
+      long _bs[8] = {bs0,bs1,bs2,bs3,bs4,bs5,bs6,bs7};
+      for (int i=nd-1; i>=0; --i) {
+        long idx = rem % _d[i]; rem /= _d[i];
+        a_off += idx * _as[i];
+        b_off += idx * _bs[i];
+      }
     }
     float a = __bfloat162float(A[a_off]);
     float b = __bfloat162float(B[b_off]);
@@ -230,6 +215,21 @@ fn lc(n: usize) -> LaunchConfig {
     LaunchConfig::for_num_elems(n as u32)
 }
 
+/// Pad a BcSpec to exactly 8 dims for the v2 kernel scalar params.
+/// Returns (d0..d7, as0..as7, bs0..bs7) all as i64.
+fn pad8(spec: &BcSpec) -> ([i64; 8], [i64; 8], [i64; 8]) {
+    let mut d = [1i64; 8];
+    let mut a = [0i64; 8];
+    let mut b = [0i64; 8];
+    let nd = spec.out_dims.len();
+    for i in 0..nd {
+        d[i] = spec.out_dims[i];
+        a[i] = spec.a_strides[i];
+        b[i] = spec.b_strides[i];
+    }
+    (d, a, b)
+}
+
 fn ensure(dev: &Arc<CudaDevice>, nm: &'static str, code: &'static str) -> Result<()> {
     if dev.get_func(nm, nm).is_some() {
         return Ok(());
@@ -240,20 +240,32 @@ fn ensure(dev: &Arc<CudaDevice>, nm: &'static str, code: &'static str) -> Result
     let mut opts = CompileOptions::default();
     opts.include_paths.push(include_dir);
     let ptx = compile_ptx_with_opts(code, opts)
-        .map_err(|e| Error::Cuda(format!("nvrtc {}: {}", nm, e)))?;
+        .map_err(|e| Error::Cuda(format!("nvrtc {}: {:?}", nm, e)))?;
     dev.load_ptx(ptx, nm, &[nm])
-        .map_err(|e| Error::Cuda(format!("load {}: {}", nm, e)))?;
+        .map_err(|e| Error::Cuda(format!("load {}: {:?}", nm, e)))?;
     Ok(())
 }
 
-pub fn add_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+/// Generic BF16 elementwise launch — no GPU metadata copies, all params are scalars.
+fn launch_bf16_elementwise(
+    a: &Tensor,
+    b: &Tensor,
+    kernel_name: &'static str,
+    op_name: &str,
+) -> Result<Tensor> {
     debug_assert_eq!(a.dtype(), DType::BF16);
     debug_assert_eq!(b.dtype(), DType::BF16);
     let spec = make_broadcast_spec(a.shape().dims(), b.shape().dims());
     let n = spec.total as usize;
+    if spec.out_dims.len() > 8 {
+        return Err(Error::InvalidInput(format!(
+            "{}: ndim {} exceeds max 8 for scalar-param kernels",
+            op_name, spec.out_dims.len()
+        )));
+    }
 
     let data = unsafe { a.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc add bf16: {}", e)))?;
+        .map_err(|e| Error::Cuda(format!("alloc {}: {:?}", op_name, e)))?;
     let out_dims_usize: Vec<usize> = spec.out_dims.iter().map(|&d| d as usize).collect();
     let mut out = Tensor {
         storage: TensorStorage::BF16 {
@@ -266,37 +278,39 @@ pub fn add_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         requires_grad: false,
     };
 
-    ensure(&a.device, "add_bf16_kernel", CUDA_ADD_MUL_BF16)?;
+    ensure(&a.device, kernel_name, CUDA_ADD_MUL_BF16)?;
     let f = a
         .device
-        .get_func("add_bf16_kernel", "add_bf16_kernel")
-        .ok_or_else(|| Error::Cuda("missing kernel: add_bf16_kernel".into()))?;
+        .get_func(kernel_name, kernel_name)
+        .ok_or_else(|| Error::Cuda(format!("missing kernel: {}", kernel_name)))?;
 
-    // Upload small metadata buffers
-    let out_dims = a.device.htod_sync_copy(&spec.out_dims)?;
-    let a_strides = a.device.htod_sync_copy(&spec.a_strides)?;
-    let b_strides = a.device.htod_sync_copy(&spec.b_strides)?;
+    let (d, ast, bst) = pad8(&spec);
+    let a_ptr = a.as_device_ptr_bf16(&format!("{}:a", op_name))? as u64;
+    let b_ptr = b.as_device_ptr_bf16(&format!("{}:b", op_name))? as u64;
+    let o_ptr = out.as_mut_device_ptr_bf16(&format!("{}:out", op_name))? as u64;
+    let nd = spec.out_dims.len() as i32;
+    let total = spec.total;
 
-    let aslice = a.as_device_ptr_bf16("add_bf16:a")? as *const u16;
-    let bslice = b.as_device_ptr_bf16("add_bf16:b")? as *const u16;
-    let oslice = out.as_mut_device_ptr_bf16("add_bf16:out")? as *mut u16;
+    // Build params as Vec<*mut c_void> — cudarc supports this for arbitrary param counts.
+    let mut params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(29);
+    params.push(&a_ptr as *const u64 as *mut std::ffi::c_void);
+    params.push(&b_ptr as *const u64 as *mut std::ffi::c_void);
+    params.push(&o_ptr as *const u64 as *mut std::ffi::c_void);
+    for i in 0..8 { params.push(&d[i] as *const i64 as *mut std::ffi::c_void); }
+    for i in 0..8 { params.push(&ast[i] as *const i64 as *mut std::ffi::c_void); }
+    for i in 0..8 { params.push(&bst[i] as *const i64 as *mut std::ffi::c_void); }
+    params.push(&nd as *const i32 as *mut std::ffi::c_void);
+    params.push(&total as *const i64 as *mut std::ffi::c_void);
+
     unsafe {
-        f.launch(
-            lc(n),
-            (
-                aslice as u64,
-                bslice as u64,
-                oslice as u64,
-                &out_dims,
-                &a_strides,
-                &b_strides,
-                spec.out_dims.len() as i32,
-                spec.total,
-            ),
-        )
-        .map_err(|e| Error::Training(e.to_string()))?;
+        f.launch(lc(n), &mut params)
+            .map_err(|e| Error::Training(format!("{e:?}")))?;
     }
     Ok(out)
+}
+
+pub fn add_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    launch_bf16_elementwise(a, b, "add_bf16_kernel", "add_bf16")
 }
 
 pub fn transpose2d_bf16(tensor: &Tensor) -> Result<Tensor> {
@@ -364,211 +378,19 @@ pub fn transpose2d_bf16(tensor: &Tensor) -> Result<Tensor> {
 }
 
 pub fn mul_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    debug_assert_eq!(a.dtype(), DType::BF16);
-    debug_assert_eq!(b.dtype(), DType::BF16);
-    let spec = make_broadcast_spec(a.shape().dims(), b.shape().dims());
-    let n = spec.total as usize;
-
-    let data = unsafe { a.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc mul bf16: {}", e)))?;
-    let out_dims_usize: Vec<usize> = spec.out_dims.iter().map(|&d| d as usize).collect();
-    let mut out = Tensor {
-        storage: TensorStorage::BF16 {
-            data: data.into(),
-            numel: n,
-        },
-        shape: Shape::from_dims(&out_dims_usize),
-        device: a.device.clone(),
-        id: TensorId::new(),
-        requires_grad: false,
-    };
-
-    ensure(&a.device, "mul_bf16_kernel", CUDA_ADD_MUL_BF16)?;
-    let f = a
-        .device
-        .get_func("mul_bf16_kernel", "mul_bf16_kernel")
-        .ok_or_else(|| Error::Cuda("missing kernel: mul_bf16_kernel".into()))?;
-
-    let out_dims = a.device.htod_sync_copy(&spec.out_dims)?;
-    let a_strides = a.device.htod_sync_copy(&spec.a_strides)?;
-    let b_strides = a.device.htod_sync_copy(&spec.b_strides)?;
-
-    let aslice = a.as_device_ptr_bf16("mul_bf16:a")? as *const u16;
-    let bslice = b.as_device_ptr_bf16("mul_bf16:b")? as *const u16;
-    let oslice = out.as_mut_device_ptr_bf16("mul_bf16:out")? as *mut u16;
-    unsafe {
-        f.launch(
-            lc(n),
-            (
-                aslice as u64,
-                bslice as u64,
-                oslice as u64,
-                &out_dims,
-                &a_strides,
-                &b_strides,
-                spec.out_dims.len() as i32,
-                spec.total,
-            ),
-        )
-        .map_err(|e| Error::Training(e.to_string()))?;
-    }
-    Ok(out)
+    launch_bf16_elementwise(a, b, "mul_bf16_kernel", "mul_bf16")
 }
 
 pub fn div_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    debug_assert_eq!(a.dtype(), DType::BF16);
-    debug_assert_eq!(b.dtype(), DType::BF16);
-    let spec = make_broadcast_spec(a.shape().dims(), b.shape().dims());
-    let n = spec.total as usize;
-
-    let data = unsafe { a.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc div bf16: {}", e)))?;
-    let out_dims_usize: Vec<usize> = spec.out_dims.iter().map(|&d| d as usize).collect();
-    let mut out = Tensor {
-        storage: TensorStorage::BF16 {
-            data: data.into(),
-            numel: n,
-        },
-        shape: Shape::from_dims(&out_dims_usize),
-        device: a.device.clone(),
-        id: TensorId::new(),
-        requires_grad: false,
-    };
-
-    ensure(&a.device, "div_bf16_kernel", CUDA_ADD_MUL_BF16)?;
-    let f = a
-        .device
-        .get_func("div_bf16_kernel", "div_bf16_kernel")
-        .ok_or_else(|| Error::Cuda("missing kernel: div_bf16_kernel".into()))?;
-
-    let out_dims = a.device.htod_sync_copy(&spec.out_dims)?;
-    let a_strides = a.device.htod_sync_copy(&spec.a_strides)?;
-    let b_strides = a.device.htod_sync_copy(&spec.b_strides)?;
-
-    let aslice = a.as_device_ptr_bf16("div_bf16:a")? as *const u16;
-    let bslice = b.as_device_ptr_bf16("div_bf16:b")? as *const u16;
-    let oslice = out.as_mut_device_ptr_bf16("div_bf16:out")? as *mut u16;
-    unsafe {
-        f.launch(
-            lc(n),
-            (
-                aslice as u64,
-                bslice as u64,
-                oslice as u64,
-                &out_dims,
-                &a_strides,
-                &b_strides,
-                spec.out_dims.len() as i32,
-                spec.total,
-            ),
-        )
-        .map_err(|e| Error::Training(e.to_string()))?;
-    }
-    Ok(out)
+    launch_bf16_elementwise(a, b, "div_bf16_kernel", "div_bf16")
 }
 
 pub fn max_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    debug_assert_eq!(a.dtype(), DType::BF16);
-    debug_assert_eq!(b.dtype(), DType::BF16);
-    let spec = make_broadcast_spec(a.shape().dims(), b.shape().dims());
-    let n = spec.total as usize;
-
-    let data = unsafe { a.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc max bf16: {}", e)))?;
-    let out_dims_usize: Vec<usize> = spec.out_dims.iter().map(|&d| d as usize).collect();
-    let mut out = Tensor {
-        storage: TensorStorage::BF16 {
-            data: data.into(),
-            numel: n,
-        },
-        shape: Shape::from_dims(&out_dims_usize),
-        device: a.device.clone(),
-        id: TensorId::new(),
-        requires_grad: false,
-    };
-
-    ensure(&a.device, "max_bf16_kernel", CUDA_ADD_MUL_BF16)?;
-    let f = a
-        .device
-        .get_func("max_bf16_kernel", "max_bf16_kernel")
-        .ok_or_else(|| Error::Cuda("missing kernel: max_bf16_kernel".into()))?;
-
-    let out_dims = a.device.htod_sync_copy(&spec.out_dims)?;
-    let a_strides = a.device.htod_sync_copy(&spec.a_strides)?;
-    let b_strides = a.device.htod_sync_copy(&spec.b_strides)?;
-
-    let aslice = a.as_device_ptr_bf16("max_bf16:a")? as *const u16;
-    let bslice = b.as_device_ptr_bf16("max_bf16:b")? as *const u16;
-    let oslice = out.as_mut_device_ptr_bf16("max_bf16:out")? as *mut u16;
-    unsafe {
-        f.launch(
-            lc(n),
-            (
-                aslice as u64,
-                bslice as u64,
-                oslice as u64,
-                &out_dims,
-                &a_strides,
-                &b_strides,
-                spec.out_dims.len() as i32,
-                spec.total,
-            ),
-        )
-        .map_err(|e| Error::Training(e.to_string()))?;
-    }
-    Ok(out)
+    launch_bf16_elementwise(a, b, "max_bf16_kernel", "max_bf16")
 }
 
 pub fn min_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    debug_assert_eq!(a.dtype(), DType::BF16);
-    debug_assert_eq!(b.dtype(), DType::BF16);
-    let spec = make_broadcast_spec(a.shape().dims(), b.shape().dims());
-    let n = spec.total as usize;
-
-    let data = unsafe { a.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc min bf16: {}", e)))?;
-    let out_dims_usize: Vec<usize> = spec.out_dims.iter().map(|&d| d as usize).collect();
-    let mut out = Tensor {
-        storage: TensorStorage::BF16 {
-            data: data.into(),
-            numel: n,
-        },
-        shape: Shape::from_dims(&out_dims_usize),
-        device: a.device.clone(),
-        id: TensorId::new(),
-        requires_grad: false,
-    };
-
-    ensure(&a.device, "min_bf16_kernel", CUDA_ADD_MUL_BF16)?;
-    let f = a
-        .device
-        .get_func("min_bf16_kernel", "min_bf16_kernel")
-        .ok_or_else(|| Error::Cuda("missing kernel: min_bf16_kernel".into()))?;
-
-    let out_dims = a.device.htod_sync_copy(&spec.out_dims)?;
-    let a_strides = a.device.htod_sync_copy(&spec.a_strides)?;
-    let b_strides = a.device.htod_sync_copy(&spec.b_strides)?;
-
-    let aslice = a.as_device_ptr_bf16("min_bf16:a")? as *const u16;
-    let bslice = b.as_device_ptr_bf16("min_bf16:b")? as *const u16;
-    let oslice = out.as_mut_device_ptr_bf16("min_bf16:out")? as *mut u16;
-    unsafe {
-        f.launch(
-            lc(n),
-            (
-                aslice as u64,
-                bslice as u64,
-                oslice as u64,
-                &out_dims,
-                &a_strides,
-                &b_strides,
-                spec.out_dims.len() as i32,
-                spec.total,
-            ),
-        )
-        .map_err(|e| Error::Training(e.to_string()))?;
-    }
-    Ok(out)
+    launch_bf16_elementwise(a, b, "min_bf16_kernel", "min_bf16")
 }
 
 fn cmp_bf16(a: &Tensor, b: &Tensor, op: i32) -> Result<Tensor> {
@@ -576,9 +398,14 @@ fn cmp_bf16(a: &Tensor, b: &Tensor, op: i32) -> Result<Tensor> {
     debug_assert_eq!(b.dtype(), DType::BF16);
     let spec = make_broadcast_spec(a.shape().dims(), b.shape().dims());
     let n = spec.total as usize;
+    if spec.out_dims.len() > 8 {
+        return Err(Error::InvalidInput(format!(
+            "cmp_bf16: ndim {} exceeds max 8", spec.out_dims.len()
+        )));
+    }
 
     let data = unsafe { a.device.alloc::<f32>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc cmp bf16: {}", e)))?;
+        .map_err(|e| Error::Cuda(format!("alloc cmp bf16: {:?}", e)))?;
     let out_dims_usize: Vec<usize> = spec.out_dims.iter().map(|&d| d as usize).collect();
     let mut out = Tensor {
         storage: TensorStorage::Bool {
@@ -597,39 +424,34 @@ fn cmp_bf16(a: &Tensor, b: &Tensor, op: i32) -> Result<Tensor> {
         .get_func("cmp_bf16_kernel", "cmp_bf16_kernel")
         .ok_or_else(|| Error::Cuda("missing kernel: cmp_bf16_kernel".into()))?;
 
-    let out_dims = a.device.htod_sync_copy(&spec.out_dims)?;
-    let a_strides = a.device.htod_sync_copy(&spec.a_strides)?;
-    let b_strides = a.device.htod_sync_copy(&spec.b_strides)?;
-
-    let aslice = a.as_device_ptr_bf16("cmp_bf16:a")? as *const u16;
-    let bslice = b.as_device_ptr_bf16("cmp_bf16:b")? as *const u16;
-    // Output is Bool (u8), so we use try_as_mut_slice_u8 or similar if available, or just raw pointer
-    // But TensorStorage::Bool uses u8 (unsigned char).
-    // We need to handle Bool storage.
-    let oslice = match &mut out.storage {
-        TensorStorage::Bool { data, .. } => *data.device_ptr() as *mut u8,
+    let (d, ast, bst) = pad8(&spec);
+    let a_ptr = a.as_device_ptr_bf16("cmp_bf16:a")? as u64;
+    let b_ptr = b.as_device_ptr_bf16("cmp_bf16:b")? as u64;
+    let o_ptr = match &mut out.storage {
+        TensorStorage::Bool { data, .. } => *data.device_ptr() as u64,
         _ => {
             return Err(Error::InvalidOperation(
                 "expected Bool storage for out".into(),
             ))
         }
     };
+    let nd = spec.out_dims.len() as i32;
+    let total = spec.total;
+
+    let mut params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(30);
+    params.push(&a_ptr as *const u64 as *mut std::ffi::c_void);
+    params.push(&b_ptr as *const u64 as *mut std::ffi::c_void);
+    params.push(&o_ptr as *const u64 as *mut std::ffi::c_void);
+    for i in 0..8 { params.push(&d[i] as *const i64 as *mut std::ffi::c_void); }
+    for i in 0..8 { params.push(&ast[i] as *const i64 as *mut std::ffi::c_void); }
+    for i in 0..8 { params.push(&bst[i] as *const i64 as *mut std::ffi::c_void); }
+    params.push(&nd as *const i32 as *mut std::ffi::c_void);
+    params.push(&total as *const i64 as *mut std::ffi::c_void);
+    params.push(&op as *const i32 as *mut std::ffi::c_void);
+
     unsafe {
-        f.launch(
-            lc(n),
-            (
-                aslice as u64,
-                bslice as u64,
-                oslice as u64,
-                &out_dims,
-                &a_strides,
-                &b_strides,
-                spec.out_dims.len() as i32,
-                spec.total,
-                op,
-            ),
-        )
-        .map_err(|e| Error::Training(e.to_string()))?;
+        f.launch(lc(n), &mut params)
+            .map_err(|e| Error::Training(format!("{e:?}")))?;
     }
     Ok(out)
 }

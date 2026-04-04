@@ -254,7 +254,7 @@ impl CudaGradientOps {
                         "constrain_grads_kernel",
                     ],
                 )
-                .map_err(|e| Error::Cuda(format!("Failed to load gradient kernels: {}", e)))?;
+                .map_err(|e| Error::Cuda(format!("Failed to load gradient kernels: {:?}", e)))?;
             self.kernels_loaded = true;
         }
         Ok(())

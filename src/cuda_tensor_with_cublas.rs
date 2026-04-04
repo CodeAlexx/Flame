@@ -48,7 +48,7 @@ impl CudaTensor {
         use rand_distr::{Distribution, Normal};
         let mut rng = rand::thread_rng();
         let normal = Normal::new(mean, std)
-            .map_err(|e| Error::InvalidOperation(format!("invalid normal params: {e}")))?;
+            .map_err(|e| Error::InvalidOperation(format!("invalid normal params: {e:?}")))?;
         
         let cpu_data: Vec<f32> = (0..size)
             .map(|_| normal.sample(&mut rng))

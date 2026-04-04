@@ -40,10 +40,19 @@ fn main() {
         );
     }
 
-    // Check for cuDNN in the python venv if not found in system paths
-    let venv_cudnn = "/home/alex/SimpleTuner/.venv/lib/python3.11/site-packages/nvidia/cudnn/lib";
-    if Path::new(venv_cudnn).exists() {
-        println!("cargo:rustc-link-search=native={}", venv_cudnn);
+    // Check for cuDNN in python venvs
+    let cudnn_paths = [
+        "/home/alex/serenity/venv/lib/python3.12/site-packages/nvidia/cudnn/lib",
+        "/home/alex/SimpleTuner/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib",
+        "/home/alex/SimpleTuner/.venv/lib/python3.11/site-packages/nvidia/cudnn/lib",
+    ];
+    for venv_cudnn in &cudnn_paths {
+        if Path::new(venv_cudnn).exists() {
+            println!("cargo:rustc-link-search=native={}", venv_cudnn);
+            // Set rpath so binary finds libcudnn at runtime
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", venv_cudnn);
+            break;
+        }
     }
 
     println!("cargo:warning=CUDA_HOME={cuda_home}");

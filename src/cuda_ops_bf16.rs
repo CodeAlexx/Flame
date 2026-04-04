@@ -1472,12 +1472,12 @@ pub fn conv2d_bf16(
                     workspace_ptr = ptr as *mut c_void;
                 }
                 Err(e) => {
-                    eprintln!(
+                    log::debug!(
                         "conv2d_bf16: arena_alloc failed ({:?}), falling back to device alloc",
                         e
                     );
                     let alloc = unsafe { x.device().alloc(workspace_bytes as usize) }
-                        .map_err(|e| Error::Cuda(format!("Fallback alloc failed: {}", e)))?;
+                        .map_err(|e| Error::Cuda(format!("Fallback alloc failed: {:?}", e)))?;
                     workspace_ptr = *alloc.device_ptr() as *mut c_void;
                     fallback_alloc = Some(alloc);
                 }
@@ -1512,12 +1512,10 @@ pub fn conv2d_bf16(
         )
     };
 
-    if fallback_alloc.is_some() {
-        // Ensure kernel is finished before dropping fallback allocation
-        // We use device synchronize because cuStreamSynchronize is hard to import
-        // and this path is rare (fallback only).
-        let _ = x.device().synchronize();
-    }
+    // NOTE: fallback_alloc is dropped at end of scope, but that's safe because
+    // all subsequent ops on `out` run on the same CUDA stream and are ordered
+    // after the conv kernel. No synchronize needed — CUDA stream ordering
+    // guarantees the kernel completes before any op that reads `out`.
     if status != FLAME_CUDA_OK {
         let cuda_err: cudaError_t = unsafe { cudaGetLastError() };
         if cuda_err != cudaError::cudaSuccess {
