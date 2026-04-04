@@ -219,6 +219,26 @@ fn forward_bf16(
 ) -> SdpaResult<Tensor> {
     let scale = 1.0 / (d_q as f32).sqrt();
 
+    // Use the materialized GEMM path (batched cuBLASLt) when the attention matrix
+    // fits in VRAM. BH*Q*K*2 bytes BF16:
+    //   Klein 4B 512×512:  24*1536*1536*2 = 113MB — fine
+    //   Klein 4B 1024×1024: 24*4608*4608*2 = 970MB — fine on 24GB
+    //   Klein 9B 1024×1024: 32*4608*4608*2 = 1.36GB — fits on 24GB
+    //   LTX-2.3:            32*768*768*2   = 36MB — fine
+    // Only use the streaming kernel for truly huge sequences (video, >8K tokens).
+    let attn_elems = b * h * q_len * k_len;
+    let force_stream = parse_env_flag("FLAME_SDPA_FORCE_STREAM").unwrap_or(false);
+    // ~1.5GB BF16 threshold (768M elements). Safe on 24GB+ GPUs.
+    let use_materialized = !force_stream && attn_elems <= 768_000_000;
+
+    if use_materialized {
+        log::trace!(
+            "sdpa forward_bf16_fallback (materialized): B={} H={} Q={} K={} Dh={} ({}M elems)",
+            b, h, q_len, k_len, d_q, attn_elems / 1_000_000
+        );
+        return forward_bf16_fallback(q, k, v, mask, b, h, q_len, k_len, d_q, scale);
+    }
+
     #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
     {
         let limit = chunk_limit_from_env().unwrap_or(2048);
@@ -278,134 +298,79 @@ fn forward_bf16_fallback(
     d_q: usize,
     scale: f32,
 ) -> SdpaResult<Tensor> {
+    // Simple materialized SDPA: two batched GEMMs + softmax.
+    // For LTX-2.3: [32, 768, 128] @ [32, 128, 768] → [32, 768, 768] (75MB FP32).
     let device = q.device().clone();
     let bh = b * h;
+    let t0 = std::time::Instant::now();
+
+    // Flatten [B, H, seq, d] → [BH, seq, d] for batched GEMM
     let q_flat = q.reshape(&[bh, q_len, d_q])?;
     let k_flat = k.reshape(&[bh, k_len, d_q])?;
     let v_flat = v.reshape(&[bh, k_len, d_q])?;
-    let k_t = k_flat.transpose_dims(1, 2)?;
+    let t_reshape = t0.elapsed().as_millis();
 
-    let stream = CudaStream::from_raw(q.device().cuda_stream_raw_ptr());
+    let k_t = k_flat.transpose_dims(1, 2)?; // [BH, d, K]
+    let t_transpose = t0.elapsed().as_millis() - t_reshape;
+
+    // QK^T → [BH, Q, K] via batched cuBLASLt (FP32 accumulation, tensor cores)
     let logits_shape = Shape::from_dims(&[bh, q_len, k_len]);
-    let mut logits_bf16 = borrow_bf16_arena_tensor(
-        device.clone(),
-        &stream,
-        logits_shape.clone(),
-        ArenaScratch::DEFAULT_ALIGN,
-    )
-    .or_else(|_| Tensor::zeros_dtype(logits_shape.clone(), DType::BF16, device.clone()))?;
-    bmm_bf16_fp32acc_out(&q_flat, &k_t, &mut logits_bf16, false, false)?;
+    let mut logits = Tensor::zeros_dtype(logits_shape, DType::BF16, device.clone())?;
+    bmm_bf16_fp32acc_out(&q_flat, &k_t, &mut logits, false, false)?;
+    let t_qk = t0.elapsed().as_millis() - t_reshape - t_transpose;
+    drop(k_t);
 
-    let mut scores = logits_bf16.mul_scalar(scale)?;
-    drop(logits_bf16);
+    // Scale
+    let mut scores = logits.mul_scalar(scale)?;
+    let t_scale = t0.elapsed().as_millis() - t_reshape - t_transpose - t_qk;
+    drop(logits);
 
+    // Mask (if present)
     if let Some(mask_raw) = mask {
-        scores = {
-            let mut converted: Option<Tensor> = None;
-            let mask_bf16 =
-                if mask_raw.dtype() == DType::BF16 && mask_raw.storage_dtype() == DType::BF16 {
-                    mask_raw
-                } else {
-                    converted = Some(mask_raw.to_dtype(DType::BF16)?);
-                    converted.as_ref().unwrap()
-                };
-
-            let target_dims = [b, h, q_len, k_len];
-            let mut broadcasted: Option<Tensor> = None;
-            let mask_prepared = if mask_bf16.shape().dims() == target_dims {
-                mask_bf16
-            } else {
-                record_layout_fix("sdpa.mask_broadcast", mask_bf16.shape());
-                broadcasted = Some(mask_bf16.broadcast_to(&Shape::from_dims(&target_dims))?);
-                broadcasted.as_ref().unwrap()
-            };
-
-            let mask_view = mask_prepared.reshape(&[bh, q_len, k_len])?;
-            let penalty = mask_view.neg()?.add_scalar(1.0)?.mul_scalar(NEG_INF)?;
-            let updated = scores.add(&penalty)?;
-            updated
+        let mask_bf16 = if mask_raw.dtype() == DType::BF16 {
+            mask_raw.clone_result()?
+        } else {
+            mask_raw.to_dtype(DType::BF16)?
         };
+        let target_dims = [b, h, q_len, k_len];
+        let mask_prepared = if mask_bf16.shape().dims() == target_dims {
+            mask_bf16
+        } else {
+            record_layout_fix("sdpa.mask_broadcast", mask_bf16.shape());
+            mask_bf16.broadcast_to(&Shape::from_dims(&target_dims))?
+        };
+        let mask_view = mask_prepared.reshape(&[bh, q_len, k_len])?;
+        let penalty = mask_view.neg()?.add_scalar(1.0)?.mul_scalar(NEG_INF)?;
+        scores = scores.add(&penalty)?;
     }
 
-    let attn = scores.softmax(-1)?;
-    drop(scores);
-    let attn_bf16 = if attn.dtype() == DType::BF16 {
-        attn
+    let t_pre_softmax = t0.elapsed().as_millis();
+
+    // Fused softmax over last dim — single kernel instead of 5 (max, sub, exp, sum, div)
+    let attn_bf16 = if scores.dtype() == DType::BF16 {
+        crate::bf16_ops::softmax_last_dim_bf16(&scores)?
     } else {
-        attn.to_dtype(DType::BF16)?
+        let attn = scores.softmax(-1)?;
+        if attn.dtype() == DType::BF16 { attn } else { attn.to_dtype(DType::BF16)? }
     };
+    let t_softmax = t0.elapsed().as_millis() - t_pre_softmax;
+    drop(scores);
 
+    let t_pre_pv = t0.elapsed().as_millis();
+
+    // attn × V → [BH, Q, d] via batched cuBLASLt
     let out_shape = Shape::from_dims(&[bh, q_len, d_q]);
-    enum OutputBuffer {
-        Arena(Tensor),
-        Direct(Tensor),
-    }
-
-    let output = match borrow_bf16_arena_tensor(
-        device.clone(),
-        &stream,
-        out_shape.clone(),
-        ArenaScratch::DEFAULT_ALIGN,
-    ) {
-        Ok(tensor) => OutputBuffer::Arena(tensor),
-        Err(err) => {
-            log::warn!(
-                "sdpa_fallback: arena allocation for output {:?} failed: {} -- switching to chunked accumulation",
-                out_shape.dims(),
-                err
-            );
-            OutputBuffer::Direct(Tensor::zeros_dtype(
-                out_shape.clone(),
-                DType::BF16,
-                device.clone(),
-            )?)
-        }
-    };
-
-    let projected = match output {
-        OutputBuffer::Arena(mut out_bf16) => {
-            bmm_bf16_fp32acc_out(&attn_bf16, &v_flat, &mut out_bf16, false, false)?;
-            out_bf16
-        }
-        OutputBuffer::Direct(mut out_direct) => {
-            let chunk_limit = chunk_limit_from_env().unwrap_or(512).max(1);
-            let mut start = 0usize;
-            let elems_per_q = d_q;
-            let elems_per_head = q_len * elems_per_q;
-
-            while start < q_len {
-                let len = std::cmp::min(chunk_limit, q_len - start);
-                let attn_chunk = attn_bf16.narrow(1, start, len)?;
-                let chunk_shape = Shape::from_dims(&[bh, len, d_q]);
-                let mut chunk_out =
-                    Tensor::zeros_dtype(chunk_shape.clone(), DType::BF16, device.clone())?;
-                bmm_bf16_fp32acc_out(&attn_chunk, &v_flat, &mut chunk_out, false, false)?;
-
-                let chunk_elems = len * elems_per_q;
-                for bh_idx in 0..bh {
-                    let dst_offset = bh_idx * elems_per_head + start * elems_per_q;
-                    let src_offset = bh_idx * chunk_elems;
-                    out_direct.copy_bf16_region_from(
-                        dst_offset,
-                        &chunk_out,
-                        src_offset,
-                        chunk_elems,
-                    )?;
-                }
-                drop(chunk_out);
-                start += len;
-            }
-            out_direct
-        }
-    };
-
+    let mut projected = Tensor::zeros_dtype(out_shape, DType::BF16, device)?;
+    bmm_bf16_fp32acc_out(&attn_bf16, &v_flat, &mut projected, false, false)?;
+    let t_pv = t0.elapsed().as_millis() - t_pre_pv;
     drop(attn_bf16);
 
-    let projected = if q.dtype() == DType::BF16 {
-        projected
-    } else {
-        projected.to_dtype(q.dtype())?
-    };
+    let total = t0.elapsed().as_millis();
+    log::info!(
+        "[SDPA] reshape={}ms transpose={}ms QK={}ms scale={}ms softmax={}ms PV={}ms total={}ms (BH={} Q={} K={} d={})",
+        t_reshape, t_transpose, t_qk, t_scale, t_softmax, t_pv, total,
+        bh, q_len, k_len, d_q
+    );
 
     projected.reshape(&[b, h, q_len, d_q])
 }
