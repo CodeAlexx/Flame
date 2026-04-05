@@ -939,6 +939,37 @@ extern "C" __global__ void masked_fill_kernel(
         })
     }
 
+    /// Construct a BF16 tensor from a pre-populated GPU buffer.
+    ///
+    /// Takes ownership of the `CudaSlice<u16>`.  No copy — the slice IS
+    /// the tensor's storage.  Used by flame-swap to wrap async-transferred
+    /// block weights as tensors.
+    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+    pub fn from_bf16_slice_gpu(
+        data: CudaSlice<u16>,
+        shape: Shape,
+        device: Arc<CudaDevice>,
+    ) -> Self {
+        let numel = shape.elem_count();
+        debug_assert_eq!(
+            data.len(),
+            numel,
+            "CudaSlice length {} != shape numel {}",
+            data.len(),
+            numel
+        );
+        Tensor {
+            storage: TensorStorage::BF16 {
+                data: wrap_slice(data),
+                numel,
+            },
+            shape,
+            device,
+            id: TensorId::new(),
+            requires_grad: false,
+        }
+    }
+
     /// Create random tensor
     pub fn randn(shape: Shape, mean: f32, std: f32, device: Arc<CudaDevice>) -> Result<Self> {
         let size = shape.elem_count();

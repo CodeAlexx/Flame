@@ -16,21 +16,13 @@ unsafe impl Sync for LtContext {}
 static CONTEXTS: Lazy<Mutex<HashMap<usize, LtContext>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn init_context(_device: &Arc<CudaDevice>) -> Result<LtContext> {
-    let mut stream: *mut c_void = core::ptr::null_mut();
-    let stream_status = unsafe { crate::cuda::ffi::cudaStreamCreate(&mut stream as *mut _) };
-    if stream_status != 0 {
-        return Err(Error::Cuda(format!(
-            "cudaStreamCreate failed: {}",
-            stream_status
-        )));
-    }
+    // Use the default CUDA stream (null) so cublasLt GEMMs pipeline with
+    // elementwise kernels without implicit sync barriers between streams.
+    let stream: *mut c_void = core::ptr::null_mut();
 
     let mut handle: *mut c_void = core::ptr::null_mut();
     let handle_status = unsafe { crate::cuda::ffi::cublasLtCreate(&mut handle as *mut _) };
     if handle_status != 0 {
-        unsafe {
-            crate::cuda::ffi::cudaStreamDestroy(stream);
-        }
         return Err(Error::Cuda(format!(
             "cublasLtCreate failed: {}",
             handle_status

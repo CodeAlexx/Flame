@@ -96,6 +96,14 @@ fn main() {
     cuda_sources.push("kernels/sdpa_kernels.cu");
     cuda_sources.push("kernels/geglu_kernels.cu");
 
+    // Fused inference kernels (flame-swap / LTX-2 perf)
+    cuda_sources.push("src/cuda/fused_rms_norm.cu");
+    cuda_sources.push("src/cuda/fused_modulate.cu");
+    cuda_sources.push("src/cuda/fused_linear3d.cu");
+    cuda_sources.push("src/cuda/flash_attention_fwd.cu");
+    cuda_sources.push("src/cuda/fused_norm_modulate.cu");
+    cuda_sources.push("src/cuda/fused_residual_gate.cu");
+
     if !cuda_sources.iter().all(|p| Path::new(p).exists()) {
         panic!("CUDA sources missing; ensure submodules are synced");
     }

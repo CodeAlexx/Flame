@@ -402,4 +402,87 @@ extern "C" {
         w_out: i32,
         stream: *mut core::ffi::c_void,
     ) -> i32;
+
+    // ── Fused inference kernels ──────────────────────────────────────
+
+    /// Flash attention forward: BF16 in/out, FP32 accumulation, online softmax.
+    /// Q,K,V: [B*H, N, 128] BF16. O: [B*H, N, 128] BF16.
+    /// head_dim must be 128. Returns 0 on success.
+    pub fn flame_flash_attention_bf16(
+        Q: *const core::ffi::c_void,
+        K: *const core::ffi::c_void,
+        V: *const core::ffi::c_void,
+        O: *mut core::ffi::c_void,
+        batch_heads: i32,
+        seq_len_q: i32,
+        seq_len_kv: i32,
+        head_dim: i32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Fused RMS norm + modulation: out = rms_norm(x, w) * (1+scale) + shift.
+    /// Replaces fused_rms_norm + fused_modulate (2 kernels → 1).
+    pub fn flame_fused_rms_norm_modulate_bf16(
+        x: *const core::ffi::c_void,
+        norm_weight: *const core::ffi::c_void,
+        scale: *const core::ffi::c_void,
+        shift: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Fused residual + gating: out = x + gate * attn_out.
+    /// Replaces mul + add (2 kernels → 1).
+    pub fn flame_fused_residual_gate_bf16(
+        x: *const core::ffi::c_void,
+        attn_out: *const core::ffi::c_void,
+        gate: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        n_elements: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Fused RMS norm: BF16 in → BF16 out, with weight multiply.
+    /// Replaces 6 kernel launches (cast + sq + mean + rsqrt + mul + mul) with 1.
+    pub fn flame_fused_rms_norm_bf16(
+        input: *const core::ffi::c_void,
+        weight: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Fused modulation: out = x * (1 + scale) + shift. All BF16.
+    /// Replaces 4 kernel launches (add_scalar + cast + mul + add) with 1.
+    pub fn flame_fused_modulate_bf16(
+        x: *const core::ffi::c_void,
+        scale: *const core::ffi::c_void,
+        shift: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        n_elements: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Fused 3D linear via cublasLt: [B,N,Cin] @ [Cout,Cin]^T + bias = [B,N,Cout].
+    /// No reshape kernels. Bias fused into GEMM epilogue.
+    /// Replaces 4 launches (reshape + gemm + reshape + bias_add) with 1 cublasLt call.
+    pub fn flame_linear3d_bf16(
+        handle: *mut core::ffi::c_void,
+        input: *const core::ffi::c_void,
+        weight: *const core::ffi::c_void,
+        bias: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        batch_size: i32,
+        seq_len: i32,
+        in_features: i32,
+        out_features: i32,
+        workspace: *mut core::ffi::c_void,
+        workspace_size: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
 }

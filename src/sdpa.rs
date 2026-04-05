@@ -219,6 +219,18 @@ fn forward_bf16(
 ) -> SdpaResult<Tensor> {
     let scale = 1.0 / (d_q as f32).sqrt();
 
+    // Try flash attention first: single kernel, no materialization needed.
+    // Only for head_dim=128, no mask (most transformer inference).
+    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+    if d_q == 128 && mask.is_none() && !parse_env_flag("FLAME_NO_FLASH_ATTN").unwrap_or(false) {
+        match forward_flash_bf16(q, k, v, b, h, q_len, k_len) {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                log::warn!("flash_attention failed, falling back: {:?}", e);
+            }
+        }
+    }
+
     // Use the materialized GEMM path (batched cuBLASLt) when the attention matrix
     // fits in VRAM. BH*Q*K*2 bytes BF16:
     //   Klein 4B 512×512:  24*1536*1536*2 = 113MB — fine
@@ -283,6 +295,51 @@ fn forward_bf16(
     Err(Error::Unsupported(
         "sdpa_stream_bf16 unavailable (no fallback)".into(),
     ))
+}
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+/// Flash attention: single fused kernel for the entire attention computation.
+/// Q, K, V must be [B, H, N, 128] BF16, contiguous. No mask support.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn forward_flash_bf16(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    b: usize,
+    h: usize,
+    q_len: usize,
+    k_len: usize,
+) -> SdpaResult<Tensor> {
+    use crate::cuda::device_lt;
+
+    let bh = (b * h) as i32;
+    let device = q.device();
+    let stream = device_lt::stream_ptr(device)?;
+
+    // Output tensor: same shape as Q
+    let output = Tensor::zeros_dtype(q.shape().clone(), DType::BF16, device.clone())?;
+
+    let q_ptr = q.as_device_ptr_bf16("flash_attn:q")? as *const core::ffi::c_void;
+    let k_ptr = k.as_device_ptr_bf16("flash_attn:k")? as *const core::ffi::c_void;
+    let v_ptr = v.as_device_ptr_bf16("flash_attn:v")? as *const core::ffi::c_void;
+    let o_ptr = output.as_device_ptr_bf16("flash_attn:o")? as *mut core::ffi::c_void;
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_flash_attention_bf16(
+            q_ptr, k_ptr, v_ptr, o_ptr,
+            bh,
+            q_len as i32,
+            k_len as i32,
+            128, // head_dim
+            stream,
+        )
+    };
+
+    if ret != 0 {
+        return Err(Error::Cuda(format!("flash_attention CUDA error: {ret}")));
+    }
+
+    Ok(output)
 }
 
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]

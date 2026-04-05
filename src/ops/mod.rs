@@ -13,3 +13,4 @@ pub mod gemm_bf16;
 pub mod reduce;
 pub mod tile;
 pub mod utils;
+pub mod fused_inference;
