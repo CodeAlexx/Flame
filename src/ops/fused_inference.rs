@@ -9,6 +9,36 @@ use crate::DType;
 use cudarc::driver::DevicePtr;
 use crate::{Error, Result, Shape, Tensor};
 
+/// GPU-side FP8 E4M3 → BF16 dequantization.
+/// Input: raw FP8 bytes on GPU (CudaSlice<u8>), scale, shape.
+/// Output: new BF16 Tensor.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub fn dequant_fp8_to_bf16(
+    fp8_data: &cudarc::driver::CudaSlice<u8>,
+    scale: f32,
+    shape: Shape,
+    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+) -> Result<Tensor> {
+    let numel = shape.elem_count();
+    let bf16_out: cudarc::driver::CudaSlice<u16> = unsafe { device.alloc(numel)? };
+    let stream = device_lt::stream_ptr(device)?;
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_fp8_to_bf16(
+            *fp8_data.device_ptr() as *const _,
+            *bf16_out.device_ptr() as *mut _,
+            scale,
+            numel,
+            stream,
+        )
+    };
+    if ret != 0 {
+        return Err(Error::Cuda(format!("fp8_to_bf16 CUDA error: {ret}")));
+    }
+
+    Ok(Tensor::from_bf16_slice_gpu(bf16_out, shape, std::sync::Arc::clone(device)))
+}
+
 /// Fused RMS normalization: BF16 → BF16 with weight multiply.
 /// Replaces 6 kernel launches (cast + sq + mean + rsqrt + mul + mul_weight) with 1.
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]

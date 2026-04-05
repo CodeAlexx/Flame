@@ -405,6 +405,15 @@ extern "C" {
 
     // ── Fused inference kernels ──────────────────────────────────────
 
+    /// GPU-side FP8 E4M3 → BF16 dequant: out[i] = bf16(fp8(in[i]) * scale)
+    pub fn flame_fp8_to_bf16(
+        input: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        scale: f32,
+        n_elements: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// Flash attention forward: BF16 in/out, FP32 accumulation, online softmax.
     /// Q,K,V: [B*H, N, 128] BF16. O: [B*H, N, 128] BF16.
     /// head_dim must be 128. Returns 0 on success.
