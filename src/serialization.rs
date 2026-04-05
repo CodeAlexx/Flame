@@ -6,6 +6,28 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
+/// Convert FP8 E4M3 byte to f32.
+/// E4M3: 1 sign, 4 exponent (bias=7), 3 mantissa.
+#[inline]
+fn fp8_e4m3_to_f32(bits: u8) -> f32 {
+    let sign = (bits >> 7) & 1;
+    let exp = (bits >> 3) & 0xF;
+    let mant = bits & 0x7;
+    if exp == 0 && mant == 0 {
+        return if sign == 1 { -0.0 } else { 0.0 };
+    }
+    if exp == 0xF && mant == 0x7 {
+        return f32::NAN;
+    }
+    let (e, m) = if exp == 0 {
+        (-6i32, mant as f32 / 8.0)
+    } else {
+        (exp as i32 - 7, 1.0 + mant as f32 / 8.0)
+    };
+    let mag = m * (2.0f32).powi(e);
+    if sign == 1 { -mag } else { mag }
+}
+
 /// Format for saving tensors
 #[derive(Debug)]
 pub enum SerializationFormat {
@@ -447,7 +469,7 @@ fn load_tensors_safetensors(
             .unwrap_or("F32");
 
         // Skip unsupported dtypes (I64, I32, BOOL, etc.)
-        if !matches!(dtype_str, "F32" | "BF16" | "F16") {
+        if !matches!(dtype_str, "F32" | "BF16" | "F16" | "F8_E4M3") {
             continue;
         }
 
@@ -461,6 +483,31 @@ fn load_tensors_safetensors(
                 }
                 let s = Shape::from_dims(&shape);
                 let mut tensor = Tensor::zeros_dtype(s, DType::BF16, device.clone())?;
+                tensor.copy_from_bf16_slice(&bf16_u16)?;
+                tensor
+            }
+            "F8_E4M3" => {
+                // FP8 E4M3: 1 byte per element. Dequant with per-tensor scale.
+                let scale_key = format!("{name}_scale");
+                let scale = if let Some(scale_info) = metadata.get(&scale_key) {
+                    let s_offsets = scale_info["data_offsets"].as_array()
+                        .and_then(|a| Some((a[0].as_u64()? as usize, a[1].as_u64()? as usize)));
+                    if let Some((s_start, _)) = s_offsets {
+                        f32::from_le_bytes([
+                            all_data[s_start], all_data[s_start+1],
+                            all_data[s_start+2], all_data[s_start+3],
+                        ])
+                    } else { 1.0 }
+                } else { 1.0 };
+                let num_elems = end - start;
+                let mut bf16_u16 = vec![0u16; num_elems];
+                for (value, &byte) in bf16_u16.iter_mut().zip(all_data[start..end].iter()) {
+                    let f = fp8_e4m3_to_f32(byte) * scale;
+                    *value = half::bf16::from_f32(f).to_bits();
+                }
+                let mut tensor = Tensor::zeros_dtype(
+                    Shape::from_dims(&shape), DType::BF16, device.clone(),
+                )?;
                 tensor.copy_from_bf16_slice(&bf16_u16)?;
                 tensor
             }
@@ -571,7 +618,7 @@ where
             .ok_or_else(|| Error::InvalidInput("invalid end".into()))? as usize;
 
         let dtype_str = info["dtype"].as_str().unwrap_or("F32");
-        if !matches!(dtype_str, "F32" | "BF16" | "F16") {
+        if !matches!(dtype_str, "F32" | "BF16" | "F16" | "F8_E4M3") {
             continue;
         }
 
@@ -583,6 +630,31 @@ where
                 let mut bf16_u16 = vec![0u16; num_elems];
                 for (value, chunk) in bf16_u16.iter_mut().zip(data.chunks_exact(2)) {
                     *value = u16::from_le_bytes([chunk[0], chunk[1]]);
+                }
+                let mut tensor = Tensor::zeros_dtype(
+                    Shape::from_dims(&shape), DType::BF16, device.clone(),
+                )?;
+                tensor.copy_from_bf16_slice(&bf16_u16)?;
+                tensor
+            }
+            "F8_E4M3" => {
+                // FP8 E4M3: 1 byte per element. Dequant: value * weight_scale → BF16
+                let scale_key = format!("{name}_scale");
+                let scale = if let Some(scale_info) = metadata_obj.get(&scale_key) {
+                    let s_offsets = scale_info["data_offsets"].as_array()
+                        .and_then(|a| Some((
+                            data_start + a[0].as_u64()? as usize,
+                            data_start + a[1].as_u64()? as usize,
+                        )));
+                    if let Some((s_start, _s_end)) = s_offsets {
+                        f32::from_le_bytes([mmap[s_start], mmap[s_start+1], mmap[s_start+2], mmap[s_start+3]])
+                    } else { 1.0 }
+                } else { 1.0 };
+                let num_elems = data.len();
+                let mut bf16_u16 = vec![0u16; num_elems];
+                for (value, &byte) in bf16_u16.iter_mut().zip(data.iter()) {
+                    let f = fp8_e4m3_to_f32(byte) * scale;
+                    *value = half::bf16::from_f32(f).to_bits();
                 }
                 let mut tensor = Tensor::zeros_dtype(
                     Shape::from_dims(&shape), DType::BF16, device.clone(),
