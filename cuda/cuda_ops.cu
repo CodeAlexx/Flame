@@ -406,6 +406,53 @@ __global__ void group_norm_forward_bf16_kernel(const __nv_bfloat16* input,
 
 }  // namespace
 
+// RMS norm: BF16 input → F32 output (for Gemma3-style (1+w) multiply in F32)
+__global__ void rms_norm_bf16_to_f32_kernel(const __nv_bfloat16* x, float* y,
+                                             int64_t outer, int64_t channels, float eps) {
+  int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  while (idx < outer) {
+    const __nv_bfloat16* x_ptr = x + idx * channels;
+    float* y_ptr = y + idx * channels;
+    float mean = 0.0f;
+    for (int64_t c = 0; c < channels; ++c) {
+      float v = f32_from_bf16(x_ptr[c]);
+      mean += v * v;
+    }
+    mean /= static_cast<float>(channels);
+    float inv = rsqrtf(mean + eps);
+    for (int64_t c = 0; c < channels; ++c) {
+      float v = f32_from_bf16(x_ptr[c]);
+      y_ptr[c] = v * inv;  // F32 output — no BF16 truncation
+    }
+    idx += gridDim.x * blockDim.x;
+  }
+}
+
+extern "C" fc_status_t fc_rms_norm_bf16_to_f32(const fc_tensor_view_t* x,
+                                                 float eps,
+                                                 fc_tensor_view_t* y,
+                                                 cudaStream_t stream) {
+  FC_RETURN_IF_ERROR(check_tensor(x));
+  FC_RETURN_IF_ERROR(check_tensor(y));
+  const int64_t channels = x->dims[x->rank - 1];
+  int64_t outer = 1;
+  for (int32_t i = 0; i < x->rank - 1; ++i) {
+    outer *= x->dims[i];
+  }
+  dim3 grid, block;
+  FC_RETURN_IF_ERROR(launch_grid(static_cast<size_t>(outer), &grid, &block));
+  if (outer == 0) {
+    return FC_OK;
+  }
+  rms_norm_bf16_to_f32_kernel<<<grid, block, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x->data),
+      static_cast<float*>(y->data), outer, channels, eps);
+  if (cudaGetLastError() != cudaSuccess) {
+    return FC_ERR_LAUNCH;
+  }
+  return FC_OK;
+}
+
 extern "C" fc_status_t fc_rms_norm_bf16(const fc_tensor_view_t* x,
                                          const fc_tensor_view_t* weight,
                                          float eps,

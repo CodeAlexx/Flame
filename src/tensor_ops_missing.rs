@@ -173,6 +173,62 @@ impl Tensor {
         GpuOps::upsample2d_nearest(self, (new_h, new_w))
     }
 
+    /// Pad a 3D tensor [B, C, L] on the last dimension with zeros.
+    ///
+    /// `pad_left`: number of zeros prepended.
+    /// `pad_right`: number of zeros appended.
+    /// Returns [B, C, L + pad_left + pad_right].
+    pub fn pad1d(&self, pad_left: usize, pad_right: usize) -> Result<Tensor> {
+        let dims = self.shape().dims();
+        if dims.len() != 3 {
+            return Err(Error::InvalidOperation(format!(
+                "pad1d: expected 3D [B,C,L], got {}D", dims.len()
+            )));
+        }
+        if pad_left == 0 && pad_right == 0 {
+            return Ok(self.clone());
+        }
+        let (b, c, l) = (dims[0], dims[1], dims[2]);
+        let new_l = l + pad_left + pad_right;
+        let mut out = Tensor::zeros_dtype(
+            Shape::from_dims(&[b, c, new_l]),
+            self.dtype(),
+            self.device().clone(),
+        )?;
+        // Copy original data into the middle
+        // out[:, :, pad_left:pad_left+l] = self
+        if l > 0 {
+            let src_flat = self.reshape(&[b * c, l])?;
+            let mut dst_flat = out.reshape(&[b * c, new_l])?;
+            // Use narrow + copy pattern
+            // For now, construct via concat
+            let parts: Vec<&Tensor> = Vec::new();
+            // Actually, simplest: create left pad, self, right pad, then cat
+            drop(dst_flat);
+            drop(out);
+
+            let mut to_cat: Vec<Tensor> = Vec::new();
+            if pad_left > 0 {
+                to_cat.push(Tensor::zeros_dtype(
+                    Shape::from_dims(&[b, c, pad_left]),
+                    self.dtype(),
+                    self.device().clone(),
+                )?);
+            }
+            to_cat.push(self.clone());
+            if pad_right > 0 {
+                to_cat.push(Tensor::zeros_dtype(
+                    Shape::from_dims(&[b, c, pad_right]),
+                    self.dtype(),
+                    self.device().clone(),
+                )?);
+            }
+            let refs: Vec<&Tensor> = to_cat.iter().collect();
+            return Tensor::cat(&refs, 2);
+        }
+        Ok(out)
+    }
+
     /// Power operation with float exponent
     pub fn powf(&self, exponent: f32) -> Result<Tensor> {
         self.pow(exponent)

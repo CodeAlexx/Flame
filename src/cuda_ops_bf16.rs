@@ -21,9 +21,11 @@ use crate::{
         fc_axpby_bf16, fc_bf16_broadcast, fc_bf16_index_select, fc_bf16_repeat_axis,
         fc_bf16_repeat_nd, fc_bf16_slice, fc_gelu_bf16, fc_gemm_bf16, fc_group_norm_backward_bf16,
         fc_group_norm_bf16, fc_layer_norm_backward_bf16, fc_layer_norm_bf16, fc_relu_bf16,
-        fc_rms_norm_bf16, fc_silu_bf16, flame_conv2d_nhwc_bf16, flame_sdpa_chunked_bf16,
+        fc_rms_norm_bf16, fc_rms_norm_bf16_to_f32, fc_silu_bf16, flame_conv2d_nhwc_bf16,
+        flame_sdpa_chunked_bf16,
         flame_status_to_result, sdpa_stream_bf16_launch, tensor_as_view_bf16,
-        tensor_as_view_bf16_mut, CudaStream, FLAME_CUDA_ERR_UNSUPPORTED, FLAME_CUDA_OK,
+        tensor_as_view_bf16_mut, tensor_as_view_f32_mut, CudaStream,
+        FLAME_CUDA_ERR_UNSUPPORTED, FLAME_CUDA_OK,
     },
     staging::{
         arena_alloc, arena_record_and_release, conv2d_autotune_stats as staging_conv2d_stats,
@@ -285,6 +287,29 @@ pub fn rms_norm_bf16(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> Result<Te
         )
     };
     status_to_result(status, "fc_rms_norm_bf16")?;
+    Ok(out)
+}
+
+/// RMSNorm with BF16 input → F32 output (no weight).
+/// Used for Gemma3-style `(1+weight)` formulation where the multiply
+/// must happen in F32 precision to match PyTorch's `norm(x.float())`.
+pub fn rms_norm_bf16_to_f32(x: &Tensor, eps: f32) -> Result<Tensor> {
+    ensure_bf16(x, "rms_norm_bf16_to_f32:x")?;
+    let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::F32, x.device().clone())?;
+
+    let stream = default_stream(x);
+    let vx = tensor_as_view_bf16(x, "rms_norm_bf16_to_f32:x")?;
+    let mut vy = tensor_as_view_f32_mut(&mut out, "rms_norm_bf16_to_f32:out")?;
+
+    let status = unsafe {
+        fc_rms_norm_bf16_to_f32(
+            &vx,
+            eps,
+            &mut vy,
+            stream.as_raw(),
+        )
+    };
+    status_to_result(status, "fc_rms_norm_bf16_to_f32")?;
     Ok(out)
 }
 

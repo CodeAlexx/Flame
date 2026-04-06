@@ -152,6 +152,12 @@ extern "C" {
         y: *mut FcTensorView,
         stream: *mut c_void,
     ) -> i32;
+    pub fn fc_rms_norm_bf16_to_f32(
+        x: *const FcTensorView,
+        eps: f32,
+        y: *mut FcTensorView,
+        stream: *mut c_void,
+    ) -> i32;
     pub fn fc_gemm_bf16(
         x: *const FcTensorView,
         w: *const FcTensorView,
@@ -418,6 +424,34 @@ pub fn tensor_as_view_bf16(tensor: &Tensor, tag: &str) -> Result<FcTensorView> {
         strides[i] = shape.strides()[i] as i64;
     }
     let ptr = tensor.as_device_ptr_bf16(tag)? as *mut c_void;
+    Ok(FcTensorView {
+        data: ptr,
+        dims,
+        strides,
+        rank,
+    })
+}
+
+pub fn tensor_as_view_f32_mut(tensor: &mut Tensor, tag: &str) -> Result<FcTensorView> {
+    if tensor.dtype() != DType::F32 {
+        return Err(Error::InvalidInput(
+            format!("{tag}: expected F32 storage, got {:?}", tensor.dtype()),
+        ));
+    }
+    let shape = tensor.shape();
+    let rank = shape.rank() as i32;
+    let mut dims = [0i64; 8];
+    let mut strides = [0i64; 8];
+    for i in 0..rank as usize {
+        dims[i] = shape.dims()[i] as i64;
+        strides[i] = shape.strides()[i] as i64;
+    }
+    // F32 storage: get raw device pointer
+    let slice = tensor.as_mut_slice_f32(tag)?;
+    let ptr = {
+        use cudarc::driver::DevicePtr;
+        *slice.device_ptr() as *mut c_void
+    };
     Ok(FcTensorView {
         data: ptr,
         dims,
