@@ -104,6 +104,7 @@ fn main() {
     cuda_sources.push("src/cuda/fp8_dequant.cu");
     cuda_sources.push("src/cuda/fused_norm_modulate.cu");
     cuda_sources.push("src/cuda/fused_residual_gate.cu");
+    cuda_sources.push("src/cuda/fused_dequant_transpose.cu");
 
     if !cuda_sources.iter().all(|p| Path::new(p).exists()) {
         panic!("CUDA sources missing; ensure submodules are synced");

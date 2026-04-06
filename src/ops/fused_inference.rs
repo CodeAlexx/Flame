@@ -39,6 +39,77 @@ pub fn dequant_fp8_to_bf16(
     Ok(Tensor::from_bf16_slice_gpu(bf16_out, shape, std::sync::Arc::clone(device)))
 }
 
+/// GPU-side FP8 E4M3 → BF16 dequantization INTO an existing Tensor.
+/// Zero allocation — writes directly into the output tensor's GPU memory.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub fn dequant_fp8_to_bf16_into(
+    fp8_data: &cudarc::driver::CudaSlice<u8>,
+    scale: f32,
+    output: &Tensor,
+) -> Result<()> {
+    let numel = output.shape().elem_count();
+    let stream = device_lt::stream_ptr(output.device())?;
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_fp8_to_bf16(
+            *fp8_data.device_ptr() as *const _,
+            output.as_device_ptr_bf16("dequant_into:output")? as *mut _,
+            scale,
+            numel,
+            stream,
+        )
+    };
+    if ret != 0 {
+        return Err(Error::Cuda(format!("fp8_to_bf16_into CUDA error: {ret}")));
+    }
+    Ok(())
+}
+
+/// Fused FP8 E4M3 dequant + transpose into a pre-allocated BF16 tensor.
+/// Reads [M, N] row-major FP8 data, writes [N, M] row-major BF16.
+/// One kernel launch, zero allocation.
+///
+/// - `fp8_data`: FP8 bytes on GPU, length = M * N
+/// - `scale`: dequant scale factor
+/// - `output`: pre-allocated BF16 tensor with shape [N, M]
+/// - `m`: rows of the FP8 input (out_features)
+/// - `n`: cols of the FP8 input (in_features)
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub fn dequant_fp8_transpose_into(
+    fp8_data: &cudarc::driver::CudaSlice<u8>,
+    scale: f32,
+    output: &Tensor,
+    m: usize,
+    n: usize,
+) -> Result<()> {
+    let expected = m * n;
+    let out_elems = output.shape().elem_count();
+    if out_elems != expected {
+        return Err(Error::InvalidShape(format!(
+            "dequant_fp8_transpose_into: output has {out_elems} elements, expected {expected} (N={n} x M={m})"
+        )));
+    }
+
+    let stream = device_lt::stream_ptr(output.device())?;
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_fused_dequant_transpose_bf16(
+            *fp8_data.device_ptr() as *const _,
+            output.as_device_ptr_bf16("dequant_transpose:output")? as *mut _,
+            scale,
+            m as i32,
+            n as i32,
+            stream,
+        )
+    };
+    if ret != 0 {
+        return Err(Error::Cuda(format!(
+            "flame_fused_dequant_transpose_bf16 CUDA error: {ret}"
+        )));
+    }
+    Ok(())
+}
+
 /// Fused RMS normalization: BF16 → BF16 with weight multiply.
 /// Replaces 6 kernel launches (cast + sq + mean + rsqrt + mul + mul_weight) with 1.
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]

@@ -10,6 +10,7 @@ pub fn assert_cuda(tag: &str, t: &Tensor) -> Result<()> {
             | TensorStorage::F16 { .. }
             | TensorStorage::BF16 { .. }
             | TensorStorage::BF16Arena { .. }
+            | TensorStorage::BF16View { .. }
             | TensorStorage::I8 { .. }
             | TensorStorage::I32 { .. }
             | TensorStorage::Bool { .. }
@@ -31,6 +32,7 @@ pub fn log_device(tag: &str, t: &Tensor) {
             | TensorStorage::F16 { .. }
             | TensorStorage::BF16 { .. }
             | TensorStorage::BF16Arena { .. }
+            | TensorStorage::BF16View { .. }
             | TensorStorage::I8 { .. }
             | TensorStorage::I32 { .. }
             | TensorStorage::Bool { .. }

@@ -427,6 +427,8 @@ extern "C" __global__ void masked_fill_kernel(
             TensorStorage::BF16 { .. } => return std::ptr::null_mut(),
             #[cfg(feature = "bf16_u16")]
             TensorStorage::BF16Arena { .. } => return std::ptr::null_mut(),
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16View { .. } => return std::ptr::null_mut(),
             TensorStorage::I32 { data, .. } => *data.device_ptr(),
             TensorStorage::Bool { data, .. } => *data.device_ptr(),
             TensorStorage::I8 { .. } => {
@@ -450,6 +452,7 @@ extern "C" __global__ void masked_fill_kernel(
         match self.storage_ref() {
             TensorStorage::BF16 { data, .. } => Ok((*data.device_ptr()) as *const u16),
             TensorStorage::BF16Arena { ptr, .. } => Ok(ptr.as_ptr()),
+            TensorStorage::BF16View { ptr, .. } => Ok(ptr.as_ptr()),
             _ => Err(Error::InvalidOperation(format!(
                 "[{tag}] expected BF16(u16) backing storage"
             ))),
@@ -527,6 +530,7 @@ extern "C" __global__ void masked_fill_kernel(
                 Ok((*data.device_ptr_mut()) as *mut u16)
             }
             TensorStorage::BF16Arena { ptr, .. } => Ok(ptr.as_ptr()),
+            TensorStorage::BF16View { ptr, .. } => Ok(ptr.as_ptr()),
             _ => Err(Error::InvalidOperation(format!(
                 "[{tag}] expected BF16(u16) backing storage"
             ))),
@@ -968,6 +972,48 @@ extern "C" __global__ void masked_fill_kernel(
             id: TensorId::new(),
             requires_grad: false,
         }
+    }
+
+    /// Create a non-owning BF16 tensor that aliases existing GPU memory.
+    ///
+    /// Create a non-owning BF16 tensor that views into a shared GPU buffer.
+    ///
+    /// The returned tensor does NOT free the underlying memory on drop.
+    /// The caller must guarantee that the backing buffer outlives all views
+    /// created from it (e.g. the shared buffer lives for the entire forward
+    /// pass, and views are dropped at block boundaries).
+    ///
+    /// # Safety
+    /// - `ptr` must be a valid device pointer to `numel` BF16 elements.
+    /// - The backing buffer must outlive this tensor.
+    #[cfg(feature = "bf16_u16")]
+    pub unsafe fn view_from_buffer(
+        ptr: *mut u16,
+        shape: Shape,
+        device: Arc<CudaDevice>,
+    ) -> Self {
+        let numel = shape.elem_count();
+        Tensor {
+            storage: TensorStorage::BF16View {
+                ptr: NonNull::new_unchecked(ptr),
+                numel,
+            },
+            shape,
+            device,
+            id: TensorId::new(),
+            requires_grad: false,
+        }
+    }
+
+    /// Backwards-compatible alias for `view_from_buffer`.
+    #[cfg(feature = "bf16_u16")]
+    pub unsafe fn from_bf16_device_ptr_non_owning(
+        ptr: u64,
+        numel: usize,
+        shape: Shape,
+        device: Arc<CudaDevice>,
+    ) -> Self {
+        Self::view_from_buffer(ptr as *mut u16, shape, device)
     }
 
     /// Create random tensor
@@ -2389,6 +2435,23 @@ extern "C" __global__ void f32_to_bool_kernel(
                     numel: *numel,
                 }
             }
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16View { ptr, numel } => {
+                use cudarc::driver::DevicePtrMut;
+                let mut new_data =
+                    unsafe { self.device.alloc::<u16>(*numel) }.map_err(|_| Error::CudaDriver)?;
+                let stream = CudaStream::from_raw(self.device.cuda_stream_raw_ptr());
+                bf16_copy_async(
+                    (*new_data.device_ptr_mut()) as *mut std::ffi::c_void,
+                    ptr.as_ptr() as *const std::ffi::c_void,
+                    *numel,
+                    &stream,
+                )?;
+                TensorStorage::BF16 {
+                    data: wrap_slice(new_data),
+                    numel: *numel,
+                }
+            }
             TensorStorage::I8 { data, numel } => {
                 let mut new_data =
                     unsafe { self.device.alloc::<i8>(*numel) }.map_err(|_| Error::CudaDriver)?;
@@ -3168,10 +3231,9 @@ impl Tensor {
                 Ok(())
             }
             #[cfg(feature = "bf16_u16")]
-            TensorStorage::BF16Arena { ptr, .. } => {
+            TensorStorage::BF16Arena { ptr, .. } | TensorStorage::BF16View { ptr, .. } => {
                 use cudarc::driver::DevicePtrMut;
 
-                // Using a staging buffer is safest and easiest with current APIs
                 let mut staging = unsafe { device.alloc::<u16>(data.len()) }
                     .map_err(|e| Error::Cuda(format!("alloc staging: {:?}", e)))?;
                 device
@@ -3280,7 +3342,7 @@ impl Tensor {
                         .map_err(|_| Error::CudaDriver)?;
                 }
                 #[cfg(feature = "bf16_u16")]
-                TensorStorage::BF16Arena { ptr, .. } => {
+                TensorStorage::BF16Arena { ptr, .. } | TensorStorage::BF16View { ptr, .. } => {
                     // Copy via staging
                     let mut staging = unsafe { device_ref.alloc::<u16>(len) }
                         .map_err(|e| Error::Cuda(format!("alloc staging: {:?}", e)))?;
@@ -3289,7 +3351,6 @@ impl Tensor {
                         .map_err(|_| Error::CudaDriver)?;
 
                     let stream = CudaStream::from_raw(device_ref.cuda_stream_raw_ptr());
-                    // Calculate dest ptr
                     let dst_ptr = unsafe { ptr.as_ptr().add(offset) };
 
                     bf16_copy_async(

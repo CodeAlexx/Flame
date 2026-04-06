@@ -78,6 +78,13 @@ pub enum TensorStorage {
         device: Arc<CudaDevice>,
         lease: crate::staging::ArenaLease,
     },
+    /// Non-owning view into a shared GPU buffer. Does NOT free on drop.
+    /// The caller must guarantee the backing buffer outlives all views.
+    #[cfg(feature = "bf16_u16")]
+    BF16View {
+        ptr: NonNull<u16>,
+        numel: usize,
+    },
     I8 {
         data: StorageSlice<i8>,
         numel: usize,
@@ -98,7 +105,7 @@ impl TensorStorage {
         match self {
             TensorStorage::F32 { .. } => DType::F32,
             TensorStorage::F16 { .. } => DType::F16,
-            TensorStorage::BF16 { .. } | TensorStorage::BF16Arena { .. } => DType::BF16,
+            TensorStorage::BF16 { .. } | TensorStorage::BF16Arena { .. } | TensorStorage::BF16View { .. } => DType::BF16,
             TensorStorage::I8 { .. } => DType::I8,
             TensorStorage::I32 { .. } => DType::I32,
             TensorStorage::Bool { .. } => DType::Bool,
@@ -110,7 +117,7 @@ impl TensorStorage {
         match self {
             TensorStorage::F32 { numel, .. } => *numel,
             TensorStorage::F16 { numel, .. } => *numel,
-            TensorStorage::BF16 { numel, .. } | TensorStorage::BF16Arena { numel, .. } => *numel,
+            TensorStorage::BF16 { numel, .. } | TensorStorage::BF16Arena { numel, .. } | TensorStorage::BF16View { numel, .. } => *numel,
             TensorStorage::I8 { numel, .. } => *numel,
             TensorStorage::I32 { numel, .. } => *numel,
             TensorStorage::Bool { numel, .. } => *numel,
@@ -278,6 +285,19 @@ impl TensorStorage {
                     Ok(out)
                 }
             }
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16View { ptr, numel } => {
+                use cudarc::driver::DevicePtr;
+                // BF16View: convert via direct bf16→f32 kernel from raw pointer
+                let mut out = alloc_aligned_f32(device, *numel)?;
+                crate::bf16_convert::bf16_u16_to_f32(
+                    device.clone(),
+                    ptr.as_ptr() as u64,
+                    &mut out,
+                    *numel,
+                )?;
+                Ok(out)
+            }
             TensorStorage::I8 { .. } => Err(Error::InvalidOperation(
                 "I8 to F32 conversion not yet implemented".into(),
             )),
@@ -327,6 +347,10 @@ impl TensorStorage {
                 )
                 .into(),
             )),
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16View { numel, .. } => Err(Error::InvalidInput(
+                format!("expected F32 slice, got view-backed BF16(u16) (len={})", numel).into(),
+            )),
             TensorStorage::I8 { .. } => {
                 Err(Error::InvalidInput("expected F32 slice, got I8".into()))
             }
@@ -350,6 +374,10 @@ impl TensorStorage {
             TensorStorage::BF16Arena { .. } => Err(Error::InvalidInput(
                 "expected F32 slice, got arena-backed BF16(u16)".into(),
             )),
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16View { .. } => Err(Error::InvalidInput(
+                "expected F32 slice, got view-backed BF16(u16)".into(),
+            )),
             TensorStorage::I8 { .. } => {
                 Err(Error::InvalidInput("expected F32 slice, got I8".into()))
             }
@@ -371,6 +399,9 @@ impl TensorStorage {
             TensorStorage::BF16 { data, .. } => Ok(slice_ref(data)),
             TensorStorage::BF16Arena { .. } => Err(Error::InvalidOperation(
                 "expected owning BF16 storage, got arena-backed BF16".into(),
+            )),
+            TensorStorage::BF16View { .. } => Err(Error::InvalidOperation(
+                "expected owning BF16 storage, got view-backed BF16".into(),
             )),
             TensorStorage::F32 { .. } => Err(Error::InvalidInput(
                 "expected BF16(u16) slice, got F32".into(),
@@ -397,6 +428,9 @@ impl TensorStorage {
             TensorStorage::BF16 { data, .. } => ensure_unique_slice(data),
             TensorStorage::BF16Arena { .. } => Err(Error::InvalidOperation(
                 "expected owning BF16 storage, got arena-backed BF16".into(),
+            )),
+            TensorStorage::BF16View { .. } => Err(Error::InvalidOperation(
+                "expected owning BF16 storage, got view-backed BF16".into(),
             )),
             TensorStorage::F32 { .. } => Err(Error::InvalidInput(
                 "expected BF16(u16) slice, got F32".into(),
@@ -481,6 +515,22 @@ impl TensorStorage {
                     &stream,
                 )?;
                 arena_device
+                    .dtoh_sync_copy(&staging)
+                    .map_err(|_| Error::CudaDriver)
+            }
+            TensorStorage::BF16View { ptr, numel } => {
+                use cudarc::driver::DevicePtrMut;
+                // View: copy from raw ptr to staging, then dtoh
+                let mut staging = unsafe { device.alloc::<u16>(*numel) }
+                    .map_err(|e| Error::Cuda(format!("alloc bf16 view staging: {:?}", e)))?;
+                let stream = CudaStream::from_raw(device.cuda_stream_raw_ptr());
+                bf16_copy_async(
+                    (*staging.device_ptr_mut()) as *mut c_void,
+                    ptr.as_ptr() as *const c_void,
+                    *numel,
+                    &stream,
+                )?;
+                device
                     .dtoh_sync_copy(&staging)
                     .map_err(|_| Error::CudaDriver)
             }

@@ -477,6 +477,17 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// Fused FP8 E4M3 dequant + transpose: [M,N] FP8 -> [N,M] BF16.
+    /// One kernel launch, zero allocation. Output must be pre-allocated.
+    pub fn flame_fused_dequant_transpose_bf16(
+        input: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        scale: f32,
+        m: i32,
+        n: i32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// Fused 3D linear via cublasLt: [B,N,Cin] @ [Cout,Cin]^T + bias = [B,N,Cout].
     /// No reshape kernels. Bias fused into GEMM epilogue.
     /// Replaces 4 launches (reshape + gemm + reshape + bias_add) with 1 cublasLt call.
