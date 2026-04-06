@@ -222,8 +222,8 @@ fn forward_bf16(
     // Try flash attention first: single kernel, no materialization needed.
     // Only for head_dim=128, no mask (most transformer inference).
     #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-    if d_q == 128 && mask.is_none() && !parse_env_flag("FLAME_NO_FLASH_ATTN").unwrap_or(false) {
-        match forward_flash_bf16(q, k, v, b, h, q_len, k_len) {
+    if (d_q == 64 || d_q == 96 || d_q == 128) && mask.is_none() && !parse_env_flag("FLAME_NO_FLASH_ATTN").unwrap_or(false) {
+        match forward_flash_bf16(q, k, v, b, h, q_len, k_len, d_q) {
             Ok(out) => return Ok(out),
             Err(e) => {
                 log::warn!("flash_attention failed, falling back: {:?}", e);
@@ -299,7 +299,7 @@ fn forward_bf16(
 
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 /// Flash attention: single fused kernel for the entire attention computation.
-/// Q, K, V must be [B, H, N, 128] BF16, contiguous. No mask support.
+/// Q, K, V must be [B, H, N, D] BF16, contiguous. D = 64, 96, or 128. No mask support.
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 fn forward_flash_bf16(
     q: &Tensor,
@@ -309,6 +309,7 @@ fn forward_flash_bf16(
     h: usize,
     q_len: usize,
     k_len: usize,
+    d_q: usize,
 ) -> SdpaResult<Tensor> {
     use crate::cuda::device_lt;
 
@@ -330,7 +331,7 @@ fn forward_flash_bf16(
             bh,
             q_len as i32,
             k_len as i32,
-            128, // head_dim
+            d_q as i32,
             stream,
         )
     };
