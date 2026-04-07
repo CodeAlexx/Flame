@@ -1,0 +1,512 @@
+# flame-core conventions and gotchas
+
+> The patterns, naming rules, and dispatch tricks that take 3 grep rounds to
+> figure out each session. Read once, save hours later.
+
+---
+
+## File / module layout
+
+### Three places kernels can live
+
+1. **NVRTC inline string consts** — `src/bf16_*.rs`, `src/cuda_kernels*.rs`,
+   `src/conv3d_bf16.rs`, etc. The kernel source is a `const &str`, compiled
+   at runtime via `cudarc::nvrtc::compile_ptx_with_opts`. Each module has
+   an `ensure(dev, name, code)` helper that compiles + caches via
+   `dev.get_func(name, name).is_some()`. The launcher is a small `pub fn`
+   in the same module.
+
+2. **Build-time `.cu` files at `cuda/`** (repo root). Older surface. Symbols
+   are `fc_*` returning `fc_status_t`. Compiled via `cc-rs/nvcc` from
+   `build.rs`. The Rust FFI declarations live in `src/cuda_ops_ffi.rs`.
+
+3. **Build-time `.cu` files at `src/cuda/`** (newer). Symbols are `flame_*`
+   returning `int`. The Rust FFI declarations live in `src/cuda/ffi.rs`.
+
+`build.rs` lists every `.cu` file with `cuda_sources.push(...)`. If you add
+a new `.cu` file, you must add it there or it won't compile.
+
+There's also `src/kernels/` (.cu files for SDPA / RoPE / GeGLU primitives)
+and `kernels/` at the repo root (some duplicates of the `src/kernels/` files).
+Always check `build.rs` to see which copy is actually built.
+
+### Modules that look duplicated but aren't
+
+- `attention/sdpa.rs` (the live public dispatcher) **vs** `sdpa.rs` (the
+  lower-level dispatcher under it). Use `attention::sdpa` from model code.
+- `attention/sdpa_legacy.rs` and `sdpa_legacy.rs` — both legacy, unrelated
+  to the live path. Don't call.
+- `layer_norm.rs::LayerNorm` (the live struct) **vs** `attention/sdpa.rs::LayerNorm`
+  (a duplicate inside the attention module — don't use).
+- `cuda_ops.rs::GpuOps` (training F32) **vs** `cuda_ops_bf16.rs` (live BF16).
+  The live entry from `Tensor::permute` falls back to `GpuOps::permute_generic`
+  for non-fast-path orders, but otherwise `cuda_ops.rs` is training-only.
+- `cuda_kernels.rs` and `cuda_kernels_gpu.rs` — both training NVRTC F32
+  kernel registries.
+- Multiple conv2d implementations: `conv::Conv2d` (use this), `cuda_conv2d*.rs`
+  (older direct CUDA), `ops/conv2d*.rs` (alternative entry points).
+
+When you find yourself with two functions with the same name in different
+files: the canonical one is whichever `inference-flame` actually calls.
+Search `inference-flame/src` for `flame_core::module_name::fn_name` to find
+out.
+
+---
+
+## Naming conventions
+
+### Module / function naming
+
+| Pattern | Meaning | Example |
+|---|---|---|
+| `*_bf16` | BF16 operand | `silu_bf16`, `rms_norm_bf16`, `add_bf16` |
+| `*_f32` | F32 operand | `mse_loss_f32`, `silu_f32` |
+| `*_into` | Output-into variant (writes to a passed-in `&mut Tensor`) | `gelu_bf16_into`, `layer_norm_into` |
+| `*_with_stats` | Returns intermediate stats (mean/rstd) for backward | `layer_norm_bf16_with_stats` |
+| `fused_*` | Single kernel covering multiple ops | `fused_rms_norm`, `fused_residual_gate` |
+| `*_native` | Takes weight in standard PyTorch `[Cout, Cin]` layout (not pre-transposed) | `fused_linear3d_native` |
+| `*_flat` | Fast path for contiguous same-shape inputs | `add_bf16_flat_kernel`, `mul_bf16_flat_kernel` |
+| `*_kernel` | The kernel itself (vs the launcher) | `silu_bf16_kernel` |
+| `flame_*` | C-side `extern "C"` symbol returning `int` | `flame_flash_attention_bf16` |
+| `fc_*` | C-side `extern "C"` symbol returning `fc_status_t` | `fc_rms_norm_bf16` |
+
+### Tensor parameter ordering
+
+For elementwise: `op(input1, input2)`. For norms: `norm(x, weight, bias, eps)`
+or `norm(x, weight, eps)` if no bias. For matmul: `matmul(x, weight)` (NOT
+`matmul(weight, x)`). For attention: `sdpa(q, k, v, mask)`.
+
+### Output dtype
+
+By default, BF16 ops return BF16. F32 ops return F32. There is NO automatic
+promotion — passing an F32 tensor to a BF16 op raises an error. Use
+`.to_dtype(DType::BF16)` explicitly.
+
+---
+
+## The launch config family
+
+### `lc(n)` vs `lc_pairs(n)` — vectorized vs scalar kernels
+
+In `bf16_*.rs` and `bf16_convert.rs`:
+
+```rust
+#[inline]
+fn lc(n: usize) -> LaunchConfig {
+    LaunchConfig::for_num_elems(n as u32)
+}
+
+#[inline]
+fn lc_pairs(n: usize) -> LaunchConfig {
+    let pairs = (n + 1) / 2;
+    LaunchConfig::for_num_elems(pairs as u32)
+}
+```
+
+**Use `lc(n)` for 1-element-per-thread kernels** (the default).
+**Use `lc_pairs(n)` for 2-element-per-thread vectorized kernels** that
+process `__nv_bfloat162` pairs. If you launch a vectorized kernel with
+`lc(n)`, you'll launch 2× as many threads as needed and they'll all check
+`if (i2 < n2)` and exit, wasting half the work. The kernel will still
+produce correct output but at half the speed. **This bit me twice.**
+
+`build.rs` C++ code (in `cuda/` and `src/cuda/`) uses an inline
+`launch_grid(n_pairs, &grid, &block)` helper instead.
+
+### Block / grid sizing
+
+For "1 row per block" kernels (RMSNorm, LayerNorm, softmax):
+```rust
+let block_size = 1usize;
+while block_size * 2 <= cols && block_size * 2 <= 1024 { block_size *= 2; }
+if block_size < 32 { block_size = 32; }
+let grid = (rows as u32, 1, 1);
+let block = (block_size as u32, 1, 1);
+```
+
+Power-of-two block size up to 1024, minimum 32 (one warp). Shared memory is
+sized for the reduction.
+
+---
+
+## NVRTC pitfalls
+
+### `<cfloat>` and `<float.h>` are NOT available
+
+NVRTC only ships a minimal subset of the C++ standard library. If you need
+`FLT_MAX`, define it as a literal in the kernel source:
+
+```cuda
+#define LOCAL_FLT_MAX 3.402823466e+38f
+```
+
+Don't `#include <float.h>` or `#include <cfloat>`. They will fail with
+"cannot open source file" at runtime when the NVRTC compile happens — and
+the failure only shows up the first time the kernel is called, not at
+build time.
+
+### `#pragma unroll` inside macro definitions
+
+`#pragma` doesn't survive C preprocessor macro stringification. If you have
+a macro that defines a kernel (like `flash_attention_fwd.cu`'s
+`DEFINE_FLASH_ATTN_WMMA_KERNEL`), use `_Pragma("unroll")` instead:
+
+```cuda
+_Pragma("unroll")
+for (int off = 16; off > 0; off >>= 1) { ... }
+```
+
+### Compiled-once kernel cache
+
+`cudarc` caches NVRTC-compiled functions per `(device, name)`. If you change
+the kernel source string in `bf16_ops.rs` and rebuild, the new kernel WILL
+be picked up at runtime (because the device-side cache is per-process and a
+fresh `cargo run` starts a new process). But if you forget to bump the
+function name and the cache layer is shared somehow (e.g. across test runs),
+you can get the old kernel. Easiest debug: rename the kernel temporarily to
+force a recompile.
+
+---
+
+## BF16 vs F32 hot path — what to use when
+
+| Situation | Use |
+|---|---|
+| Inference, BF16 in/out, elementwise op on shape-equal tensors | `bf16_elementwise::*_bf16` (auto-routed by `Tensor::*` for matching shapes) |
+| Inference, BF16 unary op (silu/gelu/sqrt/etc) | `bf16_ops::*_bf16` |
+| Inference, BF16 matmul | `Tensor::matmul` (auto-routes) or `ops::fused_inference::fused_linear3d_native` for the cuBLASLt+bias path |
+| Inference, RMSNorm/LayerNorm | `cuda_ops_bf16::rms_norm_bf16 / layer_norm_bf16` (the `Tensor::softmax` BF16 fast path is automatic) |
+| Inference, attention | `attention::sdpa` |
+| Inference, RoPE | `bf16_ops::rope_fused_bf16` (interleaved-pair) or `bf16_ops::rope_halfsplit_bf16` (Z-Image format) |
+| Inference, FFN gate-residual | `bf16_ops::gate_residual_fused_bf16` and `bf16_ops::swiglu_fused_bf16` |
+| Training F32 tensor add | falls through to `cuda_ops::GpuOps::add` |
+| Need autograd | use the `Tensor::*` methods (they record on the tape); the bare BF16 functions DO NOT record |
+
+### The autograd recording trap
+
+`bf16_elementwise::add_bf16(a, b)` does NOT record on the autograd tape.
+`Tensor::add(&b)` DOES (when `requires_grad` is true).
+
+So:
+- Inference code can call the bare functions directly — slightly faster, no
+  tape overhead.
+- Training code must call `Tensor::add(&b)` (or `tensor_a + tensor_b` if
+  the operator overload is in scope).
+
+The fused inference primitives in `ops::fused_inference::*` also do NOT
+record. They're designed for inference, not training.
+
+---
+
+## Layout conventions
+
+### NCHW vs NHWC
+
+- `tensor::Tensor` has no inherent layout — it's just `[d0, d1, d2, ...]`.
+- `conv::Conv2d::forward(input)` expects **NCHW**.
+- `conv::Conv2d::forward_nhwc(input)` expects **NHWC**.
+- `cuda_ops_bf16::group_norm_bf16(x, ...)` expects **NHWC** (this trips
+  people up — the docstring says `[N, H, W, C]`).
+- `group_norm::group_norm(...)` (the functional API) handles either layout
+  by converting if needed.
+
+If you're going to call `group_norm_bf16` directly, permute first:
+```rust
+let nhwc = nchw.permute(&[0, 2, 3, 1])?;
+let out_nhwc = group_norm_bf16(&nhwc, ...)?;
+let out = out_nhwc.permute(&[0, 3, 1, 2])?;
+```
+
+### `[B, N, C]` vs `[B, C, N]` for sequence-like tensors
+
+Most flame-core inference functions use `[B, N, C]` (batch, sequence, channel)
+— same as PyTorch transformer convention. Some legacy training code uses
+`[B, C, N]`. Check the function docs.
+
+### Attention `[B, H, N, D]`
+
+`attention::sdpa(q, k, v, mask)` expects `[B, H, N, D]` where H is heads, N
+is sequence length, D is head_dim. Reshape from `[B, N, H*D]` first via
+`.reshape(&[B, N, H, D]).permute(&[0, 2, 1, 3])`.
+
+### Weight layouts
+
+Standard PyTorch `nn.Linear` saves weight as `[Cout, Cin]` row-major.
+Most flame-core matmul functions want this layout — `Tensor::matmul`,
+`ops::fused_inference::fused_linear3d_native`, etc.
+
+The exception is `fused_linear3d` (without `_native`): it wants
+**pre-transposed** `[Cin, Cout]` row-major. Klein and a few other models
+pre-transpose all linear weights at load time. New code should use
+`fused_linear3d_native` instead.
+
+---
+
+## Adding a new BF16 op — template
+
+### Single-arg unary (like silu, gelu)
+
+In `src/bf16_ops.rs`:
+
+```rust
+const CUDA_MY_OP: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void my_op_bf16_kernel(const __nv_bfloat16* __restrict__ X,
+                        __nv_bfloat16* __restrict__ Y,
+                        long n) {
+    long i2 = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long n2 = n >> 1;
+    if (i2 < n2) {
+        const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(X);
+        __nv_bfloat162* y2 = reinterpret_cast<__nv_bfloat162*>(Y);
+        float2 v = __bfloat1622float2(x2[i2]);
+        // ... your math on v.x and v.y ...
+        y2[i2] = __floats2bfloat162_rn(result.x, result.y);
+    }
+    if (i2 == n2 && (n & 1)) {
+        long last = n - 1;
+        // ... scalar path for the tail ...
+    }
+}
+"#;
+
+pub fn my_op_bf16(x: &Tensor) -> Result<Tensor> {
+    debug_assert_eq!(x.dtype(), DType::BF16);
+    let n = x.shape().elem_count();
+    let data = unsafe { x.device.alloc::<u16>(n) }
+        .map_err(|e| Error::Cuda(format!("alloc my_op: {:?}", e)))?;
+    let mut out = Tensor {
+        storage: TensorStorage::BF16 { data: data.into(), numel: n },
+        shape: x.shape().clone(),
+        device: x.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+    };
+    ensure(&x.device, "my_op_bf16_kernel", CUDA_MY_OP)?;
+    let f = x.device
+        .get_func("my_op_bf16_kernel", "my_op_bf16_kernel")
+        .ok_or_else(|| Error::Cuda("my_op_bf16_kernel missing".into()))?;
+    let xs = match &x.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("my_op_bf16 expects BF16".into())),
+    };
+    let ys = match &mut out.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
+    let ys = ensure_unique_slice(ys)?;
+    unsafe {
+        f.launch(lc_pairs(n), (slice_ref(xs), ys, n as i64))?;
+    }
+    Ok(out)
+}
+```
+
+Use `lc_pairs(n)` for the vectorized kernel. Use `lc(n)` if you went with a
+scalar 1-element-per-thread kernel.
+
+### Two-input elementwise (like add, mul)
+
+In `src/bf16_elementwise.rs`. Add a new flat-path kernel to `CUDA_ADD_MUL_BF16_FLAT`,
+add a `pub fn` that uses `shapes_equal_no_broadcast` to dispatch:
+
+```rust
+pub fn my_binary_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if shapes_equal_no_broadcast(a, b) {
+        return launch_bf16_flat(a, b, "my_binary_bf16_flat_kernel", "my_binary_bf16");
+    }
+    // fall back to the broadcast path
+    launch_bf16_elementwise(a, b, "my_binary_bf16_kernel", "my_binary_bf16")
+}
+```
+
+Add the broadcast-path kernel to `CUDA_ADD_MUL_BF16` (the slow generic 8-D
+broadcast path).
+
+### Build-time `.cu` kernel (cuBLASLt wrapper, big kernel)
+
+1. Create `src/cuda/my_kernel.cu` with an `extern "C" int flame_my_op_bf16(...)`
+   entry point and any `__global__` kernels it dispatches to.
+2. Add `cuda_sources.push("src/cuda/my_kernel.cu");` in `build.rs`.
+3. Declare in `src/cuda/ffi.rs`:
+   ```rust
+   pub fn flame_my_op_bf16(
+       handle: *mut core::ffi::c_void,
+       /* ... */
+       stream: *mut core::ffi::c_void,
+   ) -> i32;
+   ```
+4. Write the Rust wrapper in `src/ops/fused_inference.rs`:
+   ```rust
+   #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+   pub fn fused_my_op(input: &Tensor, ...) -> Result<Tensor> {
+       // alloc output, get stream, get cublasLt handle
+       let device = input.device();
+       let stream = device_lt::stream_ptr(device)?;
+       let lt = device_lt::cublaslt_handle_ptr(device)?;
+       let workspace_size: usize = 4 * 1024 * 1024;
+       let workspace: cudarc::driver::CudaSlice<u8> = unsafe { device.alloc(workspace_size)? };
+       // ... build the call ...
+       let ret = unsafe {
+           crate::cuda::ffi::flame_my_op_bf16(
+               lt, input.as_device_ptr_bf16("fused_my_op:input")? as *const _,
+               /* ... */
+               stream,
+           )
+       };
+       if ret != 0 {
+           return Err(Error::Cuda(format!("fused_my_op error: {ret}")));
+       }
+       Ok(output)
+   }
+   ```
+
+After editing the `.cu` file, `touch src/cuda/my_kernel.cu` and rebuild —
+cargo's incremental build sometimes misses `.cu` mtime changes.
+
+---
+
+## Common gotchas
+
+### "My .cu changes aren't taking effect"
+
+`cargo build` uses cargo's incremental cache, which sometimes misses
+`.cu` mtime updates inside `OUT_DIR`. Force a rebuild:
+```bash
+touch src/cuda/your_file.cu src/cuda/flash_attention_fwd.cu
+cargo build --release ...
+```
+
+If that doesn't work, `cargo clean -p flame-core` and rebuild.
+
+### Two paths for silu/gelu
+
+There are TWO BF16 silu/gelu implementations:
+1. `bf16_ops::silu_bf16 / gelu_bf16` (NVRTC, in `src/bf16_ops.rs`)
+2. `cuda_ops_bf16::silu_bf16 / gelu_bf16` → `fc_silu_bf16 / fc_gelu_bf16`
+   (build-time, in `cuda/cuda_ops.cu`)
+
+`Tensor::silu()` and `Tensor::gelu()` route to **#1** (the `bf16_ops` NVRTC
+path). If you edit `cuda/cuda_ops.cu`'s silu/gelu kernels, NOTHING in
+`Tensor::silu` will change. If you want to fix the live silu/gelu, edit
+`bf16_ops.rs`.
+
+This bit me during the elementwise perf work.
+
+### `Tensor::softmax` has a fast path
+
+For `dtype == BF16` and `dim == last_dim` and `!requires_grad`, `Tensor::softmax`
+dispatches to `bf16_elementwise::softmax_lastdim_bf16` (single fused kernel,
+no scratch alloc). For everything else it falls back to the slow 5-step
+pipeline `max_dim → sub → exp → sum → div`. If you need fast softmax for a
+non-last dim, you'll need to permute first.
+
+### Group norm layout trap
+
+`cuda_ops_bf16::group_norm_bf16` takes **NHWC** (`[N, H, W, C]`), not NCHW.
+The functional `group_norm::group_norm` handles either. Document at the call
+site whichever you're using or you'll spend 30 minutes debugging "channels
+look weird."
+
+### Pre-transposing weights for fused_linear3d (the older one)
+
+`ops::fused_inference::fused_linear3d` (without `_native`) wants
+**pre-transposed** `[Cin, Cout]` weight. Klein loads weights and immediately
+transposes them via `bf16_elementwise::transpose2d_bf16`. New code should
+use `fused_linear3d_native` instead — it takes the standard PyTorch
+`[Cout, Cin]` layout and uses cuBLASLt `TRANSA=T` to do the transpose
+inside the GEMM (no extra pass over memory).
+
+### `.unsqueeze(1)` for broadcasting modulation
+
+In every DiT block forward, the modulation params are `[B, dim]` and need
+to broadcast over `[B, N, dim]`. The pattern is:
+```rust
+let modulated = norm.mul(&scale.add_scalar(1.0)?.unsqueeze(1)?)?
+                    .add(&shift.unsqueeze(1)?)?;
+```
+
+`unsqueeze(1)` makes the `[B, dim]` into `[B, 1, dim]` which broadcasts over
+the seq dim during `.mul` and `.add`.
+
+### Storage match patterns
+
+When you need raw access to the BF16 data inside a `Tensor`:
+```rust
+let xs = match &x.storage {
+    TensorStorage::BF16 { data, .. } => data,
+    _ => return Err(Error::InvalidOperation("expects BF16".into())),
+};
+```
+
+For mutable access:
+```rust
+let ys = match &mut out.storage {
+    TensorStorage::BF16 { data, .. } => data,
+    _ => unreachable!(),
+};
+let ys = ensure_unique_slice(ys)?;
+```
+
+`ensure_unique_slice` makes the `Arc<CudaSlice<u16>>` unique (clones the
+data if shared) so you can write to it without breaking aliasing. The
+helpers `slice_ref(xs)` and `slice_ref(ys)` give you `&CudaSlice<u16>` for
+launch params.
+
+### Async vs sync in tests
+
+Most flame-core ops dispatch to async streams. If you're testing and want to
+ensure a kernel actually finished before reading data, call
+`device.synchronize()` between the launch and the read-back. The
+`Tensor::to_vec()` family does this internally.
+
+### Strict mode
+
+When `strict::is_enabled()` (env var `FLAME_STRICT_DTYPE=1` or similar),
+flame-core will:
+- Fail any op that needs an implicit F32 fallback
+- Fail any silent clone (like `.contiguous()` on a non-contiguous tensor
+  inside a kernel)
+- Fail tape ops that try to record an unsupported op
+
+For inference code, leave it off (the default). For training, turn it on
+to catch silent precision drops.
+
+---
+
+## Build flags
+
+| Feature | What it does | Default |
+|---|---|---|
+| `cuda` | Enable CUDA backend | on |
+| `bf16_u16` | Enable BF16-as-u16 storage | on |
+| `cudnn` | Enable cuDNN integration | depends |
+| `flash_attn` | Enable external flash-attn FFI shim | off (in-tree wmma is the real path) |
+| `autograd_v4` | Enable v4 autograd engine | off |
+| `borrowed_weights` | Enable borrowed-weight tensor variant (FlameSwap) | off |
+| `python` | Build PyO3 bindings | off |
+| `capi` | Build C API surface | off |
+| `dtype_trace` | Compile in dtype trace prints (slow) | off |
+| `legacy_cpu_autograd` | **EXPLICITLY BANNED** — `compile_error!` if set | n/a |
+
+---
+
+## Quick "where do I X" reference
+
+| I want to... | Look at |
+|---|---|
+| Add a fused inference kernel | `src/cuda/fused_*.cu` + `src/cuda/ffi.rs` + `src/ops/fused_inference.rs` |
+| Add a BF16 elementwise op | `src/bf16_elementwise.rs` (flat path) + `src/bf16_ops.rs` (single-arg) |
+| Add a build-time `.cu` file | Create file → add to `build.rs` `cuda_sources.push(...)` → declare in `src/cuda/ffi.rs` or `src/cuda_ops_ffi.rs` |
+| Change the SDPA kernel | `src/cuda/flash_attention_fwd.cu` (wmma path) |
+| Change RMSNorm | `cuda/cuda_ops.cu::rms_norm_kernel` (the live one) |
+| Change LayerNorm | `cuda/cuda_ops.cu::layer_norm_forward_bf16_kernel` |
+| Change cuBLASLt linear | `src/cuda/fused_linear3d.cu` |
+| Add a new diffusion model | `inference-flame/src/models/your_model.rs` — flame-core just provides primitives |
+| Save/load safetensors | `serialization::load_file_filtered / save_file` |
+| Get the global device | `flame_core::global_cuda_device()` |
+| Get a cublasLt handle | `cuda::device_lt::cublaslt_handle_ptr(device)?` |
+| Get a stream pointer | `cuda::device_lt::stream_ptr(device)?` |
+| Force-rebuild after .cu edit | `touch the_file.cu` then `cargo build --release ...` |
+| Run a test binary | `cargo run --bin minimal_test --release` |
