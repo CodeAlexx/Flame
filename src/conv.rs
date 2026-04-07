@@ -2,6 +2,20 @@ use crate::cuda_ops_bf16::{self, ConvActivation};
 use crate::{DType, Error, Result, Shape, Tensor};
 use std::sync::Arc;
 
+// Cached env flags for hot-path Conv2d::forward — used to be a syscall
+// on every call (up to 3 per call).
+#[inline]
+fn no_cudnn_conv() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("FLAME_NO_CUDNN_CONV").is_ok())
+}
+
+#[inline]
+fn force_f32_conv() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("FORCE_F32_CONV").is_ok())
+}
+
 /// 2D Convolution parameters
 pub struct Conv2dConfig {
     pub in_channels: usize,
@@ -322,7 +336,7 @@ impl Conv2d {
         // Try cuDNN first — native BF16, no format conversion needed
         #[cfg(feature = "cudnn")]
         {
-            if std::env::var("FLAME_NO_CUDNN_CONV").is_err() {
+            if !no_cudnn_conv() {
                 match crate::cudnn::cudnn_conv2d_bf16(
                     input,
                     &self.weight, // OIHW format, cuDNN native
@@ -346,7 +360,7 @@ impl Conv2d {
         {
             if x_nhwc.dtype() == DType::BF16
                 && self.weight.dtype() == DType::BF16
-                && std::env::var("FORCE_F32_CONV").is_err()
+                && !force_f32_conv()
             {
                 match crate::cuda_ops_bf16::conv2d_bf16(
                     &x_nhwc,
@@ -386,7 +400,7 @@ impl Conv2d {
 
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
         {
-            if std::env::var("FORCE_F32_CONV").is_err() {
+            if !force_f32_conv() {
                 return crate::cuda_ops_bf16::conv2d_bf16(
                     input,
                     &self.weight_hwio_bf16,

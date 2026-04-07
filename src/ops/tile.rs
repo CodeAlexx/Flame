@@ -24,7 +24,7 @@ pub fn tile_bc_to_bhwc_f32(
         ));
     }
     let owned = as_owned_f32(in_bc)?;
-    if std::env::var("SDXL_DEBUG_SHAPES").ok().as_deref() == Some("1") {
+    if crate::env_flags::sdxl_debug_shapes_enabled() {
         eprintln!(
             "[tile_bc_to_bhwc_f32] src dtype {:?} storage {:?} shape {:?}",
             owned.dtype(),
@@ -57,7 +57,7 @@ pub fn tile_bc_to_bhwc_f32(
             stream,
         );
     }
-    if std::env::var("SDXL_DEBUG_SHAPES").ok().as_deref() == Some("1") {
+    if crate::env_flags::sdxl_debug_shapes_enabled() {
         eprintln!(
             "[tile_bc_to_bhwc_f32] out dtype {:?} storage {:?} shape {:?}",
             out.dtype(),

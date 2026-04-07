@@ -8,7 +8,7 @@ pub fn to_owning_fp32_strong(x: &Tensor) -> Result<Tensor> {
     } else {
         let numel = x.shape().elem_count();
         guard_fp32_alloc(numel * std::mem::size_of::<f32>(), "to_owning_fp32_strong");
-        if std::env::var("SDXL_DEBUG_SHAPES").ok().as_deref() == Some("1") {
+        if crate::env_flags::sdxl_debug_shapes_enabled() {
             eprintln!(
                 "[to_owning_fp32_strong] cast dtype {:?} storage {:?} shape {:?}",
                 x.dtype(),
@@ -25,7 +25,7 @@ pub fn to_owning_fp32_strong(x: &Tensor) -> Result<Tensor> {
             numel * std::mem::size_of::<f32>(),
             "to_owning_fp32_strong-storage",
         );
-        if std::env::var("SDXL_DEBUG_SHAPES").ok().as_deref() == Some("1") {
+        if crate::env_flags::sdxl_debug_shapes_enabled() {
             eprintln!(
                 "[to_owning_fp32_strong] fixing storage {:?} -> F32 shape {:?}",
                 out.storage_dtype(),

@@ -130,6 +130,54 @@ impl TensorStorage {
     }
 
     /// Allocate new storage using memory pool
+    /// Allocate storage without zeroing, for use by kernels that fully
+    /// overwrite the output. For the `bf16_u16` path this skips an
+    /// explicit `memset_zeros` pass over the buffer — measurable savings
+    /// on large activations (a 1 GB BF16 output saves ~2 ms per call at
+    /// HBM bandwidth). For F32/F16/I32 paths the underlying allocator
+    /// (`alloc_aligned_f32` → `device.alloc_zeros`) always zeros, so
+    /// this is semantically identical to `zeros` on those dtypes and
+    /// just saves the redundant second zero.
+    ///
+    /// **Contract:** only use for output tensors that are FULLY written
+    /// by the kernel that follows. Never use for accumulator tensors or
+    /// partial writes — the initial bytes are undefined.
+    pub fn empty(shape: &Shape, dtype: DType, device: &Arc<CudaDevice>) -> Result<Self> {
+        let numel = shape.elem_count();
+        match dtype {
+            DType::F32 => {
+                let data = alloc_aligned_f32(device, numel)?;
+                Ok(TensorStorage::F32 { data: wrap_slice(data), numel })
+            }
+            DType::F16 => {
+                let data = alloc_aligned_f32(device, numel)?;
+                Ok(TensorStorage::F16 { data: wrap_slice(data), numel, scale: 1.0 })
+            }
+            DType::BF16 => {
+                #[cfg(not(feature = "bf16_u16"))]
+                {
+                    let data = alloc_aligned_f32(device, numel)?;
+                    Ok(TensorStorage::BF16 { data: wrap_slice(data), numel })
+                }
+                #[cfg(feature = "bf16_u16")]
+                {
+                    // Raw alloc, no memset — kernel must fully write the buffer.
+                    let data = unsafe { device.alloc::<u16>(numel) }
+                        .map_err(|e| Error::Cuda(format!("alloc bf16 u16: {:?}", e)))?;
+                    Ok(TensorStorage::BF16 { data: wrap_slice(data), numel })
+                }
+            }
+            DType::I32 => {
+                let data = alloc_aligned_f32(device, numel)?;
+                Ok(TensorStorage::I32 { data: wrap_slice(data), numel })
+            }
+            // Rare dtypes: fall through to zeros semantics.
+            DType::I8 | DType::Bool | DType::F64 | DType::U8 | DType::U32 | DType::I64 => {
+                Self::zeros(shape, dtype, device)
+            }
+        }
+    }
+
     pub fn zeros(shape: &Shape, dtype: DType, device: &Arc<CudaDevice>) -> Result<Self> {
         let numel = shape.elem_count();
 

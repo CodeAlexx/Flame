@@ -8,9 +8,9 @@ cfg_if! {
         mod flash_impl;
         mod sdpa;
         pub use flash_impl::attention_impl;
-        pub use sdpa::{attend, sdpa, GeGLU};
+        pub use sdpa::{attend, sdpa, sdpa_with_bias, GeGLU};
     } else {
         mod sdpa;
-        pub use sdpa::{attention_impl, attend, sdpa, GeGLU};
+        pub use sdpa::{attention_impl, attend, sdpa, sdpa_with_bias, GeGLU};
     }
 }

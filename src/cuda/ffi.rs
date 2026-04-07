@@ -505,4 +505,23 @@ extern "C" {
         workspace_size: usize,
         stream: *mut core::ffi::c_void,
     ) -> i32;
+
+    /// Same as flame_linear3d_bf16 but takes the weight in standard PyTorch
+    /// `[Cout, Cin]` row-major layout (no pre-transpose). cuBLASLt does the
+    /// transpose inside the GEMM via TRANSA=T, eliminating the wasted
+    /// transpose pass that flux1_dit's `linear_bias` was paying every call.
+    pub fn flame_linear3d_bf16_native(
+        handle: *mut core::ffi::c_void,
+        input: *const core::ffi::c_void,
+        weight: *const core::ffi::c_void,
+        bias: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        batch_size: i32,
+        seq_len: i32,
+        in_features: i32,
+        out_features: i32,
+        workspace: *mut core::ffi::c_void,
+        workspace_size: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
 }

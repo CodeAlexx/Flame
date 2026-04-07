@@ -52,7 +52,7 @@ pub fn normal_bf16(
     device: Arc<CudaDevice>,
 ) -> Result<Tensor> {
     let n = shape.elem_count();
-    if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+    if crate::env_flags::alloc_log_enabled() {
         let bytes = n * DType::BF16.size_in_bytes();
         if bytes >= (8 << 20) {
             eprintln!(

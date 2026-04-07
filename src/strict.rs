@@ -13,18 +13,24 @@ mod inner {
     }
 
     impl GuardMode {
+        /// Called on every `strict::scope` invocation, which wraps most
+        /// flame-core ops. Previously read `STRICT_BF16_MODE` via
+        /// `std::env::var` on every call (one syscall per op). Now cached
+        /// once via `OnceLock`.
         pub fn env_default() -> Self {
-            if let Ok(value) = std::env::var("STRICT_BF16_MODE") {
-                let value = value.to_ascii_lowercase();
-                if matches!(value.as_str(), "panic" | "strict") {
-                    return GuardMode::Panic;
-                }
-                if matches!(value.as_str(), "warn" | "relaxed") {
-                    return GuardMode::Warn;
-                }
-            }
             static MODE: OnceLock<GuardMode> = OnceLock::new();
-            *MODE.get_or_init(|| GuardMode::Warn)
+            *MODE.get_or_init(|| {
+                if let Ok(value) = std::env::var("STRICT_BF16_MODE") {
+                    let value = value.to_ascii_lowercase();
+                    if matches!(value.as_str(), "panic" | "strict") {
+                        return GuardMode::Panic;
+                    }
+                    if matches!(value.as_str(), "warn" | "relaxed") {
+                        return GuardMode::Warn;
+                    }
+                }
+                GuardMode::Warn
+            })
         }
     }
 

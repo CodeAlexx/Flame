@@ -8,19 +8,37 @@ use cudarc::{
     nvrtc::{compile_ptx_with_opts, CompileOptions},
 };
 
+// Vectorized BF16 unary kernels: 2 elements per thread via __nv_bfloat162.
+// The previous scalar versions were running ~3.6 ms on [1,4096,15360] = 13×
+// slower than PyTorch (0.29 ms). The vectorized versions should hit ~0.4 ms,
+// matching PyTorch within 1.5×.
+//
+// Each kernel is launched with `(n+1)/2` threads (see `silu_bf16` /
+// `gelu_bf16` below). The `if (i2 < n2)` guard handles the typical case;
+// the `(n & 1)` tail handles odd `n`.
 const CUDA_GELU: &str = r#"
 #include <cuda_bf16.h>
 extern "C" __global__
 void gelu_bf16_kernel(const __nv_bfloat16* __restrict__ X,
                       __nv_bfloat16* __restrict__ Y,
                       long n) {
-  long i = blockIdx.x * blockDim.x + threadIdx.x;
-  while (i < n) {
-    float x = __bfloat162float(X[i]);
-    float c = 0.7978845608f*(x + 0.044715f*x*x*x);
-    float y = 0.5f * x * (1.0f + tanhf(c));
-    Y[i] = __float2bfloat16(y);
-    i += gridDim.x * blockDim.x;
+  long i2 = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long n2 = n >> 1;
+  if (i2 < n2) {
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(X);
+    __nv_bfloat162* y2 = reinterpret_cast<__nv_bfloat162*>(Y);
+    float2 v = __bfloat1622float2(x2[i2]);
+    float c0 = 0.7978845608f * (v.x + 0.044715f * v.x * v.x * v.x);
+    float c1 = 0.7978845608f * (v.y + 0.044715f * v.y * v.y * v.y);
+    float g0 = 0.5f * v.x * (1.0f + tanhf(c0));
+    float g1 = 0.5f * v.y * (1.0f + tanhf(c1));
+    y2[i2] = __floats2bfloat162_rn(g0, g1);
+  }
+  if (i2 == n2 && (n & 1)) {
+    long last = n - 1;
+    float x = __bfloat162float(X[last]);
+    float c = 0.7978845608f * (x + 0.044715f * x * x * x);
+    Y[last] = __float2bfloat16(0.5f * x * (1.0f + tanhf(c)));
   }
 }
 "#;
@@ -31,12 +49,20 @@ extern "C" __global__
 void silu_bf16_kernel(const __nv_bfloat16* __restrict__ X,
                       __nv_bfloat16* __restrict__ Y,
                       long n) {
-  long i = blockIdx.x * blockDim.x + threadIdx.x;
-  while (i < n) {
-    float x = __bfloat162float(X[i]);
-    float y = x / (1.0f + expf(-x));
-    Y[i] = __float2bfloat16(y);
-    i += gridDim.x * blockDim.x;
+  long i2 = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long n2 = n >> 1;
+  if (i2 < n2) {
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(X);
+    __nv_bfloat162* y2 = reinterpret_cast<__nv_bfloat162*>(Y);
+    float2 v = __bfloat1622float2(x2[i2]);
+    float s0 = v.x / (1.0f + __expf(-v.x));
+    float s1 = v.y / (1.0f + __expf(-v.y));
+    y2[i2] = __floats2bfloat162_rn(s0, s1);
+  }
+  if (i2 == n2 && (n & 1)) {
+    long last = n - 1;
+    float x = __bfloat162float(X[last]);
+    Y[last] = __float2bfloat16(x / (1.0f + expf(-x)));
   }
 }
 "#;
@@ -47,11 +73,18 @@ extern "C" __global__
 void square_bf16_kernel(const __nv_bfloat16* __restrict__ X,
                         __nv_bfloat16* __restrict__ Y,
                         long n) {
-  long i = blockIdx.x * blockDim.x + threadIdx.x;
-  while (i < n) {
-    float x = __bfloat162float(X[i]);
-    Y[i] = __float2bfloat16(x*x);
-    i += gridDim.x * blockDim.x;
+  long i2 = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long n2 = n >> 1;
+  if (i2 < n2) {
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(X);
+    __nv_bfloat162* y2 = reinterpret_cast<__nv_bfloat162*>(Y);
+    float2 v = __bfloat1622float2(x2[i2]);
+    y2[i2] = __floats2bfloat162_rn(v.x * v.x, v.y * v.y);
+  }
+  if (i2 == n2 && (n & 1)) {
+    long last = n - 1;
+    float x = __bfloat162float(X[last]);
+    Y[last] = __float2bfloat16(x * x);
   }
 }
 "#;
@@ -75,6 +108,13 @@ fn ensure(dev: &Arc<CudaDevice>, name: &'static str, code: &'static str) -> Resu
 #[inline]
 fn lc(n: usize) -> LaunchConfig {
     LaunchConfig::for_num_elems(n as u32)
+}
+
+/// Launch config for vectorized 2-element-per-thread kernels.
+#[inline]
+fn lc_pairs(n: usize) -> LaunchConfig {
+    let pairs = (n + 1) / 2;
+    LaunchConfig::for_num_elems(pairs as u32)
 }
 
 pub fn gelu_bf16(x: &Tensor) -> Result<Tensor> {
@@ -107,7 +147,7 @@ pub fn gelu_bf16(x: &Tensor) -> Result<Tensor> {
     };
     let ys = ensure_unique_slice(ys)?;
     unsafe {
-        f.launch(lc(n), (slice_ref(xs), ys, n as i64))?;
+        f.launch(lc_pairs(n), (slice_ref(xs), ys, n as i64))?;
     }
     Ok(out)
 }
@@ -142,7 +182,7 @@ pub fn square_bf16(x: &Tensor) -> Result<Tensor> {
     };
     let ys = ensure_unique_slice(ys)?;
     unsafe {
-        f.launch(lc(n), (slice_ref(xs), ys, n as i64))?;
+        f.launch(lc_pairs(n), (slice_ref(xs), ys, n as i64))?;
     }
     Ok(out)
 }
@@ -290,7 +330,7 @@ pub fn silu_bf16(x: &Tensor) -> Result<Tensor> {
     };
     let ys = ensure_unique_slice(ys)?;
     unsafe {
-        f.launch(lc(n), (slice_ref(xs), ys, n as i64))?;
+        f.launch(lc_pairs(n), (slice_ref(xs), ys, n as i64))?;
     }
     Ok(out)
 }

@@ -50,7 +50,7 @@ pub fn broadcast_to_impl(tensor: &Tensor, target_shape: &[i64]) -> Result<Tensor
             };
 
             let dtype = prepared.dtype();
-            if std::env::var("SDXL_DEBUG_SHAPES").ok().as_deref() == Some("1") {
+            if crate::env_flags::sdxl_debug_shapes_enabled() {
                 let ok = match dtype {
                     DType::F32 => prepared.storage_ref().try_as_slice_f32().is_ok(),
                     DType::BF16 => {

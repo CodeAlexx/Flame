@@ -42,6 +42,46 @@ macro_rules! launch_kernel {
     }};
 }
 
+// ---------------------------------------------------------------------------
+// Cached env-var flags (syscall-free hot-path reads)
+// ---------------------------------------------------------------------------
+//
+// Every `std::env::var(...)` is a syscall (stat the environ table + copy the
+// value to a `String`). flame-core used to read `ALLOC_LOG`, `FLAME_TRACE_DTYPE`,
+// `FLAME_DTYPE_TRACE`, and `SDXL_DEBUG_SHAPES` on EVERY allocation / matmul /
+// dtype cast / narrow, which is thousands of syscalls per denoise step even
+// when nothing is set. These wrappers cache the reads once per process via
+// `OnceLock` so the hot path only pays an atomic load.
+
+#[inline]
+fn env_flag_enabled(var: &'static str, cache: &'static std::sync::OnceLock<bool>) -> bool {
+    *cache.get_or_init(|| std::env::var(var).ok().as_deref() == Some("1"))
+}
+
+#[inline]
+fn alloc_log_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag_enabled("ALLOC_LOG", &CACHED)
+}
+
+#[inline]
+fn trace_dtype_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag_enabled("FLAME_TRACE_DTYPE", &CACHED)
+}
+
+#[inline]
+fn dtype_trace_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag_enabled("FLAME_DTYPE_TRACE", &CACHED)
+}
+
+#[inline]
+fn sdxl_debug_shapes_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag_enabled("SDXL_DEBUG_SHAPES", &CACHED)
+}
+
 /// Global tensor ID counter
 static TENSOR_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -263,7 +303,7 @@ extern "C" __global__ void masked_fill_kernel(
     pub fn zeros(shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
         let dtype = default_dtype();
         let numel = shape.elem_count();
-        if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+        if alloc_log_enabled() {
             let bytes = numel * dtype.size_in_bytes();
             if bytes >= (8 << 20) {
                 eprintln!(
@@ -279,7 +319,7 @@ extern "C" __global__ void masked_fill_kernel(
 
     /// Create tensor with specific dtype
     pub fn zeros_dtype(shape: Shape, dtype: DType, device: Arc<CudaDevice>) -> Result<Self> {
-        if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+        if alloc_log_enabled() {
             let bytes = shape.elem_count() * dtype.size_in_bytes();
             if bytes >= (8 << 20) {
                 eprintln!(
@@ -291,6 +331,33 @@ extern "C" __global__ void masked_fill_kernel(
             }
         }
         let storage = TensorStorage::zeros(&shape, dtype, &device)?;
+        Ok(Self {
+            storage,
+            shape,
+            device,
+            id: TensorId::new(),
+            requires_grad: false,
+        })
+    }
+
+    /// Allocate an output tensor without zeroing. Safe ONLY when the
+    /// caller immediately writes every element (e.g. as a cuBLASLt GEMM
+    /// output or fused kernel output). The saved `memset_zeros` pass is
+    /// ~2 ms per GB of BF16 activations at HBM bandwidth — small per
+    /// call but adds up across a full VAE or DiT forward.
+    pub fn empty_dtype(shape: Shape, dtype: DType, device: Arc<CudaDevice>) -> Result<Self> {
+        if alloc_log_enabled() {
+            let bytes = shape.elem_count() * dtype.size_in_bytes();
+            if bytes >= (8 << 20) {
+                eprintln!(
+                    "[alloc] tag=empty_dtype dtype={:?} shape={:?} bytes={}",
+                    dtype,
+                    shape.dims(),
+                    bytes
+                );
+            }
+        }
+        let storage = TensorStorage::empty(&shape, dtype, &device)?;
         Ok(Self {
             storage,
             shape,
@@ -1188,7 +1255,7 @@ extern "C" __global__ void masked_fill_kernel(
 
     /// Matrix multiplication routed through the shared GEMM backend.
     pub fn matmul(&self, other: &Tensor) -> Result<Tensor> {
-        if std::env::var("FLAME_TRACE_DTYPE").ok().as_deref() == Some("1") {
+        if trace_dtype_enabled() {
             eprintln!(
                 "[tensor.matmul] lhs dtype {:?} storage {:?} shape {:?}; rhs dtype {:?} storage {:?} shape {:?}",
                 self.dtype(),
@@ -2153,7 +2220,7 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Copy to CPU
     pub fn to_vec(&self) -> Result<Vec<f32>> {
-        if std::env::var("FLAME_DTYPE_TRACE").ok().as_deref() == Some("1") {
+        if dtype_trace_enabled() {
             eprintln!(
                 "[dtype-trace] to_vec dtype={:?} shape={:?}",
                 self.dtype(),
@@ -2577,76 +2644,29 @@ extern "C" __global__ void f32_to_bool_kernel(
             seen[d] = true;
         }
 
-        // Optimized special-cases
+        // Optimized special-cases.
+        //
+        // Everything that does not match a hand-written hot path routes
+        // through `GpuOps::permute_generic`, which JIT-loads
+        // `permute_generic_bf16_kernel` / `permute_generic_f32_kernel`
+        // (see `cuda_kernel_sources.rs`) — a real GPU scatter that
+        // supports arbitrary rank up to 8 and preserves BF16 storage.
+        //
+        // Before this wire-up the fallback was a `to_vec()` → scalar
+        // Rust loop → `from_vec` path that did a full GPU↔CPU round-trip
+        // and silently downcast BF16 → F32. That path regularly took 5+
+        // seconds per call on large tensors — see `PERF_VAE_PERMUTE.md`
+        // for the VAE-decode symptom and the measured 68× speedup from
+        // flipping NCHW↔NHWC off the CPU fallback.
         let mut output = if shape.len() == 2 && dims == [1, 0] {
-            // Simple 2D transpose
             self.transpose()?
         } else if shape.len() == 3 && dims == [0, 2, 1] {
-            // Attention reshapes hit this constantly; keep it on GPU.
             GpuOps::permute_021(self)?
         } else if shape.len() == 4 && dims == [0, 2, 1, 3] {
-            // Hot path for Flux attention.  Keep this on GPU so BF16 tensors
-            // never bounce through CPU or get silently retyped.
             GpuOps::permute_0213(self)?
-        } else if shape.len() == 4 && dims == [0, 1, 3, 2] {
-            // [batch, num_heads, seq_len, head_dim] -> [batch, num_heads, head_dim, seq_len]
-            self.permute_0132()?
         } else {
-            // General permutation fallback (CPU copy for now)
-            let src_dims = shape;
-            let dst_dims: Vec<usize> = dims.iter().map(|&i| src_dims[i]).collect();
-
-            // Compute strides for source (row-major)
-            let mut src_strides = vec![1; src_dims.len()];
-            for i in (0..src_dims.len().saturating_sub(1)).rev() {
-                src_strides[i] = src_strides[i + 1] * src_dims[i + 1];
-            }
-
-            // Compute strides for destination
-            let mut dst_strides = vec![1; dst_dims.len()];
-            for i in (0..dst_dims.len().saturating_sub(1)).rev() {
-                dst_strides[i] = dst_strides[i + 1] * dst_dims[i + 1];
-            }
-
-            // Map each destination linear index to source linear index
-            let total: usize = dst_dims.iter().product();
-            let src_data = self.to_vec()?;
-            let mut dst_data = vec![0.0f32; total];
-
-            for (dst_idx, dst_val) in dst_data.iter_mut().enumerate() {
-                // Decompose destination index to coordinates
-                let mut remaining = dst_idx;
-                let mut dst_coords = vec![0usize; dst_dims.len()];
-                for (axis, stride) in dst_strides.iter().enumerate() {
-                    dst_coords[axis] = remaining / stride;
-                    remaining %= stride;
-                }
-
-                // Build source coordinates by inverting permutation: src_coord[p] = dst_coord[idx]
-                let mut src_coords = vec![0usize; src_dims.len()];
-                for (dst_axis, &src_axis) in dims.iter().enumerate() {
-                    src_coords[src_axis] = dst_coords[dst_axis];
-                }
-
-                // Convert source coordinates to linear index
-                let mut src_idx = 0usize;
-                for (coord, stride) in src_coords.into_iter().zip(src_strides.iter()) {
-                    src_idx += coord * *stride;
-                }
-                *dst_val = src_data[src_idx];
-            }
-
-            let tmp = Tensor::from_vec_dtype(
-                dst_data,
-                Shape::from_dims(&dst_dims),
-                self.device.clone(),
-                crate::DType::F32,
-            )?;
-            if self.dtype() == crate::DType::F32 {
-                tmp
-            } else {
-                tmp.to_dtype(self.dtype())?
-            }
+            // General N-D GPU permute (rank <= 8, BF16-preserving).
+            GpuOps::permute_generic(self, dims)?
         };
 
         // AUTOGRAD: Record operation if needed
@@ -2680,6 +2700,23 @@ extern "C" __global__ void f32_to_bool_kernel(
                 dim,
                 shape.len()
             )));
+        }
+
+        // FAST PATH: BF16 + last-dim softmax → fused kernel, no scratch allocs.
+        // Replaces the 5-step pipeline (max → sub → exp → sum → div) which was
+        // catastrophically slow (175× PyTorch) and allocated 5× tensor memory.
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        {
+            if !self.requires_grad
+                && self.dtype() == DType::BF16
+                && dim == shape.len() - 1
+            {
+                let mut output = crate::bf16_elementwise::softmax_lastdim_bf16(self)?;
+                if output.dtype() != crate::config::default_dtype() {
+                    output = output.to_dtype(crate::config::default_dtype())?;
+                }
+                return Ok(output);
+            }
         }
 
         // Compute max along dimension for numerical stability
@@ -2722,44 +2759,10 @@ extern "C" __global__ void f32_to_bool_kernel(
         }
     }
 
-    /// Specific permutation: [batch, num_heads, seq_len, head_dim] -> [batch, num_heads, head_dim, seq_len]
-    fn permute_0132(&self) -> Result<Tensor> {
-        let dims = self.shape.dims();
-        if dims.len() != 4 {
-            return Err(Error::InvalidOperation(
-                "permute_0132 requires 4D tensor".into(),
-            ));
-        }
-
-        let (d0, d1, d2, d3) = (dims[0], dims[1], dims[2], dims[3]);
-        let data = self.to_vec()?;
-        let mut result = vec![0.0f32; data.len()];
-
-        for i0 in 0..d0 {
-            for i1 in 0..d1 {
-                for i2 in 0..d2 {
-                    for i3 in 0..d3 {
-                        let src_idx = i0 * d1 * d2 * d3 + i1 * d2 * d3 + i2 * d3 + i3;
-                        let dst_idx = i0 * d1 * d3 * d2 + i1 * d3 * d2 + i3 * d2 + i2;
-                        result[dst_idx] = data[src_idx];
-                    }
-                }
-            }
-        }
-
-        let mut output = Tensor::from_vec(
-            result,
-            Shape::from_dims(&[d0, d1, d3, d2]),
-            self.device.clone(),
-        )?;
-
-        // Inherit gradient tracking
-        if self.requires_grad {
-            output.requires_grad = true;
-        }
-
-        Ok(output)
-    }
+    // NOTE: `permute_0132` (CPU scalar loop that downcast BF16 → F32) was
+    // removed 2026-04-06. The `[0,1,3,2]` case now flows through
+    // `Tensor::permute` → `GpuOps::permute_generic`, which is a real GPU
+    // scatter that preserves dtype. See PERF_PERMUTE_FALLBACK_FIX.md.
 
     /// Add bias (broadcasting over batch dimensions)
     pub fn add_bias(&self, bias: &Tensor) -> Result<Tensor> {
@@ -3008,12 +3011,16 @@ extern "C" __global__ void f32_to_bool_kernel(
             return cuda_ops_bf16::slice_axis_bf16(self, dim, start, length);
         }
 
-        // For now, only support up to 4D tensors
+        // For ND > 4: collapse dims except `dim` into outer/inner, recurse, reshape back.
         if dims.len() > 4 {
-            return Err(Error::InvalidOperation(format!(
-                "narrow operation currently supports up to 4D tensors, got {}D",
-                dims.len()
-            )));
+            let outer: usize = dims[..dim].iter().product();
+            let inner: usize = dims[dim + 1..].iter().product();
+            let mid = dims[dim];
+            let collapsed = self.reshape(&[outer, mid, inner])?;
+            let narrowed = collapsed.narrow(1, start, length)?; // 3D path
+            let mut new_dims = dims.to_vec();
+            new_dims[dim] = length;
+            return narrowed.reshape(&new_dims);
         }
 
         // Pad dimensions to 4D for kernel
@@ -3029,7 +3036,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         // Prepare F32 views for the CUDA kernel (kernels currently assume F32 storage)
         use crate::cuda_kernels::CudaKernels;
         let input_f32 = to_owning_fp32_strong(self)?;
-        if std::env::var("SDXL_DEBUG_SHAPES").ok().as_deref() == Some("1") {
+        if sdxl_debug_shapes_enabled() {
             eprintln!(
                 "[narrow] input logical={:?} storage={:?} dims={:?}",
                 input_f32.dtype(),
@@ -3131,7 +3138,7 @@ pub fn guard_fp32_alloc(bytes: usize, tag: &str) {
 }
 
 pub(crate) fn alloc_from_pool(device: &Arc<CudaDevice>, size: usize) -> Result<CudaSlice<f32>> {
-    if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+    if alloc_log_enabled() {
         let bytes = size * std::mem::size_of::<f32>();
         if bytes >= (8 << 20) {
             eprintln!("[alloc] tag=pool_alloc_f32 size={} bytes={}", size, bytes);
@@ -3152,7 +3159,7 @@ pub(crate) fn alloc_zeros_from_pool(
     device: &Arc<CudaDevice>,
     size: usize,
 ) -> Result<CudaSlice<f32>> {
-    if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+    if alloc_log_enabled() {
         let bytes = size * std::mem::size_of::<f32>();
         if bytes >= (8 << 20) {
             eprintln!("[alloc] tag=pool_zeros_f32 size={} bytes={}", size, bytes);

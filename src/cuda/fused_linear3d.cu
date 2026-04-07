@@ -112,4 +112,106 @@ int flame_linear3d_bf16(
     return (int)status;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// flame_linear3d_bf16_native
+// Same as flame_linear3d_bf16, but takes the weight in standard PyTorch
+// `[Cout, Cin]` row-major layout (not pre-transposed). Uses cuBLASLt's
+// TRANSA=T so the transpose happens inside the GEMM with no extra pass over
+// memory. Bias is still fused via the epilogue.
+//
+// This eliminates the per-call `transpose2d_bf16` that the FLUX blocks were
+// paying on every forward — for `single_blocks.linear1` (3072 → 21504) that
+// alone was ~10–15 ms of pure memory copy per call.
+//
+// Layout reasoning (row-major notation throughout):
+//   weight is [Cout, Cin] row-major = [Cin, Cout] col-major
+//   Want: output[N, Cout] = input[N, Cin] @ weight[Cout, Cin]^T
+//
+// In cuBLASLt col-major terms with the standard `C^T = B^T @ A^T` trick:
+//   output^T[Cout, N] = (weight as [Cout, Cin] col-major)^T_op @ input^T[Cin, N]
+// The "weight as [Cout, Cin] col-major" interpretation is exactly TRANSA=T
+// applied to the [Cin, Cout] col-major view of the stored buffer.
+// ─────────────────────────────────────────────────────────────────────────────
+int flame_linear3d_bf16_native(
+    cublasLtHandle_t handle,
+    const void* input,       // [B, N, Cin] BF16, row-major
+    const void* weight,      // [Cout, Cin] BF16, row-major (PyTorch layout)
+    const void* bias,        // [Cout] BF16 or NULL
+    void* output,            // [B, N, Cout] BF16, row-major
+    int batch_size,
+    int seq_len,
+    int in_features,         // Cin
+    int out_features,        // Cout
+    void* workspace,
+    size_t workspace_size,
+    void* stream
+) {
+    cublasLtMatmulDesc_t matmulDesc;
+    cublasLtMatrixLayout_t layoutA, layoutB, layoutC;
+    cublasStatus_t status;
+
+    int m = out_features;
+    int n = seq_len;
+    int k = in_features;
+
+    status = cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    if (status != CUBLAS_STATUS_SUCCESS) return (int)status;
+
+    // Weight stored as [Cout, Cin] row-major == [Cin, Cout] col-major.
+    // Set TRANSA=T so cuBLAS treats it as [Cout, Cin] col-major = [m, k].
+    cublasOperation_t opT = CUBLAS_OP_T;
+    cublasOperation_t opN = CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
+    cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+
+    if (bias != NULL) {
+        cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+        cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue));
+        cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias));
+        cudaDataType_t biasType = CUDA_R_16BF;
+        cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &biasType, sizeof(biasType));
+    }
+
+    // A = weight: stored col-major as [k=Cin, m=Cout], lda = k
+    // After TRANSA=T, cuBLAS sees A as [m, k].
+    int batchOne = 1;
+    int64_t strideZero = 0;
+    cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_16BF, k, m, k);
+    cublasLtMatrixLayoutSetAttribute(layoutA, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batchOne, sizeof(batchOne));
+    cublasLtMatrixLayoutSetAttribute(layoutA, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideZero, sizeof(strideZero));
+
+    // B = input: [k=Cin, n=seq_len] col-major, ldb = k
+    int64_t strideB = (int64_t)n * k;
+    cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_16BF, k, n, k);
+    cublasLtMatrixLayoutSetAttribute(layoutB, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_size, sizeof(batch_size));
+    cublasLtMatrixLayoutSetAttribute(layoutB, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideB, sizeof(strideB));
+
+    // C = output: [m=Cout, n=seq_len] col-major, ldc = m
+    int64_t strideC = (int64_t)n * m;
+    cublasLtMatrixLayoutCreate(&layoutC, CUDA_R_16BF, m, n, m);
+    cublasLtMatrixLayoutSetAttribute(layoutC, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_size, sizeof(batch_size));
+    cublasLtMatrixLayoutSetAttribute(layoutC, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideC, sizeof(strideC));
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+
+    status = cublasLtMatmul(
+        handle, matmulDesc, &alpha,
+        weight, layoutA,
+        input,  layoutB,
+        &beta,
+        output, layoutC,
+        output, layoutC,
+        NULL,
+        workspace, workspace_size,
+        (cudaStream_t)stream
+    );
+
+    cublasLtMatrixLayoutDestroy(layoutA);
+    cublasLtMatrixLayoutDestroy(layoutB);
+    cublasLtMatrixLayoutDestroy(layoutC);
+    cublasLtMatmulDescDestroy(matmulDesc);
+    return (int)status;
+}
+
 } // extern "C"

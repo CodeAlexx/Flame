@@ -535,6 +535,28 @@ pub fn attend(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Resu
     sdpa(q, k, v, mask)
 }
 
+/// SDPA variant with ADDITIVE float bias (for T5 relative position bias) and
+/// optional custom scale (pass `Some(1.0)` for T5's unscaled attention).
+///
+/// See `crate::sdpa::forward_with_bias` for full semantics.
+pub fn sdpa_with_bias(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    bias: Option<&Tensor>,
+    scale: Option<f32>,
+) -> Result<Tensor> {
+    trap_is_bf16("sdpa_with_bias::q", q)?;
+    trap_is_bf16("sdpa_with_bias::k", k)?;
+    trap_is_bf16("sdpa_with_bias::v", v)?;
+
+    let mut output = crate::sdpa::forward_with_bias(q, k, v, bias, scale)?;
+    if output.dtype() != DType::BF16 {
+        output = output.to_dtype(DType::BF16)?;
+    }
+    Ok(output)
+}
+
 /// GeGLU activation for transformer FFN
 pub struct GeGLU {
     pub proj: Linear,

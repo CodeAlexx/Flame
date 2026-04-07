@@ -1021,7 +1021,9 @@ pub fn gemm_bf16(x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> Result<Tensor
         let (m, k, n) = validate_gemm_bf16_inputs(x, w, bias)?;
         strict_block_lt_fallback(m, n)?;
         let out_shape = Shape::from_dims(&[m, n]);
-        let mut out = Tensor::zeros_dtype(out_shape, DType::BF16, x.device().clone())?;
+        // cuBLASLt writes every output element in `gemm_bf16_into_impl`;
+        // no need to memset-zero the buffer first.
+        let mut out = Tensor::empty_dtype(out_shape, DType::BF16, x.device().clone())?;
         gemm_bf16_into_impl(&mut out, x, w, bias, m, k, n)?;
         Ok(out)
     })
