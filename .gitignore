@@ -7,3 +7,5 @@
 *.bak_*
 inference-test/
 unused/
+# Claude Code project instructions — local only, not tracked
+CLAUDE.md
