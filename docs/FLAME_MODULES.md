@@ -356,6 +356,7 @@ the rest during backward. Used by training to fit larger models.
 ### `adam.rs`
 `AdamW` implementation. BF16 master weights, F32 moments by default
 (configurable via `select_optimizer_state_dtype`). Re-exported as `nn::AdamW`.
+Includes `set_lr()` for step-wise schedulers.
 
 ### `optimizers.rs`
 Additional optimizer variants (Lion, RAdam, etc.).

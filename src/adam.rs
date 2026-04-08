@@ -38,6 +38,11 @@ impl Adam {
         }
     }
 
+    /// Update the learning rate used for subsequent optimizer steps.
+    pub fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
+    }
+
     /// Perform a single optimization step
     pub fn step(&mut self, parameters: &[Parameter]) -> Result<()> {
         self.t += 1;
@@ -143,6 +148,11 @@ impl AdamW {
         Self {
             adam: Adam::new(lr, beta1, beta2, eps, weight_decay),
         }
+    }
+
+    /// Update the learning rate used for subsequent optimizer steps.
+    pub fn set_lr(&mut self, lr: f32) {
+        self.adam.set_lr(lr);
     }
 
     pub fn step(&mut self, parameters: &[Parameter]) -> Result<()> {

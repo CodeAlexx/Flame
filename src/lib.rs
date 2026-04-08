@@ -202,6 +202,7 @@ pub mod tensor_ops_missing;
 // pub mod sdxl_attention;  // Removed: model-specific
 // pub mod sdxl_unet_blocks;  // Removed: model-specific
 pub mod gradient_checkpointing;
+pub mod gradient_clip;
 pub mod loss;
 pub mod sage_attention;
 

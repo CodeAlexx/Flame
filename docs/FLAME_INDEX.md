@@ -464,7 +464,7 @@ convention (`fc_status_t` returns), different file generation:
 
 ## Optimizers
 
-- `adam::AdamW` — re-exported as `nn::AdamW`. Standard AdamW with BF16 master / F32 moments.
+- `adam::AdamW` — re-exported as `nn::AdamW`. Standard AdamW with BF16 master / F32 moments; `set_lr()` supports runtime schedulers.
 - `optimizers::*` — additional optimizers (SGD variants, Lion, etc.)
 - `sgd::*` — basic SGD
 - `parameter::Parameter` — re-exported as `Var` and `Parameter`. Wraps a `Tensor` with `requires_grad=true`.
