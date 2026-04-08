@@ -216,8 +216,21 @@ new code.
 GEMM → bias add pipeline. Used by LTX-2 audio VAE and the (planned)
 Wan / QwenImage 3D VAE ports.
 
-### `conv1d.rs`
-1D conv used by Mistral / T5 audio paths.
+### ⭐ `conv1d.rs`
+1D conv + 1D transposed conv, both BF16-via-cuDNN. The `[B, C, L]` tensors
+are reshaped to `[B, C, 1, L]` and routed through `cudnn_conv2d_bf16` with
+`(H=1, W=L)`. Used by Mistral / T5 audio paths and the LTX-2.3 BigVGAN
+vocoder.
+
+- `conv1d(x, w, bias, stride, padding, dilation, groups)` — the `dilation`
+  parameter is plumbed through to cuDNN as of 2026-04 (previously silently
+  dropped, see `FLAME_INDEX.md` for the fix).
+- `conv_transpose1d(x, w, bias, stride, padding, output_padding, groups)`
+  and `conv_transpose1d_dilated` — implemented via zero-insert + regular
+  cuDNN conv1d with a flipped + C_in↔C_out–transposed weight. Matches
+  PyTorch `torch.nn.ConvTranspose1d` bit-exact in BF16 (verified against
+  stride-5/k-11, stride-2/k-4, grouped anti-alias filters, and
+  `output_padding>0`).
 
 ### `conv3d.rs` / `conv3d_simple.rs`
 F32 conv3d alternatives (training).

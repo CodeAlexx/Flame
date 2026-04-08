@@ -59,12 +59,16 @@ extern "C" {
 /// Output: NCHW BF16
 ///
 /// Uses FP32 compute with tensor core math (ALLOW_CONVERSION) for accuracy.
+///
+/// `dilation` is `(1, 1)` for a standard conv. Output size follows
+/// `out = (in + 2*pad - dilation*(kernel - 1) - 1) / stride + 1`.
 pub fn cudnn_conv2d_bf16(
     input: &Tensor,
     weight: &Tensor,
     bias: Option<&Tensor>,
     stride: (usize, usize),
     padding: (usize, usize),
+    dilation: (usize, usize),
     groups: usize,
 ) -> Result<Tensor> {
     let input_shape = input.shape();
@@ -100,8 +104,12 @@ pub fn cudnn_conv2d_bf16(
         )));
     }
 
-    let out_height = (in_height + 2 * padding.0 - kernel_h) / stride.0 + 1;
-    let out_width = (in_width + 2 * padding.1 - kernel_w) / stride.1 + 1;
+    // Output shape with dilation: out = (in + 2*pad - dilation*(kernel - 1) - 1) / stride + 1.
+    // For dilation=1 this reduces to the standard formula.
+    let eff_kernel_h = dilation.0 * (kernel_h - 1) + 1;
+    let eff_kernel_w = dilation.1 * (kernel_w - 1) + 1;
+    let out_height = (in_height + 2 * padding.0 - eff_kernel_h) / stride.0 + 1;
+    let out_width = (in_width + 2 * padding.1 - eff_kernel_w) / stride.1 + 1;
 
     // Get cuDNN handle
     let handle = get_cudnn_handle()?;
@@ -129,7 +137,7 @@ pub fn cudnn_conv2d_bf16(
 
     // Convolution descriptor: FP32 compute, with tensor core math
     let conv_desc = ConvolutionDescriptor::new()?;
-    conv_desc.set_2d_asymmetric(padding, stride, (1, 1), compute_type)?;
+    conv_desc.set_2d_asymmetric(padding, stride, dilation, compute_type)?;
     conv_desc.set_math_type(CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION)?;
     if groups > 1 {
         conv_desc.set_group_count(groups)?;

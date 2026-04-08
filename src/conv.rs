@@ -343,6 +343,7 @@ impl Conv2d {
                     self.bias_bf16.as_ref(),
                     (self.config.stride.0, self.config.stride.1),
                     (self.config.padding.0, self.config.padding.1),
+                    (1, 1), // Conv2dConfig has no dilation field — always 1
                     self.config.groups,
                 ) {
                     Ok(output) => return Ok(output),

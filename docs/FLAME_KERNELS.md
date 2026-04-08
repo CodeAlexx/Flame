@@ -85,6 +85,40 @@ ensure / get_func / launch dance.
 
 `Conv3dBF16::forward` does: `im2vol` → cuBLASLt GEMM → `bias_add` → optional `copy`.
 
+### `conv1d.rs` — 1D conv + transposed conv (BF16 via cuDNN)
+
+No dedicated CUDA kernels — the 1D conv paths reshape `[B, C, L]` to
+`[B, C, 1, L]` and call `cudnn_conv2d_bf16` with `(H=1, W=L)` descriptors. This
+re-uses cuDNN's mature BF16 conv2d path with F32 accumulation.
+
+| Function | File:line | Purpose |
+|---|---|---|
+| `conv1d(x, w, bias, stride, padding, dilation, groups)` | `conv1d.rs:17` | Forward 1D conv. Plumbs dilation through to `cudnn_conv2d_bf16` via the length-axis (`dilation_w`). |
+| `conv1d_grouped(x, w, stride, padding, groups)` | `conv1d.rs` | Thin wrapper over `conv1d` for depthwise/grouped cases. |
+| `conv_transpose1d(x, w, bias, stride, padding, output_padding, groups)` | `conv1d.rs:83` | 1D transposed conv. Implemented via zero-insert → regular cuDNN conv1d with flipped + C_in/C_out-transposed weight. |
+| `conv_transpose1d_dilated(x, w, bias, stride, padding, output_padding, dilation, groups)` | `conv1d.rs` | Same, with explicit `dilation`. The non-`_dilated` variant forwards `dilation=1`. |
+
+**`conv_transpose1d` math** (documented at the call site too):
+
+> `ConvTranspose1d(x, w, s, p, op) ≡ Conv1d(zero_insert(x, s, right_pad=op), flip+transpose(w), padding_side=(K-1)·d - p)`
+
+No dedicated CUDA kernel — the im2col + cuBLASLt GEMM + col2im path is a
+potential optimization for large output lengths (see the BigVGAN vocoder
+speed work in `handoff_ltx23_pure_rust_port.md`).
+
+**`cudnn_conv2d_bf16` signature** is:
+```rust
+pub fn cudnn_conv2d_bf16(
+    input: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    stride: (usize, usize),
+    padding: (usize, usize),
+    dilation: (usize, usize),  // 2026-04: previously hardcoded (1, 1)
+    groups: usize,
+) -> Result<Tensor>
+```
+
 ### `rng/mod.rs` — F32 RNG
 
 | Kernel | Line | Purpose |

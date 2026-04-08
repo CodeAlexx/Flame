@@ -237,7 +237,16 @@ This is a critical area with several implementations. **Use these for inference*
   - `Conv2d::forward_nhwc(input)` — NHWC fast path
 - `conv::Conv2dConfig` — `conv.rs:20`
 - `conv::conv2d_forward(...)` — `conv.rs` — functional API
-- `conv1d::*` — Conv1d (Mistral encoder, etc.)
+- ⭐ `conv1d::conv1d(x, w, bias, stride, padding, dilation, groups)` — `conv1d.rs:17`
+  BF16 1D conv via cuDNN conv2d with H=1. `dilation` is plumbed through
+  (fixed 2026-04 — previously silently dropped).
+- ⭐ `conv1d::conv_transpose1d(x, w, bias, stride, padding, output_padding, groups)` — `conv1d.rs:83`
+  BF16 1D transposed conv. Implemented via `zero_insert → cuDNN conv1d` with a
+  flipped + transposed weight. Supports arbitrary `stride`, `padding`,
+  `output_padding`, `dilation` (via `conv_transpose1d_dilated`), and `groups`.
+  Bit-exact vs PyTorch (max|Δ| ≤ 0.008 BF16) across BigVGAN configs and
+  grouped anti-alias filters.
+- `conv1d::conv1d_grouped(x, w, stride, padding, groups)` — thin no-bias wrapper over `conv1d`.
 - ⭐ `conv3d_bf16::Conv3dBF16` — `conv3d_bf16.rs:183` — 3D conv used by LTX-2 audio VAE +
   Wan / QwenImage 3D VAEs (when ported).
 - `conv3d_simple::*` — F32 conv3d fallback
