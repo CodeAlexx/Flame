@@ -473,6 +473,80 @@ flame-core will:
 For inference code, leave it off (the default). For training, turn it on
 to catch silent precision drops.
 
+### Training with flame-core autograd — the hard-won lessons
+
+These were discovered during `klein-trainer` development (2026-04-09).
+
+**1. Inference binaries MUST wrap in `AutogradContext::no_grad()`.**
+The autograd tape is enabled by default. Any binary that only does forward
+passes (e.g. `prepare_dataset`, VAE encode, text encode) will accumulate
+saved tensors into the global tape forever and OOM after ~20 samples at
+1024². Fix: `let _guard = AutogradContext::no_grad();` at the top of `run()`.
+
+**2. `Tensor::narrow` BF16 fast path silently drops `requires_grad`.**
+Fixed 2026-04-09 (flame-core commit `12d1433`). Before the fix, every
+`narrow()` on a BF16 tensor went through `cuda_ops_bf16::slice_axis_bf16`
+which returned a new tensor with `requires_grad=false` and no `Op::Slice`
+recorded. This broke the autograd chain through any fused QKV split,
+causing `pred.requires_grad=false` and silent zero gradients. **If your
+model forward calls `.narrow()` on a tensor that should carry gradients,
+verify this commit is applied.** Post-fix, the BF16 fast path records
+`Op::Slice` and propagates `requires_grad`.
+
+**3. `Tensor::bmm` dispatches on `self.dtype()` only — not `other`.**
+If `self` is BF16, the BF16 kernel is called even if `other` is F32. The
+kernel then fails with `"bmm_bf16_fp32acc_out: tensors must be BF16"`.
+Keep Q/K/V in the SAME dtype throughout attention. Don't mix F32 cast
+intermediates into a BF16 bmm.
+
+**4. Use `Op::FlashAttention` instead of decomposed attention for training.**
+A hand-rolled `bmm → mul_scalar → softmax → bmm` chain records ~12
+tape entries per attention block and saves the N×N score matrix (1 GB at
+1024², 113 MB at 512²). `Op::FlashAttention` records ONE entry and its
+backward handler (`attention_backward_recompute`) recomputes scores from
+Q/K/V, saving only the three small input tensors. For Klein 4B (25 blocks)
+this reduces tape entries by ~275 and eliminates ~2.8 GB of saved scores.
+
+To use: compute attention under `no_grad`, then record `Op::FlashAttention`
+manually:
+```rust
+let output = {
+    let _guard = AutogradContext::no_grad();
+    q.bmm(&k.transpose_dims(1,2)?)?.mul_scalar(scale)?.softmax(-1)?.bmm(&v)?
+}?;
+if q.requires_grad() || k.requires_grad() || v.requires_grad() {
+    let mut out = output.requires_grad_(true);
+    AutogradContext::record_op(out.id(), Op::FlashAttention {
+        query: q.id(), key: k.id(), value: v.id(),
+        mask: None, scale, causal: false,
+    }, vec![(q.id(), q.clone()), (k.id(), k.clone()), (v.id(), v.clone())]);
+}
+```
+
+**5. BF16 `clone_result()` is a full GPU memcpy — not cheap.**
+Unlike F32 storage (which is `Arc<CudaSlice<f32>>` and clones by ref-bump),
+BF16 uses raw `CudaSlice<u16>`. `clone_result()` does
+`device.alloc + dtod_copy`. Every `record_op` that saves BF16 tensors
+this way allocates new GPU memory. ~300 saves per forward = ~8 GB overhead.
+`Tensor::clone()` (the derived Clone) is equally expensive for BF16
+because `CudaSlice<u16>::clone` is a deep copy.
+
+**Future fix:** Arc-wrap BF16 storage (the `shared_storage` feature flag
+exists but only covers `from_bf16_arena`). Until then, minimize saves:
+use `Vec::new()` for saved_tensors in ops whose backward doesn't need them
+(e.g. `Op::Slice` only uses `input_shape` from the Op variant, not saved
+tensor data).
+
+**6. `requires_grad` "infects" the residual stream.**
+After the first LoRA delta is added via `base.add(&lora_delta)`, the
+residual tensor has `requires_grad=true`. All subsequent ops on that tensor
+record to the tape — even frozen base-weight matmuls. Klein 4B: block 0's
+LoRA add infects img → 24 subsequent blocks record everything → ~2700
+tape entries instead of ~60. This is standard autograd behavior but without
+gradient checkpointing it makes per-step backward ~45 min for DiT models.
+**Gradient checkpointing per block is the fix** — see
+`gradient_checkpointing.rs` docs.
+
 ---
 
 ## Build flags
@@ -484,6 +558,7 @@ to catch silent precision drops.
 | `cudnn` | Enable cuDNN integration | depends |
 | `flash_attn` | Enable external flash-attn FFI shim | off (in-tree wmma is the real path) |
 | `autograd_v4` | Enable v4 autograd engine | off |
+| `shared_storage` | Arc-wrap BF16 storage for cheap `clone()` (training perf) | off |
 | `borrowed_weights` | Enable borrowed-weight tensor variant (FlameSwap) | off |
 | `python` | Build PyO3 bindings | off |
 | `capi` | Build C API surface | off |
@@ -506,6 +581,9 @@ to catch silent precision drops.
 | Add a new diffusion model | `inference-flame/src/models/your_model.rs` — flame-core just provides primitives |
 | Save/load safetensors | `serialization::load_file_filtered / save_file` |
 | Get the global device | `flame_core::global_cuda_device()` |
+| Disable autograd (inference) | `let _guard = AutogradContext::no_grad();` |
+| Record a fused attention Op | See "Training with autograd" §4 above |
+| Train a LoRA on a DiT | `klein-trainer/` — reference impl with all the gotchas applied |
 | Get a cublasLt handle | `cuda::device_lt::cublaslt_handle_ptr(device)?` |
 | Get a stream pointer | `cuda::device_lt::stream_ptr(device)?` |
 | Force-rebuild after .cu edit | `touch the_file.cu` then `cargo build --release ...` |

@@ -29,6 +29,16 @@ elementwise, `bf16_elementwise::softmax_lastdim_bf16` for last-dim softmax,
 `bf16_ops::silu_bf16` for unary). The struct is large but its discoverability
 is good — start in [`FLAME_INDEX.md`](./FLAME_INDEX.md) "tensor.rs" section.
 
+**Training-critical fixes (2026-04-09):**
+- `narrow()` BF16 path now records `Op::Slice` for autograd and preserves
+  `requires_grad` (both BF16 fast path AND F32 slow path patched).
+- `to_dtype()` records `Op::Cast` which properly reverses the cast in
+  backward — this is how F32 LoRA master params receive correct gradients
+  after BF16 casts in forward.
+- `bmm()` F32 path works via `launch_gemm_strided_batched`; BF16 path via
+  `bmm_bf16_fp32acc_out`. Both dispatch on `self.dtype()` — mismatched
+  dtypes between `self` and `other` will error.
+
 ### ⭐ `tensor_storage.rs`
 The `TensorStorage` enum that backs every `Tensor`: `BF16 { data: Arc<CudaSlice<u16>>, numel }`,
 `F32(...)`, `F16(...)`, `I32(...)`, `Arena { ... }` (for the staging arena
@@ -338,9 +348,41 @@ tape of `(out_id, Op, saved_inputs)` triples and walks it backward when
 flame-core supports (Add, Sub, Mul, Div, Matmul, Bmm, Reshape, View, Permute,
 Narrow, Cat, Softmax, Sdpa, LayerNorm, GroupNorm, Conv2d, Conv3d, ...).
 
+**Training performance caveat (2026-04-09):** The tape-based backward is
+synchronous and has ~1s overhead per entry on 3090 Ti (HashMap lookup + GPU
+kernel launch + implicit sync + gradient accumulate). Klein 4B generates
+~2700 tape entries → ~45 min/step. This makes raw tape-based training
+impractical for DiT-scale models. **Gradient checkpointing per transformer
+block is required** to reduce the tape to ~100 entries. See
+`gradient_checkpointing.rs` and the klein-trainer `PLAN_AUTOGRAD.md` for
+the concrete approach.
+
+**Key gotchas found during klein-trainer development:**
+- `Tensor::narrow` BF16 fast path (`cuda_ops_bf16::slice_axis_bf16`) was
+  silently dropping `requires_grad` and not recording `Op::Slice`. **Fixed
+  2026-04-09** (commit `12d1433` in flame-core). Without this fix, LoRA
+  training silently produces zero gradients because every QKV split breaks
+  the autograd chain.
+- `BF16 TensorStorage` uses `CudaSlice<u16>` (NOT `Arc`-wrapped, unlike
+  F32 which uses `Arc<CudaSlice<f32>>`). This means `Tensor::clone()` for
+  BF16 is a full GPU memcpy, not a cheap ref bump. Every `record_op` that
+  saves BF16 tensors via `clone()` or `clone_result()` allocates new GPU
+  memory. With ~300 saves per forward pass this adds ~8 GB overhead.
+  **Fix:** Arc-wrap BF16 storage to match F32 (the `shared_storage` feature
+  flag exists but only covers `from_bf16_arena`).
+- `Op::FlashAttention` has a backward handler (`attention_backward_recompute`)
+  that only saves Q/K/V and recomputes scores during backward. Using this
+  instead of decomposed `bmm + softmax + bmm` eliminates ~275 tape entries
+  for Klein 4B. klein-trainer's `sdpa_train` records `Op::FlashAttention`
+  directly for this reason.
+
 ### `autograd.rs` (top-level re-export)
-Just re-exports `AutogradContext` and `Op` from `autograd_v3` so callers can
-say `flame_core::autograd::AutogradContext`. Has a few additional helpers.
+Re-exports `AutogradContext`, `Op`, `NoGradGuard` from `autograd_v3` so
+callers can say `flame_core::autograd::AutogradContext`. Key public API:
+- `AutogradContext::record_op(output_id, op, saved_tensors)` — add to tape
+- `AutogradContext::no_grad()` → `NoGradGuard` RAII guard (disables taping)
+- `AutogradContext::backward(loss)` → `GradientMap`
+- `AutogradContext::set_enabled(bool)` — manual enable/disable
 
 ### `autograd_v4` (feature gated)
 A newer experimental engine with explicit `Gradients` and `graph` types.
@@ -359,8 +401,29 @@ backward.
 Gradient clipping helpers (per-norm and per-value).
 
 ### `gradient_checkpointing.rs`
-Activation checkpointing — saves a subset of activations during forward, recomputes
-the rest during backward. Used by training to fit larger models.
+Activation checkpointing scaffolding. Contains `CheckpointManager` (global
+singleton behind `CHECKPOINT_MANAGER` mutex), `CheckpointPolicy` enum
+(`CPUOffload` / `Recompute` / `Adaptive`), `CheckpointedBlock<F>` wrapper,
+and `CheckpointableModel` trait.
+
+**Current status (2026-04-09):** scaffolding only, not production-wired.
+- `CPUOffload` policy is a placeholder that clones to device (no actual
+  CPU transfer — line 88-92: "Placeholder: clone tensor on device").
+- `Recompute` requires explicit `set_recompute_for(id, closure)` calls
+  that nobody invokes.
+- `CheckpointableModel` trait has zero implementors.
+- `record_op` at `autograd.rs:456` already calls
+  `mgr.checkpoint_saved_tensor()` for every saved tensor — so the hook
+  point exists; the policies just don't do anything useful yet.
+
+**To make training work at DiT scale**, the plan is to wrap each
+transformer block's forward in a `CheckpointedBlock` that:
+1. Saves only block inputs (2 tensors: img + txt residual)
+2. Runs block forward under `NoGradGuard` (no taping)
+3. Records one `Op::Checkpoint` entry
+4. At backward: re-runs the block forward WITH autograd, builds a
+   per-block tape, backward through it, frees it, returns grad
+This reduces the global tape from ~2700 to ~50 entries for Klein 4B.
 
 ---
 
