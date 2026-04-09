@@ -102,6 +102,7 @@ fn main() {
     cuda_sources.push("src/cuda/fused_linear3d.cu");
     cuda_sources.push("src/cuda/flash_attention_fwd.cu");
     cuda_sources.push("src/cuda/fp8_dequant.cu");
+    cuda_sources.push("src/cuda/fp16_to_bf16.cu");
     cuda_sources.push("src/cuda/fused_norm_modulate.cu");
     cuda_sources.push("src/cuda/fused_residual_gate.cu");
     cuda_sources.push("src/cuda/fused_dequant_transpose.cu");

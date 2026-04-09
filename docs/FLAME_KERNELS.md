@@ -224,6 +224,13 @@ no separate add kernel).
 | `fp8_to_bf16_kernel` | `:10` | E4M3 / E5M2 unpack. Used by FlameSwap FP8 paths. |
 | `flame_fp8_to_bf16` | `:40` | C entry. |
 
+### `src/cuda/fp16_to_bf16.cu` — FP16 (IEEE half) → BF16
+
+| Symbol | Line | Notes |
+|---|---|---|
+| `fp16_to_bf16_kernel` | `:14` | Per-element `__half2float` → `__float2bfloat16`. In-place safe (both 2 bytes/elem). Used by FlameSwap for FP16 model weights (e.g. Wan2.2). |
+| `flame_fp16_to_bf16` | `:27` | C entry. `(input, output, n_elements, stream) → int`. |
+
 ### `src/cuda/fused_dequant_transpose.cu` — FP8 dequant + transpose fused
 
 | Symbol | Line | Notes |

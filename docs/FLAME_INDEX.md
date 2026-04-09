@@ -343,7 +343,8 @@ to see what kernels are linked in. Notable groups:
 - `flame_geglu_pointwise_fp32` (`:313`) — GeGLU
 - `fc_upsample2d_nearest_bf16 / fc_upsample2d_nearest_f32` (`:382,394`) — VAE upsample
 - `flame_fp8_to_bf16` (`:409`) — FP8 dequant
-- `flame_flash_attention_bf16` (`:420`) — wmma flash attention
+- `flame_fp16_to_bf16` (`:416`) — FP16 → BF16 conversion (in-place safe). Used by FlameSwap for FP16 checkpoints.
+- `flame_flash_attention_bf16` (`:424`) — wmma flash attention
 - `flame_fused_rms_norm_modulate_bf16` (`:434`)
 - `flame_fused_residual_gate_bf16` (`:448`)
 - `flame_fused_rms_norm_bf16` (`:459`)
@@ -562,3 +563,4 @@ by `.cu` file with launch configs and perf notes.
 - **"Where is the global RNG seed?"** → `rng::set_seed`
 - **"Where is the FP8 dequant?"** → `ops::fused_inference::dequant_fp8_to_bf16` →
   `flame_fp8_to_bf16` → `src/cuda/fp8_dequant.cu`
+  `flame_fp16_to_bf16` → `src/cuda/fp16_to_bf16.cu`

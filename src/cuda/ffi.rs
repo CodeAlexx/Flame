@@ -414,6 +414,15 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// GPU-side FP16 (IEEE half) → BF16 conversion.
+    /// In-place safe (both 2 bytes per element).
+    pub fn flame_fp16_to_bf16(
+        input: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        n_elements: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// Flash attention forward: BF16 in/out, FP32 accumulation, online softmax.
     /// Q,K,V: [B*H, N, 128] BF16. O: [B*H, N, 128] BF16.
     /// head_dim must be 128. Returns 0 on success.
