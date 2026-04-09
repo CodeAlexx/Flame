@@ -637,10 +637,12 @@ impl AutogradContext {
             let prev_enabled = ctx.enabled;
             ctx.enabled = false;
 
-            // Process tape in reverse
+            // Process tape in reverse. Use `take` instead of `get + clone_result`
+            // to avoid an extra GPU memcpy per entry. The gradient is consumed
+            // (moved out of the map) — if a later entry re-accumulates into the
+            // same tensor_id, `accumulate` handles the addition.
             for entry in ctx.tape.iter().rev() {
-                if let Some(output_grad) = gradients.get(entry.output_id) {
-                    let output_grad = output_grad.clone_result()?;
+                if let Some(output_grad) = gradients.take(entry.output_id) {
                     // Compute input gradients
                     let input_grads = compute_gradients(entry, &output_grad, &device)?;
 
