@@ -3008,7 +3008,30 @@ extern "C" __global__ void f32_to_bool_kernel(
 
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
         if self.dtype() == DType::BF16 && self.storage_dtype() == DType::BF16 {
-            return cuda_ops_bf16::slice_axis_bf16(self, dim, start, length);
+            let mut out = cuda_ops_bf16::slice_axis_bf16(self, dim, start, length)?;
+            // Autograd: the BF16 fast path previously dropped `requires_grad`
+            // silently. Training code (klein-trainer) splits fused QKV/MLP
+            // projections with `narrow`, so every split broke the gradient
+            // chain. Record `Op::Slice` here to keep backward working.
+            if self.requires_grad {
+                out.requires_grad = true;
+                let mut ranges: Vec<(usize, usize)> =
+                    dims.iter().map(|&d| (0, d)).collect();
+                ranges[dim] = (start, start + length);
+                // Op::Slice backward reads only `input_shape` from the Op
+                // variant — no saved tensor data is needed. Avoid cloning
+                // the (potentially huge) input; empty saved_tensors vec.
+                AutogradContext::record_op(
+                    out.id,
+                    Op::Slice {
+                        input: self.id,
+                        ranges,
+                        input_shape: self.shape.clone(),
+                    },
+                    Vec::new(),
+                );
+            }
+            return Ok(out);
         }
 
         // For ND > 4: collapse dims except `dim` into outer/inner, recurse, reshape back.
@@ -3089,11 +3112,31 @@ extern "C" __global__ void f32_to_bool_kernel(
 
         self.device.synchronize()?;
 
-        if self.dtype() == DType::F32 {
-            Ok(output)
+        let mut out = if self.dtype() == DType::F32 {
+            output
         } else {
-            output.to_dtype(self.dtype())
+            output.to_dtype(self.dtype())?
+        };
+
+        // Autograd recording for the F32 slow path. Mirrors the BF16 fast path
+        // above. Without this, `Tensor::narrow` silently breaks training-time
+        // gradient flow through fused-QKV splits.
+        if self.requires_grad {
+            out.requires_grad = true;
+            let mut ranges: Vec<(usize, usize)> =
+                dims.iter().map(|&d| (0, d)).collect();
+            ranges[dim] = (start, start + length);
+            AutogradContext::record_op(
+                out.id,
+                Op::Slice {
+                    input: self.id,
+                    ranges,
+                    input_shape: self.shape.clone(),
+                },
+                Vec::new(),
+            );
         }
+        Ok(out)
     }
 
     /// Copy data from another tensor
