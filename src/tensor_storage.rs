@@ -161,9 +161,8 @@ impl TensorStorage {
                 }
                 #[cfg(feature = "bf16_u16")]
                 {
-                    // Raw alloc, no memset — kernel must fully write the buffer.
-                    let data = unsafe { device.alloc::<u16>(numel) }
-                        .map_err(|e| Error::Cuda(format!("alloc bf16 u16: {:?}", e)))?;
+                    // Raw alloc via caching pool, no memset — kernel must fully write.
+                    let data = crate::cuda_alloc_pool::pool_alloc_u16(device, numel)?;
                     Ok(TensorStorage::BF16 { data: wrap_slice(data), numel })
                 }
             }
@@ -213,8 +212,7 @@ impl TensorStorage {
                 }
                 #[cfg(feature = "bf16_u16")]
                 {
-                    let mut data = unsafe { device.alloc::<u16>(numel) }
-                        .map_err(|e| Error::Cuda(format!("alloc bf16 u16: {:?}", e)))?;
+                    let mut data = crate::cuda_alloc_pool::pool_alloc_u16(device, numel)?;
                     device.memset_zeros(&mut data)?;
                     Ok(TensorStorage::BF16 {
                         data: wrap_slice(data),
@@ -595,6 +593,95 @@ impl TensorStorage {
         Err(Error::InvalidOperation(
             "to_vec_bf16 requires the bf16_u16 feature".into(),
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drop: return owned CudaSlice memory to the caching allocator pool
+// ---------------------------------------------------------------------------
+//
+// When a TensorStorage drops, Rust calls Drop::drop and then drops each
+// variant field.  We intercept by ptr::read-ing the CudaSlice out and
+// handing it to the pool (which mem::forgets it to skip cudaFree), then
+// writing a dummy CudaSlice back so the subsequent Rust field drop is
+// harmless (cudaFree(0) is a documented CUDA no-op, and the dummy carries
+// a valid Arc<CudaDevice> clone so Arc::drop won't segfault).
+//
+// Mirror struct matching cudarc 0.11.9 CudaSlice<T> layout.
+// Must NOT be #[repr(C)] — must match CudaSlice's default Rust layout.
+struct CudaSliceMirror<T> {
+    cu_device_ptr: u64,
+    len: usize,
+    device: Arc<CudaDevice>,
+    host_buf: Option<std::pin::Pin<Vec<T>>>,
+}
+
+/// Create a dummy CudaSlice<T> with ptr=0, len=0, and the given device.
+/// When Rust drops this, cudarc calls cudaFree(0) which is a no-op.
+///
+/// # Safety
+/// Only valid for the purpose of replacing a ptr::read-moved field so
+/// Rust's field-drop doesn't touch freed memory.
+unsafe fn make_dummy_slice<T>(device: Arc<CudaDevice>) -> CudaSlice<T> {
+    let mirror = CudaSliceMirror::<T> {
+        cu_device_ptr: 0,
+        len: 0,
+        device,
+        host_buf: None,
+    };
+    std::mem::transmute(mirror)
+}
+
+#[cfg(not(feature = "shared_storage"))]
+impl Drop for TensorStorage {
+    fn drop(&mut self) {
+        // Only intercept when the pool is enabled.
+        if crate::cuda_alloc_pool::pool_disabled() {
+            return; // Let Rust drop the CudaSlice normally (cudaFree).
+        }
+
+        match self {
+            TensorStorage::F32 { data, .. } => {
+                let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
+                let dev = slice.device();
+                crate::cuda_alloc_pool::pool_return_f32(slice);
+                unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+            }
+            TensorStorage::F16 { data, .. } => {
+                let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
+                let dev = slice.device();
+                crate::cuda_alloc_pool::pool_return_f32(slice);
+                unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+            }
+            #[cfg(not(feature = "bf16_u16"))]
+            TensorStorage::BF16 { data, .. } => {
+                let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
+                let dev = slice.device();
+                crate::cuda_alloc_pool::pool_return_f32(slice);
+                unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+            }
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16 { data, .. } => {
+                let slice: CudaSlice<u16> = unsafe { std::ptr::read(data) };
+                let dev = slice.device();
+                crate::cuda_alloc_pool::pool_return_u16(slice);
+                unsafe { std::ptr::write(data, make_dummy_slice::<u16>(dev)) };
+            }
+            TensorStorage::I32 { data, .. } => {
+                let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
+                let dev = slice.device();
+                crate::cuda_alloc_pool::pool_return_f32(slice);
+                unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+            }
+            TensorStorage::Bool { data, .. } => {
+                let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
+                let dev = slice.device();
+                crate::cuda_alloc_pool::pool_return_f32(slice);
+                unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+            }
+            // I8, BF16Arena, BF16View — let Rust drop them normally.
+            _ => {}
+        }
     }
 }
 

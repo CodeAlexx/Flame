@@ -13,7 +13,12 @@ use crate::{
 use cudarc::driver::{CudaDevice, CudaStream, DevicePtr, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::compile_ptx;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+
+/// Fast-path flag: true when CHECKPOINT_MANAGER has saved activations.
+/// Checked with Relaxed ordering to skip the mutex lock when no checkpoints exist.
+pub static CHECKPOINT_HAS_ENTRIES: AtomicBool = AtomicBool::new(false);
 
 /// Global checkpoint manager
 lazy_static::lazy_static! {
@@ -88,6 +93,7 @@ impl CheckpointManager {
                 // Placeholder: clone tensor on device until host-offload path is reworked
                 self.saved_activations
                     .insert(id, CheckpointedTensor::OnDevice(tensor.clone_result()?));
+                CHECKPOINT_HAS_ENTRIES.store(true, Ordering::Relaxed);
                 // Memory accounting disabled for now (no actual savings)
             }
             _ => {
@@ -113,6 +119,7 @@ impl CheckpointManager {
                 dtype,
             },
         );
+        CHECKPOINT_HAS_ENTRIES.store(true, Ordering::Relaxed);
     }
 
     /// Fetch a saved activation according to policy
@@ -225,6 +232,7 @@ impl CheckpointManager {
             }
         }
 
+        CHECKPOINT_HAS_ENTRIES.store(!self.saved_activations.is_empty(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -265,6 +273,7 @@ impl CheckpointManager {
         self.saved_activations.clear();
         self.memory_saved = 0;
         self.recompute_count = 0;
+        CHECKPOINT_HAS_ENTRIES.store(false, Ordering::Relaxed);
     }
 }
 

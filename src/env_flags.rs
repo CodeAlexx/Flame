@@ -83,3 +83,13 @@ pub fn cublaslt_force_fallback() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     flag_enabled("FLAME_CUBLASLT_FORCE_FALLBACK", &CACHED)
 }
+
+/// `FLAME_CUDA_GRAPH=1` — enable CUDA Graph capture/replay for the
+/// backward pass. Eliminates per-kernel launch overhead by recording
+/// all backward kernels into a graph on step 2 and replaying on step 3+.
+/// Requires fixed tape structure (same batch size / sequence length).
+#[inline]
+pub fn cuda_graph_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    flag_enabled("FLAME_CUDA_GRAPH", &CACHED)
+}

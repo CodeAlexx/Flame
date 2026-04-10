@@ -147,9 +147,13 @@ pub fn alloc_aligned<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZero
     }
 }
 
-/// Allocate f32 memory with alignment
+/// Allocate f32 memory with alignment.
+///
+/// Routes through the CUDA caching allocator ([`crate::cuda_alloc_pool`]) so
+/// repeated alloc/free cycles during backward reuse GPU memory instead of
+/// hitting `cudaMalloc`/`cudaFree` every time.
 pub fn alloc_aligned_f32(device: &Arc<CudaDevice>, size: usize) -> Result<CudaSlice<f32>> {
-    alloc_aligned::<f32>(device, size)
+    crate::cuda_alloc_pool::pool_alloc_f32(device, size)
 }
 
 /// Check if a tensor shape would cause alignment issues

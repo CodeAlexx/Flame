@@ -3219,12 +3219,12 @@ pub(crate) fn alloc_zeros_from_pool(
     Ok(data)
 }
 
-/// Drop implementation to return memory to pool
+/// Drop: TensorStorage::drop handles returning GPU memory to the
+/// caching allocator pool (see `cuda_alloc_pool` module).
 impl Drop for Tensor {
     fn drop(&mut self) {
-        // NOTE: Memory pooling currently relies on cloning `CudaSlice`, which performs a fresh
-        // device allocation in cudarc. Until the pool is refactored to recycle the existing
-        // allocation without cloning, simply allow the underlying `CudaSlice` to drop normally.
+        // TensorStorage::drop returns the CudaSlice to the pool.
+        // Nothing else needed here.
     }
 }
 

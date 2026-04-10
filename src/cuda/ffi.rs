@@ -533,4 +533,45 @@ extern "C" {
         workspace_size: usize,
         stream: *mut core::ffi::c_void,
     ) -> i32;
+
+    // ── CUDA Graph capture / replay ─────────────────────────────────
+    //
+    // These are CUDA Runtime API functions linked via -lcudart.
+    // Used by `cuda_graph.rs` for recording the backward pass as a
+    // replayable graph, eliminating per-kernel launch overhead.
+
+    /// Begin capturing kernel launches on `stream` into a graph.
+    /// `mode`: 0 = cudaStreamCaptureModeGlobal,
+    ///         1 = cudaStreamCaptureModeThreadLocal,
+    ///         2 = cudaStreamCaptureModeRelaxed.
+    pub fn cudaStreamBeginCapture(stream: *mut core::ffi::c_void, mode: i32) -> i32;
+
+    /// End capture on `stream` and return the captured graph in `*graph`.
+    pub fn cudaStreamEndCapture(
+        stream: *mut core::ffi::c_void,
+        graph: *mut *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Instantiate a captured graph into an executable form.
+    /// `error_node` and `log`/`log_size` are for debug diagnostics (may be null/0).
+    pub fn cudaGraphInstantiate(
+        graph_exec: *mut *mut core::ffi::c_void,
+        graph: *mut core::ffi::c_void,
+        error_node: *mut *mut core::ffi::c_void,
+        log: *mut core::ffi::c_char,
+        log_size: usize,
+    ) -> i32;
+
+    /// Launch a previously instantiated graph on `stream`.
+    pub fn cudaGraphLaunch(graph_exec: *mut core::ffi::c_void, stream: *mut core::ffi::c_void)
+        -> i32;
+
+    /// Destroy a captured graph (not the executable).
+    pub fn cudaGraphDestroy(graph: *mut core::ffi::c_void) -> i32;
+
+    /// Destroy an instantiated (executable) graph.
+    pub fn cudaGraphExecDestroy(graph_exec: *mut core::ffi::c_void) -> i32;
+
+    /// Synchronize all pending work on `stream`.
+    pub fn cudaStreamSynchronize(stream: *mut core::ffi::c_void) -> i32;
 }

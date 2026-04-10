@@ -88,6 +88,8 @@ pub use pinned::{
     unregister_pinned, PinnedAllocFlags, PinnedHostBuffer, PinnedHostBufferView,
     PinnedHostBufferViewMut, StagingDeviceBuf,
 };
+pub mod cuda_alloc_pool;
+pub mod cuda_graph;
 pub mod device;
 pub mod devtensor;
 pub mod dtype;
