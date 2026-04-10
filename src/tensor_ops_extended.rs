@@ -709,49 +709,51 @@ impl Tensor {
 
     /// Divide by another tensor
     pub fn div(&self, other: &Tensor) -> Result<Tensor> {
-        // Check if shapes match exactly
-        if self.shape == other.shape {
-            // Use CUDA kernel for GPU-accelerated division
-            let mut output = GpuOps::div(self, other)?;
-
-            // AUTOGRAD: Record operation if needed
-            if self.requires_grad || other.requires_grad {
-                output.requires_grad = true;
-
-                AutogradContext::record_op(
-                    output.id,
-                    Op::Div {
-                        lhs: self.id,
-                        rhs: other.id,
-                    },
-                    vec![
-                        (self.id, self.clone_result()?),
-                        (other.id, other.clone_result()?),
-                    ],
-                );
-            }
-
-            Ok(output)
+        // Broadcast both tensors to common shape if needed
+        let mut lhs = if self.shape == other.shape {
+            self.clone_result()?
         } else {
-            // Broadcasting case
             let broadcast_shape = broadcast_shapes(self.shape().dims(), other.shape().dims())?;
-
-            // Broadcast both tensors to the target shape
-            let self_broadcast = if self.shape().dims() == broadcast_shape {
+            if self.shape().dims() == broadcast_shape {
                 self.clone_result()?
             } else {
                 self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-            };
-
-            let other_broadcast = if other.shape().dims() == broadcast_shape {
+            }
+        };
+        let rhs = if self.shape == other.shape {
+            other.clone_result()?
+        } else {
+            let broadcast_shape = broadcast_shapes(self.shape().dims(), other.shape().dims())?;
+            if other.shape().dims() == broadcast_shape {
                 other.clone_result()?
             } else {
                 other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-            };
+            }
+        };
 
-            // Now divide with matching shapes
-            self_broadcast.div(&other_broadcast)
+        let mut output = GpuOps::div(&lhs, &rhs)?;
+
+        // AUTOGRAD: Record with ORIGINAL tensor IDs so gradients flow
+        // back to the actual inputs, not broadcast intermediates.
+        if self.requires_grad || other.requires_grad {
+            output.requires_grad = true;
+
+            AutogradContext::record_op(
+                output.id,
+                Op::Div {
+                    lhs: self.id,
+                    rhs: other.id,
+                    lhs_shape: self.shape.clone(),
+                    rhs_shape: other.shape.clone(),
+                },
+                vec![
+                    (self.id, self.clone()),
+                    (other.id, other.clone()),
+                ],
+            );
         }
+
+        Ok(output)
     }
 
     /// Element-wise equality comparison

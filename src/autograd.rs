@@ -58,6 +58,8 @@ pub enum Op {
     Div {
         lhs: TensorId,
         rhs: TensorId,
+        lhs_shape: Shape,
+        rhs_shape: Shape,
     },
     MulScalar {
         input: TensorId,
@@ -87,6 +89,9 @@ pub enum Op {
         input: TensorId,
     },
     Square {
+        input: TensorId,
+    },
+    Sqrt {
         input: TensorId,
     },
     Sum {
@@ -500,12 +505,19 @@ impl AutogradContext {
 impl AutogradContext {
     /// Record an operation in the computation graph
     pub fn record_op(output_id: TensorId, op: Op, saved_tensors: Vec<(TensorId, Tensor)>) {
+        // Fast path: skip lock entirely when autograd is disabled (e.g., during backward).
+        // This prevents deadlock when backward ops call high-level Tensor methods
+        // that would otherwise try to re-acquire the already-held context lock.
+        if !AUTOGRAD_ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+
         let mut ctx = match AUTOGRAD_CONTEXT.lock() {
             Ok(guard) => guard,
             Err(_) => return,
         };
 
-        // Only record if autograd is enabled
+        // Double-check under lock (race between atomic check and lock acquisition)
         if !ctx.enabled {
             return;
         }
@@ -719,7 +731,7 @@ impl AutogradContext {
                         // Extract input IDs from the op variant
                         match &e.op {
                             Op::Add { lhs, rhs, .. } | Op::Sub { lhs, rhs }
-                            | Op::Mul { lhs, rhs } | Op::Div { lhs, rhs }
+                            | Op::Mul { lhs, rhs } | Op::Div { lhs, rhs, .. }
                             | Op::MatMul { lhs, rhs } | Op::BatchMatMul { lhs, rhs }
                             | Op::Maximum { a: lhs, b: rhs } | Op::Minimum { a: lhs, b: rhs } => {
                                 ids.push(*lhs); ids.push(*rhs);
@@ -727,6 +739,7 @@ impl AutogradContext {
                             Op::MulScalar { input, .. } | Op::AddScalar { input, .. }
                             | Op::ReLU { input } | Op::GELU { input } | Op::SiLU { input }
                             | Op::Tanh { input } | Op::Sigmoid { input } | Op::Square { input }
+                            | Op::Sqrt { input }
                             | Op::Sum { input, .. } | Op::Mean { input, .. }
                             | Op::Transpose { input } | Op::Reshape { input, .. }
                             | Op::Permute { input, .. } | Op::SumDim { input, .. }
@@ -904,25 +917,34 @@ impl AutogradContext {
             let mut slowest_nodes: Vec<(std::time::Duration, String)> = Vec::new();
 
             eprintln!("[backward] tape len={}, starting reverse walk", ctx.tape.len());
-            // Debug: print all ops on tape
-            for (i, entry) in ctx.tape.iter().enumerate() {
-                eprintln!("[backward] tape[{i}]: {:?} out_id={:?}", std::mem::discriminant(&entry.op), entry.output_id);
-            }
             let backward_result: Result<()> = (|| {
                 for entry in ctx.tape.iter().rev() {
                     if let Some(output_grad) = gradients.take(entry.output_id) {
-                        eprintln!("[backward] processing {:?} out_id={:?}", std::mem::discriminant(&entry.op), entry.output_id);
                         let t_node = std::time::Instant::now();
 
                         // Compute input gradients
-                        let input_grads = compute_gradients(entry, &output_grad, &device)?;
+                        let input_grads = match compute_gradients(entry, &output_grad, &device) {
+                            Ok(g) => g,
+                            Err(e) => {
+                                eprintln!("[bwd:ERROR] #{} {:?} shape={:?}: {e:?}",
+                                    nodes_executed, std::mem::discriminant(&entry.op),
+                                    output_grad.shape().dims());
+                                return Err(e);
+                            }
+                        };
                         let kernel_dt = t_node.elapsed();
+                        if nodes_executed % 100 == 0 || kernel_dt.as_millis() > 500 {
+                            eprintln!("[bwd] #{}/{} dt={:.1}ms grads_in_map={}", nodes_executed, ctx.tape.len(), kernel_dt.as_secs_f64() * 1000.0, gradients.len());
+                        }
                         total_kernel_time += kernel_dt;
 
                         // Accumulate gradients
                         let t_accum = std::time::Instant::now();
                         for (tensor_id, grad) in input_grads {
-                            gradients.accumulate(tensor_id, grad)?;
+                            if let Err(e) = gradients.accumulate(tensor_id, grad) {
+                                eprintln!("[bwd:ACCUM_ERR] #{} {:?}: {e:?}", nodes_executed, std::mem::discriminant(&entry.op));
+                                return Err(e);
+                            }
                         }
                         total_accum_time += t_accum.elapsed();
 
@@ -1337,34 +1359,72 @@ fn compute_gradients(
         }
 
         Op::GELU { input } => {
-            // Use the complete GELU backward implementation
-            let input_tensor = &fetch_saved(input)?;
-            let grad = crate::autograd_ops_complete::gelu_backward(output_grad, input_tensor)?;
+            // GELU'(x) ≈ 0.5*(1+tanh(k)) + 0.5*x*(1-tanh²(k)) * dk/dx
+            // where k = sqrt(2/π) * (x + 0.044715*x³), dk/dx = sqrt(2/π)*(1+3*0.044715*x²)
+            // Use GpuOps only — no high-level Tensor methods (deadlock in backward).
+            let x = fetch_saved(input)?;
+            let x2 = GpuOps::mul(&x, &x)?;
+            let x3 = GpuOps::mul(&x2, &x)?;
+            let inner = GpuOps::add(
+                &x,
+                &GpuOps::mul_scalar(&x3, 0.044715)?,
+            )?;
+            let k = GpuOps::mul_scalar(&inner, (2.0f32 / std::f32::consts::PI).sqrt())?;
+            let tanh_k = GpuOps::tanh(&k)?;
+            let one_plus_tanh = GpuOps::add_scalar(&tanh_k, 1.0)?;
+            let tanh_k_sq = GpuOps::mul(&tanh_k, &tanh_k)?;
+            let sech2 = GpuOps::add(
+                &Tensor::ones_dtype(tanh_k.shape().clone(), tanh_k.dtype(), device.clone())?,
+                &GpuOps::mul_scalar(&tanh_k_sq, -1.0)?,
+            )?;
+            let dk_dx_inner = GpuOps::add_scalar(
+                &GpuOps::mul_scalar(&x2, 3.0 * 0.044715)?,
+                1.0,
+            )?;
+            let dk_dx = GpuOps::mul_scalar(&dk_dx_inner, (2.0f32 / std::f32::consts::PI).sqrt())?;
+            let term2 = GpuOps::mul(&GpuOps::mul(&x, &sech2)?, &dk_dx)?;
+            let derivative = GpuOps::mul_scalar(&GpuOps::add(&one_plus_tanh, &term2)?, 0.5)?;
+            let grad = GpuOps::mul(output_grad, &derivative)?;
             Ok(vec![(*input, grad)])
         }
 
         Op::SiLU { input } => {
-            // Use the complete SiLU backward implementation
-            let input_tensor = &fetch_saved(input)?;
-            let grad = crate::autograd_ops_complete::silu_backward(output_grad, input_tensor)?;
+            // SiLU(x) = x * sigmoid(x), SiLU'(x) = sig(x) + x*sig(x)*(1-sig(x))
+            // Use GpuOps only — no high-level Tensor methods (deadlock in backward).
+            let x = fetch_saved(input)?;
+            let sig = GpuOps::sigmoid(&x)?;
+            let one_minus_sig = GpuOps::add(
+                &Tensor::ones_dtype(sig.shape().clone(), sig.dtype(), device.clone())?,
+                &GpuOps::mul_scalar(&sig, -1.0)?,
+            )?;
+            let x_sig = GpuOps::mul(&x, &sig)?;
+            let x_sig_1ms = GpuOps::mul(&x_sig, &one_minus_sig)?;
+            let derivative = GpuOps::add(&sig, &x_sig_1ms)?;
+            let grad = GpuOps::mul(output_grad, &derivative)?;
             Ok(vec![(*input, grad)])
         }
 
         Op::Tanh { input } => {
-            // Use the complete Tanh backward implementation
-            let input_tensor = &fetch_saved(input)?;
-            let output_tensor = input_tensor.tanh()?;
-            let grad = crate::autograd_ops_complete::tanh_backward(output_grad, &output_tensor)?;
+            // tanh'(x) = 1 - tanh²(x)
+            // Use GpuOps only — no high-level Tensor methods (deadlock in backward).
+            let x = fetch_saved(input)?;
+            let tanh_x = GpuOps::tanh(&x)?;
+            let tanh_sq = GpuOps::mul(&tanh_x, &tanh_x)?;
+            let ones = Tensor::ones_dtype(tanh_sq.shape().clone(), tanh_sq.dtype(), device.clone())?;
+            let derivative = GpuOps::add(&ones, &GpuOps::mul_scalar(&tanh_sq, -1.0)?)?;
+            let grad = GpuOps::mul(output_grad, &derivative)?;
             Ok(vec![(*input, grad)])
         }
 
         Op::Sigmoid { input } => {
-            // Use the complete Sigmoid backward implementation
-            let input_tensor = entry
-                .get_saved(input)
-                .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for input".into()))?;
-            let output_tensor = input_tensor.sigmoid()?;
-            let grad = crate::autograd_ops_complete::sigmoid_backward(output_grad, &output_tensor)?;
+            // sigmoid'(x) = sig(x) * (1 - sig(x))
+            // Use GpuOps only — no high-level Tensor methods (deadlock in backward).
+            let x = fetch_saved(input)?;
+            let sig = GpuOps::sigmoid(&x)?;
+            let ones = Tensor::ones_dtype(sig.shape().clone(), sig.dtype(), device.clone())?;
+            let one_minus_sig = GpuOps::add(&ones, &GpuOps::mul_scalar(&sig, -1.0)?)?;
+            let derivative = GpuOps::mul(&sig, &one_minus_sig)?;
+            let grad = GpuOps::mul(output_grad, &derivative)?;
             Ok(vec![(*input, grad)])
         }
 
@@ -1374,6 +1434,18 @@ fn compute_gradients(
             let two_x = GpuOps::mul_scalar(input_tensor, 2.0)?;
             let grad = GpuOps::mul(output_grad, &two_x)?;
             Ok(vec![(*input, grad)])
+        }
+
+        Op::Sqrt { input } => {
+            // d/dx sqrt(x) = 0.5 / sqrt(x) = 0.5 * x^(-0.5)
+            // Use the output (sqrt(x)) from saved tensor to compute: grad * 0.5 / sqrt(x)
+            let input_tensor = fetch_saved(input)?;
+            let sqrt_x = GpuOps::sqrt(&input_tensor)?;
+            let half_inv_sqrt = GpuOps::div(
+                &GpuOps::mul_scalar(output_grad, 0.5)?,
+                &sqrt_x,
+            )?;
+            Ok(vec![(*input, half_inv_sqrt)])
         }
 
         Op::Sum { input, input_shape } => {
@@ -1788,7 +1860,7 @@ fn compute_gradients(
             Ok(vec![(*input, ensure_bf16(grad)?)])
         }
 
-        Op::Div { lhs, rhs } => {
+        Op::Div { lhs, rhs, lhs_shape, rhs_shape } => {
             // d/dx (x/y) = 1/y
             // d/dy (x/y) = -x/y^2
             let lhs_tensor = fetch_saved(lhs)?;
@@ -1796,21 +1868,33 @@ fn compute_gradients(
             guard_tensor("AutogradContext::div_backward lhs", &lhs_tensor)?;
             guard_tensor("AutogradContext::div_backward rhs", &rhs_tensor)?;
 
+            // Broadcast saved tensors to output shape for correct gradient computation
+            let lhs_bc = if lhs_tensor.shape() != output_grad.shape() {
+                GpuOps::broadcast(&lhs_tensor, output_grad.shape())?
+            } else {
+                lhs_tensor
+            };
+            let rhs_bc = if rhs_tensor.shape() != output_grad.shape() {
+                GpuOps::broadcast(&rhs_tensor, output_grad.shape())?
+            } else {
+                rhs_tensor
+            };
+
             // Gradient w.r.t. lhs: grad * (1/rhs)
-            let mut grad_lhs = GpuOps::div(output_grad, &rhs_tensor)?;
+            let mut grad_lhs = GpuOps::div(output_grad, &rhs_bc)?;
 
             // Gradient w.r.t. rhs: grad * (-lhs/rhs^2)
-            let rhs_squared = GpuOps::mul(&rhs_tensor, &rhs_tensor)?; // x^2 = x * x
-            let neg_lhs = GpuOps::mul_scalar(&lhs_tensor, -1.0)?;
+            let rhs_squared = GpuOps::mul(&rhs_bc, &rhs_bc)?;
+            let neg_lhs = GpuOps::mul_scalar(&lhs_bc, -1.0)?;
             let grad_rhs_term = GpuOps::div(&neg_lhs, &rhs_squared)?;
             let mut grad_rhs = GpuOps::mul(output_grad, &grad_rhs_term)?;
 
-            // Reduce for broadcasting if shapes differ
-            if grad_lhs.shape() != lhs_tensor.shape() {
-                grad_lhs = reduce_grad_for_broadcast(&grad_lhs, lhs_tensor.shape())?;
+            // Reduce for broadcasting — use original shapes from Op
+            if grad_lhs.shape() != lhs_shape {
+                grad_lhs = reduce_grad_for_broadcast(&grad_lhs, lhs_shape)?;
             }
-            if grad_rhs.shape() != rhs_tensor.shape() {
-                grad_rhs = reduce_grad_for_broadcast(&grad_rhs, rhs_tensor.shape())?;
+            if grad_rhs.shape() != rhs_shape {
+                grad_rhs = reduce_grad_for_broadcast(&grad_rhs, rhs_shape)?;
             }
 
             Ok(vec![
@@ -2064,75 +2148,65 @@ fn compute_gradients(
             ranges,
             input_shape,
         } => {
-            // Backward for slice: prefer CUDA scatter-add when slice is a narrow along a single dim
+            // Backward for slice: pad output_grad with zeros to reconstruct input shape.
+            // Uses cat-based approach (works with all dtypes, avoids FFI scatter kernel issues).
             let device = device.clone();
-            let mut grad_in = Tensor::zeros(input_shape.clone(), device.clone())?;
-
-            // Detect single-axis narrow: exactly one dim has (start,end) not equal to (0, size)
             let in_dims = input_shape.dims();
-            let mut narrow_dim: Option<(usize, usize, usize)> = None; // (dim, start, length)
+            let grad_dtype = output_grad.dtype();
+
+            // Detect single-axis narrow
+            let mut narrow_dim: Option<(usize, usize, usize)> = None;
             for (i, &(s, e)) in ranges.iter().enumerate() {
-                let full = s == 0 && e == in_dims[i];
-                if !full {
+                if !(s == 0 && e == in_dims[i]) {
                     if narrow_dim.is_some() {
-                        narrow_dim = None; // more than one axis sliced
+                        narrow_dim = None;
                         break;
                     }
-                    let len = e - s;
-                    narrow_dim = Some((i, s, len));
+                    narrow_dim = Some((i, s, e - s));
                 }
             }
 
             if let Some((dim, start, length)) = narrow_dim {
-                // Use local CUDA scatter-add helper for single-axis narrow
-                gpu_scatter_add_narrow(output_grad, &mut grad_in, dim, start)?;
+                let mut parts: Vec<Tensor> = Vec::new();
+                if start > 0 {
+                    let mut pad_shape = output_grad.shape().dims().to_vec();
+                    pad_shape[dim] = start;
+                    parts.push(Tensor::zeros_dtype(crate::Shape::from_dims(&pad_shape), grad_dtype, device.clone())?);
+                }
+                parts.push(output_grad.clone_result()?);
+                let end = start + length;
+                if end < in_dims[dim] {
+                    let mut pad_shape = output_grad.shape().dims().to_vec();
+                    pad_shape[dim] = in_dims[dim] - end;
+                    parts.push(Tensor::zeros_dtype(crate::Shape::from_dims(&pad_shape), grad_dtype, device.clone())?);
+                }
+                let refs: Vec<&Tensor> = parts.iter().collect();
+                let grad_in = Tensor::cat(&refs, dim)?;
                 Ok(vec![(*input, grad_in)])
-            } else if can_gpu_multi_axis(ranges, input_shape.dims()) {
-                // Multi-axis: perform chained CUDA scatters in reverse axis order
-                let mut tmp = output_grad.clone_result()?;
-                // Collect sliced axes (dim,start,len)
-                let mut axes: Vec<(usize, usize, usize)> = Vec::new();
-                for (i, &(s, e)) in ranges.iter().enumerate() {
-                    if !(s == 0 && e == input_shape.dims()[i]) {
-                        axes.push((i, s, e - s));
-                    }
-                }
-                // Apply expansions in reverse
-                for (axis, s, len) in axes.into_iter().rev() {
-                    let mut expanded_dims = tmp.shape().dims().to_vec();
-                    expanded_dims[axis] = input_shape.dims()[axis];
-                    let expanded_shape = crate::Shape::from_dims(&expanded_dims);
-                    let mut expanded =
-                        Tensor::zeros_dtype(expanded_shape, grad_in.dtype(), device.clone())?;
-                    // Scatter tmp into expanded along this axis
-                    gpu_scatter_add_narrow(&tmp, &mut expanded, axis, s)?;
-                    tmp = expanded;
-                }
-                Ok(vec![(*input, tmp)])
             } else {
-                // GPU fallback for multi-axis slices that failed can_gpu_multi_axis
-                // (only possible with invalid ranges — forward pass should prevent this)
                 let mut tmp = output_grad.clone_result()?;
                 let mut axes: Vec<(usize, usize, usize)> = Vec::new();
                 for (i, &(s, e)) in ranges.iter().enumerate() {
-                    if !(s == 0 && e == input_shape.dims()[i]) {
-                        if s > e || e > input_shape.dims()[i] {
-                            return Err(Error::InvalidOperation(format!(
-                                "Slice backward: invalid range dim={} start={} end={} size={}",
-                                i, s, e, input_shape.dims()[i]
-                            )));
-                        }
+                    if !(s == 0 && e == in_dims[i]) {
                         axes.push((i, s, e - s));
                     }
                 }
-                for (axis, s, _len) in axes.into_iter().rev() {
-                    let mut expanded_dims = tmp.shape().dims().to_vec();
-                    expanded_dims[axis] = input_shape.dims()[axis];
-                    let expanded_shape = crate::Shape::from_dims(&expanded_dims);
-                    let mut expanded =
-                        Tensor::zeros_dtype(expanded_shape, grad_in.dtype(), device.clone())?;
-                    gpu_scatter_add_narrow(&tmp, &mut expanded, axis, s)?;
-                    tmp = expanded;
+                for (axis, s, len) in axes.into_iter().rev() {
+                    let mut parts: Vec<Tensor> = Vec::new();
+                    if s > 0 {
+                        let mut pad_shape = tmp.shape().dims().to_vec();
+                        pad_shape[axis] = s;
+                        parts.push(Tensor::zeros_dtype(crate::Shape::from_dims(&pad_shape), grad_dtype, device.clone())?);
+                    }
+                    parts.push(tmp);
+                    let end = s + len;
+                    if end < in_dims[axis] {
+                        let mut pad_shape = parts.last().unwrap().shape().dims().to_vec();
+                        pad_shape[axis] = in_dims[axis] - end;
+                        parts.push(Tensor::zeros_dtype(crate::Shape::from_dims(&pad_shape), grad_dtype, device.clone())?);
+                    }
+                    let refs: Vec<&Tensor> = parts.iter().collect();
+                    tmp = Tensor::cat(&refs, axis)?;
                 }
                 Ok(vec![(*input, tmp)])
             }

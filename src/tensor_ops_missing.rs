@@ -71,7 +71,19 @@ impl Tensor {
 
     /// Square root
     pub fn sqrt(&self) -> Result<Tensor> {
-        GpuOps::sqrt(self)
+        let mut output = GpuOps::sqrt(self)?;
+
+        if self.requires_grad {
+            output.requires_grad = true;
+            use crate::autograd::{AutogradContext, Op};
+            AutogradContext::record_op(
+                output.id,
+                Op::Sqrt { input: self.id },
+                vec![(self.id, self.clone())],
+            );
+        }
+
+        Ok(output)
     }
 
     /// Mean along dimensions
