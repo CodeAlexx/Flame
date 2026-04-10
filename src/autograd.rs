@@ -1453,18 +1453,59 @@ fn compute_gradients(
         }
 
         Op::SiLU { input } => {
-            // SiLU(x) = x * sigmoid(x), SiLU'(x) = sig(x) + x*sig(x)*(1-sig(x))
-            // Use GpuOps only — no high-level Tensor methods (deadlock in backward).
+            // Fused SiLU backward: single CUDA kernel instead of 7 GpuOps calls.
+            // SiLU'(x) = sig(x) + x*sig(x)*(1-sig(x))
             let x = fetch_saved(input)?;
-            let sig = GpuOps::sigmoid(&x)?;
-            let one_minus_sig = GpuOps::add(
-                &Tensor::ones_dtype(sig.shape().clone(), sig.dtype(), device.clone())?,
-                &GpuOps::mul_scalar(&sig, -1.0)?,
-            )?;
-            let x_sig = GpuOps::mul(&x, &sig)?;
-            let x_sig_1ms = GpuOps::mul(&x_sig, &one_minus_sig)?;
-            let derivative = GpuOps::add(&sig, &x_sig_1ms)?;
-            let grad = GpuOps::mul(output_grad, &derivative)?;
+            let n = x.shape().elem_count() as i64;
+            let stream = device.cuda_stream_raw_ptr();
+
+            // Try fused kernel path (BF16 or F32)
+            let grad = if output_grad.dtype() == DType::BF16 && x.dtype() == DType::BF16 {
+                let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, device.clone())?;
+                let status = unsafe {
+                    crate::cuda::ffi::flame_silu_backward_bf16(
+                        tensor_raw_ptr(output_grad)?,
+                        tensor_raw_ptr(&x)?,
+                        tensor_raw_ptr_mut(&mut out)?,
+                        n, stream,
+                    )
+                };
+                if status != 0 {
+                    return Err(Error::Cuda("flame_silu_backward_bf16 failed".into()));
+                }
+                out
+            } else if output_grad.dtype() == DType::F32 && x.dtype() == DType::F32 {
+                let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::F32, device.clone())?;
+                let status = unsafe {
+                    crate::cuda::ffi::flame_silu_backward_f32(
+                        tensor_raw_ptr(output_grad)?,
+                        tensor_raw_ptr(&x)?,
+                        tensor_raw_ptr_mut(&mut out)?,
+                        n, stream,
+                    )
+                };
+                if status != 0 {
+                    return Err(Error::Cuda("flame_silu_backward_f32 failed".into()));
+                }
+                out
+            } else {
+                // Fallback: mixed dtypes — cast and use f32 kernel
+                let og_f32 = if output_grad.dtype() != DType::F32 { output_grad.to_dtype(DType::F32)? } else { output_grad.clone_result()? };
+                let x_f32 = if x.dtype() != DType::F32 { x.to_dtype(DType::F32)? } else { x };
+                let mut out = Tensor::zeros_dtype(x_f32.shape().clone(), DType::F32, device.clone())?;
+                let status = unsafe {
+                    crate::cuda::ffi::flame_silu_backward_f32(
+                        tensor_raw_ptr(&og_f32)?,
+                        tensor_raw_ptr(&x_f32)?,
+                        tensor_raw_ptr_mut(&mut out)?,
+                        n, stream,
+                    )
+                };
+                if status != 0 {
+                    return Err(Error::Cuda("flame_silu_backward_f32 failed".into()));
+                }
+                out
+            };
             Ok(vec![(*input, grad)])
         }
 
@@ -1590,18 +1631,30 @@ fn compute_gradients(
                 sub_grads.set(last_entry.output_id, output_grad.clone());
             }
 
+            let mut sub_op_times: Vec<(std::time::Duration, &Op)> = Vec::new();
             for sub_entry in recomputed_tape.iter().rev() {
                 if let Some(sg) = sub_grads.take(sub_entry.output_id) {
+                    let _t0 = std::time::Instant::now();
                     let input_grads = compute_gradients(sub_entry, &sg, device)?;
+                    let _dt = _t0.elapsed();
+                    if _dt.as_millis() > 5 {
+                        sub_op_times.push((_dt, &sub_entry.op));
+                    }
                     for (tid, g) in input_grads {
                         if sub_needed.contains(&tid) {
                             sub_grads.accumulate(tid, g)?;
                         }
-                        // else: frozen weight grad — drop immediately
                     }
                 }
             }
             let _sub_bwd_dt = _sub_bwd_t0.elapsed();
+            if !sub_op_times.is_empty() {
+                sub_op_times.sort_by(|a, b| b.0.cmp(&a.0));
+                let top: Vec<String> = sub_op_times.iter().take(3)
+                    .map(|(dt, op)| format!("{:.1}ms {:?}", dt.as_secs_f64()*1000.0, std::mem::discriminant(*op)))
+                    .collect();
+                eprintln!("[ckpt:hot] {}", top.join(" | "));
+            }
 
             eprintln!(
                 "[ckpt] tape={} recomp={:.1}ms sub_bwd={:.1}ms total={:.1}ms",
