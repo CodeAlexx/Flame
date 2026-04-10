@@ -1182,9 +1182,20 @@ impl Drop for NoGradGuard {
 /// Compute gradients for a single operation
 fn compute_gradients(
     entry: &TapeEntry,
-    output_grad: &Tensor,
+    output_grad_raw: &Tensor,
     device: &Arc<CudaDevice>,
 ) -> Result<Vec<(TensorId, Tensor)>> {
+    // Ensure output_grad is BF16 to match saved tensors and avoid dtype
+    // mismatches in backward ops (GpuOps::mul, matmul, etc. require matching dtypes).
+    // GradientMap stores F32 internally, so output_grad arrives as F32.
+    let output_grad_owned;
+    let output_grad = if output_grad_raw.dtype() != DType::BF16 {
+        output_grad_owned = output_grad_raw.to_dtype(DType::BF16)?;
+        &output_grad_owned
+    } else {
+        output_grad_raw
+    };
+
     // Optional backtrace: print op and shapes when FLAME_BACKWARD_TRACE=1
     // Cached to avoid syscall per-op (was ~0.5ms × 800 ops = 400ms overhead)
     static TRACE_CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1296,18 +1307,23 @@ fn compute_gradients(
         }
 
         Op::MatMul { lhs, rhs } => {
-            // d/dA(A @ B) = grad @ B^T
-            // d/dB(A @ B) = A^T @ grad
             let lhs_tensor = &fetch_saved(lhs)?;
             let rhs_tensor = &fetch_saved(rhs)?;
 
-            // Gradient w.r.t. lhs: grad @ B^T
-            // Use GPU ops directly to avoid autograd recording
-            let rhs_t = GpuOps::transpose(rhs_tensor)?;
+            // BF16 2D transpose is ~100x faster than GpuOps::transpose (which
+            // casts BF16→F32, transposes in F32, returns F32).
+            let rhs_t = if rhs_tensor.dtype() == DType::BF16 && rhs_tensor.rank() == 2 {
+                crate::bf16_elementwise::transpose2d_bf16(rhs_tensor)?
+            } else {
+                GpuOps::transpose(rhs_tensor)?
+            };
             let grad_lhs = GpuOps::matmul(output_grad, &rhs_t)?;
 
-            // Gradient w.r.t. rhs: A^T @ grad
-            let lhs_t = GpuOps::transpose(lhs_tensor)?;
+            let lhs_t = if lhs_tensor.dtype() == DType::BF16 && lhs_tensor.rank() == 2 {
+                crate::bf16_elementwise::transpose2d_bf16(lhs_tensor)?
+            } else {
+                GpuOps::transpose(lhs_tensor)?
+            };
             let grad_rhs = GpuOps::matmul(&lhs_t, output_grad)?;
 
             Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
@@ -1459,8 +1475,11 @@ fn compute_gradients(
         }
 
         Op::Transpose { input } => {
-            // Gradient of transpose is transpose of gradient
-            let grad = GpuOps::transpose(output_grad)?;
+            let grad = if output_grad.dtype() == DType::BF16 {
+                crate::bf16_elementwise::transpose2d_bf16(output_grad)?
+            } else {
+                GpuOps::transpose(output_grad)?
+            };
             Ok(vec![(*input, grad)])
         }
 
@@ -2648,10 +2667,12 @@ fn compute_gradients(
         }
     }?;
 
-    grads
-        .into_iter()
-        .map(|(id, tensor)| ensure_bf16(tensor).map(|t| (id, t)))
-        .collect()
+    // Return gradients in their native dtype (typically F32 from GpuOps).
+    // Previously every gradient was cast to BF16 here, then immediately cast
+    // back to F32 in GradientMap::accumulate — a wasteful round-trip that also
+    // caused dtype mismatches when the next backward op received F32 output_grad
+    // but BF16 saved_tensors, triggering F32 casts in GpuOps::mul etc.
+    Ok(grads)
 }
 
 /// Reduce gradient for broadcast operations
