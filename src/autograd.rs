@@ -504,6 +504,10 @@ pub fn backward(loss: &Tensor, _retain_graph: bool) -> Result<crate::GradientMap
 }
 // Local, dependency-free SDPA backward (recompute path)
 // SDPA backward (recompute path)
+/// SDPA backward via recompute. If `cached_attn` is Some, uses it directly
+/// as the softmax output — skipping the Q@K^T + softmax recompute entirely.
+/// This is the ~500ms/step win for Klein 9B: attn shape is [bh, q_len, k_len],
+/// 4D inputs are reshaped to match before bmm.
 fn attention_backward_recompute(
     q: &Tensor,
     k: &Tensor,
@@ -511,6 +515,7 @@ fn attention_backward_recompute(
     dout: &Tensor,
     mask: Option<&Tensor>,
     scale: f32,
+    cached_attn: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     // All ops in BF16 (bmm requires matching dtypes)
     let q = if q.dtype() != DType::BF16 { &q.to_dtype(DType::BF16)? } else { q };
@@ -518,15 +523,28 @@ fn attention_backward_recompute(
     let v = if v.dtype() != DType::BF16 { &v.to_dtype(DType::BF16)? } else { v };
     let dout = if dout.dtype() != DType::BF16 { &dout.to_dtype(DType::BF16)? } else { dout };
 
-    // logits = (Q K^T) * scale
-    let kt = k.transpose_dims(2, 3)?;
-    let mut logits = q.bmm(&kt)?;
-    logits = logits.mul_scalar(scale)?;
-    if let Some(m) = mask {
-        logits = logits.add(m)?;
-    }
-
-    let attn = logits.softmax(-1)?;
+    // attn: either the cached softmax output from forward, or recompute
+    // from Q, K. Cached is [bh, q_len, k_len] (3D); recompute produces same.
+    let attn_owned;
+    let attn: &Tensor = if let Some(cached) = cached_attn {
+        let cached = if cached.dtype() != DType::BF16 {
+            attn_owned = cached.to_dtype(DType::BF16)?;
+            &attn_owned
+        } else {
+            cached
+        };
+        cached
+    } else {
+        // Recompute fallback: logits = (Q K^T) * scale, then softmax
+        let kt = k.transpose_dims(2, 3)?;
+        let mut logits = q.bmm(&kt)?;
+        logits = logits.mul_scalar(scale)?;
+        if let Some(m) = mask {
+            logits = logits.add(m)?;
+        }
+        attn_owned = logits.softmax(-1)?;
+        &attn_owned
+    };
 
     // dV = attn^T @ dO
     let d_v = attn.transpose_dims(2, 3)?.bmm(dout)?;
@@ -535,9 +553,9 @@ fn attention_backward_recompute(
     let d_attn = dout.bmm(&v.transpose_dims(2, 3)?)?;
 
     // softmax backward: d_logits = (dAttn - sum(dAttn*attn, -1, keepdim)) * attn
-    let dattn_times_attn = d_attn.mul(&attn)?;
+    let dattn_times_attn = d_attn.mul(attn)?;
     let sum_term = dattn_times_attn.sum_dim_keepdim(3)?;
-    let d_logits = d_attn.sub(&sum_term)?.mul(&attn)?;
+    let d_logits = d_attn.sub(&sum_term)?.mul(attn)?;
     let d_logits = d_logits.mul_scalar(scale)?;
 
     // dQ = d_logits @ K, dK = d_logits^T @ Q
@@ -2796,6 +2814,26 @@ fn compute_gradients(
                 )
             })();
 
+            // Look for a cached attn tensor in saved_tensors (shape
+            // [batch, heads, q_len, k_len]). Matches the attn saved by
+            // callers that pre-compute softmax in forward.
+            let expected_attn_shape = {
+                let q_dims = query_tensor.shape().dims();
+                let k_dims = key_tensor.shape().dims();
+                if q_dims.len() == 4 && k_dims.len() == 4 {
+                    Some([q_dims[0], q_dims[1], q_dims[2], k_dims[2]])
+                } else {
+                    None
+                }
+            };
+            let cached_attn: Option<&Tensor> = expected_attn_shape.and_then(|s| {
+                entry
+                    .saved_tensors
+                    .iter()
+                    .map(|(_, t)| t)
+                    .find(|t| t.shape().dims() == s)
+            });
+
             let (grad_q, grad_k, grad_v) = match fused {
                 Ok(triple) => triple,
                 Err(_) => {
@@ -2807,6 +2845,7 @@ fn compute_gradients(
                         output_grad,
                         mask_tensor,
                         *scale,
+                        cached_attn,
                     )?;
                     (dq, dk, dv)
                 }
@@ -2838,6 +2877,28 @@ fn compute_gradients(
             } else {
                 None
             };
+
+            // Look for a cached attn tensor in saved_tensors (shape
+            // [batch, heads, q_len, k_len]). Callers that pre-compute
+            // softmax in forward append it to saved_tensors; the rest
+            // fall back to recomputing logits+softmax in backward.
+            let expected_attn_shape = {
+                let q_dims = query_tensor.shape().dims();
+                let k_dims = key_tensor.shape().dims();
+                if q_dims.len() == 4 && k_dims.len() == 4 {
+                    Some([q_dims[0], q_dims[1], q_dims[2], k_dims[2]])
+                } else {
+                    None
+                }
+            };
+            let cached_attn: Option<&Tensor> = expected_attn_shape.and_then(|s| {
+                entry
+                    .saved_tensors
+                    .iter()
+                    .map(|(_, t)| t)
+                    .find(|t| t.shape().dims() == s)
+            });
+
             let (grad_q, grad_k, grad_v) = attention_backward_recompute(
                 query_tensor,
                 key_tensor,
@@ -2845,6 +2906,7 @@ fn compute_gradients(
                 output_grad,
                 mask_tensor,
                 *scale,
+                cached_attn,
             )?;
             Ok(vec![(*query, grad_q), (*key, grad_k), (*value, grad_v)])
         }
