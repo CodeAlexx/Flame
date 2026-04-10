@@ -404,17 +404,19 @@ extern "C" __global__ void masked_fill_kernel(
         let mut output = crate::ops::gemm::launch_gemm(self, other)?;
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
-            AutogradContext::record_op(
-                output.id,
-                Op::MatMul {
-                    lhs: self.id,
-                    rhs: other.id,
-                },
-                vec![
-                    (self.id, self.clone()),
-                    (other.id, other.clone()),
-                ],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::MatMul {
+                        lhs: self.id,
+                        rhs: other.id,
+                    },
+                    vec![
+                        (self.id, self.clone()),
+                        (other.id, other.clone()),
+                    ],
+                );
+            }
         }
         Ok(output)
     }
@@ -425,17 +427,19 @@ extern "C" __global__ void masked_fill_kernel(
         let mut output = crate::ops::gemm::launch_gemm(self, other)?;
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
-            AutogradContext::record_op(
-                output.id,
-                Op::MatMul {
-                    lhs: self.id,
-                    rhs: other.id,
-                },
-                vec![
-                    (self.id, self.clone()),
-                    (other.id, other.clone()),
-                ],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::MatMul {
+                        lhs: self.id,
+                        rhs: other.id,
+                    },
+                    vec![
+                        (self.id, self.clone()),
+                        (other.id, other.clone()),
+                    ],
+                );
+            }
         }
         Ok(output)
     }
@@ -764,7 +768,7 @@ extern "C" __global__ void masked_fill_kernel(
             id: TensorId::new(),
             requires_grad: self.requires_grad,
         };
-        if self.requires_grad {
+        if self.requires_grad && AutogradContext::is_recording() {
             // Record autograd Cast op so gradients flow across dtype boundaries
             AutogradContext::record_op(
                 out.id,
@@ -793,7 +797,7 @@ extern "C" __global__ void masked_fill_kernel(
         }
         let gathered = crate::cuda_kernels::gather_rows(self, ids, 0)?;
 
-        if self.requires_grad {
+        if self.requires_grad && AutogradContext::is_recording() {
             let mut tracked = gathered.clone_result()?;
             tracked.requires_grad = true;
             AutogradContext::record_op(
@@ -1279,14 +1283,16 @@ extern "C" __global__ void masked_fill_kernel(
 
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
-            AutogradContext::record_op(
-                output.id,
-                Op::MatMul {
-                    lhs: self.id,
-                    rhs: other.id,
-                },
-                vec![(self.id, self.clone()), (other.id, other.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::MatMul {
+                        lhs: self.id,
+                        rhs: other.id,
+                    },
+                    vec![(self.id, self.clone()), (other.id, other.clone())],
+                );
+            }
         }
 
         Ok(output)
@@ -1385,17 +1391,19 @@ extern "C" __global__ void masked_fill_kernel(
 
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
-            AutogradContext::record_op(
-                output.id,
-                Op::BatchMatMul {
-                    lhs: self.id,
-                    rhs: other.id,
-                },
-                vec![
-                    (self.id, self.clone()),
-                    (other.id, other.clone()),
-                ],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::BatchMatMul {
+                        lhs: self.id,
+                        rhs: other.id,
+                    },
+                    vec![
+                        (self.id, self.clone()),
+                        (other.id, other.clone()),
+                    ],
+                );
+            }
         }
 
         Ok(output)
@@ -1444,18 +1452,19 @@ extern "C" __global__ void masked_fill_kernel(
         // AUTOGRAD: Record operation if needed
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::BatchMatMul {
-                    lhs: self.id,
-                    rhs: other.id,
-                },
-                vec![
-                    (self.id, self.clone()),
-                    (other.id, other.clone()),
-                ],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::BatchMatMul {
+                        lhs: self.id,
+                        rhs: other.id,
+                    },
+                    vec![
+                        (self.id, self.clone()),
+                        (other.id, other.clone()),
+                    ],
+                );
+            }
         }
 
         Ok(output)
@@ -1686,17 +1695,18 @@ extern "C" __global__ void f32_to_bool_kernel(
         // AUTOGRAD: Record operation if needed
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::Add {
-                    lhs: self.id,
-                    rhs: other.id,
-                    lhs_shape: self.shape.clone(),
-                    rhs_shape: other.shape.clone(),
-                },
-                Vec::new(),
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Add {
+                        lhs: self.id,
+                        rhs: other.id,
+                        lhs_shape: self.shape.clone(),
+                        rhs_shape: other.shape.clone(),
+                    },
+                    Vec::new(),
+                );
+            }
         }
 
         Ok(output)
@@ -1710,8 +1720,8 @@ extern "C" __global__ void f32_to_bool_kernel(
         let output = self.add(&neg_other)?;
 
         // Record subtraction operation if needed
-        if self.requires_grad || other.requires_grad {
-            // Record as subtraction
+        if (self.requires_grad || other.requires_grad) && AutogradContext::is_recording() {
+            // Note: output.requires_grad is already set by add() above
             AutogradContext::record_op(
                 output.id,
                 Op::Sub {
@@ -1737,15 +1747,16 @@ extern "C" __global__ void f32_to_bool_kernel(
         // AUTOGRAD: Record operation if needed
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::Mul {
-                    lhs: self.id,
-                    rhs: other.id,
-                },
-                vec![(self.id, self.clone()), (other.id, other.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Mul {
+                        lhs: self.id,
+                        rhs: other.id,
+                    },
+                    vec![(self.id, self.clone()), (other.id, other.clone())],
+                );
+            }
         }
 
         Ok(output)
@@ -1759,15 +1770,16 @@ extern "C" __global__ void f32_to_bool_kernel(
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::MulScalar {
-                    input: self.id,
-                    scalar,
-                },
-                Vec::new(),
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::MulScalar {
+                        input: self.id,
+                        scalar,
+                    },
+                    Vec::new(),
+                );
+            }
         }
 
         Ok(output)
@@ -1786,15 +1798,16 @@ extern "C" __global__ void f32_to_bool_kernel(
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::AddScalar {
-                    input: self.id,
-                    scalar,
-                },
-                Vec::new(),
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::AddScalar {
+                        input: self.id,
+                        scalar,
+                    },
+                    Vec::new(),
+                );
+            }
         }
 
         Ok(output)
@@ -1808,12 +1821,13 @@ extern "C" __global__ void f32_to_bool_kernel(
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::ReLU { input: self.id },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::ReLU { input: self.id },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
 
         Ok(output)
@@ -1836,12 +1850,13 @@ extern "C" __global__ void f32_to_bool_kernel(
 
         if self.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::GELU { input: self.id },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::GELU { input: self.id },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
 
         Ok(output)
@@ -1864,12 +1879,13 @@ extern "C" __global__ void f32_to_bool_kernel(
 
         if self.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::SiLU { input: self.id },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::SiLU { input: self.id },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
 
         Ok(output)
@@ -1883,12 +1899,13 @@ extern "C" __global__ void f32_to_bool_kernel(
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::Tanh { input: self.id },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Tanh { input: self.id },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
 
         Ok(output)
@@ -1902,12 +1919,13 @@ extern "C" __global__ void f32_to_bool_kernel(
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::Sigmoid { input: self.id },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Sigmoid { input: self.id },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
 
         Ok(output)
@@ -1954,13 +1972,14 @@ extern "C" __global__ void f32_to_bool_kernel(
         // Set requires_grad if input requires grad
         if self.requires_grad {
             output.requires_grad = true;
-
-            // Record as square operation
-            AutogradContext::record_op(
-                output.id,
-                Op::Square { input: self.id },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                // Record as square operation
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Square { input: self.id },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
 
         Ok(output)
@@ -1981,14 +2000,16 @@ extern "C" __global__ void f32_to_bool_kernel(
         // Record mean operation if needed (attach grad to original input)
         if self.requires_grad {
             out32.requires_grad = true;
-            AutogradContext::record_op(
-                out32.id,
-                Op::Mean {
-                    input: self.id,
-                    input_shape: self.shape.clone(),
-                },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    out32.id,
+                    Op::Mean {
+                        input: self.id,
+                        input_shape: self.shape.clone(),
+                    },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
 
         // Downcast to original dtype when appropriate
@@ -2007,15 +2028,16 @@ extern "C" __global__ void f32_to_bool_kernel(
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::Sum {
-                    input: self.id,
-                    input_shape: self.shape.clone(),
-                },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Sum {
+                        input: self.id,
+                        input_shape: self.shape.clone(),
+                    },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
 
         Ok(output)
@@ -2045,14 +2067,16 @@ extern "C" __global__ void f32_to_bool_kernel(
         if self.requires_grad {
             let mut out = current;
             out.requires_grad = true;
-            AutogradContext::record_op(
-                out.id,
-                Op::SumDims {
-                    input: self.id,
-                    dims: dims_sorted.clone(),
-                },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    out.id,
+                    Op::SumDims {
+                        input: self.id,
+                        dims: dims_sorted.clone(),
+                    },
+                    vec![(self.id, self.clone())],
+                );
+            }
             Ok(out)
         } else {
             Ok(current)
@@ -2086,15 +2110,16 @@ extern "C" __global__ void f32_to_bool_kernel(
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::SumDim {
-                    input: self.id,
-                    dim,
-                },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::SumDim {
+                        input: self.id,
+                        dim,
+                    },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
 
         Ok(output)
@@ -2175,7 +2200,7 @@ extern "C" __global__ void f32_to_bool_kernel(
             requires_grad: self.requires_grad,
         };
         // Record autograd op so gradients flow through reshape
-        if self.requires_grad {
+        if self.requires_grad && AutogradContext::is_recording() {
             AutogradContext::record_op(
                 out.id,
                 Op::Reshape {
@@ -2293,12 +2318,13 @@ extern "C" __global__ void f32_to_bool_kernel(
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::Transpose { input: self.id },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Transpose { input: self.id },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
 
         Ok(output)
@@ -2672,15 +2698,16 @@ extern "C" __global__ void f32_to_bool_kernel(
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::Permute {
-                    input: self.id,
-                    dims: dims.to_vec(),
-                },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Permute {
+                        input: self.id,
+                        dims: dims.to_vec(),
+                    },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
 
         Ok(output)
@@ -2741,15 +2768,16 @@ extern "C" __global__ void f32_to_bool_kernel(
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::Softmax {
-                    input: self.id,
-                    dim: dim as isize,
-                },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Softmax {
+                        input: self.id,
+                        dim: dim as isize,
+                    },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
 
         // Cast to default dtype if not F32
@@ -3015,21 +3043,23 @@ extern "C" __global__ void f32_to_bool_kernel(
             // chain. Record `Op::Slice` here to keep backward working.
             if self.requires_grad {
                 out.requires_grad = true;
-                let mut ranges: Vec<(usize, usize)> =
-                    dims.iter().map(|&d| (0, d)).collect();
-                ranges[dim] = (start, start + length);
-                // Op::Slice backward reads only `input_shape` from the Op
-                // variant — no saved tensor data is needed. Avoid cloning
-                // the (potentially huge) input; empty saved_tensors vec.
-                AutogradContext::record_op(
-                    out.id,
-                    Op::Slice {
-                        input: self.id,
-                        ranges,
-                        input_shape: self.shape.clone(),
-                    },
-                    Vec::new(),
-                );
+                if AutogradContext::is_recording() {
+                    let mut ranges: Vec<(usize, usize)> =
+                        dims.iter().map(|&d| (0, d)).collect();
+                    ranges[dim] = (start, start + length);
+                    // Op::Slice backward reads only `input_shape` from the Op
+                    // variant — no saved tensor data is needed. Avoid cloning
+                    // the (potentially huge) input; empty saved_tensors vec.
+                    AutogradContext::record_op(
+                        out.id,
+                        Op::Slice {
+                            input: self.id,
+                            ranges,
+                            input_shape: self.shape.clone(),
+                        },
+                        Vec::new(),
+                    );
+                }
             }
             return Ok(out);
         }
@@ -3123,18 +3153,20 @@ extern "C" __global__ void f32_to_bool_kernel(
         // gradient flow through fused-QKV splits.
         if self.requires_grad {
             out.requires_grad = true;
-            let mut ranges: Vec<(usize, usize)> =
-                dims.iter().map(|&d| (0, d)).collect();
-            ranges[dim] = (start, start + length);
-            AutogradContext::record_op(
-                out.id,
-                Op::Slice {
-                    input: self.id,
-                    ranges,
-                    input_shape: self.shape.clone(),
-                },
-                Vec::new(),
-            );
+            if AutogradContext::is_recording() {
+                let mut ranges: Vec<(usize, usize)> =
+                    dims.iter().map(|&d| (0, d)).collect();
+                ranges[dim] = (start, start + length);
+                AutogradContext::record_op(
+                    out.id,
+                    Op::Slice {
+                        input: self.id,
+                        ranges,
+                        input_shape: self.shape.clone(),
+                    },
+                    Vec::new(),
+                );
+            }
         }
         Ok(out)
     }

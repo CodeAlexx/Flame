@@ -389,49 +389,53 @@ fn finalize_group_norm(
 
     if needs_grad {
         output.requires_grad = true;
+        if AutogradContext::is_recording() {
+            let mut saved_tensors = vec![(input.id, input.clone_result()?)];
+            if let Some(w) = weight {
+                saved_tensors.push((w.id, w.clone_result()?));
+            }
+            if let Some(b) = bias {
+                saved_tensors.push((b.id, b.clone_result()?));
+            }
 
-        let mut saved_tensors = vec![(input.id, input.clone_result()?)];
-        if let Some(w) = weight {
-            saved_tensors.push((w.id, w.clone_result()?));
+            let mean_tensor = Tensor {
+                storage: TensorStorage::F32 {
+                    data: artifacts.mean_data.into(),
+                    numel: batch_size * num_groups,
+                },
+                shape: Shape::from_dims(&[batch_size, num_groups]),
+                device: input.device.clone(),
+                id: TensorId::new(),
+                requires_grad: false,
+            };
+            let var_tensor = Tensor {
+                storage: TensorStorage::F32 {
+                    data: artifacts.var_data.into(),
+                    numel: batch_size * num_groups,
+                },
+                shape: Shape::from_dims(&[batch_size, num_groups]),
+                device: input.device.clone(),
+                id: TensorId::new(),
+                requires_grad: false,
+            };
+
+            saved_tensors.push((mean_tensor.id, mean_tensor));
+            saved_tensors.push((var_tensor.id, var_tensor));
+
+            AutogradContext::record_op(
+                output.id,
+                Op::GroupNorm {
+                    input: input.id,
+                    num_groups,
+                    weight: weight.map(|w| w.id),
+                    bias: bias.map(|b| b.id),
+                },
+                saved_tensors,
+            );
+        } else {
+            drop(artifacts.mean_data);
+            drop(artifacts.var_data);
         }
-        if let Some(b) = bias {
-            saved_tensors.push((b.id, b.clone_result()?));
-        }
-
-        let mean_tensor = Tensor {
-            storage: TensorStorage::F32 {
-                data: artifacts.mean_data.into(),
-                numel: batch_size * num_groups,
-            },
-            shape: Shape::from_dims(&[batch_size, num_groups]),
-            device: input.device.clone(),
-            id: TensorId::new(),
-            requires_grad: false,
-        };
-        let var_tensor = Tensor {
-            storage: TensorStorage::F32 {
-                data: artifacts.var_data.into(),
-                numel: batch_size * num_groups,
-            },
-            shape: Shape::from_dims(&[batch_size, num_groups]),
-            device: input.device.clone(),
-            id: TensorId::new(),
-            requires_grad: false,
-        };
-
-        saved_tensors.push((mean_tensor.id, mean_tensor));
-        saved_tensors.push((var_tensor.id, var_tensor));
-
-        AutogradContext::record_op(
-            output.id,
-            Op::GroupNorm {
-                input: input.id,
-                num_groups,
-                weight: weight.map(|w| w.id),
-                bias: bias.map(|b| b.id),
-            },
-            saved_tensors,
-        );
     } else {
         drop(artifacts.mean_data);
         drop(artifacts.var_data);

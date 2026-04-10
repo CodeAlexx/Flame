@@ -369,47 +369,51 @@ pub fn layer_norm(
 
     if needs_grad {
         output.requires_grad = true;
+        if AutogradContext::is_recording() {
+            let mut saved_tensors = vec![(input.id, input.clone_result()?)];
+            if let Some(w) = weight {
+                saved_tensors.push((w.id, w.clone_result()?));
+            }
+            if let Some(b) = bias {
+                saved_tensors.push((b.id, b.clone_result()?));
+            }
 
-        let mut saved_tensors = vec![(input.id, input.clone_result()?)];
-        if let Some(w) = weight {
-            saved_tensors.push((w.id, w.clone_result()?));
+            let mean_tensor = Tensor {
+                storage: TensorStorage::F32 {
+                    data: mean_data.into(),
+                    numel: batch_size,
+                },
+                shape: Shape::from_dims(&[batch_size]),
+                device: device.clone(),
+                id: crate::tensor::TensorId::new(),
+                requires_grad: false,
+            };
+            let rstd_tensor = Tensor {
+                storage: TensorStorage::F32 {
+                    data: rstd_data.into(),
+                    numel: batch_size,
+                },
+                shape: Shape::from_dims(&[batch_size]),
+                device: device.clone(),
+                id: crate::tensor::TensorId::new(),
+                requires_grad: false,
+            };
+
+            saved_tensors.push((mean_tensor.id, mean_tensor));
+            saved_tensors.push((rstd_tensor.id, rstd_tensor));
+
+            AutogradContext::record_op(
+                output.id,
+                Op::LayerNorm {
+                    input: input.id,
+                    normalized_shape: normalized_shape.to_vec(),
+                },
+                saved_tensors,
+            );
+        } else {
+            drop(mean_data);
+            drop(rstd_data);
         }
-        if let Some(b) = bias {
-            saved_tensors.push((b.id, b.clone_result()?));
-        }
-
-        let mean_tensor = Tensor {
-            storage: TensorStorage::F32 {
-                data: mean_data.into(),
-                numel: batch_size,
-            },
-            shape: Shape::from_dims(&[batch_size]),
-            device: device.clone(),
-            id: crate::tensor::TensorId::new(),
-            requires_grad: false,
-        };
-        let rstd_tensor = Tensor {
-            storage: TensorStorage::F32 {
-                data: rstd_data.into(),
-                numel: batch_size,
-            },
-            shape: Shape::from_dims(&[batch_size]),
-            device: device.clone(),
-            id: crate::tensor::TensorId::new(),
-            requires_grad: false,
-        };
-
-        saved_tensors.push((mean_tensor.id, mean_tensor));
-        saved_tensors.push((rstd_tensor.id, rstd_tensor));
-
-        AutogradContext::record_op(
-            output.id,
-            Op::LayerNorm {
-                input: input.id,
-                normalized_shape: normalized_shape.to_vec(),
-            },
-            saved_tensors,
-        );
     } else {
         drop(mean_data);
         drop(rstd_data);

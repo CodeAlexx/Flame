@@ -153,30 +153,30 @@ pub fn flash_attention_forward(
     if query.requires_grad || key.requires_grad || value.requires_grad {
         let mut output_with_grad = output.clone_result()?;
         output_with_grad.requires_grad = true;
+        if AutogradContext::is_recording() {
+            let mut saved_tensors = vec![
+                (query.id, query.clone_result()?),
+                (key.id, key.clone_result()?),
+                (value.id, value.clone_result()?),
+            ];
 
-        let mut saved_tensors = vec![
-            (query.id, query.clone_result()?),
-            (key.id, key.clone_result()?),
-            (value.id, value.clone_result()?),
-        ];
+            if let Some(mask) = attention_mask {
+                saved_tensors.push((mask.id, mask.clone_result()?));
+            }
 
-        if let Some(mask) = attention_mask {
-            saved_tensors.push((mask.id, mask.clone_result()?));
+            AutogradContext::record_op(
+                output_with_grad.id,
+                Op::FlashAttention {
+                    query: query.id,
+                    key: key.id,
+                    value: value.id,
+                    mask: attention_mask.map(|m| m.id),
+                    scale,
+                    causal,
+                },
+                saved_tensors,
+            );
         }
-
-        AutogradContext::record_op(
-            output_with_grad.id,
-            Op::FlashAttention {
-                query: query.id,
-                key: key.id,
-                value: value.id,
-                mask: attention_mask.map(|m| m.id),
-                scale,
-                causal,
-            },
-            saved_tensors,
-        );
-
         Ok(output_with_grad)
     } else {
         Ok(output)

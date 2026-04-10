@@ -33,20 +33,20 @@ pub fn mse_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
     if predictions.requires_grad || targets.requires_grad {
         let mut loss_with_grad = loss.clone_result()?;
         loss_with_grad.requires_grad = true;
-
-        AutogradContext::record_op(
-            loss_with_grad.id,
-            Op::MSELoss {
-                predictions: predictions.id,
-                targets: targets.id,
-                num_elements: predictions.shape.elem_count(),
-            },
-            vec![
-                (predictions.id, predictions.clone_result()?),
-                (targets.id, targets.clone_result()?),
-            ],
-        );
-
+        if AutogradContext::is_recording() {
+            AutogradContext::record_op(
+                loss_with_grad.id,
+                Op::MSELoss {
+                    predictions: predictions.id,
+                    targets: targets.id,
+                    num_elements: predictions.shape.elem_count(),
+                },
+                vec![
+                    (predictions.id, predictions.clone_result()?),
+                    (targets.id, targets.clone_result()?),
+                ],
+            );
+        }
         Ok(loss_with_grad)
     } else {
         Ok(loss)
@@ -107,20 +107,20 @@ pub fn l1_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
     if predictions.requires_grad || targets.requires_grad {
         let mut loss_with_grad = loss.clone_result()?;
         loss_with_grad.requires_grad = true;
-
-        AutogradContext::record_op(
-            loss_with_grad.id,
-            Op::L1Loss {
-                predictions: predictions.id,
-                targets: targets.id,
-                num_elements: predictions.shape.elem_count(),
-            },
-            vec![
-                (predictions.id, predictions.clone_result()?),
-                (targets.id, targets.clone_result()?),
-            ],
-        );
-
+        if AutogradContext::is_recording() {
+            AutogradContext::record_op(
+                loss_with_grad.id,
+                Op::L1Loss {
+                    predictions: predictions.id,
+                    targets: targets.id,
+                    num_elements: predictions.shape.elem_count(),
+                },
+                vec![
+                    (predictions.id, predictions.clone_result()?),
+                    (targets.id, targets.clone_result()?),
+                ],
+            );
+        }
         Ok(loss_with_grad)
     } else {
         Ok(loss)
@@ -177,21 +177,21 @@ pub fn huber_loss(predictions: &Tensor, targets: &Tensor, delta: f32) -> Result<
     if predictions.requires_grad || targets.requires_grad {
         let mut loss_with_grad = loss.clone_result()?;
         loss_with_grad.requires_grad = true;
-
-        AutogradContext::record_op(
-            loss_with_grad.id,
-            Op::HuberLoss {
-                predictions: predictions.id,
-                targets: targets.id,
-                delta,
-                num_elements: predictions.shape.elem_count(),
-            },
-            vec![
-                (predictions.id, predictions.clone_result()?),
-                (targets.id, targets.clone_result()?),
-            ],
-        );
-
+        if AutogradContext::is_recording() {
+            AutogradContext::record_op(
+                loss_with_grad.id,
+                Op::HuberLoss {
+                    predictions: predictions.id,
+                    targets: targets.id,
+                    delta,
+                    num_elements: predictions.shape.elem_count(),
+                },
+                vec![
+                    (predictions.id, predictions.clone_result()?),
+                    (targets.id, targets.clone_result()?),
+                ],
+            );
+        }
         Ok(loss_with_grad)
     } else {
         Ok(loss)
@@ -230,20 +230,20 @@ pub fn binary_cross_entropy(predictions: &Tensor, targets: &Tensor) -> Result<Te
     if predictions.requires_grad || targets.requires_grad {
         let mut loss_with_grad = loss.clone_result()?;
         loss_with_grad.requires_grad = true;
-
-        AutogradContext::record_op(
-            loss_with_grad.id,
-            Op::BCELoss {
-                predictions: predictions.id,
-                targets: targets.id,
-                num_elements: predictions.shape.elem_count(),
-            },
-            vec![
-                (predictions.id, predictions.clone_result()?),
-                (targets.id, targets.clone_result()?),
-            ],
-        );
-
+        if AutogradContext::is_recording() {
+            AutogradContext::record_op(
+                loss_with_grad.id,
+                Op::BCELoss {
+                    predictions: predictions.id,
+                    targets: targets.id,
+                    num_elements: predictions.shape.elem_count(),
+                },
+                vec![
+                    (predictions.id, predictions.clone_result()?),
+                    (targets.id, targets.clone_result()?),
+                ],
+            );
+        }
         Ok(loss_with_grad)
     } else {
         Ok(loss)
@@ -300,20 +300,20 @@ pub fn nll_loss(log_probs: &Tensor, targets: &Tensor) -> Result<Tensor> {
     if log_probs.requires_grad {
         let mut loss_with_grad = loss.clone_result()?;
         loss_with_grad.requires_grad = true;
-
-        AutogradContext::record_op(
-            loss_with_grad.id,
-            Op::NLLLoss {
-                log_probs: log_probs.id,
-                targets: targets.id,
-                batch_size,
-            },
-            vec![
-                (log_probs.id, log_probs.clone_result()?),
-                (targets.id, targets.clone_result()?),
-            ],
-        );
-
+        if AutogradContext::is_recording() {
+            AutogradContext::record_op(
+                loss_with_grad.id,
+                Op::NLLLoss {
+                    log_probs: log_probs.id,
+                    targets: targets.id,
+                    batch_size,
+                },
+                vec![
+                    (log_probs.id, log_probs.clone_result()?),
+                    (targets.id, targets.clone_result()?),
+                ],
+            );
+        }
         Ok(loss_with_grad)
     } else {
         Ok(loss)

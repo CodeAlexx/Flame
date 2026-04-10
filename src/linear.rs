@@ -222,7 +222,7 @@ impl Linear {
                         output = output.to_dtype(DType::BF16)?;
                     }
 
-                    if input.requires_grad() || self.weight.requires_grad() {
+                    if (input.requires_grad() || self.weight.requires_grad()) && crate::autograd::AutogradContext::is_recording() {
                         use crate::autograd::{AutogradContext, Op};
 
                         let mut saved = vec![
@@ -316,7 +316,7 @@ impl Linear {
                 output = output.to_dtype(DType::BF16)?;
             }
 
-            if input.requires_grad() || self.weight.requires_grad() {
+            if (input.requires_grad() || self.weight.requires_grad()) && crate::autograd::AutogradContext::is_recording() {
                 use crate::autograd::{AutogradContext, Op};
 
                 let mut saved = vec![
@@ -351,6 +351,7 @@ impl Linear {
 
             Ok(output)
         })
+
     }
 
     #[cfg(all(feature = "cuda", feature = "bf16_u16"))]

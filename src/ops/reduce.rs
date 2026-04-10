@@ -88,11 +88,13 @@ pub fn sum_dim_keepdim_as(x: &Tensor, dim: usize, out_dtype: DType) -> Result<Te
 
     if x.requires_grad() {
         out.requires_grad = true;
-        AutogradContext::record_op(
-            out.id,
-            Op::SumDimKeepdim { input: x.id(), dim },
-            vec![(x.id(), x.clone_result()?)],
-        );
+        if AutogradContext::is_recording() {
+            AutogradContext::record_op(
+                out.id,
+                Op::SumDimKeepdim { input: x.id(), dim },
+                vec![(x.id(), x.clone_result()?)],
+            );
+        }
     }
 
     Ok(out)

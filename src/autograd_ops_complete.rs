@@ -513,19 +513,21 @@ impl Tensor {
             result
         };
 
-        // Preserve gradient tracking
+        // Preserve gradient tracking — requires_grad propagates even when not recording
         if self.requires_grad {
-            // Record clamp operation for autograd
-            let saved_tensors = vec![(self.id, self.clone_result()?)];
-            crate::autograd::AutogradContext::record_op(
-                result.id,
-                Op::Clamp {
-                    input: self.id,
-                    min,
-                    max,
-                },
-                saved_tensors,
-            );
+            // Record clamp operation for autograd when recording
+            if crate::autograd::AutogradContext::is_recording() {
+                let saved_tensors = vec![(self.id, self.clone_result()?)];
+                crate::autograd::AutogradContext::record_op(
+                    result.id,
+                    Op::Clamp {
+                        input: self.id,
+                        min,
+                        max,
+                    },
+                    saved_tensors,
+                );
+            }
         }
 
         Ok(result)

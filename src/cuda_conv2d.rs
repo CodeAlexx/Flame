@@ -265,16 +265,18 @@ impl CudaConv2d {
         {
             let mut out = y_nhwc.clone_result()?;
             out.requires_grad = true;
-            crate::autograd::AutogradContext::record_op(
-                out.id(),
-                crate::autograd::Op::Conv2dNHWC {
-                    input: input_nhwc.id(),
-                    weight: weight_khwkicoc.id(),
-                    stride: stride.0,
-                    padding: padding.0,
-                },
-                vec![(input_nhwc.id(), x_nchw), (weight_khwkicoc.id(), w_ocic)],
-            );
+            if crate::autograd::AutogradContext::is_recording() {
+                crate::autograd::AutogradContext::record_op(
+                    out.id(),
+                    crate::autograd::Op::Conv2dNHWC {
+                        input: input_nhwc.id(),
+                        weight: weight_khwkicoc.id(),
+                        stride: stride.0,
+                        padding: padding.0,
+                    },
+                    vec![(input_nhwc.id(), x_nchw), (weight_khwkicoc.id(), w_ocic)],
+                );
+            }
             return Ok(out);
         }
         assert_nhwc_bf16_public("cuda_conv2d::forward_nhwc out", &y_nhwc)?;

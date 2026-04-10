@@ -13,11 +13,13 @@ impl Tensor {
         // Autograd support
         if self.requires_grad {
             output.requires_grad = true;
-            AutogradContext::record_op(
-                output.id,
-                Op::Square { input: self.id }, // Using Square for now
-                vec![(self.id, self.clone_result()?)],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Square { input: self.id }, // Using Square for now
+                    vec![(self.id, self.clone_result()?)],
+                );
+            }
         }
 
         Ok(output)
@@ -29,12 +31,14 @@ impl Tensor {
 
         if self.requires_grad {
             output.requires_grad = true;
-            // For sin, we need to save the input for cos(x) in backward
-            AutogradContext::record_op(
-                output.id,
-                Op::Abs { input: self.id }, // Pending: add Sin op
-                vec![(self.id, self.clone_result()?)],
-            );
+            if AutogradContext::is_recording() {
+                // For sin, we need to save the input for cos(x) in backward
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Abs { input: self.id }, // Pending: add Sin op
+                    vec![(self.id, self.clone_result()?)],
+                );
+            }
         }
 
         Ok(output)
@@ -46,12 +50,14 @@ impl Tensor {
 
         if self.requires_grad {
             output.requires_grad = true;
-            // For cos, we need to save the input for -sin(x) in backward
-            AutogradContext::record_op(
-                output.id,
-                Op::Abs { input: self.id }, // Pending: add Cos op
-                vec![(self.id, self.clone_result()?)],
-            );
+            if AutogradContext::is_recording() {
+                // For cos, we need to save the input for -sin(x) in backward
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Abs { input: self.id }, // Pending: add Cos op
+                    vec![(self.id, self.clone_result()?)],
+                );
+            }
         }
 
         Ok(output)
@@ -75,12 +81,14 @@ impl Tensor {
 
         if self.requires_grad {
             output.requires_grad = true;
-            use crate::autograd::{AutogradContext, Op};
-            AutogradContext::record_op(
-                output.id,
-                Op::Sqrt { input: self.id },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                use crate::autograd::{AutogradContext, Op};
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Sqrt { input: self.id },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
 
         Ok(output)
@@ -333,14 +341,16 @@ impl Tensor {
 
             if self.requires_grad {
                 result.requires_grad = true;
-                AutogradContext::record_op(
-                    result.id,
-                    Op::Repeat {
-                        input: self.id,
-                        repeats: repeats.to_vec(),
-                    },
-                    vec![(self.id, self.clone_result()?)],
-                );
+                if AutogradContext::is_recording() {
+                    AutogradContext::record_op(
+                        result.id,
+                        Op::Repeat {
+                            input: self.id,
+                            repeats: repeats.to_vec(),
+                        },
+                        vec![(self.id, self.clone_result()?)],
+                    );
+                }
             }
             return Ok(result);
         }

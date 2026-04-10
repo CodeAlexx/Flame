@@ -140,7 +140,7 @@ impl SageAttention {
         };
 
         // Record for autograd if needed
-        if query.requires_grad() || key.requires_grad() || value.requires_grad() {
+        if (query.requires_grad() || key.requires_grad() || value.requires_grad()) && AutogradContext::is_recording() {
             let mut saved_tensors = vec![
                 (query.id, query.clone_result()?),
                 (key.id, key_smoothed),

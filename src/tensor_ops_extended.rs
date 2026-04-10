@@ -270,15 +270,17 @@ impl Tensor {
         // Record autograd slice op
         if self.requires_grad {
             output.requires_grad = true;
-            AutogradContext::record_op(
-                output.id,
-                Op::Slice {
-                    input: self.id,
-                    ranges: ranges.to_vec(),
-                    input_shape: self.shape.clone(),
-                },
-                vec![(self.id, self.clone())],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Slice {
+                        input: self.id,
+                        ranges: ranges.to_vec(),
+                        input_shape: self.shape.clone(),
+                    },
+                    vec![(self.id, self.clone())],
+                );
+            }
         }
         Ok(output)
     }
@@ -431,24 +433,25 @@ impl Tensor {
         let requires_grad = tensors.iter().any(|t| t.requires_grad);
         if requires_grad {
             output.requires_grad = true;
+            if AutogradContext::is_recording() {
+                let mut saved_tensors = Vec::new();
+                let mut input_ids = Vec::new();
 
-            let mut saved_tensors = Vec::new();
-            let mut input_ids = Vec::new();
+                for tensor in tensors {
+                    let id = tensor.id;
+                    saved_tensors.push((id, (*tensor).clone_result()?));
+                    input_ids.push(id);
+                }
 
-            for tensor in tensors {
-                let id = tensor.id;
-                saved_tensors.push((id, (*tensor).clone_result()?));
-                input_ids.push(id);
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Cat {
+                        inputs: input_ids,
+                        dim,
+                    },
+                    saved_tensors,
+                );
             }
-
-            AutogradContext::record_op(
-                output.id,
-                Op::Cat {
-                    inputs: input_ids,
-                    dim,
-                },
-                saved_tensors,
-            );
         }
 
         Ok(output)
@@ -501,6 +504,29 @@ impl Tensor {
 
             if self.requires_grad {
                 output.requires_grad = true;
+                if AutogradContext::is_recording() {
+                    AutogradContext::record_op(
+                        output.id,
+                        Op::IndexSelect {
+                            input: self.id,
+                            indices: indices.id(),
+                            dim,
+                        },
+                        vec![
+                            (self.id, self.clone_result()?),
+                            (indices.id(), indices.clone_result()?),
+                        ],
+                    );
+                }
+            }
+            return Ok(output);
+        }
+
+        let mut output = GpuOps::index_select(self, dim, indices)?;
+        // Record autograd op for backward via scatter_add
+        if self.requires_grad {
+            output.requires_grad = true;
+            if AutogradContext::is_recording() {
                 AutogradContext::record_op(
                     output.id,
                     Op::IndexSelect {
@@ -514,25 +540,6 @@ impl Tensor {
                     ],
                 );
             }
-            return Ok(output);
-        }
-
-        let mut output = GpuOps::index_select(self, dim, indices)?;
-        // Record autograd op for backward via scatter_add
-        if self.requires_grad {
-            output.requires_grad = true;
-            AutogradContext::record_op(
-                output.id,
-                Op::IndexSelect {
-                    input: self.id,
-                    indices: indices.id(),
-                    dim,
-                },
-                vec![
-                    (self.id, self.clone_result()?),
-                    (indices.id(), indices.clone_result()?),
-                ],
-            );
         }
         Ok(output)
     }
@@ -621,17 +628,19 @@ impl Tensor {
         // Autograd record
         if self.requires_grad || other.requires_grad {
             out.requires_grad = true;
-            AutogradContext::record_op(
-                out.id,
-                Op::Maximum {
-                    a: self.id,
-                    b: other.id,
-                },
-                vec![
-                    (self.id, self.clone_result()?),
-                    (other.id, other.clone_result()?),
-                ],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    out.id,
+                    Op::Maximum {
+                        a: self.id,
+                        b: other.id,
+                    },
+                    vec![
+                        (self.id, self.clone_result()?),
+                        (other.id, other.clone_result()?),
+                    ],
+                );
+            }
         }
         Ok(out)
     }
@@ -662,17 +671,19 @@ impl Tensor {
 
         if self.requires_grad || other.requires_grad {
             out.requires_grad = true;
-            AutogradContext::record_op(
-                out.id,
-                Op::Minimum {
-                    a: self.id,
-                    b: other.id,
-                },
-                vec![
-                    (self.id, self.clone_result()?),
-                    (other.id, other.clone_result()?),
-                ],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    out.id,
+                    Op::Minimum {
+                        a: self.id,
+                        b: other.id,
+                    },
+                    vec![
+                        (self.id, self.clone_result()?),
+                        (other.id, other.clone_result()?),
+                    ],
+                );
+            }
         }
 
         Ok(out)
@@ -697,11 +708,13 @@ impl Tensor {
 
         if self.requires_grad {
             output.requires_grad = true;
-            AutogradContext::record_op(
-                output.id,
-                Op::SumDimKeepdim { input: self.id, dim },
-                vec![(self.id, self.clone_result()?)],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::SumDimKeepdim { input: self.id, dim },
+                    vec![(self.id, self.clone_result()?)],
+                );
+            }
         }
 
         Ok(output)
@@ -737,20 +750,21 @@ impl Tensor {
         // back to the actual inputs, not broadcast intermediates.
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::Div {
-                    lhs: self.id,
-                    rhs: other.id,
-                    lhs_shape: self.shape.clone(),
-                    rhs_shape: other.shape.clone(),
-                },
-                vec![
-                    (self.id, self.clone()),
-                    (other.id, other.clone()),
-                ],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Div {
+                        lhs: self.id,
+                        rhs: other.id,
+                        lhs_shape: self.shape.clone(),
+                        rhs_shape: other.shape.clone(),
+                    },
+                    vec![
+                        (self.id, self.clone()),
+                        (other.id, other.clone()),
+                    ],
+                );
+            }
         }
 
         Ok(output)
@@ -972,15 +986,16 @@ impl Tensor {
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
             output.requires_grad = true;
-
-            AutogradContext::record_op(
-                output.id,
-                Op::LogSoftmax {
-                    input: self.id,
-                    dim: dim as isize,
-                },
-                vec![(self.id, self.clone_result()?)],
-            );
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::LogSoftmax {
+                        input: self.id,
+                        dim: dim as isize,
+                    },
+                    vec![(self.id, self.clone_result()?)],
+                );
+            }
         }
 
         match crate::config::default_dtype() {
@@ -1106,17 +1121,20 @@ impl Tensor {
         if self.requires_grad {
             for tensor in result.iter_mut() {
                 tensor.requires_grad = true;
-
-                // Record split operation for each output
-                AutogradContext::record_op(
-                    tensor.id,
-                    Op::Split {
-                        input: self.id,
-                        sizes: sizes.to_vec(),
-                        dim,
-                    },
-                    vec![(self.id, self.clone_result()?)],
-                );
+            }
+            if AutogradContext::is_recording() {
+                for tensor in result.iter_mut() {
+                    // Record split operation for each output
+                    AutogradContext::record_op(
+                        tensor.id,
+                        Op::Split {
+                            input: self.id,
+                            sizes: sizes.to_vec(),
+                            dim,
+                        },
+                        vec![(self.id, self.clone_result()?)],
+                    );
+                }
             }
         }
 

@@ -1083,37 +1083,38 @@ impl RMSNorm {
 
         if needs_grad {
             output.requires_grad = true;
+            if AutogradContext::is_recording() {
+                let mut saved_tensors = vec![(input.id, input.clone_result()?)];
+                if let Some(w) = &self.weight {
+                    saved_tensors.push((w.id, w.clone_result()?));
+                }
 
-            let mut saved_tensors = vec![(input.id, input.clone_result()?)];
-            if let Some(w) = &self.weight {
-                saved_tensors.push((w.id, w.clone_result()?));
+                let batch_size = artifacts.inv_rms.len();
+                let inv_rms_tensor = Tensor {
+                    storage: TensorStorage::F32 {
+                        data: artifacts.inv_rms.into(),
+                        numel: batch_size,
+                    },
+                    shape: Shape::from_dims(&[batch_size]),
+                    device: input.device.clone(),
+                    id: TensorId::new(),
+                    requires_grad: false,
+                };
+                let inv_rms_id = inv_rms_tensor.id;
+                saved_tensors.push((inv_rms_id, inv_rms_tensor));
+
+                AutogradContext::record_op(
+                    output.id,
+                    Op::RMSNorm {
+                        input: input.id,
+                        weight: self.weight.as_ref().map(|w| w.id),
+                        eps: self.eps,
+                        inv_rms: inv_rms_id,
+                        normalized_shape: self.normalized_shape.clone(),
+                    },
+                    saved_tensors,
+                );
             }
-
-            let batch_size = artifacts.inv_rms.len();
-            let inv_rms_tensor = Tensor {
-                storage: TensorStorage::F32 {
-                    data: artifacts.inv_rms.into(),
-                    numel: batch_size,
-                },
-                shape: Shape::from_dims(&[batch_size]),
-                device: input.device.clone(),
-                id: TensorId::new(),
-                requires_grad: false,
-            };
-            let inv_rms_id = inv_rms_tensor.id;
-            saved_tensors.push((inv_rms_id, inv_rms_tensor));
-
-            AutogradContext::record_op(
-                output.id,
-                Op::RMSNorm {
-                    input: input.id,
-                    weight: self.weight.as_ref().map(|w| w.id),
-                    eps: self.eps,
-                    inv_rms: inv_rms_id,
-                    normalized_shape: self.normalized_shape.clone(),
-                },
-                saved_tensors,
-            );
         }
 
         Ok(output)
