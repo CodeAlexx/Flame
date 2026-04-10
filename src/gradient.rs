@@ -291,6 +291,26 @@ impl GradientMap {
         self.vec_store.iter().all(|s| s.is_none()) && self.overflow.is_empty()
     }
 
+    /// Drain all remaining gradients as (TensorId, Tensor) pairs.
+    /// Used by checkpoint backward to return ALL accumulated gradients
+    /// (including those for LoRA weights used inside the checkpoint closure).
+    pub fn drain_all(&mut self) -> Result<Vec<(TensorId, Tensor)>> {
+        let mut result = Vec::new();
+        // Drain vec_store entries
+        if let Some(idx) = &self.index {
+            for (tid, &i) in &idx.id_to_idx {
+                if let Some(grad) = self.vec_store[i].take() {
+                    result.push((*tid, grad));
+                }
+            }
+        }
+        // Drain overflow entries
+        for (tid, grad) in self.overflow.drain() {
+            result.push((tid, grad));
+        }
+        Ok(result)
+    }
+
     /// Iterate over gradients
     pub fn iter(&self) -> impl Iterator<Item = (TensorId, &Tensor)> + '_ {
         let vec_iter = self

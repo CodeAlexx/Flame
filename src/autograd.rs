@@ -750,174 +750,149 @@ impl AutogradContext {
 
         let device = loss.device.clone();
 
-        // Process tape in reverse under lock
+        // Drain the tape and build index structures under the lock, then
+        // release it before the backward loop. This is critical: Op::Checkpoint
+        // backward re-acquires the lock to re-enable autograd and record
+        // recomputed ops. Holding the lock across the whole loop deadlocks.
         let gradients = {
-            let mut ctx = AUTOGRAD_CONTEXT
-                .lock()
-                .map_err(|_| Error::Training("autograd context mutex poisoned".into()))?;
+            let (tape_entries, prev_enabled, compact_index, needed_grad_ids, use_cuda_graph, tape_len, graph_phase) = {
+                let mut ctx = AUTOGRAD_CONTEXT
+                    .lock()
+                    .map_err(|_| Error::Training("autograd context mutex poisoned".into()))?;
 
-            // Disable autograd during backward pass
-            let prev_enabled = ctx.enabled;
-            ctx.enabled = false;
-            AUTOGRAD_ENABLED.store(false, Ordering::Relaxed);
+                // Disable autograd during backward pass
+                let prev_enabled = ctx.enabled;
+                ctx.enabled = false;
+                AUTOGRAD_ENABLED.store(false, Ordering::Relaxed);
 
-            // Build compact index from the tape for Vec-based gradient storage.
-            // Collect all tensor IDs that will be accessed during backward:
-            // output_ids (for gradient lookup) and input_ids from each op (for accumulation).
-            let compact_index = {
-                use crate::gradient::CompactIndex;
-                let id_iter = std::iter::once(loss.id).chain(
-                    ctx.tape.iter().flat_map(|e| {
-                        let mut ids = vec![e.output_id];
-                        // Also include saved tensor IDs (they receive accumulated gradients)
-                        for (tid, _) in &e.saved_tensors {
-                            ids.push(*tid);
-                        }
-                        // Extract input IDs from the op variant
-                        match &e.op {
-                            Op::Add { lhs, rhs, .. } | Op::Sub { lhs, rhs }
-                            | Op::Mul { lhs, rhs } | Op::Div { lhs, rhs, .. }
-                            | Op::MatMul { lhs, rhs } | Op::BatchMatMul { lhs, rhs }
-                            | Op::Maximum { a: lhs, b: rhs } | Op::Minimum { a: lhs, b: rhs } => {
-                                ids.push(*lhs); ids.push(*rhs);
+                // Build compact index from the tape for Vec-based gradient storage.
+                let compact_index = {
+                    use crate::gradient::CompactIndex;
+                    let id_iter = std::iter::once(loss.id).chain(
+                        ctx.tape.iter().flat_map(|e| {
+                            let mut ids = vec![e.output_id];
+                            for (tid, _) in &e.saved_tensors {
+                                ids.push(*tid);
                             }
-                            Op::MulScalar { input, .. } | Op::AddScalar { input, .. }
-                            | Op::ReLU { input } | Op::GELU { input } | Op::SiLU { input }
-                            | Op::Tanh { input } | Op::Sigmoid { input } | Op::Square { input }
-                            | Op::Sqrt { input }
-                            | Op::Sum { input, .. } | Op::Mean { input, .. }
-                            | Op::Transpose { input } | Op::Reshape { input, .. }
-                            | Op::Permute { input, .. } | Op::SumDim { input, .. }
-                            | Op::SumDimKeepdim { input, .. } | Op::SumDims { input, .. }
-                            | Op::Repeat { input, .. } | Op::MaxDim { input, .. }
-                            | Op::Clamp { input, .. } | Op::Abs { input }
-                            | Op::Log { input } | Op::Softmax { input, .. }
-                            | Op::LogSoftmax { input, .. } | Op::Checkpoint { input, .. }
-                            | Op::Cast { input, .. } => {
-                                ids.push(*input);
+                            match &e.op {
+                                Op::Add { lhs, rhs, .. } | Op::Sub { lhs, rhs }
+                                | Op::Mul { lhs, rhs } | Op::Div { lhs, rhs, .. }
+                                | Op::MatMul { lhs, rhs } | Op::BatchMatMul { lhs, rhs }
+                                | Op::Maximum { a: lhs, b: rhs } | Op::Minimum { a: lhs, b: rhs } => {
+                                    ids.push(*lhs); ids.push(*rhs);
+                                }
+                                Op::MulScalar { input, .. } | Op::AddScalar { input, .. }
+                                | Op::ReLU { input } | Op::GELU { input } | Op::SiLU { input }
+                                | Op::Tanh { input } | Op::Sigmoid { input } | Op::Square { input }
+                                | Op::Sqrt { input }
+                                | Op::Sum { input, .. } | Op::Mean { input, .. }
+                                | Op::Transpose { input } | Op::Reshape { input, .. }
+                                | Op::Permute { input, .. } | Op::SumDim { input, .. }
+                                | Op::SumDimKeepdim { input, .. } | Op::SumDims { input, .. }
+                                | Op::Repeat { input, .. } | Op::MaxDim { input, .. }
+                                | Op::Clamp { input, .. } | Op::Abs { input }
+                                | Op::Log { input } | Op::Softmax { input, .. }
+                                | Op::LogSoftmax { input, .. } | Op::Checkpoint { input, .. }
+                                | Op::Cast { input, .. } => {
+                                    ids.push(*input);
+                                }
+                                Op::Conv2d { input, weight, .. } | Op::Conv2dNHWC { input, weight, .. }
+                                | Op::AddBias { input, bias: weight } => {
+                                    ids.push(*input); ids.push(*weight);
+                                }
+                                Op::Linear { input, weight, bias } => {
+                                    ids.push(*input); ids.push(*weight);
+                                    if let Some(b) = bias { ids.push(*b); }
+                                }
+                                Op::LayerNorm { input, .. } => { ids.push(*input); }
+                                Op::RMSNorm { input, weight, inv_rms, .. } => {
+                                    ids.push(*input); ids.push(*inv_rms);
+                                    if let Some(w) = weight { ids.push(*w); }
+                                }
+                                Op::GroupNorm { input, weight, bias, .. } => {
+                                    ids.push(*input);
+                                    if let Some(w) = weight { ids.push(*w); }
+                                    if let Some(b) = bias { ids.push(*b); }
+                                }
+                                Op::Embedding { weight, indices } | Op::IndexSelect { input: weight, indices, .. } => {
+                                    ids.push(*weight); ids.push(*indices);
+                                }
+                                Op::Cat { inputs, .. } => { ids.extend(inputs.iter()); }
+                                Op::Split { input, .. } | Op::Slice { input, .. } => { ids.push(*input); }
+                                Op::Where { cond, t, f } => { ids.push(*cond); ids.push(*t); ids.push(*f); }
+                                Op::MSELoss { predictions, targets, .. }
+                                | Op::L1Loss { predictions, targets, .. }
+                                | Op::HuberLoss { predictions, targets, .. }
+                                | Op::BCELoss { predictions, targets, .. } => {
+                                    ids.push(*predictions); ids.push(*targets);
+                                }
+                                Op::NLLLoss { log_probs, targets, .. } => {
+                                    ids.push(*log_probs); ids.push(*targets);
+                                }
+                                Op::FlashAttention { query, key, value, mask, .. } => {
+                                    ids.push(*query); ids.push(*key); ids.push(*value);
+                                    if let Some(m) = mask { ids.push(*m); }
+                                }
+                                Op::SageAttention { query_id, key_id, value_id, .. } => {
+                                    ids.push(*query_id); ids.push(*key_id); ids.push(*value_id);
+                                }
+                                Op::RoPePrecomputed { input, cos, sin } => {
+                                    ids.push(*input); ids.push(*cos); ids.push(*sin);
+                                }
                             }
-                            Op::Conv2d { input, weight, .. } | Op::Conv2dNHWC { input, weight, .. }
-                            | Op::AddBias { input, bias: weight } => {
-                                ids.push(*input); ids.push(*weight);
-                            }
-                            Op::Linear { input, weight, bias } => {
-                                ids.push(*input); ids.push(*weight);
-                                if let Some(b) = bias { ids.push(*b); }
-                            }
-                            Op::LayerNorm { input, .. } => { ids.push(*input); }
-                            Op::RMSNorm { input, weight, inv_rms, .. } => {
-                                ids.push(*input); ids.push(*inv_rms);
-                                if let Some(w) = weight { ids.push(*w); }
-                            }
-                            Op::GroupNorm { input, weight, bias, .. } => {
-                                ids.push(*input);
-                                if let Some(w) = weight { ids.push(*w); }
-                                if let Some(b) = bias { ids.push(*b); }
-                            }
-                            Op::Embedding { weight, indices } | Op::IndexSelect { input: weight, indices, .. } => {
-                                ids.push(*weight); ids.push(*indices);
-                            }
-                            Op::Cat { inputs, .. } => { ids.extend(inputs.iter()); }
-                            Op::Split { input, .. } | Op::Slice { input, .. } => { ids.push(*input); }
-                            Op::Where { cond, t, f } => { ids.push(*cond); ids.push(*t); ids.push(*f); }
-                            Op::MSELoss { predictions, targets, .. }
-                            | Op::L1Loss { predictions, targets, .. }
-                            | Op::HuberLoss { predictions, targets, .. }
-                            | Op::BCELoss { predictions, targets, .. } => {
-                                ids.push(*predictions); ids.push(*targets);
-                            }
-                            Op::NLLLoss { log_probs, targets, .. } => {
-                                ids.push(*log_probs); ids.push(*targets);
-                            }
-                            Op::FlashAttention { query, key, value, mask, .. } => {
-                                ids.push(*query); ids.push(*key); ids.push(*value);
-                                if let Some(m) = mask { ids.push(*m); }
-                            }
-                            Op::SageAttention { query_id, key_id, value_id, .. } => {
-                                ids.push(*query_id); ids.push(*key_id); ids.push(*value_id);
-                            }
-                            Op::RoPePrecomputed { input, cos, sin } => {
-                                ids.push(*input); ids.push(*cos); ids.push(*sin);
-                            }
-                        }
-                        ids
-                    })
-                );
-                CompactIndex::from_tensor_ids(id_iter)
-            };
+                            ids
+                        })
+                    );
+                    CompactIndex::from_tensor_ids(id_iter)
+                };
 
-            // Build set of tensor IDs that actually need gradients:
-            // - All output_ids (intermediate chain nodes — backward needs to find them)
-            // - Saved tensor IDs where requires_grad=true (trainable parameters)
-            // Frozen weight IDs are excluded → their gradients are not accumulated,
-            // saving significant GPU memory during backward.
-            let needed_grad_ids: std::collections::HashSet<TensorId> = {
-                let mut ids = std::collections::HashSet::new();
-                ids.insert(loss.id);
-                for e in ctx.tape.iter() {
-                    ids.insert(e.output_id);
-                    for (tid, tensor) in &e.saved_tensors {
-                        if tensor.requires_grad() {
-                            ids.insert(*tid);
+                // Build set of tensor IDs that actually need gradients
+                let needed_grad_ids: std::collections::HashSet<TensorId> = {
+                    let mut ids = std::collections::HashSet::new();
+                    ids.insert(loss.id);
+                    for e in ctx.tape.iter() {
+                        ids.insert(e.output_id);
+                        for (tid, tensor) in &e.saved_tensors {
+                            if tensor.requires_grad() {
+                                ids.insert(*tid);
+                            }
                         }
                     }
-                }
-                ids
-            };
+                    ids
+                };
+
+                let use_cuda_graph = crate::cuda_graph::cuda_graph_enabled();
+                let tape_len = ctx.tape.len();
+
+                let graph_phase = if use_cuda_graph {
+                    let cache = crate::cuda_graph::BACKWARD_GRAPH_CACHE
+                        .lock()
+                        .map_err(|_| Error::Training("backward graph cache mutex poisoned".into()))?;
+                    cache.phase(tape_len)
+                } else {
+                    crate::cuda_graph::BackwardPhase::Warmup
+                };
+
+                // Drain the tape — we now own all entries, lock can be released.
+                let tape_entries: Vec<TapeEntry> = ctx.tape.drain(..).collect();
+
+                (tape_entries, prev_enabled, compact_index, needed_grad_ids, use_cuda_graph, tape_len, graph_phase)
+            }; // ← lock released here
 
             // Initialize gradient storage with compact index for O(1) Vec-based access
             let mut gradients = GradientMap::with_index(device.clone(), compact_index);
             gradients.set_ones(loss.id, loss.shape.clone())?;
 
-            // ── CUDA Graph integration ──────────────────────────────
-            //
-            // When FLAME_CUDA_GRAPH=1, the backward pass follows a
-            // warmup-capture-replay protocol:
-            //
-            //   Step 0 (warmup): normal backward. Fills the allocator
-            //     pool so no cudaMalloc happens on subsequent steps.
-            //   Step 1 (capture): wrap the backward kernel loop in
-            //     cudaStreamBeginCapture / cudaStreamEndCapture. All
-            //     kernel launches are recorded, not executed.
-            //   Step 2+ (replay): launch the cached graph. All kernels
-            //     replay using the same memory addresses (guaranteed by
-            //     the caching allocator's exact-size matching).
-            //
-            // If the tape length changes between steps, the graph is
-            // invalidated and re-captured on the next step.
-
-            let use_cuda_graph = crate::cuda_graph::cuda_graph_enabled();
-            let tape_len = ctx.tape.len();
-
-            // Determine CUDA graph phase (if enabled)
-            let graph_phase = if use_cuda_graph {
-                let cache = crate::cuda_graph::BACKWARD_GRAPH_CACHE
-                    .lock()
-                    .map_err(|_| Error::Training("backward graph cache mutex poisoned".into()))?;
-                cache.phase(tape_len)
-            } else {
-                crate::cuda_graph::BackwardPhase::Warmup // unused, but needs a value
-            };
-
-            // ── Replay path: skip the entire backward loop ──────────
-            //
-            // On replay we need to:
-            // 1. Allocate gradient tensors in the same order/sizes as capture
-            //    (the caching allocator returns the same device pointers).
-            // 2. Populate the GradientMap with those tensors.
-            // 3. Launch the graph (which writes correct values to those buffers).
+            // ── CUDA Graph replay path ──────────────────────────────
             if use_cuda_graph && graph_phase == crate::cuda_graph::BackwardPhase::Replay {
                 let t_replay = std::time::Instant::now();
                 let stream: *mut core::ffi::c_void = core::ptr::null_mut();
 
-                // Reproduce the gradient allocations from capture
                 {
                     let cache = crate::cuda_graph::BACKWARD_GRAPH_CACHE
                         .lock()
                         .map_err(|_| Error::Training("backward graph cache mutex poisoned".into()))?;
                     for entry in cache.grad_recipe() {
-                        // Allocate a tensor with the same shape/dtype — the pool
-                        // returns the same device pointer as during capture.
                         let grad = Tensor::zeros_dtype(
                             entry.shape.clone(),
                             entry.dtype,
@@ -932,7 +907,6 @@ impl AutogradContext {
                     }
                 }
 
-                // Advance step counter
                 {
                     let mut cache = crate::cuda_graph::BACKWARD_GRAPH_CACHE
                         .lock()
@@ -950,10 +924,14 @@ impl AutogradContext {
                     eprintln!("╚══════════════════════════════════════════════════════════\n");
                 }
 
-                // Re-enable autograd and clear tape
-                ctx.enabled = prev_enabled;
+                // Re-enable autograd
+                {
+                    let mut ctx = AUTOGRAD_CONTEXT
+                        .lock()
+                        .map_err(|_| Error::Training("autograd context mutex poisoned".into()))?;
+                    ctx.enabled = prev_enabled;
                     AUTOGRAD_ENABLED.store(prev_enabled, Ordering::Relaxed);
-                ctx.tape.clear();
+                }
 
                 return Ok(gradients);
             }
@@ -973,19 +951,17 @@ impl AutogradContext {
                 }
             }
 
-            // Process tape in reverse. Use `take` instead of `get + clone_result`
-            // to avoid an extra GPU memcpy per entry. The gradient is consumed
-            // (moved out of the map) — if a later entry re-accumulates into the
-            // same tensor_id, `accumulate` handles the addition.
+            // Process tape in reverse (now from our owned Vec, lock is NOT held).
+            // Checkpoint ops can safely re-acquire the lock for recompute.
             let t_backward_start = std::time::Instant::now();
             let mut nodes_executed = 0usize;
             let mut total_kernel_time = std::time::Duration::ZERO;
             let mut total_accum_time = std::time::Duration::ZERO;
             let mut slowest_nodes: Vec<(std::time::Duration, String)> = Vec::new();
 
-            eprintln!("[backward] tape len={}, starting reverse walk", ctx.tape.len());
+            eprintln!("[backward] tape len={}, starting reverse walk", tape_len);
             let backward_result: Result<()> = (|| {
-                for entry in ctx.tape.iter().rev() {
+                for entry in tape_entries.iter().rev() {
                     if let Some(output_grad) = gradients.take(entry.output_id) {
                         let t_node = std::time::Instant::now();
 
@@ -1001,14 +977,17 @@ impl AutogradContext {
                         };
                         let kernel_dt = t_node.elapsed();
                         if nodes_executed % 100 == 0 || kernel_dt.as_millis() > 500 {
-                            eprintln!("[bwd] #{}/{} dt={:.1}ms grads_in_map={}", nodes_executed, ctx.tape.len(), kernel_dt.as_secs_f64() * 1000.0, gradients.len());
+                            eprintln!("[bwd] #{}/{} dt={:.1}ms grads_in_map={}", nodes_executed, tape_len, kernel_dt.as_secs_f64() * 1000.0, gradients.len());
                         }
                         total_kernel_time += kernel_dt;
 
-                        // Accumulate gradients (skip frozen weight IDs to save memory)
+                        // Accumulate gradients (skip frozen weight IDs to save memory).
+                        // Checkpoint backward returns ALL internal gradients (including
+                        // LoRA params) that aren't in needed_grad_ids — always accept those.
+                        let is_checkpoint = matches!(&entry.op, Op::Checkpoint { .. });
                         let t_accum = std::time::Instant::now();
                         for (tensor_id, grad) in input_grads {
-                            if needed_grad_ids.contains(&tensor_id) {
+                            if is_checkpoint || needed_grad_ids.contains(&tensor_id) {
                                 gradients.accumulate(tensor_id, grad)?;
                             }
                             // else: gradient for frozen weight — drop it
@@ -1081,10 +1060,14 @@ impl AutogradContext {
 
                         eprintln!("[cuda_graph] capture failed, falling back to normal backward: {:?}", e);
 
-                        // Re-enable autograd and clear tape
-                        ctx.enabled = prev_enabled;
-                    AUTOGRAD_ENABLED.store(prev_enabled, Ordering::Relaxed);
-                        ctx.tape.clear();
+                        // Re-enable autograd
+                        {
+                            let mut ctx = AUTOGRAD_CONTEXT
+                                .lock()
+                                .map_err(|_| Error::Training("autograd context mutex poisoned".into()))?;
+                            ctx.enabled = prev_enabled;
+                            AUTOGRAD_ENABLED.store(prev_enabled, Ordering::Relaxed);
+                        }
                         return Err(e);
                     }
                 }
@@ -1142,12 +1125,14 @@ impl AutogradContext {
                 eprintln!("╚══════════════════════════════════════════════════════════\n");
             }
 
-            // Re-enable autograd
-            ctx.enabled = prev_enabled;
-                    AUTOGRAD_ENABLED.store(prev_enabled, Ordering::Relaxed);
-
-            // Clear tape after backward pass
-            ctx.tape.clear();
+            // Re-enable autograd (tape was already drained at the top)
+            {
+                let mut ctx = AUTOGRAD_CONTEXT
+                    .lock()
+                    .map_err(|_| Error::Training("autograd context mutex poisoned".into()))?;
+                ctx.enabled = prev_enabled;
+                AUTOGRAD_ENABLED.store(prev_enabled, Ordering::Relaxed);
+            }
 
             gradients
         };
@@ -1594,10 +1579,28 @@ fn compute_gradients(
                 _ckpt_t0.elapsed().as_secs_f64() * 1000.0,
             );
 
+            // Return gradients for: checkpoint inputs (chain continuation)
+            // + trainable params (LoRA weights used in the block).
+            // Skip frozen weight gradients to avoid OOM.
+            // Filter: keep if the ID matches a saved tensor with requires_grad
+            // in the recomputed tape, OR if it's the checkpoint input ID.
             let mut result = Vec::new();
-            for (tid, _) in &entry.saved_tensors {
-                if let Some(g) = sub_grads.take(*tid) {
-                    result.push((*tid, g));
+            let trainable_ids: std::collections::HashSet<TensorId> = {
+                let mut s = std::collections::HashSet::new();
+                s.insert(*input); // checkpoint input — always needed for chain
+                for e in &recomputed_tape {
+                    s.insert(e.output_id); // intermediate chain nodes
+                    for (sid, st) in &e.saved_tensors {
+                        if st.requires_grad() {
+                            s.insert(*sid); // trainable params (LoRA weights)
+                        }
+                    }
+                }
+                s
+            };
+            for (tid, g) in sub_grads.drain_all()? {
+                if trainable_ids.contains(&tid) {
+                    result.push((tid, g));
                 }
             }
             Ok(result)
