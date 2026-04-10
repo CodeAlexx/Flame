@@ -1567,6 +1567,23 @@ fn compute_gradients(
                 }
             };
 
+            // Build filter BEFORE sub-backward: only accumulate gradients
+            // for chain nodes + trainable params. Drops frozen weight grads
+            // DURING accumulation (not just at return) to save peak VRAM.
+            let sub_needed: std::collections::HashSet<TensorId> = {
+                let mut s = std::collections::HashSet::new();
+                s.insert(*input);
+                for e in &recomputed_tape {
+                    s.insert(e.output_id);
+                    for (sid, st) in &e.saved_tensors {
+                        if st.requires_grad() {
+                            s.insert(*sid);
+                        }
+                    }
+                }
+                s
+            };
+
             let _sub_bwd_t0 = std::time::Instant::now();
             let mut sub_grads = crate::gradient::GradientMap::new(device.clone());
             if let Some(last_entry) = recomputed_tape.last() {
@@ -1577,7 +1594,10 @@ fn compute_gradients(
                 if let Some(sg) = sub_grads.take(sub_entry.output_id) {
                     let input_grads = compute_gradients(sub_entry, &sg, device)?;
                     for (tid, g) in input_grads {
-                        sub_grads.accumulate(tid, g)?;
+                        if sub_needed.contains(&tid) {
+                            sub_grads.accumulate(tid, g)?;
+                        }
+                        // else: frozen weight grad — drop immediately
                     }
                 }
             }
@@ -1591,29 +1611,9 @@ fn compute_gradients(
                 _ckpt_t0.elapsed().as_secs_f64() * 1000.0,
             );
 
-            // Return gradients for: checkpoint inputs (chain continuation)
-            // + trainable params (LoRA weights used in the block).
-            // Skip frozen weight gradients to avoid OOM.
-            // Filter: keep if the ID matches a saved tensor with requires_grad
-            // in the recomputed tape, OR if it's the checkpoint input ID.
             let mut result = Vec::new();
-            let trainable_ids: std::collections::HashSet<TensorId> = {
-                let mut s = std::collections::HashSet::new();
-                s.insert(*input); // checkpoint input — always needed for chain
-                for e in &recomputed_tape {
-                    s.insert(e.output_id); // intermediate chain nodes
-                    for (sid, st) in &e.saved_tensors {
-                        if st.requires_grad() {
-                            s.insert(*sid); // trainable params (LoRA weights)
-                        }
-                    }
-                }
-                s
-            };
             for (tid, g) in sub_grads.drain_all()? {
-                if trainable_ids.contains(&tid) {
-                    result.push((tid, g));
-                }
+                result.push((tid, g));
             }
             Ok(result)
         }
