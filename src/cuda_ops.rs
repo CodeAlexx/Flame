@@ -119,10 +119,10 @@ impl GpuOps {
         }
         let kernels = Self::get_kernels(&a_cast.device)?;
         let result_f32 = if a_cast.shape() != b_cast.shape() {
-            if std::env::var("FLAME_BC_TRACE")
-                .ok()
-                .map(|v| v == "1")
-                .unwrap_or(false)
+            static BC_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *BC_TRACE.get_or_init(|| {
+                std::env::var("FLAME_BC_TRACE").ok().as_deref() == Some("1")
+            })
             {
                 eprintln!(
                     "[bc-trace] add lhs={:?} rhs={:?}",
@@ -269,10 +269,10 @@ impl GpuOps {
         }
         let kernels = Self::get_kernels(&a_cast.device)?;
         let result_f32 = if a_cast.shape() != b_cast.shape() {
-            if std::env::var("FLAME_BC_TRACE")
-                .ok()
-                .map(|v| v == "1")
-                .unwrap_or(false)
+            static BC_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *BC_TRACE.get_or_init(|| {
+                std::env::var("FLAME_BC_TRACE").ok().as_deref() == Some("1")
+            })
             {
                 eprintln!(
                     "[bc-trace] mul lhs={:?} rhs={:?}",

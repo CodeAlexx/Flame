@@ -3,6 +3,210 @@
 use crate::{config, parameter::Parameter, DType, Error, Result, Tensor, TensorId};
 use std::collections::{hash_map::Entry, HashMap};
 
+// ---------------------------------------------------------------------------
+// Fused Adam CUDA kernel (inline PTX, compiled on first use)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+const CUDA_ADAM_FUSED_BF16: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__ void adam_fused_bf16_kernel(
+    __nv_bfloat16* __restrict__ param,
+    const __nv_bfloat16* __restrict__ grad,
+    float* __restrict__ m,
+    float* __restrict__ v,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    float bias_correction1,
+    float bias_correction2,
+    long long n
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float g = __bfloat162float(grad[idx]);
+    float p = __bfloat162float(param[idx]);
+
+    if (weight_decay > 0.0f) {
+        g += weight_decay * p;
+    }
+
+    float mi = beta1 * m[idx] + (1.0f - beta1) * g;
+    float vi = beta2 * v[idx] + (1.0f - beta2) * g * g;
+    m[idx] = mi;
+    v[idx] = vi;
+
+    float m_hat = mi / bias_correction1;
+    float v_hat = vi / bias_correction2;
+    p -= lr * m_hat / (sqrtf(v_hat) + eps);
+
+    param[idx] = __float2bfloat16(p);
+}
+
+extern "C" __global__ void adam_fused_f32grad_kernel(
+    __nv_bfloat16* __restrict__ param,
+    const float* __restrict__ grad,
+    float* __restrict__ m,
+    float* __restrict__ v,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    float bias_correction1,
+    float bias_correction2,
+    long long n
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float g = grad[idx];
+    float p = __bfloat162float(param[idx]);
+
+    if (weight_decay > 0.0f) {
+        g += weight_decay * p;
+    }
+
+    float mi = beta1 * m[idx] + (1.0f - beta1) * g;
+    float vi = beta2 * v[idx] + (1.0f - beta2) * g * g;
+    m[idx] = mi;
+    v[idx] = vi;
+
+    float m_hat = mi / bias_correction1;
+    float v_hat = vi / bias_correction2;
+    p -= lr * m_hat / (sqrtf(v_hat) + eps);
+
+    param[idx] = __float2bfloat16(p);
+}
+"#;
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+mod fused {
+    use super::*;
+    use cudarc::driver::{CudaDevice, DevicePtr, DevicePtrMut, LaunchAsync, LaunchConfig};
+    use cudarc::nvrtc::CompileOptions;
+    use std::sync::Arc;
+
+    const MODULE_NAME: &str = "adam_fused";
+
+    fn ensure_adam_kernels(device: &Arc<CudaDevice>) -> Result<()> {
+        // Fast path: already loaded
+        if device.get_func(MODULE_NAME, "adam_fused_bf16_kernel").is_some() {
+            return Ok(());
+        }
+        // Cold path: compile and load
+        let include_dir = std::env::var("CUDA_INCLUDE_DIR")
+            .or_else(|_| std::env::var("CUDA_HOME").map(|home| format!("{home}/include")))
+            .unwrap_or_else(|_| "/usr/local/cuda/include".into());
+        let mut opts = CompileOptions::default();
+        opts.include_paths.push(include_dir);
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(CUDA_ADAM_FUSED_BF16, opts)
+            .map_err(|e| Error::Cuda(format!("nvrtc adam_fused: {:?}", e)))?;
+        device
+            .load_ptx(
+                ptx,
+                MODULE_NAME,
+                &["adam_fused_bf16_kernel", "adam_fused_f32grad_kernel"],
+            )
+            .map_err(|e| Error::Cuda(format!("load adam_fused: {:?}", e)))?;
+        Ok(())
+    }
+
+    /// Launch fused Adam update — single kernel, no temporaries.
+    ///
+    /// `param` must be BF16, `m` and `v` must be F32, `grad` can be BF16 or F32.
+    /// All tensors are modified in-place (param, m, v).
+    pub fn adam_fused_step(
+        param: &mut Tensor,
+        grad: &Tensor,
+        m: &mut Tensor,
+        v: &mut Tensor,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bias_correction1: f32,
+        bias_correction2: f32,
+    ) -> Result<()> {
+        use crate::device::CudaStreamRawPtrExt;
+
+        // Validate dtypes once at entry
+        debug_assert_eq!(param.dtype(), DType::BF16);
+        debug_assert_eq!(m.dtype(), DType::F32);
+        debug_assert_eq!(v.dtype(), DType::F32);
+
+        let n = param.shape().elem_count();
+        debug_assert_eq!(n, grad.shape().elem_count());
+        debug_assert_eq!(n, m.shape().elem_count());
+        debug_assert_eq!(n, v.shape().elem_count());
+
+        let device = param.device.clone();
+        ensure_adam_kernels(&device)?;
+
+        let grad_is_bf16 = grad.dtype() == DType::BF16;
+        let kernel_name = if grad_is_bf16 {
+            "adam_fused_bf16_kernel"
+        } else {
+            "adam_fused_f32grad_kernel"
+        };
+
+        let f = device
+            .get_func(MODULE_NAME, kernel_name)
+            .ok_or_else(|| Error::Cuda(format!("missing kernel: {kernel_name}")))?;
+
+        // Get raw pointers — minimal overhead, no format! tags
+        let param_ptr = param.as_mut_device_ptr_bf16("adam:p")? as u64;
+        let m_ptr = {
+            let s = m.as_mut_slice_f32("adam:m")?;
+            *s.device_ptr_mut()
+        };
+        let v_ptr = {
+            let s = v.as_mut_slice_f32("adam:v")?;
+            *s.device_ptr_mut()
+        };
+
+        let grad_ptr: u64 = if grad_is_bf16 {
+            grad.as_device_ptr_bf16("adam:g")? as u64
+        } else {
+            let s = grad.as_slice_f32("adam:g")?;
+            *s.device_ptr()
+        };
+
+        let n_i64 = n as i64;
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(12);
+        params.push(&param_ptr as *const u64 as *mut std::ffi::c_void);
+        params.push(&grad_ptr as *const u64 as *mut std::ffi::c_void);
+        params.push(&m_ptr as *const u64 as *mut std::ffi::c_void);
+        params.push(&v_ptr as *const u64 as *mut std::ffi::c_void);
+        params.push(&lr as *const f32 as *mut std::ffi::c_void);
+        params.push(&beta1 as *const f32 as *mut std::ffi::c_void);
+        params.push(&beta2 as *const f32 as *mut std::ffi::c_void);
+        params.push(&eps as *const f32 as *mut std::ffi::c_void);
+        params.push(&weight_decay as *const f32 as *mut std::ffi::c_void);
+        params.push(&bias_correction1 as *const f32 as *mut std::ffi::c_void);
+        params.push(&bias_correction2 as *const f32 as *mut std::ffi::c_void);
+        params.push(&n_i64 as *const i64 as *mut std::ffi::c_void);
+
+        unsafe {
+            f.launch(cfg, &mut params)
+                .map_err(|e| Error::Cuda(format!("adam_fused launch: {e:?}")))?;
+        }
+        Ok(())
+    }
+}
+
 /// Adam optimizer with momentum and adaptive learning rates
 pub struct Adam {
     /// Learning rate
@@ -52,75 +256,117 @@ impl Adam {
         let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
 
         for param in parameters {
-            if let Some(mut grad) = param.grad() {
+            if let Some(grad) = param.grad() {
                 let param_id = param.id();
                 let param_dtype = param.dtype()?;
-                let state_dtype = config::select_optimizer_state_dtype(param_dtype);
 
-                if state_dtype != param_dtype {
-                    crate::log_once!(
-                        "adam_state_dtype_mismatch",
-                        "Adam states use {state:?} while params use {param:?}",
-                        state = state_dtype,
-                        param = param_dtype
-                    );
+                // Fused path: BF16 param with F32 state — single kernel launch
+                #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+                if param_dtype == DType::BF16 {
+                    let state_dtype = DType::F32;
+
+                    // Initialize m/v on first step
+                    if let Entry::Vacant(entry) = self.m.entry(param_id) {
+                        entry.insert(grad.zeros_like_with_dtype(state_dtype)?);
+                    }
+                    if let Entry::Vacant(entry) = self.v.entry(param_id) {
+                        entry.insert(grad.zeros_like_with_dtype(state_dtype)?);
+                    }
+
+                    let m = self
+                        .m
+                        .get_mut(&param_id)
+                        .ok_or_else(|| Error::Training("optimizer m state missing".into()))?;
+                    let v = self
+                        .v
+                        .get_mut(&param_id)
+                        .ok_or_else(|| Error::Training("optimizer v state missing".into()))?;
+
+                    // Single fused kernel: param, m, v updated in-place
+                    param.with_data_mut(|param_tensor| {
+                        fused::adam_fused_step(
+                            param_tensor,
+                            &grad,
+                            m,
+                            v,
+                            self.lr,
+                            self.beta1,
+                            self.beta2,
+                            self.eps,
+                            self.weight_decay,
+                            bias_correction1,
+                            bias_correction2,
+                        )
+                    })?;
+                    continue;
                 }
 
-                if grad.dtype() != state_dtype {
-                    grad = grad.to_dtype(state_dtype)?;
-                }
-                if self.weight_decay > 0.0 {
-                    let param_tensor = param.tensor()?;
-                    let param_adjust = if param_tensor.dtype() == state_dtype {
-                        param_tensor
-                    } else {
-                        param_tensor.to_dtype(state_dtype)?
-                    };
-                    grad = grad.add(&param_adjust.mul_scalar(self.weight_decay)?)?;
-                }
-
-                if let Entry::Vacant(entry) = self.m.entry(param_id) {
-                    entry.insert(grad.zeros_like_with_dtype(state_dtype)?);
-                }
-                if let Entry::Vacant(entry) = self.v.entry(param_id) {
-                    entry.insert(grad.zeros_like_with_dtype(state_dtype)?);
-                }
-
-                // Get momentum buffers
-                let m = self
-                    .m
-                    .get_mut(&param_id)
-                    .ok_or_else(|| Error::Training("optimizer m state missing".into()))?;
-                let v = self
-                    .v
-                    .get_mut(&param_id)
-                    .ok_or_else(|| Error::Training("optimizer v state missing".into()))?;
-
-                // Update biased first moment: m_t = β1 * m_{t-1} + (1 - β1) * g_t
-                *m = m
-                    .mul_scalar(self.beta1)?
-                    .add(&grad.mul_scalar(1.0 - self.beta1)?)?;
-
-                // Update biased second moment: v_t = β2 * v_{t-1} + (1 - β2) * g_t²
-                let grad_sq = grad.mul(&grad)?;
-                *v = v
-                    .mul_scalar(self.beta2)?
-                    .add(&grad_sq.mul_scalar(1.0 - self.beta2)?)?;
-
-                // Compute bias-corrected moments
-                let m_hat = m.div_scalar(bias_correction1)?;
-                let v_hat = v.div_scalar(bias_correction2)?;
-
-                // Compute update: lr * m_hat / (sqrt(v_hat) + eps)
-                let v_sqrt = v_hat.sqrt()?;
-                let denominator = v_sqrt.add_scalar(self.eps)?;
-                let update = m_hat.div(&denominator)?.mul_scalar(self.lr)?;
-
-                // Apply update
-                param.apply_update(&update)?;
+                // Fallback path: non-BF16 params (F32 params, etc.)
+                self.step_scalar_ops(param, grad, param_id, param_dtype, bias_correction1, bias_correction2)?;
             }
         }
 
+        Ok(())
+    }
+
+    /// Scalar-op fallback for non-BF16 parameters (original 13-15 kernel path).
+    fn step_scalar_ops(
+        &mut self,
+        param: &Parameter,
+        mut grad: Tensor,
+        param_id: TensorId,
+        param_dtype: DType,
+        bias_correction1: f32,
+        bias_correction2: f32,
+    ) -> Result<()> {
+        let state_dtype = config::select_optimizer_state_dtype(param_dtype);
+
+        if grad.dtype() != state_dtype {
+            grad = grad.to_dtype(state_dtype)?;
+        }
+        if self.weight_decay > 0.0 {
+            let param_tensor = param.tensor()?;
+            let param_adjust = if param_tensor.dtype() == state_dtype {
+                param_tensor
+            } else {
+                param_tensor.to_dtype(state_dtype)?
+            };
+            grad = grad.add(&param_adjust.mul_scalar(self.weight_decay)?)?;
+        }
+
+        if let Entry::Vacant(entry) = self.m.entry(param_id) {
+            entry.insert(grad.zeros_like_with_dtype(state_dtype)?);
+        }
+        if let Entry::Vacant(entry) = self.v.entry(param_id) {
+            entry.insert(grad.zeros_like_with_dtype(state_dtype)?);
+        }
+
+        let m = self
+            .m
+            .get_mut(&param_id)
+            .ok_or_else(|| Error::Training("optimizer m state missing".into()))?;
+        let v = self
+            .v
+            .get_mut(&param_id)
+            .ok_or_else(|| Error::Training("optimizer v state missing".into()))?;
+
+        *m = m
+            .mul_scalar(self.beta1)?
+            .add(&grad.mul_scalar(1.0 - self.beta1)?)?;
+
+        let grad_sq = grad.mul(&grad)?;
+        *v = v
+            .mul_scalar(self.beta2)?
+            .add(&grad_sq.mul_scalar(1.0 - self.beta2)?)?;
+
+        let m_hat = m.div_scalar(bias_correction1)?;
+        let v_hat = v.div_scalar(bias_correction2)?;
+
+        let v_sqrt = v_hat.sqrt()?;
+        let denominator = v_sqrt.add_scalar(self.eps)?;
+        let update = m_hat.div(&denominator)?.mul_scalar(self.lr)?;
+
+        param.apply_update(&update)?;
         Ok(())
     }
 

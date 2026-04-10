@@ -408,7 +408,7 @@ impl LayerNorm {
         if output.dtype() != DType::BF16 {
             output = output.to_dtype(DType::BF16)?;
         }
-        trap_is_bf16("LayerNorm::forward out", &output)?;
+        debug_assert_eq!(output.dtype(), DType::BF16);
         if output.rank() == 4 {
             assert_nhwc_public("LayerNorm::forward out", &output)?;
         }
@@ -722,11 +722,8 @@ fn rms_norm_forward_bf16(
 ) -> Result<RmsNormForwardArtifacts> {
     use crate::cuda_kernels::CudaKernels;
 
-    if input.storage.dtype() != DType::BF16 {
-        return Err(Error::InvalidOperation(
-            "RMSNorm forward expects BF16 storage".into(),
-        ));
-    }
+    // Caller (rms_norm_forward) already validated BF16 dtype
+    debug_assert_eq!(input.storage.dtype(), DType::BF16);
 
     let device = input.device();
     CudaKernels::ensure_kernel(device, "rms_norm_forward_bf16", RMS_NORM_FWD_KERNEL_BF16)?;
@@ -1071,7 +1068,8 @@ impl RMSNorm {
         if output.dtype() != DType::BF16 {
             output = output.to_dtype(DType::BF16)?;
         }
-        trap_is_bf16("RMSNorm::forward out", &output)?;
+        // Output is created as BF16 by rms_norm_forward_bf16 — skip redundant check
+        debug_assert_eq!(output.dtype(), DType::BF16);
         if output.rank() == 4 {
             assert_nhwc_public("RMSNorm::forward out", &output)?;
         }

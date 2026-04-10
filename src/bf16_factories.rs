@@ -15,7 +15,8 @@ fn lc(n: usize) -> LaunchConfig {
 /// Allocate a BF16 (u16) tensor of zeros (no FP32 materialization).
 pub fn zeros_bf16(shape: Shape, device: Arc<CudaDevice>) -> Result<Tensor> {
     let n = shape.elem_count();
-    if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+    static ALLOC_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ALLOC_LOG.get_or_init(|| std::env::var("ALLOC_LOG").ok().as_deref() == Some("1")) {
         let bytes = n * DType::BF16.size_in_bytes();
         if bytes >= (8 << 20) {
             eprintln!(
@@ -72,7 +73,8 @@ pub fn uniform_bf16(
     device: Arc<CudaDevice>,
 ) -> Result<Tensor> {
     let n = shape.elem_count();
-    if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+    static ALLOC_LOG2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ALLOC_LOG2.get_or_init(|| std::env::var("ALLOC_LOG").ok().as_deref() == Some("1")) {
         let bytes = n * DType::BF16.size_in_bytes();
         if bytes >= (8 << 20) {
             eprintln!(

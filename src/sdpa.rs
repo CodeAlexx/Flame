@@ -94,7 +94,7 @@ fn allow_sdpa_f32_fallback() -> bool {
 pub fn forward(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> SdpaResult<Tensor> {
     scope("sdpa.forward", GuardMode::env_default(), || {
         let output = forward_inner(q, k, v, mask)?;
-        trap_is_bf16("sdpa.forward out", &output)?;
+        debug_assert_eq!(output.dtype(), DType::BF16);
         Ok(output)
     })
 }
@@ -299,7 +299,7 @@ pub fn forward_v4(
 ) -> SdpaResult<Tensor> {
     scope("sdpa.forward_v4", GuardMode::env_default(), || {
         let output = forward_v4_inner(q, k, v, mask, causal, scale, chunk)?;
-        trap_is_bf16("sdpa.forward_v4 out", &output)?;
+        debug_assert_eq!(output.dtype(), DType::BF16);
         Ok(output)
     })
 }

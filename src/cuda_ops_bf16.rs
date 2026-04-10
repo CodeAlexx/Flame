@@ -186,7 +186,7 @@ fn default_stream(t: &Tensor) -> CudaStream {
 pub fn relu_bf16(x: &Tensor) -> Result<Tensor> {
     ensure_bf16(x, "relu_bf16:x")?;
     let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
-    ensure_bf16(&out, "relu_bf16:out")?;
+    debug_assert_eq!(out.dtype(), DType::BF16);
 
     let stream = default_stream(x);
     let vx = tensor_as_view_bf16(x, "relu_bf16:x")?;
@@ -200,7 +200,7 @@ pub fn relu_bf16(x: &Tensor) -> Result<Tensor> {
 pub fn gelu_bf16(x: &Tensor) -> Result<Tensor> {
     ensure_bf16(x, "gelu_bf16:x")?;
     let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
-    ensure_bf16(&out, "gelu_bf16:out")?;
+    debug_assert_eq!(out.dtype(), DType::BF16);
 
     let stream = default_stream(x);
     let vx = tensor_as_view_bf16(x, "gelu_bf16:x")?;
@@ -213,7 +213,7 @@ pub fn gelu_bf16(x: &Tensor) -> Result<Tensor> {
 
 pub fn gelu_bf16_into(x: &Tensor, out: &mut Tensor) -> Result<()> {
     ensure_bf16(x, "gelu_bf16_into:x")?;
-    ensure_bf16(out, "gelu_bf16_into:out")?;
+    debug_assert_eq!(out.dtype(), DType::BF16);
     if !Arc::ptr_eq(x.device(), out.device()) {
         return Err(Error::InvalidInput(
             "gelu_bf16_into: input and output tensors must share a device".into(),
@@ -237,7 +237,7 @@ pub fn gelu_bf16_into(x: &Tensor, out: &mut Tensor) -> Result<()> {
 pub fn silu_bf16(x: &Tensor) -> Result<Tensor> {
     ensure_bf16(x, "silu_bf16:x")?;
     let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
-    ensure_bf16(&out, "silu_bf16:out")?;
+    debug_assert_eq!(out.dtype(), DType::BF16);
 
     let stream = default_stream(x);
     let vx = tensor_as_view_bf16(x, "silu_bf16:x")?;
@@ -266,7 +266,7 @@ pub fn rms_norm_bf16(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> Result<Te
         ensure_bf16(w, "rms_norm_bf16:weight")?;
     }
     let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
-    ensure_bf16(&out, "rms_norm_bf16:out")?;
+    debug_assert_eq!(out.dtype(), DType::BF16);
 
     let stream = default_stream(x);
     let vx = tensor_as_view_bf16(x, "rms_norm_bf16:x")?;
@@ -394,7 +394,7 @@ fn layer_norm_bf16_with_stats_impl(
         ));
     }
 
-    ensure_bf16(out, "layer_norm_bf16:out")?;
+    debug_assert_eq!(out.dtype(), DType::BF16);
     if !Arc::ptr_eq(out.device(), x.device()) {
         return Err(Error::InvalidInput(
             "layer_norm_bf16: output tensor must share device with input".into(),
@@ -694,7 +694,7 @@ pub fn group_norm_bf16_with_stats(
     }
 
     let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
-    ensure_bf16(&out, "group_norm_bf16:out")?;
+    debug_assert_eq!(out.dtype(), DType::BF16);
 
     let stream = default_stream(x);
     let vx = tensor_as_view_bf16(x, "group_norm_bf16:x")?;
@@ -911,10 +911,13 @@ fn strict_block_lt_fallback(m: usize, n: usize) -> Result<()> {
     #[cfg(feature = "strict_bf16")]
     {
         if strict::is_enabled() {
-            let forced = std::env::var("FLAME_CUBLASLT_FORCE_FALLBACK")
-                .ok()
-                .map(|v| v.to_ascii_lowercase())
-                .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "on"));
+            static FORCE_LT_FALLBACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let forced = *FORCE_LT_FALLBACK.get_or_init(|| {
+                std::env::var("FLAME_CUBLASLT_FORCE_FALLBACK")
+                    .ok()
+                    .map(|v| v.to_ascii_lowercase())
+                    .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "on"))
+            });
             if forced {
                 let out_shape = Shape::from_dims(&[m, n]);
                 strict::record_layout_fix("cuda_ops.gemm_bf16.lt_fallback", &out_shape);
@@ -936,21 +939,11 @@ fn gemm_bf16_into_impl(
     k: usize,
     n: usize,
 ) -> Result<()> {
-    ensure_bf16(out, "gemm_bf16:out")?;
-    if !Arc::ptr_eq(out.device(), x.device()) {
-        return Err(Error::InvalidInput(
-            "gemm_bf16: output tensor must share device with inputs".into(),
-        ));
-    }
-    let out_dims = out.shape().dims();
-    if out_dims.len() != 2 || out_dims[0] != m || out_dims[1] != n {
-        return Err(Error::InvalidInput(format!(
-            "gemm_bf16: output shape {:?} incompatible with [{m}, {n}]",
-            out_dims
-        )));
-    }
-
-    strict_block_lt_fallback(m, n)?;
+    // Callers (gemm_bf16, gemm_bf16_into) already validate inputs and create
+    // the output tensor with correct dtype/device/shape. Use debug_assert only.
+    debug_assert_eq!(out.dtype(), DType::BF16);
+    debug_assert!(Arc::ptr_eq(out.device(), x.device()));
+    debug_assert_eq!(out.shape().dims(), &[m, n]);
 
     let stream = default_stream(x);
     let vx = tensor_as_view_bf16(x, "gemm_bf16:x")?;
@@ -1116,7 +1109,7 @@ pub fn broadcast_to_bf16(t: &Tensor, out_shape: &[usize]) -> Result<Tensor> {
 
 pub fn broadcast_to_bf16_into(t: &Tensor, out: &mut Tensor) -> Result<()> {
     ensure_bf16(t, "broadcast_bf16_into:in")?;
-    ensure_bf16(out, "broadcast_bf16_into:out")?;
+    debug_assert_eq!(out.dtype(), DType::BF16);
     if t.shape().rank() != out.shape().rank() {
         return Err(Error::InvalidInput(format!(
             "broadcast_bf16_into: rank mismatch (input {} vs output {})",
@@ -1618,13 +1611,16 @@ pub fn sdpa_stream_bf16_with_workspace(
     scale: Option<f32>,
     workspace: Option<SdpaWorkspace>,
 ) -> Result<Tensor> {
-    let disable_stream = matches!(
-        std::env::var("FLAME_SDPA_DISABLE_STREAM")
-            .ok()
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref(),
-        Some("1") | Some("true") | Some("on")
-    );
+    static DISABLE_STREAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let disable_stream = *DISABLE_STREAM.get_or_init(|| {
+        matches!(
+            std::env::var("FLAME_SDPA_DISABLE_STREAM")
+                .ok()
+                .map(|v| v.to_ascii_lowercase())
+                .as_deref(),
+            Some("1") | Some("true") | Some("on")
+        )
+    });
     struct SdpaLogData {
         b: usize,
         h: usize,

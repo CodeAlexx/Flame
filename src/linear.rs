@@ -226,13 +226,13 @@ impl Linear {
                         use crate::autograd::{AutogradContext, Op};
 
                         let mut saved = vec![
-                            (input.id(), input.clone_result()?),
-                            (self.weight.id(), self.weight.clone_result()?),
+                            (input.id(), input.clone()),
+                            (self.weight.id(), self.weight.clone()),
                         ];
 
                         let bias_id = if let Some(bias) = &self.bias {
                             if bias.requires_grad() {
-                                saved.push((bias.id(), bias.clone_result()?));
+                                saved.push((bias.id(), bias.clone()));
                             }
                             Some(bias.id())
                         } else {
@@ -263,7 +263,10 @@ impl Linear {
                 .iter()
                 .product::<usize>();
 
-            if std::env::var("FLAME_LINEAR_CLEAR_POOL").ok().as_deref() == Some("1") {
+            static CLEAR_POOL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *CLEAR_POOL.get_or_init(|| {
+                std::env::var("FLAME_LINEAR_CLEAR_POOL").ok().as_deref() == Some("1")
+            }) {
                 MEMORY_POOL.clear_all_caches();
             }
 
@@ -317,13 +320,13 @@ impl Linear {
                 use crate::autograd::{AutogradContext, Op};
 
                 let mut saved = vec![
-                    (input.id(), input.clone_result()?),
-                    (self.weight.id(), self.weight.clone_result()?),
+                    (input.id(), input.clone()),
+                    (self.weight.id(), self.weight.clone()),
                 ];
 
                 let bias_id = if let Some(bias) = &self.bias {
                     if bias.requires_grad() {
-                        saved.push((bias.id(), bias.clone_result()?));
+                        saved.push((bias.id(), bias.clone()));
                     }
                     Some(bias.id())
                 } else {

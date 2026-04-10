@@ -199,7 +199,7 @@ impl GradientMap {
         }
     }
 
-    /// Accumulate gradient (in-place GPU addition)
+    /// Accumulate gradient (in-place GPU addition — no temporary tensor allocation)
     pub fn accumulate(&mut self, id: TensorId, grad: Tensor) -> Result<()> {
         // Always upcast incoming gradient to FP32 before accumulation
         let grad = if grad.dtype() != DType::F32 {
@@ -217,14 +217,8 @@ impl GradientMap {
                         let up = existing.to_dtype(DType::F32)?;
                         *existing = up;
                     }
-                    // GPU add, then guarantee FP32 dtype on the stored tensor
-                    let sum = existing.add(&grad)?;
-                    let sum = if sum.dtype() != DType::F32 {
-                        sum.to_dtype(DType::F32)?
-                    } else {
-                        sum
-                    };
-                    *existing = sum;
+                    // In-place add: existing += grad (no new tensor allocation)
+                    crate::ops::elt::add_inplace_same_dtype(existing, &grad)?;
                 }
                 slot @ None => {
                     *slot = Some(grad);
@@ -238,13 +232,7 @@ impl GradientMap {
                         let up = existing.to_dtype(DType::F32)?;
                         *existing = up;
                     }
-                    let sum = existing.add(&grad)?;
-                    let sum = if sum.dtype() != DType::F32 {
-                        sum.to_dtype(DType::F32)?
-                    } else {
-                        sum
-                    };
-                    *existing = sum;
+                    crate::ops::elt::add_inplace_same_dtype(existing, &grad)?;
                 }
                 None => {
                     self.overflow.insert(id, grad);

@@ -411,8 +411,8 @@ extern "C" __global__ void masked_fill_kernel(
                     rhs: other.id,
                 },
                 vec![
-                    (self.id, self.clone_result()?),
-                    (other.id, other.clone_result()?),
+                    (self.id, self.clone()),
+                    (other.id, other.clone()),
                 ],
             );
         }
@@ -432,8 +432,8 @@ extern "C" __global__ void masked_fill_kernel(
                     rhs: other.id,
                 },
                 vec![
-                    (self.id, self.clone_result()?),
-                    (other.id, other.clone_result()?),
+                    (self.id, self.clone()),
+                    (other.id, other.clone()),
                 ],
             );
         }
@@ -773,7 +773,7 @@ extern "C" __global__ void masked_fill_kernel(
                     from: self.dtype(),
                     to: dtype,
                 },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
         }
         Ok(out)
@@ -804,8 +804,8 @@ extern "C" __global__ void masked_fill_kernel(
                     dim: 0,
                 },
                 vec![
-                    (self.id, self.clone_result()?),
-                    (ids.id, ids.clone_result()?),
+                    (self.id, self.clone()),
+                    (ids.id, ids.clone()),
                 ],
             );
             Ok(tracked)
@@ -1392,8 +1392,8 @@ extern "C" __global__ void masked_fill_kernel(
                     rhs: other.id,
                 },
                 vec![
-                    (self.id, self.clone_result()?),
-                    (other.id, other.clone_result()?),
+                    (self.id, self.clone()),
+                    (other.id, other.clone()),
                 ],
             );
         }
@@ -1452,8 +1452,8 @@ extern "C" __global__ void masked_fill_kernel(
                     rhs: other.id,
                 },
                 vec![
-                    (self.id, self.clone_result()?),
-                    (other.id, other.clone_result()?),
+                    (self.id, self.clone()),
+                    (other.id, other.clone()),
                 ],
             );
         }
@@ -1812,7 +1812,7 @@ extern "C" __global__ void f32_to_bool_kernel(
             AutogradContext::record_op(
                 output.id,
                 Op::ReLU { input: self.id },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
         }
 
@@ -1840,7 +1840,7 @@ extern "C" __global__ void f32_to_bool_kernel(
             AutogradContext::record_op(
                 output.id,
                 Op::GELU { input: self.id },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
         }
 
@@ -1868,7 +1868,7 @@ extern "C" __global__ void f32_to_bool_kernel(
             AutogradContext::record_op(
                 output.id,
                 Op::SiLU { input: self.id },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
         }
 
@@ -1887,7 +1887,7 @@ extern "C" __global__ void f32_to_bool_kernel(
             AutogradContext::record_op(
                 output.id,
                 Op::Tanh { input: self.id },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
         }
 
@@ -1906,7 +1906,7 @@ extern "C" __global__ void f32_to_bool_kernel(
             AutogradContext::record_op(
                 output.id,
                 Op::Sigmoid { input: self.id },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
         }
 
@@ -1959,7 +1959,7 @@ extern "C" __global__ void f32_to_bool_kernel(
             AutogradContext::record_op(
                 output.id,
                 Op::Square { input: self.id },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
         }
 
@@ -1987,7 +1987,7 @@ extern "C" __global__ void f32_to_bool_kernel(
                     input: self.id,
                     input_shape: self.shape.clone(),
                 },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
         }
 
@@ -2014,7 +2014,7 @@ extern "C" __global__ void f32_to_bool_kernel(
                     input: self.id,
                     input_shape: self.shape.clone(),
                 },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
         }
 
@@ -2051,7 +2051,7 @@ extern "C" __global__ void f32_to_bool_kernel(
                     input: self.id,
                     dims: dims_sorted.clone(),
                 },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
             Ok(out)
         } else {
@@ -2093,7 +2093,7 @@ extern "C" __global__ void f32_to_bool_kernel(
                     input: self.id,
                     dim,
                 },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
         }
 
@@ -2297,7 +2297,7 @@ extern "C" __global__ void f32_to_bool_kernel(
             AutogradContext::record_op(
                 output.id,
                 Op::Transpose { input: self.id },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
         }
 
@@ -2679,7 +2679,7 @@ extern "C" __global__ void f32_to_bool_kernel(
                     input: self.id,
                     dims: dims.to_vec(),
                 },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
         }
 
@@ -2748,7 +2748,7 @@ extern "C" __global__ void f32_to_bool_kernel(
                     input: self.id,
                     dim: dim as isize,
                 },
-                vec![(self.id, self.clone_result()?)],
+                vec![(self.id, self.clone())],
             );
         }
 

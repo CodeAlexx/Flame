@@ -135,6 +135,21 @@ impl Parameter {
         Ok(())
     }
 
+    /// Get mutable access to the raw parameter tensor for in-place optimizers.
+    ///
+    /// The closure receives `&mut Tensor` while the data mutex is held.
+    /// Use this for fused optimizer kernels that modify param in-place.
+    pub fn with_data_mut<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Tensor) -> Result<R>,
+    {
+        let mut data_lock = self
+            .data
+            .lock()
+            .map_err(|_| Error::Training("parameter data mutex poisoned".into()))?;
+        f(&mut data_lock)
+    }
+
     /// Apply an arbitrary update tensor
     pub fn apply_update(&self, update: &Tensor) -> Result<()> {
         let mut data_lock = self

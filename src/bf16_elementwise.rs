@@ -320,10 +320,18 @@ fn pad8(spec: &BcSpec) -> ([i64; 8], [i64; 8], [i64; 8]) {
     (d, a, b)
 }
 
-fn ensure(dev: &Arc<CudaDevice>, nm: &'static str, code: &'static str) -> Result<()> {
-    if dev.get_func(nm, nm).is_some() {
-        return Ok(());
+/// Load (if needed) and return a CUDA function in a single HashMap lookup on the hot path.
+/// Cold path: compiles from source and loads into device cache.
+fn ensure_and_get(
+    dev: &Arc<CudaDevice>,
+    nm: &'static str,
+    code: &'static str,
+) -> Result<cudarc::driver::CudaFunction> {
+    // Hot path: kernel already loaded — single HashMap lookup
+    if let Some(f) = dev.get_func(nm, nm) {
+        return Ok(f);
     }
+    // Cold path: compile and load
     let include_dir = std::env::var("CUDA_INCLUDE_DIR")
         .or_else(|_| std::env::var("CUDA_HOME").map(|home| format!("{home}/include")))
         .unwrap_or_else(|_| "/usr/local/cuda/include".into());
@@ -333,7 +341,8 @@ fn ensure(dev: &Arc<CudaDevice>, nm: &'static str, code: &'static str) -> Result
         .map_err(|e| Error::Cuda(format!("nvrtc {}: {:?}", nm, e)))?;
     dev.load_ptx(ptx, nm, &[nm])
         .map_err(|e| Error::Cuda(format!("load {}: {:?}", nm, e)))?;
-    Ok(())
+    dev.get_func(nm, nm)
+        .ok_or_else(|| Error::Cuda(format!("kernel {nm} not found after load")))
 }
 
 /// Generic BF16 elementwise launch — no GPU metadata copies, all params are scalars.
@@ -368,16 +377,12 @@ fn launch_bf16_elementwise(
         requires_grad: false,
     };
 
-    ensure(&a.device, kernel_name, CUDA_ADD_MUL_BF16)?;
-    let f = a
-        .device
-        .get_func(kernel_name, kernel_name)
-        .ok_or_else(|| Error::Cuda(format!("missing kernel: {}", kernel_name)))?;
+    let f = ensure_and_get(&a.device, kernel_name, CUDA_ADD_MUL_BF16)?;
 
     let (d, ast, bst) = pad8(&spec);
-    let a_ptr = a.as_device_ptr_bf16(&format!("{}:a", op_name))? as u64;
-    let b_ptr = b.as_device_ptr_bf16(&format!("{}:b", op_name))? as u64;
-    let o_ptr = out.as_mut_device_ptr_bf16(&format!("{}:out", op_name))? as u64;
+    let a_ptr = a.as_device_ptr_bf16("elem:a")? as u64;
+    let b_ptr = b.as_device_ptr_bf16("elem:b")? as u64;
+    let o_ptr = out.as_mut_device_ptr_bf16("elem:out")? as u64;
     let nd = spec.out_dims.len() as i32;
     let total = spec.total;
 
@@ -492,11 +497,7 @@ pub fn softmax_lastdim_bf16(x: &Tensor) -> Result<Tensor> {
         requires_grad: false,
     };
 
-    ensure(&x.device, "softmax_lastdim_bf16_kernel", CUDA_SOFTMAX_LASTDIM_BF16)?;
-    let f = x
-        .device
-        .get_func("softmax_lastdim_bf16_kernel", "softmax_lastdim_bf16_kernel")
-        .ok_or_else(|| Error::Cuda("missing kernel: softmax_lastdim_bf16_kernel".into()))?;
+    let f = ensure_and_get(&x.device, "softmax_lastdim_bf16_kernel", CUDA_SOFTMAX_LASTDIM_BF16)?;
 
     // Pick a power-of-two block size up to 1024.
     let mut block_size = 1usize;
@@ -579,11 +580,7 @@ fn launch_bf16_flat(
         requires_grad: false,
     };
 
-    ensure(&a.device, kernel_name, CUDA_ADD_MUL_BF16_FLAT)?;
-    let f = a
-        .device
-        .get_func(kernel_name, kernel_name)
-        .ok_or_else(|| Error::Cuda(format!("missing kernel: {}", kernel_name)))?;
+    let f = ensure_and_get(&a.device, kernel_name, CUDA_ADD_MUL_BF16_FLAT)?;
 
     // Launch with 2 elements per thread.
     let n_pairs = (n + 1) / 2;
@@ -595,9 +592,9 @@ fn launch_bf16_flat(
         shared_mem_bytes: 0,
     };
 
-    let a_ptr = a.as_device_ptr_bf16(&format!("{}:a", op_name))? as u64;
-    let b_ptr = b.as_device_ptr_bf16(&format!("{}:b", op_name))? as u64;
-    let o_ptr = out.as_mut_device_ptr_bf16(&format!("{}:out", op_name))? as u64;
+    let a_ptr = a.as_device_ptr_bf16("flat:a")? as u64;
+    let b_ptr = b.as_device_ptr_bf16("flat:b")? as u64;
+    let o_ptr = out.as_mut_device_ptr_bf16("flat:out")? as u64;
     let n_i64 = n as i64;
 
     let mut params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(4);
@@ -629,15 +626,7 @@ pub fn transpose2d_bf16(tensor: &Tensor) -> Result<Tensor> {
     let rows = dims[0];
     let cols = dims[1];
 
-    ensure(
-        &tensor.device,
-        "transpose2d_bf16_kernel",
-        CUDA_TRANSPOSE2D_BF16,
-    )?;
-    let f = tensor
-        .device
-        .get_func("transpose2d_bf16_kernel", "transpose2d_bf16_kernel")
-        .ok_or_else(|| Error::Cuda("missing kernel: transpose2d_bf16_kernel".into()))?;
+    let f = ensure_and_get(&tensor.device, "transpose2d_bf16_kernel", CUDA_TRANSPOSE2D_BF16)?;
 
     let mut out = Tensor::zeros_dtype(
         Shape::from_dims(&[cols, rows]),
@@ -724,11 +713,7 @@ fn cmp_bf16(a: &Tensor, b: &Tensor, op: i32) -> Result<Tensor> {
         requires_grad: false,
     };
 
-    ensure(&a.device, "cmp_bf16_kernel", CUDA_CMP_BF16)?;
-    let f = a
-        .device
-        .get_func("cmp_bf16_kernel", "cmp_bf16_kernel")
-        .ok_or_else(|| Error::Cuda("missing kernel: cmp_bf16_kernel".into()))?;
+    let f = ensure_and_get(&a.device, "cmp_bf16_kernel", CUDA_CMP_BF16)?;
 
     let (d, ast, bst) = pad8(&spec);
     let a_ptr = a.as_device_ptr_bf16("cmp_bf16:a")? as u64;
@@ -877,11 +862,7 @@ pub fn patchify_bf16(
     let n = ph * pw;
     let patch_dim = p * p * c;
 
-    ensure(&x.device, "patchify_bf16_kernel", CUDA_PATCHIFY_BF16)?;
-    let f = x
-        .device
-        .get_func("patchify_bf16_kernel", "patchify_bf16_kernel")
-        .ok_or_else(|| Error::Cuda("missing kernel: patchify_bf16_kernel".into()))?;
+    let f = ensure_and_get(&x.device, "patchify_bf16_kernel", CUDA_PATCHIFY_BF16)?;
 
     let mut out = Tensor::zeros_dtype(
         Shape::from_dims(&[b, n, patch_dim]),
@@ -937,11 +918,7 @@ pub fn unpatchify_bf16(
     let n = ph * pw;
     let patch_dim = p * p * c;
 
-    ensure(&x.device, "unpatchify_bf16_kernel", CUDA_UNPATCHIFY_BF16)?;
-    let f = x
-        .device
-        .get_func("unpatchify_bf16_kernel", "unpatchify_bf16_kernel")
-        .ok_or_else(|| Error::Cuda("missing kernel: unpatchify_bf16_kernel".into()))?;
+    let f = ensure_and_get(&x.device, "unpatchify_bf16_kernel", CUDA_UNPATCHIFY_BF16)?;
 
     let mut out = Tensor::zeros_dtype(
         Shape::from_dims(&[b, c, h, w]),
