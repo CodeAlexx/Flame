@@ -494,6 +494,7 @@ pub fn backward(loss: &Tensor, _retain_graph: bool) -> Result<crate::GradientMap
     AutogradContext::backward(loss)
 }
 // Local, dependency-free SDPA backward (recompute path)
+// SDPA backward (recompute path)
 fn attention_backward_recompute(
     q: &Tensor,
     k: &Tensor,
@@ -502,44 +503,37 @@ fn attention_backward_recompute(
     mask: Option<&Tensor>,
     scale: f32,
 ) -> Result<(Tensor, Tensor, Tensor)> {
-    // Attention recompute runs in BF16 (Q/K/V are BF16, bmm requires BF16).
-    // Cast dout to BF16 for the computation, results cast back at the end.
-    let dout_bf16;
-    let dout = if dout.dtype() != DType::BF16 {
-        dout_bf16 = dout.to_dtype(DType::BF16)?;
-        &dout_bf16
-    } else {
-        dout
-    };
+    // All ops in BF16 (bmm requires matching dtypes)
+    let q = if q.dtype() != DType::BF16 { &q.to_dtype(DType::BF16)? } else { q };
+    let k = if k.dtype() != DType::BF16 { &k.to_dtype(DType::BF16)? } else { k };
+    let v = if v.dtype() != DType::BF16 { &v.to_dtype(DType::BF16)? } else { v };
+    let dout = if dout.dtype() != DType::BF16 { &dout.to_dtype(DType::BF16)? } else { dout };
 
-    // logits = (Q K^T) * scale [+ mask]
-    let kt = k.transpose_dims(2, 3)?; // [B,H,D,Sk]
-    let mut logits = q.bmm(&kt)?; // [B,H,Sq,Sk]
+    // logits = (Q K^T) * scale
+    let kt = k.transpose_dims(2, 3)?;
+    let mut logits = q.bmm(&kt)?;
     logits = logits.mul_scalar(scale)?;
     if let Some(m) = mask {
         logits = logits.add(m)?;
     }
 
-    // attn = softmax(logits)
-    let attn = logits.softmax(-1)?; // [B,H,Sq,Sk]
+    let attn = logits.softmax(-1)?;
 
     // dV = attn^T @ dO
-    let attn_t = attn.transpose_dims(2, 3)?; // [B,H,Sk,Sq]
-    let d_v = attn_t.bmm(dout)?; // [B,H,Sk,D]
+    let d_v = attn.transpose_dims(2, 3)?.bmm(dout)?;
 
     // dAttn = dO @ V^T
-    let vt = v.transpose_dims(2, 3)?; // [B,H,D,Sk]
-    let d_attn = dout.bmm(&vt)?; // [B,H,Sq,Sk]
+    let d_attn = dout.bmm(&v.transpose_dims(2, 3)?)?;
 
-    // softmax backward: (dA - sum(dA*A, -1, keepdim)) * A
+    // softmax backward: d_logits = (dAttn - sum(dAttn*attn, -1, keepdim)) * attn
     let dattn_times_attn = d_attn.mul(&attn)?;
-    let sum_term = dattn_times_attn.sum_dim_keepdim(3)?; // [B,H,Sq,1]
-    let d_logits = d_attn.sub(&sum_term)?.mul(&attn)?; // [B,H,Sq,Sk]
+    let sum_term = dattn_times_attn.sum_dim_keepdim(3)?;
+    let d_logits = d_attn.sub(&sum_term)?.mul(&attn)?;
+    let d_logits = d_logits.mul_scalar(scale)?;
 
-    // dQ = dLogits @ K
-    let d_q = d_logits.bmm(k)?; // [B,H,Sq,D]
-                                // dK = dLogits^T @ Q
-    let d_k = d_logits.transpose_dims(2, 3)?.bmm(q)?; // [B,H,Sk,D]
+    // dQ = d_logits @ K, dK = d_logits^T @ Q
+    let d_q = d_logits.bmm(k)?;
+    let d_k = d_logits.transpose_dims(2, 3)?.bmm(q)?;
 
     Ok((d_q, d_k, d_v))
 }
