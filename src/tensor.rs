@@ -511,21 +511,29 @@ extern "C" __global__ void masked_fill_kernel(
     }
 
     /// Returns the raw BF16 device pointer if BF16(u16) storage is enabled.
+    ///
+    /// Hot path: called 3x per elementwise launch. `dtype()` and
+    /// `storage_dtype()` both return `self.storage.dtype()`, so the previous
+    /// runtime double-check was pure overhead. It is now a `debug_assert!`
+    /// that compiles out in release. The `BF16 { data }` arm is listed first
+    /// so branch prediction favors the common case.
     #[cfg(feature = "bf16_u16")]
+    #[inline]
     pub fn as_device_ptr_bf16(&self, tag: &str) -> Result<*const u16> {
-        if self.dtype() != DType::BF16 || self.storage_dtype() != DType::BF16 {
-            return Err(Error::InvalidOperation(format!(
-                "[{tag}] expected BF16 tensor, got logical {:?} / storage {:?}",
-                self.dtype(),
-                self.storage_dtype()
-            )));
-        }
+        debug_assert_eq!(
+            self.dtype(),
+            DType::BF16,
+            "[{tag}] as_device_ptr_bf16 expected BF16 tensor, got {:?}",
+            self.dtype()
+        );
         match self.storage_ref() {
             TensorStorage::BF16 { data, .. } => Ok((*data.device_ptr()) as *const u16),
             TensorStorage::BF16Arena { ptr, .. } => Ok(ptr.as_ptr()),
             TensorStorage::BF16View { ptr, .. } => Ok(ptr.as_ptr()),
             _ => Err(Error::InvalidOperation(format!(
-                "[{tag}] expected BF16(u16) backing storage"
+                "[{tag}] expected BF16(u16) backing storage, got logical {:?} / storage {:?}",
+                self.dtype(),
+                self.storage_dtype()
             ))),
         }
     }
@@ -586,15 +594,17 @@ extern "C" __global__ void masked_fill_kernel(
     }
 
     /// Returns the mutable BF16 device pointer if BF16(u16) storage is enabled.
+    ///
+    /// Hot path: see `as_device_ptr_bf16` for rationale.
     #[cfg(feature = "bf16_u16")]
+    #[inline]
     pub fn as_mut_device_ptr_bf16(&mut self, tag: &str) -> Result<*mut u16> {
-        if self.dtype() != DType::BF16 || self.storage_dtype() != DType::BF16 {
-            return Err(Error::InvalidOperation(format!(
-                "[{tag}] expected BF16 tensor, got logical {:?} / storage {:?}",
-                self.dtype(),
-                self.storage_dtype()
-            )));
-        }
+        debug_assert_eq!(
+            self.dtype(),
+            DType::BF16,
+            "[{tag}] as_mut_device_ptr_bf16 expected BF16 tensor, got {:?}",
+            self.dtype()
+        );
         match self.storage_mut() {
             TensorStorage::BF16 { ref mut data, .. } => {
                 let data = ensure_unique_slice(data)?;
@@ -602,9 +612,13 @@ extern "C" __global__ void masked_fill_kernel(
             }
             TensorStorage::BF16Arena { ptr, .. } => Ok(ptr.as_ptr()),
             TensorStorage::BF16View { ptr, .. } => Ok(ptr.as_ptr()),
-            _ => Err(Error::InvalidOperation(format!(
-                "[{tag}] expected BF16(u16) backing storage"
-            ))),
+            other => {
+                let storage_dtype = other.dtype();
+                Err(Error::InvalidOperation(format!(
+                    "[{tag}] expected BF16(u16) backing storage, got storage {:?}",
+                    storage_dtype
+                )))
+            }
         }
     }
 

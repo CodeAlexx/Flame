@@ -28,6 +28,33 @@ pub struct BcSpec {
 
 /// Build broadcast spec (NumPy rules). Set stride=0 for broadcasted dims.
 pub fn make_broadcast_spec(a_dims: &[usize], b_dims: &[usize]) -> BcSpec {
+    // Fast-path (optimization #2): same shape — skip the whole dim-matching
+    // loop, Vec inserts, and duplicate stride fixup. Strides are just the
+    // contiguous strides computed once and shared by both sides. Hit from
+    // launch_bf16_elementwise / cmp_bf16 for ops that have no flat kernel
+    // (max/min/cmp) when lhs.shape == rhs.shape.
+    if a_dims == b_dims {
+        let nd = a_dims.len();
+        let mut out_dims: Vec<i64> = Vec::with_capacity(nd);
+        for &d in a_dims {
+            out_dims.push(d as i64);
+        }
+        let mut strides = vec![0i64; nd];
+        let mut s: i64 = 1;
+        for i in (0..nd).rev() {
+            let d = out_dims[i];
+            strides[i] = if d == 1 { 0 } else { s };
+            s *= d.max(1);
+        }
+        let total: i64 = out_dims.iter().product();
+        return BcSpec {
+            out_dims,
+            a_strides: strides.clone(),
+            b_strides: strides,
+            total,
+        };
+    }
+
     let mut ad: Vec<i64> = a_dims.iter().map(|&d| d as i64).collect();
     let mut bd: Vec<i64> = b_dims.iter().map(|&d| d as i64).collect();
     let tr = ad.len().max(bd.len());
@@ -386,19 +413,41 @@ fn launch_bf16_elementwise(
     let nd = spec.out_dims.len() as i32;
     let total = spec.total;
 
-    // Build params as Vec<*mut c_void> — cudarc supports this for arbitrary param counts.
-    let mut params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(29);
-    params.push(&a_ptr as *const u64 as *mut std::ffi::c_void);
-    params.push(&b_ptr as *const u64 as *mut std::ffi::c_void);
-    params.push(&o_ptr as *const u64 as *mut std::ffi::c_void);
-    for i in 0..8 { params.push(&d[i] as *const i64 as *mut std::ffi::c_void); }
-    for i in 0..8 { params.push(&ast[i] as *const i64 as *mut std::ffi::c_void); }
-    for i in 0..8 { params.push(&bst[i] as *const i64 as *mut std::ffi::c_void); }
-    params.push(&nd as *const i32 as *mut std::ffi::c_void);
-    params.push(&total as *const i64 as *mut std::ffi::c_void);
+    // Stack-allocated params array — avoids Vec heap allocation on every dispatch.
+    let mut params: [*mut std::ffi::c_void; 29] = [
+        &a_ptr as *const u64 as *mut std::ffi::c_void,
+        &b_ptr as *const u64 as *mut std::ffi::c_void,
+        &o_ptr as *const u64 as *mut std::ffi::c_void,
+        &d[0] as *const i64 as *mut std::ffi::c_void,
+        &d[1] as *const i64 as *mut std::ffi::c_void,
+        &d[2] as *const i64 as *mut std::ffi::c_void,
+        &d[3] as *const i64 as *mut std::ffi::c_void,
+        &d[4] as *const i64 as *mut std::ffi::c_void,
+        &d[5] as *const i64 as *mut std::ffi::c_void,
+        &d[6] as *const i64 as *mut std::ffi::c_void,
+        &d[7] as *const i64 as *mut std::ffi::c_void,
+        &ast[0] as *const i64 as *mut std::ffi::c_void,
+        &ast[1] as *const i64 as *mut std::ffi::c_void,
+        &ast[2] as *const i64 as *mut std::ffi::c_void,
+        &ast[3] as *const i64 as *mut std::ffi::c_void,
+        &ast[4] as *const i64 as *mut std::ffi::c_void,
+        &ast[5] as *const i64 as *mut std::ffi::c_void,
+        &ast[6] as *const i64 as *mut std::ffi::c_void,
+        &ast[7] as *const i64 as *mut std::ffi::c_void,
+        &bst[0] as *const i64 as *mut std::ffi::c_void,
+        &bst[1] as *const i64 as *mut std::ffi::c_void,
+        &bst[2] as *const i64 as *mut std::ffi::c_void,
+        &bst[3] as *const i64 as *mut std::ffi::c_void,
+        &bst[4] as *const i64 as *mut std::ffi::c_void,
+        &bst[5] as *const i64 as *mut std::ffi::c_void,
+        &bst[6] as *const i64 as *mut std::ffi::c_void,
+        &bst[7] as *const i64 as *mut std::ffi::c_void,
+        &nd as *const i32 as *mut std::ffi::c_void,
+        &total as *const i64 as *mut std::ffi::c_void,
+    ];
 
     unsafe {
-        f.launch(lc(n), &mut params)
+        f.launch(lc(n), &mut params[..])
             .map_err(|e| Error::Training(format!("{e:?}")))?;
     }
     Ok(out)
@@ -517,14 +566,16 @@ pub fn softmax_lastdim_bf16(x: &Tensor) -> Result<Tensor> {
     let rows_i = rows as i64;
     let cols_i = cols as i64;
 
-    let mut params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(4);
-    params.push(&x_ptr as *const u64 as *mut std::ffi::c_void);
-    params.push(&o_ptr as *const u64 as *mut std::ffi::c_void);
-    params.push(&rows_i as *const i64 as *mut std::ffi::c_void);
-    params.push(&cols_i as *const i64 as *mut std::ffi::c_void);
+    // Stack-allocated params array — avoids Vec heap allocation on every dispatch.
+    let mut params: [*mut std::ffi::c_void; 4] = [
+        &x_ptr as *const u64 as *mut std::ffi::c_void,
+        &o_ptr as *const u64 as *mut std::ffi::c_void,
+        &rows_i as *const i64 as *mut std::ffi::c_void,
+        &cols_i as *const i64 as *mut std::ffi::c_void,
+    ];
 
     unsafe {
-        f.launch(cfg, &mut params)
+        f.launch(cfg, &mut params[..])
             .map_err(|e| Error::Cuda(format!("softmax_lastdim_bf16 launch: {:?}", e)))?;
     }
     Ok(out)
@@ -597,14 +648,16 @@ fn launch_bf16_flat(
     let o_ptr = out.as_mut_device_ptr_bf16("flat:out")? as u64;
     let n_i64 = n as i64;
 
-    let mut params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(4);
-    params.push(&a_ptr as *const u64 as *mut std::ffi::c_void);
-    params.push(&b_ptr as *const u64 as *mut std::ffi::c_void);
-    params.push(&o_ptr as *const u64 as *mut std::ffi::c_void);
-    params.push(&n_i64 as *const i64 as *mut std::ffi::c_void);
+    // Stack-allocated params array — avoids Vec heap allocation on every dispatch.
+    let mut params: [*mut std::ffi::c_void; 4] = [
+        &a_ptr as *const u64 as *mut std::ffi::c_void,
+        &b_ptr as *const u64 as *mut std::ffi::c_void,
+        &o_ptr as *const u64 as *mut std::ffi::c_void,
+        &n_i64 as *const i64 as *mut std::ffi::c_void,
+    ];
 
     unsafe {
-        f.launch(cfg, &mut params)
+        f.launch(cfg, &mut params[..])
             .map_err(|e| Error::Training(format!("{e:?}")))?;
     }
     Ok(out)
@@ -729,19 +782,42 @@ fn cmp_bf16(a: &Tensor, b: &Tensor, op: i32) -> Result<Tensor> {
     let nd = spec.out_dims.len() as i32;
     let total = spec.total;
 
-    let mut params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(30);
-    params.push(&a_ptr as *const u64 as *mut std::ffi::c_void);
-    params.push(&b_ptr as *const u64 as *mut std::ffi::c_void);
-    params.push(&o_ptr as *const u64 as *mut std::ffi::c_void);
-    for i in 0..8 { params.push(&d[i] as *const i64 as *mut std::ffi::c_void); }
-    for i in 0..8 { params.push(&ast[i] as *const i64 as *mut std::ffi::c_void); }
-    for i in 0..8 { params.push(&bst[i] as *const i64 as *mut std::ffi::c_void); }
-    params.push(&nd as *const i32 as *mut std::ffi::c_void);
-    params.push(&total as *const i64 as *mut std::ffi::c_void);
-    params.push(&op as *const i32 as *mut std::ffi::c_void);
+    // Stack-allocated params array — avoids Vec heap allocation on every dispatch.
+    let mut params: [*mut std::ffi::c_void; 30] = [
+        &a_ptr as *const u64 as *mut std::ffi::c_void,
+        &b_ptr as *const u64 as *mut std::ffi::c_void,
+        &o_ptr as *const u64 as *mut std::ffi::c_void,
+        &d[0] as *const i64 as *mut std::ffi::c_void,
+        &d[1] as *const i64 as *mut std::ffi::c_void,
+        &d[2] as *const i64 as *mut std::ffi::c_void,
+        &d[3] as *const i64 as *mut std::ffi::c_void,
+        &d[4] as *const i64 as *mut std::ffi::c_void,
+        &d[5] as *const i64 as *mut std::ffi::c_void,
+        &d[6] as *const i64 as *mut std::ffi::c_void,
+        &d[7] as *const i64 as *mut std::ffi::c_void,
+        &ast[0] as *const i64 as *mut std::ffi::c_void,
+        &ast[1] as *const i64 as *mut std::ffi::c_void,
+        &ast[2] as *const i64 as *mut std::ffi::c_void,
+        &ast[3] as *const i64 as *mut std::ffi::c_void,
+        &ast[4] as *const i64 as *mut std::ffi::c_void,
+        &ast[5] as *const i64 as *mut std::ffi::c_void,
+        &ast[6] as *const i64 as *mut std::ffi::c_void,
+        &ast[7] as *const i64 as *mut std::ffi::c_void,
+        &bst[0] as *const i64 as *mut std::ffi::c_void,
+        &bst[1] as *const i64 as *mut std::ffi::c_void,
+        &bst[2] as *const i64 as *mut std::ffi::c_void,
+        &bst[3] as *const i64 as *mut std::ffi::c_void,
+        &bst[4] as *const i64 as *mut std::ffi::c_void,
+        &bst[5] as *const i64 as *mut std::ffi::c_void,
+        &bst[6] as *const i64 as *mut std::ffi::c_void,
+        &bst[7] as *const i64 as *mut std::ffi::c_void,
+        &nd as *const i32 as *mut std::ffi::c_void,
+        &total as *const i64 as *mut std::ffi::c_void,
+        &op as *const i32 as *mut std::ffi::c_void,
+    ];
 
     unsafe {
-        f.launch(lc(n), &mut params)
+        f.launch(lc(n), &mut params[..])
             .map_err(|e| Error::Training(format!("{e:?}")))?;
     }
     Ok(out)

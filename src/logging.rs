@@ -1,10 +1,21 @@
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
+/// Hot-path cache for ALLOC_LOG (read on every GEMM via `gemm_tag!`).
+/// A direct `std::env::var` call is a syscall — this caches the result once
+/// per process so the macro reduces to an atomic load when alloc logging is
+/// disabled (the default).
+#[doc(hidden)]
+#[inline]
+pub fn alloc_log_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("ALLOC_LOG").ok().as_deref() == Some("1"))
+}
+
 #[macro_export]
 macro_rules! gemm_tag {
     ($name:expr, $m:expr, $n:expr, $dtype:expr) => {{
-        if std::env::var("ALLOC_LOG").ok().as_deref() == Some("1") {
+        if $crate::logging::alloc_log_enabled() {
             let bytes = ($m as usize * $n as usize) * $dtype.size_in_bytes();
             if bytes >= (8 << 20) {
                 eprintln!(

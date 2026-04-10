@@ -2,6 +2,13 @@
 // Reason: Complex broadcasting logic that's already debugged and tested
 
 use crate::error::{Error, Result};
+use smallvec::{smallvec, SmallVec};
+
+/// Inline-storage backing for shape dims. Deep-learning tensors are always
+/// 0-6 dimensions, so storing them inline avoids a heap allocation on every
+/// `Shape::clone()` (and tensor ops produce thousands of shape clones per
+/// training step via `Op::Add { lhs_shape, rhs_shape, .. }` and friends).
+pub type ShapeDims = SmallVec<[usize; 6]>;
 
 /// Dimension helper for tensor indexing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,17 +36,22 @@ impl D {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Shape {
-    dims: Vec<usize>,
+    dims: ShapeDims,
 }
 
 impl Shape {
+    /// Construct a shape from an owned `Vec<usize>`. Copied into inline
+    /// storage when it fits (usually true: rank ≤ 6).
     pub fn new(dims: Vec<usize>) -> Self {
-        Self { dims }
+        Self {
+            dims: SmallVec::from_vec(dims),
+        }
     }
 
+    /// Construct a shape by copying a slice of dims into inline storage.
     pub fn from_dims(dims: &[usize]) -> Self {
         Self {
-            dims: dims.to_vec(),
+            dims: SmallVec::from_slice(dims),
         }
     }
 
@@ -72,13 +84,20 @@ impl Shape {
 
     // COPIED FROM CANDLE - Critical broadcasting logic
     pub fn broadcast_shape_binary_op(&self, rhs: &Self) -> Result<Shape> {
+        // Fast-path: same shape — by far the most common case in training
+        // hot loops (residual adds, GEGLU muls, norms, etc.). Skip the
+        // dim-matching loop and smallvec allocation entirely.
+        if self.dims == rhs.dims {
+            return Ok(self.clone());
+        }
+
         let lhs_dims = self.dims();
         let rhs_dims = rhs.dims();
         let lhs_ndims = lhs_dims.len();
         let rhs_ndims = rhs_dims.len();
         let bcast_ndims = usize::max(lhs_ndims, rhs_ndims);
 
-        let mut bcast_dims = vec![0; bcast_ndims];
+        let mut bcast_dims: ShapeDims = smallvec![0; bcast_ndims];
         for i in 0..bcast_ndims {
             let lhs_i = if i < lhs_ndims {
                 lhs_dims[lhs_ndims - i - 1]
@@ -105,7 +124,7 @@ impl Shape {
             }
         }
 
-        Ok(Shape::new(bcast_dims))
+        Ok(Shape { dims: bcast_dims })
     }
 }
 

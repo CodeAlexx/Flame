@@ -23,9 +23,16 @@ use crate::tensor::TensorId;
 use crate::tensor_storage::TensorStorage;
 use crate::{DType, Error, Result, Shape, Tensor};
 use cudarc::driver::CudaDevice;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Inline-storage buffer for tensors saved on the tape. Most ops save 0-3
+/// tensors (input, weight, bias), so storing them inline eliminates a Vec
+/// heap allocation per recorded op — and with ~2660 tape entries per Klein
+/// 4B step that adds up.
+pub type SavedTensors = SmallVec<[(TensorId, Tensor); 3]>;
 
 /// Atomic mirror of `AutogradContextInner::enabled`. Checked by tensor ops
 /// BEFORE constructing Op enums or cloning saved_tensors, avoiding GPU memcpys
@@ -306,8 +313,10 @@ struct TapeEntry {
     /// Operation that produced the output
     op: Op,
 
-    /// Saved tensors needed for backward pass (Vec for cache locality; most ops save 1-3 tensors)
-    saved_tensors: Vec<(TensorId, Tensor)>,
+    /// Saved tensors needed for backward pass. Inline-sized for the common
+    /// 0-3 tensor case (input, weight, bias) to avoid a Vec heap allocation
+    /// per recorded op.
+    saved_tensors: SavedTensors,
 }
 
 impl TapeEntry {
@@ -552,14 +561,25 @@ impl AutogradContext {
 }
 
 impl AutogradContext {
-    /// Record an operation in the computation graph
-    pub fn record_op(output_id: TensorId, op: Op, saved_tensors: Vec<(TensorId, Tensor)>) {
+    /// Record an operation in the computation graph.
+    ///
+    /// `saved_tensors` accepts anything convertible into `SavedTensors`
+    /// (the inline-sized `SmallVec<[(TensorId, Tensor); 3]>`). This keeps
+    /// the existing `vec![...]` call sites compiling unchanged while
+    /// avoiding a heap allocation for the common 0-3 tensor case.
+    pub fn record_op(
+        output_id: TensorId,
+        op: Op,
+        saved_tensors: impl Into<SavedTensors>,
+    ) {
         // Fast path: skip lock entirely when autograd is disabled (e.g., during backward).
         // This prevents deadlock when backward ops call high-level Tensor methods
         // that would otherwise try to re-acquire the already-held context lock.
         if !AUTOGRAD_ENABLED.load(Ordering::Relaxed) {
             return;
         }
+
+        let saved_tensors: SavedTensors = saved_tensors.into();
 
         let mut ctx = match AUTOGRAD_CONTEXT.lock() {
             Ok(guard) => guard,
@@ -1205,7 +1225,7 @@ impl AutogradContext {
             .ok_or_else(|| Error::InvalidInput("checkpoint requires at least one input".into()))?
             .id;
 
-        let saved: Vec<(TensorId, Tensor)> = inputs.iter().map(|inp| (inp.id, inp.clone())).collect();
+        let saved: SavedTensors = inputs.iter().map(|inp| (inp.id, inp.clone())).collect();
 
         let mut out_with_grad = output;
         out_with_grad.requires_grad = true;

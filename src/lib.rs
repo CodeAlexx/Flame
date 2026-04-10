@@ -61,13 +61,19 @@ macro_rules! dtype_trace {
 }
 
 pub mod trace {
+    /// Hot-path helper — invoked per tensor op. Cached via `OnceLock` so the
+    /// call sites only pay an atomic load after the first hit, instead of
+    /// two `std::env::var` syscalls every single op.
     #[inline]
     pub fn trace_on() -> bool {
-        std::env::var("FLAME_DTYPE_TRACE")
-            .ok()
-            .or_else(|| std::env::var("FLAME_TRACE_DTYPE").ok())
-            .as_deref()
-            == Some("1")
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            std::env::var("FLAME_DTYPE_TRACE")
+                .ok()
+                .or_else(|| std::env::var("FLAME_TRACE_DTYPE").ok())
+                .as_deref()
+                == Some("1")
+        })
     }
 }
 
