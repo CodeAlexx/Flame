@@ -502,6 +502,16 @@ fn attention_backward_recompute(
     mask: Option<&Tensor>,
     scale: f32,
 ) -> Result<(Tensor, Tensor, Tensor)> {
+    // Attention recompute runs in BF16 (Q/K/V are BF16, bmm requires BF16).
+    // Cast dout to BF16 for the computation, results cast back at the end.
+    let dout_bf16;
+    let dout = if dout.dtype() != DType::BF16 {
+        dout_bf16 = dout.to_dtype(DType::BF16)?;
+        &dout_bf16
+    } else {
+        dout
+    };
+
     // logits = (Q K^T) * scale [+ mask]
     let kt = k.transpose_dims(2, 3)?; // [B,H,D,Sk]
     let mut logits = q.bmm(&kt)?; // [B,H,Sq,Sk]
@@ -1259,16 +1269,10 @@ fn compute_gradients(
     output_grad_raw: &Tensor,
     device: &Arc<CudaDevice>,
 ) -> Result<Vec<(TensorId, Tensor)>> {
-    // Ensure output_grad is BF16 to match saved tensors and avoid dtype
-    // mismatches in backward ops (GpuOps::mul, matmul, etc. require matching dtypes).
-    // GradientMap stores F32 internally, so output_grad arrives as F32.
-    let output_grad_owned;
-    let output_grad = if output_grad_raw.dtype() != DType::BF16 {
-        output_grad_owned = output_grad_raw.to_dtype(DType::BF16)?;
-        &output_grad_owned
-    } else {
-        output_grad_raw
-    };
+    // Keep gradients in their incoming dtype (typically F32 from GradientMap).
+    // GpuOps handles mixed F32×BF16 operations internally by casting.
+    // Forcing BF16 here caused overflow (Inf) in deep checkpoint backward chains.
+    let output_grad = output_grad_raw;
 
     // Optional backtrace: print op and shapes when FLAME_BACKWARD_TRACE=1
     // Cached to avoid syscall per-op (was ~0.5ms × 800 ops = 400ms overhead)
@@ -1383,22 +1387,30 @@ fn compute_gradients(
         Op::MatMul { lhs, rhs } => {
             let lhs_tensor = &fetch_saved(lhs)?;
             let rhs_tensor = &fetch_saved(rhs)?;
+            let og_dtype = output_grad.dtype();
 
-            // BF16 2D transpose is ~100x faster than GpuOps::transpose (which
-            // casts BF16→F32, transposes in F32, returns F32).
-            let rhs_t = if rhs_tensor.dtype() == DType::BF16 && rhs_tensor.rank() == 2 {
+            // grad_lhs = output_grad @ rhs^T
+            // Cast rhs to match output_grad dtype, keep BF16 fast-path for transpose
+            let rhs_for_grad = if rhs_tensor.dtype() != og_dtype {
+                let cast = rhs_tensor.to_dtype(og_dtype)?;
+                GpuOps::transpose(&cast)?
+            } else if og_dtype == DType::BF16 && rhs_tensor.rank() == 2 {
                 crate::bf16_elementwise::transpose2d_bf16(rhs_tensor)?
             } else {
                 GpuOps::transpose(rhs_tensor)?
             };
-            let grad_lhs = GpuOps::matmul(output_grad, &rhs_t)?;
+            let grad_lhs = GpuOps::matmul(output_grad, &rhs_for_grad)?;
 
-            let lhs_t = if lhs_tensor.dtype() == DType::BF16 && lhs_tensor.rank() == 2 {
+            // grad_rhs = lhs^T @ output_grad
+            let lhs_for_grad = if lhs_tensor.dtype() != og_dtype {
+                let cast = lhs_tensor.to_dtype(og_dtype)?;
+                GpuOps::transpose(&cast)?
+            } else if og_dtype == DType::BF16 && lhs_tensor.rank() == 2 {
                 crate::bf16_elementwise::transpose2d_bf16(lhs_tensor)?
             } else {
                 GpuOps::transpose(lhs_tensor)?
             };
-            let grad_rhs = GpuOps::matmul(&lhs_t, output_grad)?;
+            let grad_rhs = GpuOps::matmul(&lhs_for_grad, output_grad)?;
 
             Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
         }
@@ -1608,11 +1620,17 @@ fn compute_gradients(
 
         Op::RoPePrecomputed { input, cos, sin } => {
             // RoPE is an orthogonal rotation. Backward = apply_rope(grad, cos, -sin).
+            // Fused kernel requires BF16 — cast locally (don't force BF16 globally).
+            let grad_bf16 = if output_grad.dtype() != DType::BF16 {
+                output_grad.to_dtype(DType::BF16)?
+            } else {
+                output_grad.clone_result()?
+            };
             let cos_tensor = fetch_saved(cos)?;
             let sin_tensor = fetch_saved(sin)?;
             let neg_sin = GpuOps::mul_scalar(&sin_tensor, -1.0)?;
             let grad_input = crate::attention::rope::apply_rope_precomputed(
-                output_grad, &cos_tensor, &neg_sin,
+                &grad_bf16, &cos_tensor, &neg_sin,
             )?;
             Ok(vec![(*input, grad_input)])
         }
@@ -1867,16 +1885,25 @@ fn compute_gradients(
             // Similar to MatMul but preserves batch dimension
             let lhs_tensor = &fetch_saved(lhs)?;
             let rhs_tensor = &fetch_saved(rhs)?;
-            guard_tensor("AutogradContext::batch_matmul lhs", lhs_tensor)?;
-            guard_tensor("AutogradContext::batch_matmul rhs", rhs_tensor)?;
 
-            // Gradient w.r.t. lhs: grad @ rhs^T (batched)
-            let rhs_t = rhs_tensor.transpose_batch()?;
-            let grad_lhs = ensure_bf16(output_grad.batch_matmul(&rhs_t)?)?;
+            // Ensure matching dtypes
+            let og_dtype = output_grad.dtype();
+            let rhs_matched = if rhs_tensor.dtype() != og_dtype {
+                rhs_tensor.to_dtype(og_dtype)?
+            } else {
+                (*rhs_tensor).clone()
+            };
+            let lhs_matched = if lhs_tensor.dtype() != og_dtype {
+                lhs_tensor.to_dtype(og_dtype)?
+            } else {
+                (*lhs_tensor).clone()
+            };
 
-            // Gradient w.r.t. rhs: lhs^T @ grad (batched)
-            let lhs_t = lhs_tensor.transpose_batch()?;
-            let grad_rhs = ensure_bf16(lhs_t.batch_matmul(output_grad)?)?;
+            let rhs_t = rhs_matched.transpose_batch()?;
+            let grad_lhs = output_grad.batch_matmul(&rhs_t)?;
+
+            let lhs_t = lhs_matched.transpose_batch()?;
+            let grad_rhs = lhs_t.batch_matmul(output_grad)?;
 
             Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
         }
