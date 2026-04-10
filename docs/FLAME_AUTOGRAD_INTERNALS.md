@@ -115,13 +115,21 @@ gradients.set_ones(loss.id, loss.shape.clone())?;
 
 The loss gradient is initialized to a tensor of ones (FP32, `gradient.rs:97-101`).
 
-### 2.6 Per-Node Backward Sequence
+### 2.6 Frozen-Weight Gradient Filtering
 
-For each tape entry in reverse order (`autograd.rs:879-901`):
+Before the backward loop, a `needed_grad_ids: HashSet<TensorId>` is built containing:
+- All `output_id` values from the tape (intermediate chain nodes)
+- All saved tensor IDs where `requires_grad() == true` (trainable parameters)
+
+Frozen base-model weight IDs are excluded. This saves ~5 GB GPU memory for Klein 4B by not accumulating gradients for frozen weights that the optimizer never reads.
+
+### 2.7 Per-Node Backward Sequence
+
+For each tape entry in reverse order:
 
 1. **Take output gradient** -- `gradients.take(entry.output_id)` removes the gradient from the map (avoids a clone)
-2. **Compute input gradients** -- calls `compute_gradients(entry, &output_grad, &device)` (`autograd.rs:1132`)
-3. **Accumulate input gradients** -- for each `(tensor_id, grad)` returned, calls `gradients.accumulate(tensor_id, grad)` which adds the gradient to any existing gradient for that tensor (FP32 addition, `gradient.rs:203-255`)
+2. **Compute input gradients** -- calls `compute_gradients(entry, &output_grad, &device)`
+3. **Accumulate input gradients** -- for each `(tensor_id, grad)` returned, calls `gradients.accumulate(tensor_id, grad)` **only if** `needed_grad_ids.contains(&tensor_id)`. Gradients for frozen weights are silently dropped.
 
 There is **no per-node locking** beyond the outer tape lock. The entire backward runs under a single `AUTOGRAD_CONTEXT.lock()` hold.
 
@@ -153,39 +161,43 @@ When backward encounters `Op::Checkpoint` (`autograd.rs:1327-1397`):
 
 ### 3.1 Answer: NO (in the main backward loop)
 
-**Before the backward loop starts** (`autograd.rs:677-678`):
+**Before the backward loop starts**, autograd is disabled at two levels:
+
+1. **Mutex-guarded flag**: `ctx.enabled = false`
+2. **Lock-free atomic flag**: `AUTOGRAD_ENABLED.store(false, Ordering::Relaxed)`
+
+`AutogradContext::record_op()` checks the **atomic flag first** (before acquiring the mutex):
 
 ```rust
-let prev_enabled = ctx.enabled;
-ctx.enabled = false;
-```
-
-This sets `AutogradContextInner::enabled = false`. Every call to `AutogradContext::record_op()` checks this flag (`autograd.rs:492-494`):
-
-```rust
-if !ctx.enabled {
-    return;
+pub fn record_op(...) {
+    // Fast path: skip lock entirely when autograd is disabled
+    if !AUTOGRAD_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut ctx = AUTOGRAD_CONTEXT.lock()...;
+    if !ctx.enabled { return; }  // double-check under lock
 }
 ```
 
-So during backward, any tensor operation that would normally record to the tape **silently skips recording**. The backward loop does NOT create new autograd nodes.
+The atomic check is critical: without it, backward ops that call high-level Tensor methods (e.g., `input.sigmoid()` inside SiLU backward) would **deadlock** trying to re-acquire the already-held `AUTOGRAD_CONTEXT` mutex. The atomic provides a lock-free early exit that prevents this.
 
 ### 3.2 compute_gradients Uses a Mix of GpuOps and Tensor Methods
 
-Inside `compute_gradients()` (`autograd.rs:1132-2603`), backward computations use both:
+Inside `compute_gradients()`, backward computations use both:
 
-**GpuOps static methods (NO autograd recording):**
+**GpuOps static methods (preferred — NO autograd overhead):**
 - `GpuOps::mul(output_grad, rhs_tensor)` -- raw CUDA dispatch, no `record_op` call
 - `GpuOps::matmul(output_grad, &rhs_t)` -- calls `launch_gemm`, no `record_op`
-- `GpuOps::mul_scalar(...)`, `GpuOps::transpose(...)`, `GpuOps::broadcast(...)`, `GpuOps::div(...)`
+- `GpuOps::mul_scalar(...)`, `GpuOps::transpose(...)`, `GpuOps::broadcast(...)`, `GpuOps::div(...)`, `GpuOps::sigmoid(...)`, `GpuOps::tanh(...)`
 
-**Tensor methods (WOULD record if enabled, but don't because ctx.enabled = false):**
-- `output_grad.clone_result()` -- creates new tensor, no op recorded
-- `output_grad.mul_scalar(-1.0)` -- checks `requires_grad`, would call `record_op` but it returns early due to `enabled = false`
-- `output_grad.to_dtype(DType::BF16)` -- similar, no recording
-- Various `.reshape()`, `.softmax()`, `.tanh()` etc. in specific backward handlers
+**Tensor methods (safe due to atomic early-out, but add minor overhead):**
+- `output_grad.clone_result()` -- creates new tensor
+- `output_grad.to_dtype(DType::BF16)` -- dtype conversion
+- Various `.reshape()`, `.softmax()` etc. in specific backward handlers
 
-The key architectural point: `GpuOps` methods are **pure CUDA dispatchers** -- they never touch the autograd tape. They operate on raw `Tensor` storage. `Tensor` methods like `.add()`, `.mul()` go through `GpuOps` internally but also check `requires_grad` and potentially call `record_op`. Since `ctx.enabled = false` during backward, the `record_op` calls are no-ops.
+**Activation backward ops (SiLU, GELU, Tanh, Sigmoid)** are implemented inline in `compute_gradients` using GpuOps directly. This avoids the overhead of Tensor method requires_grad checks and is the safest pattern for backward code.
+
+The key architectural point: `GpuOps` methods are **pure CUDA dispatchers** -- they never touch the autograd tape. Tensor methods go through `GpuOps` internally but also check `requires_grad` and call `record_op` (which exits via the atomic check during backward).
 
 ### 3.3 Exception: Checkpoint Recomputation
 
@@ -265,16 +277,17 @@ Every gradient produced by compute_gradients is cast to BF16 before being return
 | `Add` | `autograd.rs:1174-1188` | GPU (clone_result, reduce_grad_for_broadcast) | No saved tensors needed |
 | `Sub` | `autograd.rs:1191-1194` | GPU (GpuOps::mul_scalar) | |
 | `Mul` | `autograd.rs:1197-1234` | GPU (GpuOps::mul) | Saves both operands |
-| `Div` | `autograd.rs:1720-1749` | GPU (GpuOps::div, GpuOps::mul, GpuOps::mul_scalar) | Saves both operands |
+| `Div` | `autograd.rs` | GPU (GpuOps::broadcast, GpuOps::div, GpuOps::mul, GpuOps::mul_scalar, reduce_grad_for_broadcast) | Saves both operands; Op stores lhs_shape/rhs_shape for broadcast reduction |
 | `MulScalar` | `autograd.rs:1237-1240` | GPU (Tensor::mul_scalar) | |
 | `AddScalar` | `autograd.rs:1243-1246` | GPU (clone_result) | Identity gradient |
 | `MatMul` | `autograd.rs:1248-1263` | GPU (GpuOps::transpose, GpuOps::matmul) | Saves both operands |
 | `ReLU` | `autograd.rs:1266-1270` | GPU (custom relu_backward, line 2669) | Saves input |
-| `GELU` | `autograd.rs:1273-1277` | GPU (autograd_ops_complete::gelu_backward) | Saves input |
-| `SiLU` | `autograd.rs:1280-1284` | GPU (autograd_ops_complete::silu_backward) | Saves input |
-| `Tanh` | `autograd.rs:1287-1292` | GPU (autograd_ops_complete::tanh_backward) | Recomputes tanh(input) |
-| `Sigmoid` | `autograd.rs:1295-1302` | GPU (autograd_ops_complete::sigmoid_backward) | Recomputes sigmoid(input) |
-| `Square` | `autograd.rs:1305-1310` | GPU (GpuOps::mul_scalar, GpuOps::mul) | Saves input |
+| `GELU` | `autograd.rs` | GPU (GpuOps::mul, GpuOps::tanh, GpuOps::add_scalar, GpuOps::mul_scalar) | Inline impl using GpuOps; saves input |
+| `SiLU` | `autograd.rs` | GPU (GpuOps::sigmoid, GpuOps::mul, GpuOps::add, GpuOps::mul_scalar) | Inline impl using GpuOps; saves input |
+| `Tanh` | `autograd.rs` | GPU (GpuOps::tanh, GpuOps::mul, GpuOps::add) | Inline impl: 1-tanh²(x); saves input |
+| `Sigmoid` | `autograd.rs` | GPU (GpuOps::sigmoid, GpuOps::mul, GpuOps::add) | Inline impl: sig*(1-sig); saves input |
+| `Square` | `autograd.rs` | GPU (GpuOps::mul_scalar, GpuOps::mul) | Saves input |
+| `Sqrt` | `autograd.rs` | GPU (GpuOps::sqrt, GpuOps::mul_scalar, GpuOps::div) | d/dx sqrt(x) = 0.5/sqrt(x); saves input |
 | `Sum` | `autograd.rs:1313-1318` | GPU (GpuOps::broadcast) | |
 | `Mean` | `autograd.rs:1399-1406` | GPU (GpuOps::mul_scalar, GpuOps::broadcast) | |
 | `Transpose` | `autograd.rs:1409-1412` | GPU (GpuOps::transpose) | |
@@ -297,7 +310,7 @@ Every gradient produced by compute_gradients is cast to BF16 before being return
 | `IndexSelect` | `autograd.rs:1931-1959` | GPU (cuda_kernels::scatter_add) | Saves input + indices |
 | `Cat` | `autograd.rs:1962-1988` | GPU (slice per input) | Saves all inputs |
 | `Split` | `autograd.rs:2070-2092` | GPU (add) | Saves input |
-| `Slice` | `autograd.rs:1991-2068` | GPU (gpu_scatter_add_narrow) | Custom CUDA scatter |
+| `Slice` | `autograd.rs` | GPU (gpu_scatter_add_narrow via FFI) | Uses `tensor_raw_ptr`/`tensor_raw_ptr_mut` for dtype-aware device pointers (cuda_ptr returns null for BF16) |
 | `Abs` | `autograd.rs:2094-2101` | GPU (sign + mul) | Saves input |
 | `Log` | `autograd.rs:2104-2113` | GPU (ones/div/mul) | Saves input |
 | `Softmax` | `autograd.rs:2116-2123` | GPU (autograd_ops_complete::softmax_backward) | Recomputes softmax |
