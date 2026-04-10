@@ -379,6 +379,39 @@ fn can_gpu_multi_axis(ranges: &[(usize, usize)], input_dims: &[usize]) -> bool {
     sliced > 1
 }
 
+/// Get raw device pointer for any dtype (cuda_ptr/cuda_ptr_mut only work for F32).
+fn tensor_raw_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
+    use cudarc::driver::DevicePtr;
+    match &t.storage {
+        TensorStorage::F32 { data, .. } => Ok(*data.device_ptr() as *const core::ffi::c_void),
+        TensorStorage::F16 { data, .. } => Ok(*data.device_ptr() as *const core::ffi::c_void),
+        #[cfg(feature = "bf16_u16")]
+        TensorStorage::BF16 { data, .. } => Ok(*data.device_ptr() as *const core::ffi::c_void),
+        #[cfg(feature = "bf16_u16")]
+        TensorStorage::BF16Arena { ptr, .. } => Ok(ptr.as_ptr() as *const core::ffi::c_void),
+        #[cfg(feature = "bf16_u16")]
+        TensorStorage::BF16View { ptr, .. } => Ok(ptr.as_ptr() as *const core::ffi::c_void),
+        TensorStorage::I32 { data, .. } => Ok(*data.device_ptr() as *const core::ffi::c_void),
+        _ => Err(Error::InvalidOperation("unsupported dtype for raw ptr".into())),
+    }
+}
+
+fn tensor_raw_ptr_mut(t: &mut Tensor) -> Result<*mut core::ffi::c_void> {
+    use cudarc::driver::DevicePtrMut;
+    match &mut t.storage {
+        TensorStorage::F32 { data, .. } => {
+            let slice = crate::tensor_storage::ensure_unique_slice(data)?;
+            Ok(*slice.device_ptr_mut() as *mut core::ffi::c_void)
+        }
+        #[cfg(feature = "bf16_u16")]
+        TensorStorage::BF16 { data, .. } => {
+            let slice = crate::tensor_storage::ensure_unique_slice(data)?;
+            Ok(*slice.device_ptr_mut() as *mut core::ffi::c_void)
+        }
+        _ => Err(Error::InvalidOperation("unsupported dtype for raw ptr mut".into())),
+    }
+}
+
 // Local GPU narrow scatter-add (single-axis). No cross-crate deps.
 fn gpu_scatter_add_narrow(
     grad_out: &Tensor,
@@ -390,6 +423,7 @@ fn gpu_scatter_add_narrow(
 
     let rank = grad_in.shape().dims().len();
     debug_assert_eq!(grad_out.shape().dims().len(), rank);
+    debug_assert_eq!(grad_out.dtype(), grad_in.dtype(), "scatter dtype mismatch");
 
     // out_shape (row-major strides)
     let out_dims = grad_out.shape().dims().to_vec();
@@ -416,10 +450,14 @@ fn gpu_scatter_add_narrow(
     let elem_size: i64 = grad_in.dtype().size_in_bytes() as i64;
     let stream: *mut c_void = grad_in.device().cuda_stream_raw_ptr();
 
+    // Use dtype-aware raw pointers (cuda_ptr/cuda_ptr_mut return null for BF16)
+    let src_ptr = tensor_raw_ptr(grad_out)?;
+    let dst_ptr = tensor_raw_ptr_mut(grad_in)?;
+
     let code = unsafe {
         ffi::narrow_backward_scatter_add_launch(
-            grad_out.cuda_ptr() as *const c_void,
-            grad_in.cuda_ptr_mut() as *mut c_void,
+            src_ptr,
+            dst_ptr,
             rank as i32,
             out_shape.as_ptr(),
             in_strides.as_ptr(),
@@ -2167,11 +2205,11 @@ fn compute_gradients(
             ranges,
             input_shape,
         } => {
-            // Backward for slice: pad output_grad with zeros to reconstruct input shape.
-            // Uses cat-based approach (works with all dtypes, avoids FFI scatter kernel issues).
+            // Backward for slice: scatter output_grad into a zeros tensor at the sliced position.
             let device = device.clone();
-            let in_dims = input_shape.dims();
             let grad_dtype = output_grad.dtype();
+            let mut grad_in = Tensor::zeros_dtype(input_shape.clone(), grad_dtype, device.clone())?;
+            let in_dims = input_shape.dims();
 
             // Detect single-axis narrow
             let mut narrow_dim: Option<(usize, usize, usize)> = None;
@@ -2185,24 +2223,10 @@ fn compute_gradients(
                 }
             }
 
-            if let Some((dim, start, length)) = narrow_dim {
-                let mut parts: Vec<Tensor> = Vec::new();
-                if start > 0 {
-                    let mut pad_shape = output_grad.shape().dims().to_vec();
-                    pad_shape[dim] = start;
-                    parts.push(Tensor::zeros_dtype(crate::Shape::from_dims(&pad_shape), grad_dtype, device.clone())?);
-                }
-                parts.push(output_grad.clone_result()?);
-                let end = start + length;
-                if end < in_dims[dim] {
-                    let mut pad_shape = output_grad.shape().dims().to_vec();
-                    pad_shape[dim] = in_dims[dim] - end;
-                    parts.push(Tensor::zeros_dtype(crate::Shape::from_dims(&pad_shape), grad_dtype, device.clone())?);
-                }
-                let refs: Vec<&Tensor> = parts.iter().collect();
-                let grad_in = Tensor::cat(&refs, dim)?;
+            if let Some((dim, start, _length)) = narrow_dim {
+                gpu_scatter_add_narrow(output_grad, &mut grad_in, dim, start)?;
                 Ok(vec![(*input, grad_in)])
-            } else {
+            } else if can_gpu_multi_axis(ranges, in_dims) {
                 let mut tmp = output_grad.clone_result()?;
                 let mut axes: Vec<(usize, usize, usize)> = Vec::new();
                 for (i, &(s, e)) in ranges.iter().enumerate() {
@@ -2210,22 +2234,31 @@ fn compute_gradients(
                         axes.push((i, s, e - s));
                     }
                 }
-                for (axis, s, len) in axes.into_iter().rev() {
-                    let mut parts: Vec<Tensor> = Vec::new();
-                    if s > 0 {
-                        let mut pad_shape = tmp.shape().dims().to_vec();
-                        pad_shape[axis] = s;
-                        parts.push(Tensor::zeros_dtype(crate::Shape::from_dims(&pad_shape), grad_dtype, device.clone())?);
+                for (axis, s, _len) in axes.into_iter().rev() {
+                    let mut expanded_dims = tmp.shape().dims().to_vec();
+                    expanded_dims[axis] = in_dims[axis];
+                    let expanded_shape = crate::Shape::from_dims(&expanded_dims);
+                    let mut expanded = Tensor::zeros_dtype(expanded_shape, grad_dtype, device.clone())?;
+                    gpu_scatter_add_narrow(&tmp, &mut expanded, axis, s)?;
+                    tmp = expanded;
+                }
+                Ok(vec![(*input, tmp)])
+            } else {
+                // Fallback: same as multi-axis
+                let mut tmp = output_grad.clone_result()?;
+                let mut axes: Vec<(usize, usize, usize)> = Vec::new();
+                for (i, &(s, e)) in ranges.iter().enumerate() {
+                    if !(s == 0 && e == in_dims[i]) {
+                        axes.push((i, s, e - s));
                     }
-                    parts.push(tmp);
-                    let end = s + len;
-                    if end < in_dims[axis] {
-                        let mut pad_shape = parts.last().unwrap().shape().dims().to_vec();
-                        pad_shape[axis] = in_dims[axis] - end;
-                        parts.push(Tensor::zeros_dtype(crate::Shape::from_dims(&pad_shape), grad_dtype, device.clone())?);
-                    }
-                    let refs: Vec<&Tensor> = parts.iter().collect();
-                    tmp = Tensor::cat(&refs, axis)?;
+                }
+                for (axis, s, _len) in axes.into_iter().rev() {
+                    let mut expanded_dims = tmp.shape().dims().to_vec();
+                    expanded_dims[axis] = in_dims[axis];
+                    let expanded_shape = crate::Shape::from_dims(&expanded_dims);
+                    let mut expanded = Tensor::zeros_dtype(expanded_shape, grad_dtype, device.clone())?;
+                    gpu_scatter_add_narrow(&tmp, &mut expanded, axis, s)?;
+                    tmp = expanded;
                 }
                 Ok(vec![(*input, tmp)])
             }
