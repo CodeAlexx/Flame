@@ -1605,14 +1605,9 @@ fn compute_gradients(
 
         Op::RoPePrecomputed { input, cos, sin } => {
             // RoPE is an orthogonal rotation. Backward = apply_rope(grad, cos, -sin).
-            // Uses the same fused CUDA kernel as forward.
             let cos_tensor = fetch_saved(cos)?;
             let sin_tensor = fetch_saved(sin)?;
-
-            // Negate sin for the inverse rotation
             let neg_sin = GpuOps::mul_scalar(&sin_tensor, -1.0)?;
-
-            // Call fused kernel: apply_rope(grad, cos, -sin)
             let grad_input = crate::attention::rope::apply_rope_precomputed(
                 output_grad, &cos_tensor, &neg_sin,
             )?;
@@ -2847,8 +2842,14 @@ fn reduce_grad_for_broadcast(grad: &Tensor, target_shape: &Shape) -> Result<Tens
         padded_td[g_rank - t_rank + i] = td[i];
     }
 
-    // Use sum_dim_keepdim to reduce broadcast dims (preserves rank).
-    let mut result = grad.clone_result()?;
+    // Upcast to F32 before summing — BF16 overflows when reducing large dims
+    // (e.g., summing 24×768=18432 elements exceeds BF16 max ~65504).
+    let orig_dtype = grad.dtype();
+    let mut result = if orig_dtype != DType::F32 {
+        grad.to_dtype(DType::F32)?
+    } else {
+        grad.clone_result()?
+    };
     for axis in 0..g_rank {
         if padded_td[axis] == 1 && gd[axis] != 1 {
             result = result.sum_dim_keepdim(axis)?;
@@ -2856,7 +2857,12 @@ fn reduce_grad_for_broadcast(grad: &Tensor, target_shape: &Shape) -> Result<Tens
     }
 
     // Reshape to exact target dims (drops leading 1s if target has lower rank)
-    result.reshape(&td)
+    let mut result = result.reshape(&td)?;
+    // Cast back to original dtype
+    if result.dtype() != orig_dtype {
+        result = result.to_dtype(orig_dtype)?;
+    }
+    Ok(result)
 }
 
 /// ReLU backward pass
