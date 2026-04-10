@@ -1000,6 +1000,10 @@ impl AutogradContext {
             let mut total_kernel_time = std::time::Duration::ZERO;
             let mut total_accum_time = std::time::Duration::ZERO;
             let mut slowest_nodes: Vec<(std::time::Duration, String)> = Vec::new();
+            // Per-op-kind time aggregation for profiling the backward pass.
+            // Keyed by the numeric discriminant of Op so we can decode in logs.
+            let mut per_op_time: std::collections::HashMap<u64, (std::time::Duration, usize)> =
+                std::collections::HashMap::new();
 
             eprintln!("[backward] tape len={}, starting reverse walk", tape_len);
             let backward_result: Result<()> = (|| {
@@ -1022,6 +1026,12 @@ impl AutogradContext {
                             eprintln!("[bwd] #{}/{} dt={:.1}ms grads_in_map={}", nodes_executed, tape_len, kernel_dt.as_secs_f64() * 1000.0, gradients.len());
                         }
                         total_kernel_time += kernel_dt;
+                        // Aggregate by op kind.
+                        let disc_u64: u64 =
+                            unsafe { std::mem::transmute::<_, u64>(std::mem::discriminant(&entry.op)) };
+                        let e = per_op_time.entry(disc_u64).or_insert((std::time::Duration::ZERO, 0));
+                        e.0 += kernel_dt;
+                        e.1 += 1;
 
                         // Accumulate gradients (skip frozen weight IDs to save memory).
                         // Checkpoint backward returns ALL internal gradients (including
@@ -1131,6 +1141,22 @@ impl AutogradContext {
                         };
                         eprintln!("[cuda_graph] {} step complete, next step will capture", phase_name);
                     }
+                }
+            }
+
+            // Per-op-kind summary — always emit, cheap and critical for audit.
+            if !capturing && !per_op_time.is_empty() {
+                let mut sorted: Vec<_> = per_op_time.iter().collect();
+                sorted.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+                eprintln!("[bwd:per-op] top 8 by total time across {} nodes:", nodes_executed);
+                for (disc, (dt, n)) in sorted.iter().take(8) {
+                    eprintln!(
+                        "  disc={:<4} total={:6.1}ms  count={:4}  avg={:5.2}ms",
+                        disc,
+                        dt.as_secs_f64() * 1000.0,
+                        n,
+                        dt.as_secs_f64() * 1000.0 / (*n as f64).max(1.0)
+                    );
                 }
             }
 
@@ -1421,8 +1447,49 @@ fn compute_gradients(
             let rhs_tensor = &fetch_saved(rhs)?;
             let og_dtype = output_grad.dtype();
 
-            // grad_lhs = output_grad @ rhs^T
-            // Cast rhs to match output_grad dtype, keep BF16 fast-path for transpose
+            // Fast path: BF16 2D. Use cuBLASLt with trans flags so neither
+            // operand materializes a transpose. This is the dominant backward
+            // for Linear layers in Klein/Flux DiT blocks — old path used
+            // `transpose2d_bf16` which was a full BF16 memcpy per call, 2× per
+            // MatMul backward. New path: 0 transposes.
+            //
+            // The incoming grad is F32 (gradient::accumulate upcasts everything
+            // to F32 for stability). Cast it down to BF16 for the fused kernel.
+            // cuBLASLt gemm internally accumulates in F32, so this cast only
+            // affects the INPUT grad precision, not the math.
+            #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+            if lhs_tensor.dtype() == DType::BF16
+                && rhs_tensor.dtype() == DType::BF16
+                && lhs_tensor.rank() == 2
+                && rhs_tensor.rank() == 2
+                && output_grad.rank() == 2
+            {
+                let grad_bf16_owned;
+                let grad_bf16: &Tensor = if output_grad.dtype() == DType::BF16 {
+                    output_grad
+                } else {
+                    grad_bf16_owned = output_grad.to_dtype(DType::BF16)?;
+                    &grad_bf16_owned
+                };
+                // grad_lhs = output_grad @ rhs^T
+                let grad_lhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                    grad_bf16,
+                    rhs_tensor,
+                    false,
+                    true,
+                )?;
+                // grad_rhs = lhs^T @ output_grad
+                let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                    lhs_tensor,
+                    grad_bf16,
+                    true,
+                    false,
+                )?;
+                return Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+            }
+
+            // Slow / fallback path (non-BF16, non-2D, mixed dtype): materialize
+            // transposes and call GpuOps::matmul as before.
             let rhs_for_grad = if rhs_tensor.dtype() != og_dtype {
                 let cast = rhs_tensor.to_dtype(og_dtype)?;
                 GpuOps::transpose(&cast)?
@@ -1433,7 +1500,6 @@ fn compute_gradients(
             };
             let grad_lhs = GpuOps::matmul(output_grad, &rhs_for_grad)?;
 
-            // grad_rhs = lhs^T @ output_grad
             let lhs_for_grad = if lhs_tensor.dtype() != og_dtype {
                 let cast = lhs_tensor.to_dtype(og_dtype)?;
                 GpuOps::transpose(&cast)?
