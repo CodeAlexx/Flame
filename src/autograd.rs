@@ -1835,7 +1835,6 @@ fn compute_gradients(
             input,
             normalized_shape,
         } => {
-            // Use the complete LayerNorm backward implementation
             let input_tensor = entry
                 .get_saved(input)
                 .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for input".into()))?;
@@ -1844,28 +1843,31 @@ fn compute_gradients(
                 input_tensor,
             )?;
 
-            // Support for affine LayerNorm with weight and bias
-            let mean = input_tensor.mean_dims(normalized_shape, true)?;
-            let var = input_tensor.var_dims(normalized_shape, true, true)?;
-            let normalized = input_tensor
-                .sub(&mean)?
-                .div(&var.add_scalar(1e-5)?.sqrt()?)?;
-
-            // Check if weight and bias tensors were saved (affine=true)
-            // For LayerNorm with affine parameters, we just need to know if they exist
-            let has_affine = entry.saved_tensors.len() > 1;
-
+            // Always take the BF16 fast kernel. The incoming grad arrives as
+            // F32 (gradient::accumulate upcasts), so cast it back to BF16 —
+            // the fused kernel does F32 math internally for stability.
+            let grad_bf16_owned;
+            let grad_bf16: &Tensor = if output_grad.dtype() == DType::BF16 {
+                output_grad
+            } else {
+                grad_bf16_owned = output_grad.to_dtype(DType::BF16)?;
+                &grad_bf16_owned
+            };
+            let input_bf16_owned;
+            let input_bf16: &Tensor = if input_tensor.dtype() == DType::BF16 {
+                input_tensor
+            } else {
+                input_bf16_owned = input_tensor.to_dtype(DType::BF16)?;
+                &input_bf16_owned
+            };
             let (grad_input, grad_weight, grad_bias) =
-                crate::autograd_ops_complete::layer_norm_backward(
-                    output_grad,
-                    input_tensor,
-                    &normalized,
-                    None, // weight not available in this context
-                    None, // bias not available in this context
-                    &mean,
-                    &var,
+                crate::cuda_ops_bf16::layer_norm_backward_bf16(
+                    input_bf16,
+                    grad_bf16,
+                    None, // weight: TODO lookup from saved[1]
+                    None, // bias: TODO lookup from saved[2]
                     normalized_shape,
-                    1e-5, // eps
+                    1e-5, // eps (match forward)
                 )?;
 
             let grad_input = ensure_bf16(grad_input)?;

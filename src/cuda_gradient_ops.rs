@@ -3,7 +3,32 @@
 
 use crate::{cuda_kernel_compiler::compile_cuda_kernel, Error, Result, Tensor};
 use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Process-wide cache of `CudaGradientOps` keyed by device ordinal.
+/// The NVRTC compile in `ensure_kernels()` takes ~40ms, and before
+/// caching this was called ~124× per step during gradient clipping,
+/// adding ~5s/step of pure PTX compile overhead to Klein training.
+/// Now it's called once per device per process.
+static GRADIENT_OPS_CACHE: OnceLock<Mutex<Vec<(usize, Arc<CudaGradientOps>)>>> =
+    OnceLock::new();
+
+/// Return a cached `CudaGradientOps` for the given device, compiling the
+/// PTX on first use. Safe to call from any callsite — no per-step overhead
+/// after the first call.
+pub fn cached_gradient_ops(device: &Arc<CudaDevice>) -> Result<Arc<CudaGradientOps>> {
+    let cache = GRADIENT_OPS_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let ordinal = device.ordinal();
+    let mut guard = cache.lock().map_err(|_| {
+        Error::InvalidOperation("cached_gradient_ops: poisoned mutex".into())
+    })?;
+    if let Some((_, ops)) = guard.iter().find(|(ord, _)| *ord == ordinal) {
+        return Ok(ops.clone());
+    }
+    let ops = Arc::new(CudaGradientOps::new(device.clone())?);
+    guard.push((ordinal, ops.clone()));
+    Ok(ops)
+}
 
 // Helper macro for kernel launches
 macro_rules! launch_kernel {
@@ -339,7 +364,9 @@ impl CudaGradientOps {
 
         launch_kernel!(f2, cfg2, &partial_sums, &norm_result, num_blocks as i32)?;
 
-        self.device.synchronize()?;
+        // No explicit synchronize — `dtoh_sync_copy` below does a full
+        // stream sync as part of the copy. The extra synchronize was a
+        // pure waste (second round-trip through the driver per grad).
 
         // Copy result back
         let norm_host: Vec<f32> = self.device.dtoh_sync_copy(&norm_result)?;

@@ -66,44 +66,45 @@ impl GradientClipper {
     fn clip_grads_by_norm(&self, grads: &mut [&mut Tensor], max_norm: f32) -> Result<f32> {
         // Compute total norm
         let total_norm = self.compute_grad_norm(grads)?;
-        
+
         if total_norm > max_norm {
             // Scale all gradients
             let scale_factor = max_norm / total_norm;
-            
+
             for grad in grads {
                 **grad = grad.mul_scalar(scale_factor)?;
             }
         }
-        
+
         Ok(total_norm)
     }
-    
+
     /// Clip gradients element-wise by value
     fn clip_grads_by_value(&self, grads: &mut [&mut Tensor], min_value: f32, max_value: f32) -> Result<f32> {
+        if grads.is_empty() {
+            return Ok(0.0);
+        }
+        let ops = crate::cuda_gradient_ops::cached_gradient_ops(grads[0].device())?;
         let mut total_norm_sq = 0.0f32;
-
         for grad in grads {
             let grad_tensor: &mut Tensor = *grad;
-            let mut ops = CudaGradientOps::new(grad_tensor.device().clone())?;
             let norm = ops.compute_l2_norm(grad_tensor)?;
             total_norm_sq += norm * norm;
             ops.clamp_tensor(grad_tensor, min_value, max_value)?;
         }
         Ok(total_norm_sq.sqrt())
     }
-    
+
     /// Adaptive gradient clipping (based on parameter norm)
     fn adaptive_clip_grads(&self, grads: &mut [&mut Tensor], clip_factor: f32) -> Result<f32> {
-        // For adaptive clipping, we need both gradients and parameters
-        // Implement gradient clipping by global norm on FP32 grads
-        // that clips based on gradient statistics
-
+        if grads.is_empty() {
+            return Ok(0.0);
+        }
+        let ops = crate::cuda_gradient_ops::cached_gradient_ops(grads[0].device())?;
         let mut total_norm = 0.0f32;
 
         for grad in grads.iter_mut() {
             let grad_tensor: &mut Tensor = *grad;
-            let mut ops = CudaGradientOps::new(grad_tensor.device().clone())?;
             let grad_norm = ops.compute_l2_norm(grad_tensor)?;
 
             if grad_norm > 0.0 {
@@ -126,17 +127,20 @@ impl GradientClipper {
 
         Ok(total_norm.sqrt())
     }
-    
-    /// Compute the global norm of gradients
-    pub fn compute_grad_norm(&self, grads: &[&mut Tensor]) -> Result<f32> {
-        let mut total_norm_sq = 0.0f32;
 
+    /// Compute the global norm of gradients.
+    /// Uses a process-wide cached `CudaGradientOps` so the NVRTC compile
+    /// (~40ms) only happens once per process, not once per gradient.
+    pub fn compute_grad_norm(&self, grads: &[&mut Tensor]) -> Result<f32> {
+        if grads.is_empty() {
+            return Ok(0.0);
+        }
+        let ops = crate::cuda_gradient_ops::cached_gradient_ops(grads[0].device())?;
+        let mut total_norm_sq = 0.0f32;
         for grad in grads {
-            let mut ops = CudaGradientOps::new(grad.device().clone())?;
             let norm = ops.compute_l2_norm(grad)?;
             total_norm_sq += norm * norm;
         }
-
         Ok(total_norm_sq.sqrt())
     }
 }
@@ -153,19 +157,22 @@ impl LayerWiseGradientClipper {
     
     /// Clip each gradient independently by its norm
     pub fn clip_grads(&self, grads: &mut [&mut Tensor]) -> Result<Vec<f32>> {
+        if grads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ops = crate::cuda_gradient_ops::cached_gradient_ops(grads[0].device())?;
         let mut layer_norms = Vec::new();
-        
+
         for grad in grads {
-            let mut ops = CudaGradientOps::new(grad.device().clone())?;
             let norm = ops.compute_l2_norm(grad)?;
             layer_norms.push(norm);
-            
+
             if norm > self.max_norm_per_layer {
                 let scale = self.max_norm_per_layer / norm;
                 **grad = grad.mul_scalar(scale)?;
             }
         }
-        
+
         Ok(layer_norms)
     }
 }
