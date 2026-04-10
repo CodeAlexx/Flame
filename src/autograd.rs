@@ -798,6 +798,25 @@ impl AutogradContext {
                 CompactIndex::from_tensor_ids(id_iter)
             };
 
+            // Build set of tensor IDs that actually need gradients:
+            // - All output_ids (intermediate chain nodes — backward needs to find them)
+            // - Saved tensor IDs where requires_grad=true (trainable parameters)
+            // Frozen weight IDs are excluded → their gradients are not accumulated,
+            // saving significant GPU memory during backward.
+            let needed_grad_ids: std::collections::HashSet<TensorId> = {
+                let mut ids = std::collections::HashSet::new();
+                ids.insert(loss.id);
+                for e in ctx.tape.iter() {
+                    ids.insert(e.output_id);
+                    for (tid, tensor) in &e.saved_tensors {
+                        if tensor.requires_grad() {
+                            ids.insert(*tid);
+                        }
+                    }
+                }
+                ids
+            };
+
             // Initialize gradient storage with compact index for O(1) Vec-based access
             let mut gradients = GradientMap::with_index(device.clone(), compact_index);
             gradients.set_ones(loss.id, loss.shape.clone())?;
@@ -938,13 +957,13 @@ impl AutogradContext {
                         }
                         total_kernel_time += kernel_dt;
 
-                        // Accumulate gradients
+                        // Accumulate gradients (skip frozen weight IDs to save memory)
                         let t_accum = std::time::Instant::now();
                         for (tensor_id, grad) in input_grads {
-                            if let Err(e) = gradients.accumulate(tensor_id, grad) {
-                                eprintln!("[bwd:ACCUM_ERR] #{} {:?}: {e:?}", nodes_executed, std::mem::discriminant(&entry.op));
-                                return Err(e);
+                            if needed_grad_ids.contains(&tensor_id) {
+                                gradients.accumulate(tensor_id, grad)?;
                             }
+                            // else: gradient for frozen weight — drop it
                         }
                         total_accum_time += t_accum.elapsed();
 
