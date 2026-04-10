@@ -288,6 +288,13 @@ pub enum Op {
         /// Number of tape entries the original forward produced (for validation).
         original_tape_len: usize,
     },
+    /// Fused RoPE with precomputed cos/sin.
+    /// Backward: apply_rope(grad, cos, -sin) via same fused kernel.
+    RoPePrecomputed {
+        input: TensorId,
+        cos: TensorId,
+        sin: TensorId,
+    },
 }
 
 /// Entry in the computation tape
@@ -828,6 +835,9 @@ impl AutogradContext {
                             }
                             Op::SageAttention { query_id, key_id, value_id, .. } => {
                                 ids.push(*query_id); ids.push(*key_id); ids.push(*value_id);
+                            }
+                            Op::RoPePrecomputed { input, cos, sin } => {
+                                ids.push(*input); ids.push(*cos); ids.push(*sin);
                             }
                         }
                         ids
@@ -1593,6 +1603,22 @@ fn compute_gradients(
             Ok(result)
         }
 
+        Op::RoPePrecomputed { input, cos, sin } => {
+            // RoPE is an orthogonal rotation. Backward = apply_rope(grad, cos, -sin).
+            // Uses the same fused CUDA kernel as forward.
+            let cos_tensor = fetch_saved(cos)?;
+            let sin_tensor = fetch_saved(sin)?;
+
+            // Negate sin for the inverse rotation
+            let neg_sin = GpuOps::mul_scalar(&sin_tensor, -1.0)?;
+
+            // Call fused kernel: apply_rope(grad, cos, -sin)
+            let grad_input = crate::attention::rope::apply_rope_precomputed(
+                output_grad, &cos_tensor, &neg_sin,
+            )?;
+            Ok(vec![(*input, grad_input)])
+        }
+
         Op::Mean { input, input_shape } => {
             // d/dx mean(x) = 1/n for each element
             let n = input_shape.elem_count() as f32;
@@ -1922,8 +1948,8 @@ fn compute_gradients(
             // d/dy (x/y) = -x/y^2
             let lhs_tensor = fetch_saved(lhs)?;
             let rhs_tensor = fetch_saved(rhs)?;
-            guard_tensor("AutogradContext::div_backward lhs", &lhs_tensor)?;
-            guard_tensor("AutogradContext::div_backward rhs", &rhs_tensor)?;
+            // No dtype guard — saved tensors may be F32 (e.g., from head_rms_norm).
+            // GpuOps handles mixed BF16/F32 internally.
 
             // Broadcast saved tensors to output shape for correct gradient computation
             let lhs_bc = if lhs_tensor.shape() != output_grad.shape() {
@@ -2821,46 +2847,15 @@ fn reduce_grad_for_broadcast(grad: &Tensor, target_shape: &Shape) -> Result<Tens
         padded_td[g_rank - t_rank + i] = td[i];
     }
 
-    // Reduce over axes where target had size 1 but grad had >1
+    // Use sum_dim_keepdim to reduce broadcast dims (preserves rank).
     let mut result = grad.clone_result()?;
-    let mut cur_rank = g_rank;
-    let mut axis = 0usize;
-    while axis < cur_rank {
-        let cur_dims = result.shape().dims().to_vec();
-        let tdim = padded_td[axis];
-        let gdim = cur_dims[axis];
-        if tdim == 1 && gdim != 1 {
-            result = result.sum_dim(axis)?; // removes this axis
-                                            // After removal, ranks shift left; keep axis the same
-            cur_rank -= 1;
-            // No axis += 1 here
-        } else {
-            axis += 1;
+    for axis in 0..g_rank {
+        if padded_td[axis] == 1 && gd[axis] != 1 {
+            result = result.sum_dim_keepdim(axis)?;
         }
     }
 
-    // Now result has same rank as grad minus reduced axes. Reshape to padded_td (with 1s)
-    // Build shape after reductions: for each axis in g_rank, keep dim if padded_td[axis] != 1 else 1
-    // But since we removed axes where padded_td==1 and gdim>1, the remaining axes map to those with either padded_td!=1 or gdim==1.
-    // Construct the final padded shape by iterating padded_td and taking either target dim or 1; then drop leading ones to match td rank.
-    let mut final_padded: Vec<usize> = padded_td.clone();
-    // Ensure total elements match before reshape to td
-    result = if final_padded.len() != result.shape().dims().len() {
-        // Rebuild by inserting size-1 dims where needed
-        // Current result rank equals number of axes where not reduced.
-        // We'll expand result by adding size-1 dims on the left until ranks match.
-        let mut need = final_padded.len() - result.shape().dims().len();
-        let mut shape = result.shape().dims().to_vec();
-        while need > 0 {
-            shape.insert(0, 1);
-            need -= 1;
-        }
-        result.reshape(&shape)?
-    } else {
-        result
-    };
-
-    // Finally, reshape to exact target dims
+    // Reshape to exact target dims (drops leading 1s if target has lower rank)
     result.reshape(&td)
 }
 

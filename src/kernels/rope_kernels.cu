@@ -134,3 +134,70 @@ extern "C" int flame_rope_apply_bf16_fp32(
 
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
+
+// ── Precomputed cos/sin variant ──────────────────────────────────────
+// Input x: [B, H, S, D] BF16 (D = full head dim, rotation applies to all D)
+// cos/sin: [1, H, S, D/2] BF16 (pre-expanded to H heads)
+// Output: [B, H, S, D] BF16
+// Layout: x[:, :, :, :half] * cos - x[:, :, :, half:] * sin  (first half)
+//         x[:, :, :, :half] * sin + x[:, :, :, half:] * cos  (second half)
+
+namespace {
+
+__global__ void rope_precomputed_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ cos_buf,
+    const __nv_bfloat16* __restrict__ sin_buf,
+    __nv_bfloat16* __restrict__ out,
+    int B, int H, int S, int D)
+{
+    int half = D / 2;
+    int total = B * H * S * half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int p = idx % half;       // pair index within head
+    int tmp = idx / half;
+    int s = tmp % S;
+    tmp /= S;
+    int h = tmp % H;
+    int b = tmp / H;
+
+    int base = ((b * H + h) * S + s) * D;
+    int cs_base = (h * S + s) * half;  // cos/sin: [H, S, half] (batch dim broadcast)
+
+    float x0 = __bfloat162float(x[base + p]);
+    float x1 = __bfloat162float(x[base + half + p]);
+    float c  = __bfloat162float(cos_buf[cs_base + p]);
+    float sn = __bfloat162float(sin_buf[cs_base + p]);
+
+    out[base + p]        = __float2bfloat16_rn(x0 * c - x1 * sn);
+    out[base + half + p] = __float2bfloat16_rn(x0 * sn + x1 * c);
+}
+
+} // namespace
+
+extern "C" int flame_rope_precomputed_bf16(
+    const void* x,
+    const void* cos_buf,
+    const void* sin_buf,
+    void* out,
+    int B, int H, int S, int D,
+    cudaStream_t stream)
+{
+    if (D <= 0 || (D % 2) != 0) return 1;
+
+    int half = D / 2;
+    int total = B * H * S * half;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+
+    rope_precomputed_kernel<<<grid, block, 0, stream>>>(
+        (const __nv_bfloat16*)x,
+        (const __nv_bfloat16*)cos_buf,
+        (const __nv_bfloat16*)sin_buf,
+        (__nv_bfloat16*)out,
+        B, H, S, D);
+
+    return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}

@@ -235,6 +235,18 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    pub fn flame_rope_precomputed_bf16(
+        x: *const core::ffi::c_void,
+        cos_buf: *const core::ffi::c_void,
+        sin_buf: *const core::ffi::c_void,
+        out: *mut core::ffi::c_void,
+        B: i32,
+        H: i32,
+        S: i32,
+        D: i32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     pub fn flame_apply_causal_mask_fp32(
         scores: *mut f32,
         B: i32,
