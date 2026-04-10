@@ -439,7 +439,7 @@ impl Tensor {
 
                 for tensor in tensors {
                     let id = tensor.id;
-                    saved_tensors.push((id, (*tensor).clone_result()?));
+                    saved_tensors.push((id, (*tensor).alias()));
                     input_ids.push(id);
                 }
 
@@ -513,8 +513,8 @@ impl Tensor {
                             dim,
                         },
                         vec![
-                            (self.id, self.clone_result()?),
-                            (indices.id(), indices.clone_result()?),
+                            (self.id, self.alias()),
+                            (indices.id(), indices.alias()),
                         ],
                     );
                 }
@@ -535,8 +535,8 @@ impl Tensor {
                         dim,
                     },
                     vec![
-                        (self.id, self.clone_result()?),
-                        (indices.id(), indices.clone_result()?),
+                        (self.id, self.alias()),
+                        (indices.id(), indices.alias()),
                     ],
                 );
             }
@@ -636,8 +636,8 @@ impl Tensor {
                         b: other.id,
                     },
                     vec![
-                        (self.id, self.clone_result()?),
-                        (other.id, other.clone_result()?),
+                        (self.id, self.alias()),
+                        (other.id, other.alias()),
                     ],
                 );
             }
@@ -679,8 +679,8 @@ impl Tensor {
                         b: other.id,
                     },
                     vec![
-                        (self.id, self.clone_result()?),
-                        (other.id, other.clone_result()?),
+                        (self.id, self.alias()),
+                        (other.id, other.alias()),
                     ],
                 );
             }
@@ -712,7 +712,7 @@ impl Tensor {
                 AutogradContext::record_op(
                     output.id,
                     Op::SumDimKeepdim { input: self.id, dim },
-                    vec![(self.id, self.clone_result()?)],
+                    vec![(self.id, self.alias())],
                 );
             }
         }
@@ -993,7 +993,7 @@ impl Tensor {
                         input: self.id,
                         dim: dim as isize,
                     },
-                    vec![(self.id, self.clone_result()?)],
+                    vec![(self.id, self.alias())],
                 );
             }
         }
@@ -1132,7 +1132,7 @@ impl Tensor {
                             sizes: sizes.to_vec(),
                             dim,
                         },
-                        vec![(self.id, self.clone_result()?)],
+                        vec![(self.id, self.alias())],
                     );
                 }
             }

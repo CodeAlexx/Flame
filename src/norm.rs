@@ -1084,9 +1084,9 @@ impl RMSNorm {
         if needs_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
-                let mut saved_tensors = vec![(input.id, input.clone_result()?)];
+                let mut saved_tensors = vec![(input.id, input.alias())];
                 if let Some(w) = &self.weight {
-                    saved_tensors.push((w.id, w.clone_result()?));
+                    saved_tensors.push((w.id, w.alias()));
                 }
 
                 let batch_size = artifacts.inv_rms.len();

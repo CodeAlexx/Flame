@@ -42,8 +42,8 @@ pub fn mse_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
                     num_elements: predictions.shape.elem_count(),
                 },
                 vec![
-                    (predictions.id, predictions.clone_result()?),
-                    (targets.id, targets.clone_result()?),
+                    (predictions.id, predictions.alias()),
+                    (targets.id, targets.alias()),
                 ],
             );
         }
@@ -116,8 +116,8 @@ pub fn l1_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
                     num_elements: predictions.shape.elem_count(),
                 },
                 vec![
-                    (predictions.id, predictions.clone_result()?),
-                    (targets.id, targets.clone_result()?),
+                    (predictions.id, predictions.alias()),
+                    (targets.id, targets.alias()),
                 ],
             );
         }
@@ -187,8 +187,8 @@ pub fn huber_loss(predictions: &Tensor, targets: &Tensor, delta: f32) -> Result<
                     num_elements: predictions.shape.elem_count(),
                 },
                 vec![
-                    (predictions.id, predictions.clone_result()?),
-                    (targets.id, targets.clone_result()?),
+                    (predictions.id, predictions.alias()),
+                    (targets.id, targets.alias()),
                 ],
             );
         }
@@ -239,8 +239,8 @@ pub fn binary_cross_entropy(predictions: &Tensor, targets: &Tensor) -> Result<Te
                     num_elements: predictions.shape.elem_count(),
                 },
                 vec![
-                    (predictions.id, predictions.clone_result()?),
-                    (targets.id, targets.clone_result()?),
+                    (predictions.id, predictions.alias()),
+                    (targets.id, targets.alias()),
                 ],
             );
         }
@@ -309,8 +309,8 @@ pub fn nll_loss(log_probs: &Tensor, targets: &Tensor) -> Result<Tensor> {
                     batch_size,
                 },
                 vec![
-                    (log_probs.id, log_probs.clone_result()?),
-                    (targets.id, targets.clone_result()?),
+                    (log_probs.id, log_probs.alias()),
+                    (targets.id, targets.alias()),
                 ],
             );
         }

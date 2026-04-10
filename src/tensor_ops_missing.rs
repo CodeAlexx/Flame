@@ -17,7 +17,7 @@ impl Tensor {
                 AutogradContext::record_op(
                     output.id,
                     Op::Square { input: self.id }, // Using Square for now
-                    vec![(self.id, self.clone_result()?)],
+                    vec![(self.id, self.alias())],
                 );
             }
         }
@@ -36,7 +36,7 @@ impl Tensor {
                 AutogradContext::record_op(
                     output.id,
                     Op::Abs { input: self.id }, // Pending: add Sin op
-                    vec![(self.id, self.clone_result()?)],
+                    vec![(self.id, self.alias())],
                 );
             }
         }
@@ -55,7 +55,7 @@ impl Tensor {
                 AutogradContext::record_op(
                     output.id,
                     Op::Abs { input: self.id }, // Pending: add Cos op
-                    vec![(self.id, self.clone_result()?)],
+                    vec![(self.id, self.alias())],
                 );
             }
         }
@@ -348,7 +348,7 @@ impl Tensor {
                             input: self.id,
                             repeats: repeats.to_vec(),
                         },
-                        vec![(self.id, self.clone_result()?)],
+                        vec![(self.id, self.alias())],
                     );
                 }
             }

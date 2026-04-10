@@ -92,7 +92,7 @@ pub fn sum_dim_keepdim_as(x: &Tensor, dim: usize, out_dtype: DType) -> Result<Te
             AutogradContext::record_op(
                 out.id,
                 Op::SumDimKeepdim { input: x.id(), dim },
-                vec![(x.id(), x.clone_result()?)],
+                vec![(x.id(), x.alias())],
             );
         }
     }
