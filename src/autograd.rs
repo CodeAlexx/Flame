@@ -506,8 +506,6 @@ pub fn backward(loss: &Tensor, _retain_graph: bool) -> Result<crate::GradientMap
 // SDPA backward (recompute path)
 /// SDPA backward via recompute. If `cached_attn` is Some, uses it directly
 /// as the softmax output — skipping the Q@K^T + softmax recompute entirely.
-/// This is the ~500ms/step win for Klein 9B: attn shape is [bh, q_len, k_len],
-/// 4D inputs are reshaped to match before bmm.
 fn attention_backward_recompute(
     q: &Tensor,
     k: &Tensor,
@@ -523,8 +521,6 @@ fn attention_backward_recompute(
     let v = if v.dtype() != DType::BF16 { &v.to_dtype(DType::BF16)? } else { v };
     let dout = if dout.dtype() != DType::BF16 { &dout.to_dtype(DType::BF16)? } else { dout };
 
-    // attn: either the cached softmax output from forward, or recompute
-    // from Q, K. Cached is [bh, q_len, k_len] (3D); recompute produces same.
     let attn_owned;
     let attn: &Tensor = if let Some(cached) = cached_attn {
         let cached = if cached.dtype() != DType::BF16 {
@@ -535,7 +531,6 @@ fn attention_backward_recompute(
         };
         cached
     } else {
-        // Recompute fallback: logits = (Q K^T) * scale, then softmax
         let kt = k.transpose_dims(2, 3)?;
         let mut logits = q.bmm(&kt)?;
         logits = logits.mul_scalar(scale)?;
@@ -546,19 +541,14 @@ fn attention_backward_recompute(
         &attn_owned
     };
 
-    // dV = attn^T @ dO
     let d_v = attn.transpose_dims(2, 3)?.bmm(dout)?;
-
-    // dAttn = dO @ V^T
     let d_attn = dout.bmm(&v.transpose_dims(2, 3)?)?;
 
-    // softmax backward: d_logits = (dAttn - sum(dAttn*attn, -1, keepdim)) * attn
     let dattn_times_attn = d_attn.mul(attn)?;
     let sum_term = dattn_times_attn.sum_dim_keepdim(3)?;
     let d_logits = d_attn.sub(&sum_term)?.mul(attn)?;
     let d_logits = d_logits.mul_scalar(scale)?;
 
-    // dQ = d_logits @ K, dK = d_logits^T @ Q
     let d_q = d_logits.bmm(k)?;
     let d_k = d_logits.transpose_dims(2, 3)?.bmm(q)?;
 
@@ -2035,11 +2025,37 @@ fn compute_gradients(
         }
 
         Op::BatchMatMul { lhs, rhs } => {
-            // Similar to MatMul but preserves batch dimension
             let lhs_tensor = &fetch_saved(lhs)?;
             let rhs_tensor = &fetch_saved(rhs)?;
 
-            // Ensure matching dtypes
+            // Fast path: BF16 3D. Single cuBLASLt strided-batched call per
+            // grad, no materialized transposes. Used when Op::BatchMatMul
+            // appears on the outer tape (most paths now use bmm inline in
+            // attention_backward_recompute, which has its own fast path).
+            #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+            if lhs_tensor.dtype() == DType::BF16
+                && rhs_tensor.dtype() == DType::BF16
+                && lhs_tensor.rank() == 3
+                && rhs_tensor.rank() == 3
+                && output_grad.rank() == 3
+            {
+                let grad_bf16_owned;
+                let grad_bf16: &Tensor = if output_grad.dtype() == DType::BF16 {
+                    output_grad
+                } else {
+                    grad_bf16_owned = output_grad.to_dtype(DType::BF16)?;
+                    &grad_bf16_owned
+                };
+                let grad_lhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                    grad_bf16, rhs_tensor, false, true,
+                )?;
+                let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                    lhs_tensor, grad_bf16, true, false,
+                )?;
+                return Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+            }
+
+            // Fallback: materialize transposes via transpose_batch().
             let og_dtype = output_grad.dtype();
             let rhs_matched = if rhs_tensor.dtype() != og_dtype {
                 rhs_tensor.to_dtype(og_dtype)?
