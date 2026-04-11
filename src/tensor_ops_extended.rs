@@ -418,7 +418,10 @@ impl Tensor {
                         }
                         prefix_rows += info.rows;
                     }
-                    device.synchronize()?;
+                    // Copies are enqueued on the tensor's CUDA stream. Subsequent
+                    // consumers of `output` use that same stream, so CUDA stream
+                    // ordering is sufficient here; an explicit device-wide sync
+                    // just turns queued work into artificial `cat` latency.
                 }
             }
             other => {

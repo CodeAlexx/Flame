@@ -811,11 +811,15 @@ pub(crate) fn rms_norm_backward(
     inv_rms: &Tensor,
     normalized_shape: &[usize],
 ) -> Result<(Tensor, Option<Tensor>)> {
-    if grad_out.dtype() != DType::BF16 || grad_out.storage.dtype() != DType::BF16 {
-        return Err(Error::InvalidInput(
-            "RMSNorm backward expects BF16 grad_out storage".into(),
-        ));
-    }
+    let grad_out_bf16_owned;
+    let grad_out_bf16: &Tensor = if grad_out.dtype() == DType::BF16
+        && grad_out.storage.dtype() == DType::BF16
+    {
+        grad_out
+    } else {
+        grad_out_bf16_owned = grad_out.to_dtype(DType::BF16)?;
+        &grad_out_bf16_owned
+    };
     if input.dtype() != DType::BF16 || input.storage.dtype() != DType::BF16 {
         return Err(Error::InvalidInput(
             "RMSNorm backward expects BF16 input storage".into(),
@@ -843,7 +847,7 @@ pub(crate) fn rms_norm_backward(
     }
 
     let (grad_input, grad_weight_f32) =
-        rms_norm_backward_bf16(grad_out, input, weight, inv_rms, batch_size, norm_size)?;
+        rms_norm_backward_bf16(grad_out_bf16, input, weight, inv_rms, batch_size, norm_size)?;
 
     let grad_weight_tensor = if let Some(data) = grad_weight_f32 {
         let device = input.device.clone();
@@ -874,6 +878,7 @@ fn rms_norm_backward_bf16(
     norm_size: usize,
 ) -> Result<(Tensor, Option<CudaSlice<f32>>)> {
     use crate::cuda_kernels::CudaKernels;
+    use cudarc::driver::DevicePtr;
 
     let device = input.device();
     CudaKernels::ensure_kernel(device, "rms_norm_backward_bf16", RMS_NORM_BWD_KERNEL_BF16)?;
@@ -895,6 +900,10 @@ fn rms_norm_backward_bf16(
         shared_mem_bytes: 0,
     };
 
+    let grad_out_ptr = grad_out.as_device_ptr_bf16("rms_norm_backward_bf16:grad_out")? as u64;
+    let input_ptr = input.as_device_ptr_bf16("rms_norm_backward_bf16:input")? as u64;
+    let grad_input_ptr = *grad_input_data.device_ptr();
+
     match (weight, grad_weight_data.as_mut()) {
         (Some(w), Some(gw)) => {
             if w.dtype() != DType::BF16 || w.storage.dtype() != DType::BF16 {
@@ -902,13 +911,14 @@ fn rms_norm_backward_bf16(
                     "RMSNorm backward expects BF16 weight storage".into(),
                 ));
             }
+            let weight_ptr = w.as_device_ptr_bf16("rms_norm_backward_bf16:weight")? as u64;
             launch_kernel!(
                 f,
                 cfg,
-                grad_out.storage.try_as_slice_u16()?,
-                input.storage.try_as_slice_u16()?,
-                w.storage.try_as_slice_u16()?,
-                &grad_input_data,
+                grad_out_ptr,
+                input_ptr,
+                weight_ptr,
+                grad_input_ptr,
                 gw,
                 inv_rms.storage.try_as_slice_f32()?,
                 batch_size as i32,
@@ -922,10 +932,10 @@ fn rms_norm_backward_bf16(
             launch_kernel!(
                 f,
                 cfg,
-                grad_out.storage.try_as_slice_u16()?,
-                input.storage.try_as_slice_u16()?,
-                &null_weight,
-                &grad_input_data,
+                grad_out_ptr,
+                input_ptr,
+                *null_weight.device_ptr(),
+                grad_input_ptr,
                 &mut null_grad_weight,
                 inv_rms.storage.try_as_slice_f32()?,
                 batch_size as i32,
@@ -1029,95 +1039,110 @@ impl RMSNorm {
     /// Forward pass for RMSNorm
     /// RMSNorm(x) = x * weight / sqrt(mean(x^2) + eps)
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        if input.rank() == 4 {
-            assert_nhwc_public("RMSNorm::forward in", input)?;
+        rms_norm(input, &self.normalized_shape, self.weight.as_ref(), self.eps)
+    }
+}
+
+/// Functional RMSNorm.
+///
+/// Applies RMSNorm over the last `normalized_shape.len()` dimensions and uses
+/// the fused BF16 kernel + `Op::RMSNorm` autograd path when available.
+pub fn rms_norm(
+    input: &Tensor,
+    normalized_shape: &[usize],
+    weight: Option<&Tensor>,
+    eps: f32,
+) -> Result<Tensor> {
+    if input.rank() == 4 {
+        assert_nhwc_public("rms_norm::in", input)?;
+    }
+    trap_is_bf16("rms_norm::in", input)?;
+
+    let input_dims = input.shape().dims();
+    let input_shape_len = input_dims.len();
+    let normalized_shape_len = normalized_shape.len();
+
+    // Validate that normalized_shape matches the last dimensions of input
+    if normalized_shape_len > input_shape_len {
+        return Err(Error::InvalidOperation(
+            "Normalized shape is larger than input shape".into(),
+        ));
+    }
+
+    let start_idx = input_shape_len - normalized_shape_len;
+    for i in 0..normalized_shape_len {
+        if input_dims[start_idx + i] != normalized_shape[i] {
+            return Err(Error::InvalidOperation(format!(
+                "Shape mismatch at dimension {}: expected {}, got {}",
+                i,
+                normalized_shape[i],
+                input_dims[start_idx + i]
+            )));
         }
-        trap_is_bf16("RMSNorm::forward in", input)?;
+    }
 
-        let input_dims = input.shape().dims();
-        let input_shape_len = input_dims.len();
-        let normalized_shape_len = self.normalized_shape.len();
+    let artifacts = rms_norm_forward(input, normalized_shape, weight, eps)?;
 
-        // Validate that normalized_shape matches the last dimensions of input
-        if normalized_shape_len > input_shape_len {
-            return Err(Error::InvalidOperation(
-                "Normalized shape is larger than input shape".into(),
-            ));
-        }
+    let mut output = artifacts.output;
+    if output.dtype() != DType::BF16 {
+        output = output.to_dtype(DType::BF16)?;
+    }
+    // Output is created as BF16 by rms_norm_forward_bf16 — skip redundant check
+    debug_assert_eq!(output.dtype(), DType::BF16);
+    if output.rank() == 4 {
+        assert_nhwc_public("rms_norm::out", &output)?;
+    }
 
-        let start_idx = input_shape_len - normalized_shape_len;
-        for i in 0..normalized_shape_len {
-            if input_dims[start_idx + i] != self.normalized_shape[i] {
-                return Err(Error::InvalidOperation(format!(
-                    "Shape mismatch at dimension {}: expected {}, got {}",
-                    i,
-                    self.normalized_shape[i],
-                    input_dims[start_idx + i]
-                )));
+    let needs_grad = input.requires_grad || weight.map(|w| w.requires_grad).unwrap_or(false);
+
+    if needs_grad {
+        output.requires_grad = true;
+        if AutogradContext::is_recording() {
+            let mut saved_tensors = vec![(input.id, input.alias())];
+            if let Some(w) = weight {
+                saved_tensors.push((w.id, w.alias()));
             }
+
+            let batch_size = artifacts.inv_rms.len();
+            let inv_rms_tensor = Tensor {
+                storage: TensorStorage::F32 {
+                    data: artifacts.inv_rms.into(),
+                    numel: batch_size,
+                },
+                shape: Shape::from_dims(&[batch_size]),
+                device: input.device.clone(),
+                id: TensorId::new(),
+                requires_grad: false,
+            };
+            let inv_rms_id = inv_rms_tensor.id;
+            saved_tensors.push((inv_rms_id, inv_rms_tensor));
+
+            AutogradContext::record_op(
+                output.id,
+                Op::RMSNorm {
+                    input: input.id,
+                    weight: weight.map(|w| w.id),
+                    eps,
+                    inv_rms: inv_rms_id,
+                    normalized_shape: normalized_shape.to_vec(),
+                },
+                saved_tensors,
+            );
         }
+    }
 
-        let artifacts = rms_norm_forward(
-            input,
-            &self.normalized_shape,
-            self.weight.as_ref(),
-            self.eps,
-        )?;
+    Ok(output)
+}
 
-        let mut output = artifacts.output;
-        if output.dtype() != DType::BF16 {
-            output = output.to_dtype(DType::BF16)?;
-        }
-        // Output is created as BF16 by rms_norm_forward_bf16 — skip redundant check
-        debug_assert_eq!(output.dtype(), DType::BF16);
-        if output.rank() == 4 {
-            assert_nhwc_public("RMSNorm::forward out", &output)?;
-        }
-
-        let needs_grad = input.requires_grad
-            || self
-                .weight
-                .as_ref()
-                .map(|w| w.requires_grad)
-                .unwrap_or(false);
-
-        if needs_grad {
-            output.requires_grad = true;
-            if AutogradContext::is_recording() {
-                let mut saved_tensors = vec![(input.id, input.alias())];
-                if let Some(w) = &self.weight {
-                    saved_tensors.push((w.id, w.alias()));
-                }
-
-                let batch_size = artifacts.inv_rms.len();
-                let inv_rms_tensor = Tensor {
-                    storage: TensorStorage::F32 {
-                        data: artifacts.inv_rms.into(),
-                        numel: batch_size,
-                    },
-                    shape: Shape::from_dims(&[batch_size]),
-                    device: input.device.clone(),
-                    id: TensorId::new(),
-                    requires_grad: false,
-                };
-                let inv_rms_id = inv_rms_tensor.id;
-                saved_tensors.push((inv_rms_id, inv_rms_tensor));
-
-                AutogradContext::record_op(
-                    output.id,
-                    Op::RMSNorm {
-                        input: input.id,
-                        weight: self.weight.as_ref().map(|w| w.id),
-                        eps: self.eps,
-                        inv_rms: inv_rms_id,
-                        normalized_shape: self.normalized_shape.clone(),
-                    },
-                    saved_tensors,
-                );
-            }
-        }
-
-        Ok(output)
+impl Tensor {
+    /// Functional RMSNorm convenience wrapper.
+    pub fn rms_norm(
+        &self,
+        normalized_shape: &[usize],
+        weight: Option<&Tensor>,
+        eps: f32,
+    ) -> Result<Tensor> {
+        rms_norm(self, normalized_shape, weight, eps)
     }
 }
 

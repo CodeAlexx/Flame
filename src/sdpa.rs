@@ -99,6 +99,79 @@ pub fn forward(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Sdp
     })
 }
 
+/// Fused SDPA entry point for training.
+///
+/// Forward uses the optimized BF16 SDPA implementation under `no_grad` and then
+/// records a single `Op::FlashAttention` node so backward can recompute from
+/// Q/K/V without taping the internal matmul/softmax ops.
+pub fn forward_train(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+) -> SdpaResult<Tensor> {
+    scope("sdpa.forward_train", GuardMode::env_default(), || {
+        let dims = q.shape().dims();
+        if dims.len() != 4 {
+            return Err(Error::InvalidInput(format!(
+                "sdpa.forward_train expects q shaped [B,H,Q,D], got {:?}",
+                dims
+            )));
+        }
+        let head_dim = dims[3];
+        let k_dims = k.shape().dims();
+        if k_dims.len() != 4 {
+            return Err(Error::InvalidInput(format!(
+                "sdpa.forward_train expects k shaped [B,H,K,D], got {:?}",
+                k_dims
+            )));
+        }
+        let scale = if head_dim > 0 {
+            1.0 / (head_dim as f32).sqrt()
+        } else {
+            1.0
+        };
+
+        let output = {
+            let _guard = crate::autograd::AutogradContext::no_grad();
+            forward(q, k, v, mask)?
+        };
+
+        if q.requires_grad() || k.requires_grad() || v.requires_grad() {
+            let mut out = output;
+            out = out.requires_grad_(true);
+
+            let mut saved = vec![
+                (q.id(), q.clone()),
+                (k.id(), k.clone()),
+                (v.id(), v.clone()),
+            ];
+            let mask_id = if let Some(mask_tensor) = mask {
+                saved.push((mask_tensor.id(), mask_tensor.clone()));
+                Some(mask_tensor.id())
+            } else {
+                None
+            };
+
+            crate::autograd::AutogradContext::record_op(
+                out.id(),
+                crate::autograd::Op::FlashAttention {
+                    query: q.id(),
+                    key: k.id(),
+                    value: v.id(),
+                    mask: mask_id,
+                    scale,
+                    causal: false,
+                },
+                saved,
+            );
+            Ok(out)
+        } else {
+            Ok(output)
+        }
+    })
+}
+
 /// Scaled dot-product attention with an ADDITIVE float bias (not a binary mask).
 ///
 /// This variant exists for T5-style attention where a learned relative position
