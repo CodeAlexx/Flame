@@ -2445,7 +2445,11 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                     &d_perm,
                     total as i64
                 )?;
-                self.device.synchronize()?;
+                // No device-wide sync: the scatter kernel launches on the
+                // default stream and every subsequent consumer uses the same
+                // stream. The explicit sync was forcing ~128 device syncs per
+                // Klein backward step (32 blocks × 4 transposes in
+                // attention_backward_recompute) for no ordering benefit.
                 Ok(output)
             }
             DType::BF16 => {
@@ -2478,7 +2482,10 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                         &d_perm,
                         total as i64
                     )?;
-                    self.device.synchronize()?;
+                    // No device-wide sync — see F32 branch comment.
+                    // Klein attention backward hits this path 4 times per
+                    // block (k/v/attn/d_logits transpose_dims), 32 blocks
+                    // per step = 128 sync points eliminated.
                     Ok(output)
                 }
                 #[cfg(not(feature = "bf16_u16"))]
