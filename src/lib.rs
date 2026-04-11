@@ -115,6 +115,7 @@ pub mod tensor_compute;
 pub mod tensor_ext;
 pub mod tensor_narrow;
 pub mod tensor_storage;
+pub mod activation_offload;
 pub use tensor::contracts::*;
 pub mod telemetry;
 
