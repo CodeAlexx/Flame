@@ -13,7 +13,13 @@ use std::os::raw::c_void;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-// Helper to allocate from pool and copy data
+// Helper to allocate from pool and copy i32 data as f32 (NUMERIC cast).
+//
+// WARNING: This uses `x as f32` (numeric conversion, not bit-preserving).
+// CUDA kernels that receive this data use `(int)float_val` to recover the
+// integer, which works for values that fit in f32 without precision loss
+// (up to ~16M). Kernels that use `int*` pointer reinterpretation need
+// a separate bit-preserving path — see conv3d_simple.rs for an example.
 fn alloc_from_pool_and_copy(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<f32>> {
     let f32_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
     let mut cuda_data = crate::tensor::alloc_from_pool(device, f32_data.len())?;

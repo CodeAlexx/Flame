@@ -8,16 +8,10 @@ use crate::{Tensor, Shape, Result, Error, CudaDevice};
 use std::sync::Arc;
 use cudarc::driver::{LaunchAsync, LaunchConfig, CudaSlice};
 
-// Helper to allocate from pool and copy data
-fn alloc_from_pool_and_copy(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<f32>> {
-    let f32_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
-    let mut cuda_data = crate::tensor::alloc_from_pool(device, f32_data.len())?;
-    device.htod_copy_into(f32_data, &mut cuda_data).map_err(|_| Error::CudaDriver)?;
-    Ok(cuda_data)
-}
-
-
 // Helper function for allocating and copying to GPU via memory pool
+// NOTE: Do NOT pass int parameters to CUDA kernels through float arrays
+// using plain `as f32` casts. Use f32::from_bits(i32 as u32) + __float_as_int()
+// on the kernel side (see conv3d_forward_v2 for the correct pattern).
 fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(device: &Arc<CudaDevice>, data: T) -> Result<CudaSlice<f32>> {
     let slice = data.as_ref();
     let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
@@ -151,12 +145,12 @@ impl Conv3d {
         
         // Perform convolution
         let mut output = self.conv3d_cpu(input, &output_shape)?;
-        
+
         // Add bias if present
         if let Some(bias) = &self.bias_tensor {
             self.add_bias_3d(&mut output, bias)?;
         }
-        
+
         Ok(output)
     }
     
@@ -178,53 +172,55 @@ impl Conv3d {
         let (sd, sh, sw) = self.stride;
         let (pd, ph, pw) = self.padding;
         
-        // Simple CPU implementation
-        // Now actually tries to perform 3D convolution
+        // 3D convolution CUDA kernel.
+        //
+        // BUG FIX: The original kernel read int parameters from float* arrays
+        // allocated via alloc_from_pool_and_copy(), which cast i32 -> f32 on
+        // the host.  The kernel then reinterpreted f32 bits as int, reading
+        // garbage dimensions (e.g. 3.0f bit pattern = 1077936128 as int).
+        // This made the convolution output all zeros.
+        //
+        // Fix: pack the 18 int parameters into a single float* array using
+        // f32::from_bits(i32 as u32) so the kernel's __float_as_int() reads
+        // the correct values.
         let kernel_code = r#"
-extern "C" __global__ void conv3d_forward(
+extern "C" __global__ void conv3d_forward_v2(
     float *output,
     const float *input,
     const float *weight,
-    const int *input_dims,    // [batch, in_channels, d_in, h_in, w_in]
-    const int *output_dims,   // [out_channels, d_out, h_out, w_out]
-    const int *kernel_dims,   // [kernel_d, kernel_h, kernel_w]
-    const int *conv_params    // [stride_d, stride_h, stride_w, pad_d, pad_h, pad_w]
+    const float *params   // 18 ints bit-cast to float
 ) {
-    // Unpack dimensions from arrays
-    int batch = input_dims[0];
-    int in_channels = input_dims[1];
-    int d_in = input_dims[2];
-    int h_in = input_dims[3];
-    int w_in = input_dims[4];
-    
-    int out_channels = output_dims[0];
-    int d_out = output_dims[1];
-    int h_out = output_dims[2];
-    int w_out = output_dims[3];
-    
-    int kernel_d = kernel_dims[0];
-    int kernel_h = kernel_dims[1];
-    int kernel_w = kernel_dims[2];
-    
-    int stride_d = conv_params[0];
-    int stride_h = conv_params[1];
-    int stride_w = conv_params[2];
-    int pad_d = conv_params[3];
-    int pad_h = conv_params[4];
-    int pad_w = conv_params[5];
-    
+    int batch       = __float_as_int(params[0]);
+    int in_channels = __float_as_int(params[1]);
+    int d_in        = __float_as_int(params[2]);
+    int h_in        = __float_as_int(params[3]);
+    int w_in        = __float_as_int(params[4]);
+    int out_channels= __float_as_int(params[5]);
+    int d_out       = __float_as_int(params[6]);
+    int h_out       = __float_as_int(params[7]);
+    int w_out       = __float_as_int(params[8]);
+    int kernel_d    = __float_as_int(params[9]);
+    int kernel_h    = __float_as_int(params[10]);
+    int kernel_w    = __float_as_int(params[11]);
+    int stride_d    = __float_as_int(params[12]);
+    int stride_h    = __float_as_int(params[13]);
+    int stride_w    = __float_as_int(params[14]);
+    int pad_d       = __float_as_int(params[15]);
+    int pad_h       = __float_as_int(params[16]);
+    int pad_w       = __float_as_int(params[17]);
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch * out_channels * d_out * h_out * w_out;
-    
+
     if (idx < total) {
         int w = idx % w_out;
         int h = (idx / w_out) % h_out;
         int d = (idx / (w_out * h_out)) % d_out;
         int oc = (idx / (w_out * h_out * d_out)) % out_channels;
         int b = idx / (out_channels * d_out * h_out * w_out);
-        
+
         float sum = 0.0f;
-        
+
         for (int ic = 0; ic < in_channels; ic++) {
             for (int kd = 0; kd < kernel_d; kd++) {
                 for (int kh = 0; kh < kernel_h; kh++) {
@@ -232,55 +228,54 @@ extern "C" __global__ void conv3d_forward(
                         int d_in_idx = d * stride_d - pad_d + kd;
                         int h_in_idx = h * stride_h - pad_h + kh;
                         int w_in_idx = w * stride_w - pad_w + kw;
-                        
+
                         if (d_in_idx >= 0 && d_in_idx < d_in &&
                             h_in_idx >= 0 && h_in_idx < h_in &&
                             w_in_idx >= 0 && w_in_idx < w_in) {
-                            
+
                             int in_idx = ((b * in_channels + ic) * d_in + d_in_idx) * h_in * w_in + h_in_idx * w_in + w_in_idx;
                             int w_idx = ((oc * in_channels + ic) * kernel_d + kd) * kernel_h * kernel_w + kh * kernel_w + kw;
-                            
+
                             sum += input[in_idx] * weight[w_idx];
                         }
                     }
                 }
             }
         }
-        
+
         output[idx] = sum;
     }
 }"#;
-        
+
         // Launch the kernel
-        crate::cuda_kernels_gpu::CudaKernels::ensure_kernel(&self.device, "conv3d_forward", kernel_code)?;
-        
-        let f = self.device.get_func("conv3d_forward", "conv3d_forward")
+        crate::cuda_kernels_gpu::CudaKernels::ensure_kernel(&self.device, "conv3d_forward_v2", kernel_code)?;
+
+        let f = self.device.get_func("conv3d_forward_v2", "conv3d_forward_v2")
             .ok_or_else(|| crate::Error::Cuda("Failed to get conv3d kernel".into()))?;
-        
+
         let output_numel = output_shape.elem_count();
         let mut output_data = crate::tensor::alloc_from_pool(&self.device, output_numel)
             .map_err(|_| crate::Error::CudaDriver)?;
-        
+
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(output_numel as u32);
-        // Pack dimensions into arrays to reduce parameter count
-        let input_dims = vec![batch as i32, self.in_channels as i32, d_in as i32, h_in as i32, w_in as i32];
-        let output_dims = vec![self.out_channels as i32, d_out as i32, h_out as i32, w_out as i32];
-        let kernel_dims = vec![kd as i32, kh as i32, kw as i32];
-        let conv_params = vec![sd as i32, sh as i32, sw as i32, pd as i32, ph as i32, pw as i32];
-        
-        let input_dims_gpu = alloc_from_pool_and_copy(&self.device, &input_dims)?;
-        let output_dims_gpu = alloc_from_pool_and_copy(&self.device, &output_dims)?;
-        let kernel_dims_gpu = alloc_from_pool_and_copy(&self.device, &kernel_dims)?;
-        let conv_params_gpu = alloc_from_pool_and_copy(&self.device, &conv_params)?;
-        
+
+        // Pack all 18 int parameters as bit-cast floats so the kernel can
+        // use __float_as_int() to recover them without type-punning issues.
+        let params_i32: Vec<i32> = vec![
+            batch as i32, self.in_channels as i32, d_in as i32, h_in as i32, w_in as i32,
+            self.out_channels as i32, d_out as i32, h_out as i32, w_out as i32,
+            kd as i32, kh as i32, kw as i32,
+            sd as i32, sh as i32, sw as i32,
+            pd as i32, ph as i32, pw as i32,
+        ];
+        let params_f32: Vec<f32> = params_i32.iter().map(|&v| f32::from_bits(v as u32)).collect();
+        let params_gpu = alloc_and_copy_to_pool(&self.device, &params_f32)?;
+
         launch_kernel!(f, cfg,
             &output_data,
             input.storage.try_as_slice_f32()?,
             self.weight.storage.try_as_slice_f32()?,
-            &input_dims_gpu,
-            &output_dims_gpu,
-            &kernel_dims_gpu,
-            &conv_params_gpu
+            &params_gpu
         )?;
         
         Ok(crate::cuda_kernels::create_output_tensor(output_data, output_shape.clone(), self.device.clone()))

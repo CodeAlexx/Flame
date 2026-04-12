@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 // Helper to allocate from pool and copy data
 fn alloc_from_pool_and_copy(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<f32>> {
-    let f32_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
+    let f32_data: Vec<f32> = data.iter().map(|&x| f32::from_bits(x as u32)).collect();
     let mut cuda_data = crate::tensor::alloc_from_pool(device, f32_data.len())?;
     device.htod_copy_into(&f32_data, &mut cuda_data).map_err(|_| Error::CudaDriver)?;
     Ok(cuda_data)

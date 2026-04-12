@@ -588,3 +588,32 @@ gradient checkpointing it makes per-step backward ~45 min for DiT models.
 | Get a stream pointer | `cuda::device_lt::stream_ptr(device)?` |
 | Force-rebuild after .cu edit | `touch the_file.cu` then `cargo build --release ...` |
 | Run a test binary | `cargo run --bin minimal_test --release` |
+
+---
+
+## Bug fix: i32-to-f32 parameter passing to CUDA kernels
+
+**Fixed 2026-04-12.** Files: `conv3d_simple.rs`, `cuda_kernels_gpu.rs`,
+`cuda_kernels.rs`, `cuda/kernels.rs`, `cuda_tensor.rs`.
+
+Several `alloc_from_pool_and_copy()` helpers passed `i32` dimension/shape
+data to CUDA kernels by casting `x as f32` (numeric conversion). Kernels
+that declared `int*` parameters then reinterpreted the IEEE 754 float bits
+as integers — e.g. `3i32 → 3.0f32 (0x40400000) → int 1077936128`.
+
+**Fix:** Use `f32::from_bits(x as u32)` to bit-preserve the integer value.
+The CUDA kernel reads the correct int via `__float_as_int()` or direct
+`int*` reinterpret.
+
+**Two patterns exist** — know which your kernel uses before choosing:
+
+1. Kernel declares `int* dims` (pointer reinterpret) → use `f32::from_bits(x as u32)`
+   (bit-preserving). Example: `conv3d_simple.rs`.
+2. Kernel declares `float* dims_f32` and casts `(int)dims_f32[i]` → use `x as f32`
+   (numeric). Example: `cuda_kernels_gpu.rs`, `cuda_kernel_sources.rs`.
+
+Using the wrong pattern: pattern 1 with numeric cast reads garbage ints;
+pattern 2 with bit-cast reads denormalized floats that truncate to 0.
+
+**Rule:** Always check the kernel source before choosing. Grep for
+`int\*.*dims` vs `float\*.*dims` in the kernel declaration.

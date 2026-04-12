@@ -444,9 +444,14 @@ __global__ void group_norm_forward_bf16_kernel(const __nv_bfloat16* input,
   int g = c / channels_per_group;
   int mean_index = n * groups + g;
 
-  float m = mean[mean_index];
+  // Truncate mean and rstd to BF16 precision before normalizing.
+  // PyTorch's native_group_norm returns mean/rstd in the input dtype (BF16),
+  // so its normalization step uses BF16-precision statistics. Without this
+  // truncation, the full F32 statistics cause ~0.06 per-GroupNorm divergence
+  // that compounds through deep networks (30+ layers → max diff ~5).
+  float m = __bfloat162float(__float2bfloat16_rn(mean[mean_index]));
   float v = var[mean_index];
-  float inv_std = rsqrtf(v + eps);
+  float inv_std = __bfloat162float(__float2bfloat16_rn(rsqrtf(v + eps)));
 
   int offset = ((n * channels + c) * spatial_size) + hw;
   float value = __bfloat162float(input[offset]);
