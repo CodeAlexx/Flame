@@ -375,14 +375,15 @@ void rope_fused_bf16_kernel(
 extern "C" __global__
 void rope_halfsplit_bf16_kernel(
     const __nv_bfloat16* __restrict__ X,   // [BH, N, D]  (D = 2*half)
-    const __nv_bfloat16* __restrict__ COS,  // [1, N, half]
-    const __nv_bfloat16* __restrict__ SIN,  // [1, N, half]
+    const __nv_bfloat16* __restrict__ COS,  // [cos_bh, N, half] — 1 or BH
+    const __nv_bfloat16* __restrict__ SIN,  // [cos_bh, N, half]
     __nv_bfloat16* __restrict__ Y,          // [BH, N, D]
-    long bh, long n, long half)
+    long bh, long n, long half, long cos_bh)
 {
     // Half-split RoPE (HuggingFace rotate_half convention):
     // Pairs elements across halves: (d, d+half).
-    // Used by Qwen3, LLaMA, Mistral.
+    // cos_bh=1: broadcast same frequencies to all heads.
+    // cos_bh=BH: per-head frequencies (LTX-2 style).
     long idx = blockIdx.x * blockDim.x + threadIdx.x;
     long total = bh * n * half;
     while (idx < total) {
@@ -392,7 +393,8 @@ void rope_halfsplit_bf16_kernel(
         long b = tmp;
 
         long base = (b * n + seq) * (2 * half);
-        long cos_idx = seq * half + d;
+        long cb = (cos_bh == 1) ? 0 : b;
+        long cos_idx = (cb * n + seq) * half + d;
 
         float x_first  = __bfloat162float(X[base + d]);
         float x_second = __bfloat162float(X[base + half + d]);
@@ -511,8 +513,12 @@ pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Ten
     let bh = b * h;
 
     let x_flat = x.reshape(&[bh, n, d])?;
-    let cos_flat = cos.reshape(&[1, n, half])?;
-    let sin_flat = sin.reshape(&[1, n, half])?;
+    // cos/sin can be [1, 1, N, half] (broadcast) or [B, H, N, half] (per-head).
+    // Flatten to [cos_bh, N, half] where cos_bh is 1 or BH.
+    let cos_elem = cos.shape().elem_count();
+    let cos_bh = cos_elem / (n * half);
+    let cos_flat = cos.reshape(&[cos_bh, n, half])?;
+    let sin_flat = sin.reshape(&[cos_bh, n, half])?;
 
     let total = bh * n * half;
     let out_n = bh * n * d;
@@ -565,6 +571,7 @@ pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Ten
                 bh as i64,
                 n as i64,
                 half as i64,
+                cos_bh as i64,
             ),
         )?;
     }

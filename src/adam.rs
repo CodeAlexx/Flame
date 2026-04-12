@@ -10,6 +10,17 @@ use std::collections::{hash_map::Entry, HashMap};
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 const CUDA_ADAM_FUSED_BF16: &str = r#"
 #include <cuda_bf16.h>
+// DECOUPLED weight decay (Loshchilov & Hutter, 2017 — AdamW):
+//   m = beta1 * m + (1 - beta1) * g
+//   v = beta2 * v + (1 - beta2) * g * g
+//   p = p - lr * m_hat / (sqrt(v_hat) + eps) - lr * wd * p
+// The weight-decay term is applied to `p` DIRECTLY after the Adam step.
+// It must NOT be added into `g` before the moments — doing so makes
+// wd contaminate the adaptive rate and causes a freshly-initialized
+// LoRA `A` matrix (whose `B` partner is still zero, so the real grad
+// is near-zero) to shrink at a uniform `lr * sign(p)` per step,
+// regardless of magnitude. That bug destroyed klein-trainer LoRA_A
+// training in April 2026.
 extern "C" __global__ void adam_fused_bf16_kernel(
     __nv_bfloat16* __restrict__ param,
     const __nv_bfloat16* __restrict__ grad,
@@ -30,10 +41,6 @@ extern "C" __global__ void adam_fused_bf16_kernel(
     float g = __bfloat162float(grad[idx]);
     float p = __bfloat162float(param[idx]);
 
-    if (weight_decay > 0.0f) {
-        g += weight_decay * p;
-    }
-
     float mi = beta1 * m[idx] + (1.0f - beta1) * g;
     float vi = beta2 * v[idx] + (1.0f - beta2) * g * g;
     m[idx] = mi;
@@ -42,6 +49,9 @@ extern "C" __global__ void adam_fused_bf16_kernel(
     float m_hat = mi / bias_correction1;
     float v_hat = vi / bias_correction2;
     p -= lr * m_hat / (sqrtf(v_hat) + eps);
+    if (weight_decay > 0.0f) {
+        p -= lr * weight_decay * p;
+    }
 
     param[idx] = __float2bfloat16(p);
 }
@@ -66,10 +76,6 @@ extern "C" __global__ void adam_fused_f32grad_kernel(
     float g = grad[idx];
     float p = __bfloat162float(param[idx]);
 
-    if (weight_decay > 0.0f) {
-        g += weight_decay * p;
-    }
-
     float mi = beta1 * m[idx] + (1.0f - beta1) * g;
     float vi = beta2 * v[idx] + (1.0f - beta2) * g * g;
     m[idx] = mi;
@@ -78,6 +84,9 @@ extern "C" __global__ void adam_fused_f32grad_kernel(
     float m_hat = mi / bias_correction1;
     float v_hat = vi / bias_correction2;
     p -= lr * m_hat / (sqrtf(v_hat) + eps);
+    if (weight_decay > 0.0f) {
+        p -= lr * weight_decay * p;
+    }
 
     param[idx] = __float2bfloat16(p);
 }
@@ -309,7 +318,31 @@ impl Adam {
         Ok(())
     }
 
-    /// Scalar-op fallback for non-BF16 parameters (original 13-15 kernel path).
+    /// Scalar-op fallback for non-BF16 parameters (F32 params, etc.).
+    ///
+    /// Implements DECOUPLED weight decay (Loshchilov & Hutter, "Decoupled
+    /// Weight Decay Regularization", 2017 — this is what the rest of the
+    /// world calls AdamW). The raw gradient feeds `m` and `v` as-is; the
+    /// weight-decay term is added to the final parameter update instead
+    /// of being merged into `grad`. Equivalent to:
+    ///
+    ///     param = (1 - lr·wd)·param - lr · m̂/(√v̂+ε)
+    ///
+    /// # Why not L2 regularization into grad
+    ///
+    /// The earlier implementation did `grad += wd * param` and then ran
+    /// the usual Adam moments on that contaminated grad. For a param
+    /// whose real gradient signal is small compared to `wd*param` (which
+    /// is EXACTLY the case for a freshly-initialized LoRA A matrix
+    /// whose B partner is zero), Adam's adaptive normalization
+    /// `m̂ / (√v̂+ε)` collapses the step to `~sign(param)`, and the
+    /// update becomes a uniform `lr · sign(param)` shrinkage per step
+    /// regardless of element magnitude. Observed effect on Klein 4B
+    /// LoRA rank-16 at `lr=4e-4, wd=0.01`: `lora_A` total L2 dropped
+    /// from the ~50 Kaiming init to 0.85 at step 400 and 0.25 at step
+    /// 800 — the LoRA was being unlearned. Decoupled decay removes
+    /// this runaway because the term affects `param` directly, not
+    /// the adaptive step.
     fn step_scalar_ops(
         &mut self,
         param: &Parameter,
@@ -323,15 +356,6 @@ impl Adam {
 
         if grad.dtype() != state_dtype {
             grad = grad.to_dtype(state_dtype)?;
-        }
-        if self.weight_decay > 0.0 {
-            let param_tensor = param.tensor()?;
-            let param_adjust = if param_tensor.dtype() == state_dtype {
-                param_tensor
-            } else {
-                param_tensor.to_dtype(state_dtype)?
-            };
-            grad = grad.add(&param_adjust.mul_scalar(self.weight_decay)?)?;
         }
 
         if let Entry::Vacant(entry) = self.m.entry(param_id) {
@@ -364,7 +388,20 @@ impl Adam {
 
         let v_sqrt = v_hat.sqrt()?;
         let denominator = v_sqrt.add_scalar(self.eps)?;
-        let update = m_hat.div(&denominator)?.mul_scalar(self.lr)?;
+        let mut update = m_hat.div(&denominator)?.mul_scalar(self.lr)?;
+
+        // Decoupled weight decay: add `lr·wd·param` to `update` so that
+        // `param -= update` becomes `param -= lr·(m̂/(√v̂+ε) + wd·param)`.
+        if self.weight_decay > 0.0 {
+            let param_tensor = param.tensor()?;
+            let param_f32 = if param_tensor.dtype() == state_dtype {
+                param_tensor
+            } else {
+                param_tensor.to_dtype(state_dtype)?
+            };
+            let wd_term = param_f32.mul_scalar(self.lr * self.weight_decay)?;
+            update = update.add(&wd_term)?;
+        }
 
         param.apply_update(&update)?;
         Ok(())

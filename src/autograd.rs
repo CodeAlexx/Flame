@@ -995,7 +995,6 @@ impl AutogradContext {
             let mut per_op_time: std::collections::HashMap<u64, (std::time::Duration, usize)> =
                 std::collections::HashMap::new();
 
-            eprintln!("[backward] tape len={}, starting reverse walk", tape_len);
             let backward_result: Result<()> = (|| {
                 for entry in tape_entries.iter().rev() {
                     if let Some(output_grad) = gradients.take(entry.output_id) {
@@ -1012,9 +1011,6 @@ impl AutogradContext {
                             }
                         };
                         let kernel_dt = t_node.elapsed();
-                        if nodes_executed % 100 == 0 || kernel_dt.as_millis() > 500 {
-                            eprintln!("[bwd] #{}/{} dt={:.1}ms grads_in_map={}", nodes_executed, tape_len, kernel_dt.as_secs_f64() * 1000.0, gradients.len());
-                        }
                         total_kernel_time += kernel_dt;
                         // Aggregate by op kind.
                         let disc_u64: u64 =
@@ -1134,8 +1130,8 @@ impl AutogradContext {
                 }
             }
 
-            // Per-op-kind summary — always emit, cheap and critical for audit.
-            if !capturing && !per_op_time.is_empty() {
+            // Per-op-kind summary — only emitted when explicit profiling is on.
+            if profile && !capturing && !per_op_time.is_empty() {
                 let mut sorted: Vec<_> = per_op_time.iter().collect();
                 sorted.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
                 eprintln!("[bwd:per-op] top 8 by total time across {} nodes:", nodes_executed);
@@ -1736,21 +1732,7 @@ fn compute_gradients(
                 }
             }
             let _sub_bwd_dt = _sub_bwd_t0.elapsed();
-            if !sub_op_times.is_empty() {
-                sub_op_times.sort_by(|a, b| b.0.cmp(&a.0));
-                let top: Vec<String> = sub_op_times.iter().take(3)
-                    .map(|(dt, op)| format!("{:.1}ms {:?}", dt.as_secs_f64()*1000.0, std::mem::discriminant(*op)))
-                    .collect();
-                eprintln!("[ckpt:hot] {}", top.join(" | "));
-            }
-
-            eprintln!(
-                "[ckpt] tape={} recomp={:.1}ms sub_bwd={:.1}ms total={:.1}ms",
-                recomputed_tape.len(),
-                _recomp_dt.as_secs_f64() * 1000.0,
-                _sub_bwd_dt.as_secs_f64() * 1000.0,
-                _ckpt_t0.elapsed().as_secs_f64() * 1000.0,
-            );
+            let _ = sub_op_times;
 
             let mut result = Vec::new();
             for (tid, g) in sub_grads.drain_all()? {
@@ -1761,7 +1743,10 @@ fn compute_gradients(
 
         Op::RoPePrecomputed { input, cos, sin } => {
             // RoPE is an orthogonal rotation. Backward = apply_rope(grad, cos, -sin).
-            // Fused kernel requires BF16 — cast locally (don't force BF16 globally).
+            // Always call the fused kernel — it handles both the
+            // [1, 1, N, half] and [1, H, N, half] cos/sin layouts and is
+            // the same kernel the klein-trainer forward uses, so fwd/bwd
+            // stay numerically consistent.
             let grad_bf16 = if output_grad.dtype() != DType::BF16 {
                 output_grad.to_dtype(DType::BF16)?
             } else {
@@ -1770,9 +1755,8 @@ fn compute_gradients(
             let cos_tensor = fetch_saved(cos)?;
             let sin_tensor = fetch_saved(sin)?;
             let neg_sin = GpuOps::mul_scalar(&sin_tensor, -1.0)?;
-            let grad_input = crate::attention::rope::apply_rope_precomputed(
-                &grad_bf16, &cos_tensor, &neg_sin,
-            )?;
+            let grad_input =
+                crate::bf16_ops::rope_fused_bf16(&grad_bf16, &cos_tensor, &neg_sin)?;
             Ok(vec![(*input, grad_input)])
         }
 
