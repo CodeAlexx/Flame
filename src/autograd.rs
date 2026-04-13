@@ -1672,7 +1672,8 @@ fn compute_gradients(
             }
 
             // 3D×2D path: lhs=[B,M,K], rhs=[K,N], out=[B,M,N]
-            // Flatten to 2D, compute grads, reshape back.
+            // Flatten to 2D, use matmul_bf16_trans with trans flags to avoid
+            // materializing transposes (each was a full GPU memcpy).
             if lhs_tensor.rank() == 3 && rhs_tensor.rank() == 2 {
                 let ld = lhs_tensor.shape().dims();
                 let (batch, m, k) = (ld[0], ld[1], ld[2]);
@@ -1680,6 +1681,27 @@ fn compute_gradients(
                 let og_2d = output_grad.reshape(&[batch * m, n])?;
                 let lhs_2d = lhs_tensor.reshape(&[batch * m, k])?;
 
+                // Use matmul_bf16_trans when possible — 0 transposes vs 2
+                #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+                if rhs_tensor.dtype() == DType::BF16 && lhs_2d.dtype() == DType::BF16 {
+                    let og_bf16 = if og_2d.dtype() == DType::BF16 {
+                        og_2d
+                    } else {
+                        og_2d.to_dtype_no_grad(DType::BF16)?
+                    };
+                    // grad_lhs = og @ rhs^T
+                    let grad_lhs_2d = crate::ops::gemm_bf16::matmul_bf16_trans(
+                        &og_bf16, rhs_tensor, false, true,
+                    )?;
+                    let grad_lhs = grad_lhs_2d.reshape(&[batch, m, k])?;
+                    // grad_rhs = lhs^T @ og
+                    let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                        &lhs_2d, &og_bf16, true, false,
+                    )?;
+                    return Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+                }
+
+                // Fallback for non-BF16
                 let og_cast = if og_2d.dtype() != rhs_tensor.dtype() {
                     og_2d.to_dtype_no_grad(rhs_tensor.dtype())?
                 } else { og_2d.clone() };
