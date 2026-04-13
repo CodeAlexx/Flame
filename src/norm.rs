@@ -1056,9 +1056,14 @@ pub fn rms_norm(
     if input.rank() == 4 {
         assert_nhwc_public("rms_norm::in", input)?;
     }
-    // Auto-cast non-BF16 inputs for mixed-precision training (no autograd recording)
+    // Auto-cast non-BF16 inputs. Use autograd-aware cast when the input
+    // requires grad so the gradient chain isn't silently broken.
     let input = if input.dtype() != DType::BF16 {
-        &input.to_dtype_no_grad(DType::BF16)?
+        if input.requires_grad {
+            &input.to_dtype(DType::BF16)?
+        } else {
+            &input.to_dtype_no_grad(DType::BF16)?
+        }
     } else {
         input
     };

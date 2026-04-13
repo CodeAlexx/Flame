@@ -679,6 +679,11 @@ impl AutogradContext {
         }
     }
 
+    /// Number of entries currently on the autograd tape.
+    pub fn tape_len() -> usize {
+        AUTOGRAD_CONTEXT.lock().map(|ctx| ctx.tape.len()).unwrap_or(0)
+    }
+
     /// Reset the entire autograd context (for testing)
     pub fn reset() {
         if let Ok(mut ctx) = AUTOGRAD_CONTEXT.lock() {
@@ -1094,6 +1099,7 @@ impl AutogradContext {
                         }
                     }
                 }
+                log::debug!("[backward] processed {} of {} entries, gradients.len()={}", nodes_executed, tape_entries.len(), gradients.len());
                 Ok(())
             })();
 
@@ -2209,10 +2215,9 @@ fn compute_gradients(
 
         Op::RoPePrecomputed { input, cos, sin } => {
             // RoPE is an orthogonal rotation. Backward = apply_rope(grad, cos, -sin).
-            // Always call the fused kernel — it handles both the
-            // [1, 1, N, half] and [1, H, N, half] cos/sin layouts and is
-            // the same kernel the klein-trainer forward uses, so fwd/bwd
-            // stay numerically consistent.
+            // Use rope_halfsplit_bf16 which handles both broadcast [1, N, half]
+            // and per-head [BH, N, half] cos/sin layouts (unlike rope_fused_bf16
+            // which only handles broadcast).
             let grad_bf16 = if output_grad.dtype() != DType::BF16 {
                 output_grad.to_dtype_no_grad(DType::BF16)?
             } else {
@@ -2222,7 +2227,7 @@ fn compute_gradients(
             let sin_tensor = fetch_saved(sin)?;
             let neg_sin = GpuOps::mul_scalar(&sin_tensor, -1.0)?;
             let grad_input =
-                crate::bf16_ops::rope_fused_bf16(&grad_bf16, &cos_tensor, &neg_sin)?;
+                crate::bf16_ops::rope_halfsplit_bf16(&grad_bf16, &cos_tensor, &neg_sin)?;
             Ok(vec![(*input, grad_input)])
         }
 

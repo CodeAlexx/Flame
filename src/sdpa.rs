@@ -92,13 +92,13 @@ fn allow_sdpa_f32_fallback() -> bool {
 }
 
 pub fn forward(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> SdpaResult<Tensor> {
-    // Fused wmma backward kernel: correct but ~1.4x slower than decomposed
-    // path at small seq_len (1024). Needs profiling — likely the 7-stage
-    // pipeline with per-stage __syncthreads is slower than 12 separate
-    // fully-pipelined kernel launches at this size. May win at larger seq_len.
-    // Enable with FLAME_FUSED_ATTN_BWD=1 for testing.
-    if std::env::var("FLAME_FUSED_ATTN_BWD").ok().as_deref() == Some("1")
-        && crate::autograd::AutogradContext::is_recording()
+    // When autograd is recording and any input requires grad, use the
+    // training path which records a single Op::FlashAttention node.
+    // Without this, the attention output has requires_grad=false and the
+    // entire gradient chain through Q/K/V is broken — every trainer that
+    // calls sdpa::forward (or attention::sdpa which delegates here) gets
+    // zero gradients for attention LoRA params.
+    if crate::autograd::AutogradContext::is_recording()
         && (q.requires_grad || k.requires_grad || v.requires_grad)
     {
         return forward_train(q, k, v, mask);

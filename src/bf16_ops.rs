@@ -570,7 +570,31 @@ pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Ten
         )?;
     }
 
-    out.reshape(&[b, h, n, d])
+    let mut result = out.reshape(&[b, h, n, d])?;
+
+    // Record autograd op so gradients flow through RoPE during training.
+    // Save the 3D-flattened cos/sin so backward's rope_fused_bf16 gets
+    // the layout it expects ([cos_bh, N, half]).
+    if x.requires_grad {
+        result.requires_grad = true;
+        if crate::autograd::AutogradContext::is_recording() {
+            crate::autograd::AutogradContext::record_op(
+                result.id,
+                crate::autograd::Op::RoPePrecomputed {
+                    input: x.id,
+                    cos: cos_flat.id,
+                    sin: sin_flat.id,
+                },
+                vec![
+                    (x.id, x.clone()),
+                    (cos_flat.id, cos_flat.clone()),
+                    (sin_flat.id, sin_flat.clone()),
+                ],
+            );
+        }
+    }
+
+    Ok(result)
 }
 
 // ---- Fused modulate_pre: LayerNorm + (1+scale)*x + shift, single kernel ----
