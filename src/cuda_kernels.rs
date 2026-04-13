@@ -411,7 +411,7 @@ impl CudaKernels {
         };
 
         let mut output =
-            Tensor::zeros_dtype(a_t.shape.clone(), crate::DType::F32, a_t.device.clone())?;
+            Tensor::empty_dtype(a_t.shape.clone(), crate::DType::F32, a_t.device.clone())?;
         let n = a_t.shape.elem_count();
 
         let kernel = self
@@ -438,7 +438,6 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
@@ -463,7 +462,7 @@ impl CudaKernels {
         };
 
         let mut output =
-            Tensor::zeros_dtype(a_t.shape.clone(), crate::DType::F32, a_t.device.clone())?;
+            Tensor::empty_dtype(a_t.shape.clone(), crate::DType::F32, a_t.device.clone())?;
         let n = a_t.shape.elem_count();
 
         let kernel = self
@@ -490,13 +489,12 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
     /// Scalar multiplication kernel
     pub fn mul_scalar(&self, tensor: &Tensor, scalar: f32) -> Result<Tensor> {
-        let mut output = Tensor::zeros_dtype(
+        let mut output = Tensor::empty_dtype(
             tensor.shape.clone(),
             crate::DType::F32,
             tensor.device.clone(),
@@ -527,13 +525,12 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
     /// Add scalar kernel
     pub fn add_scalar(&self, tensor: &Tensor, scalar: f32) -> Result<Tensor> {
-        let mut output = Tensor::zeros_dtype(
+        let mut output = Tensor::empty_dtype(
             tensor.shape.clone(),
             crate::DType::F32,
             tensor.device.clone(),
@@ -564,7 +561,6 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
@@ -593,7 +589,7 @@ impl CudaKernels {
             .get_func(kernel_name, kernel_name)
             .ok_or_else(|| Error::Cuda(format!("Failed to get {}", kernel_name)))?;
 
-        let mut output = Tensor::zeros_dtype(a.shape.clone(), DType::F32, a.device.clone())?;
+        let mut output = Tensor::empty_dtype(a.shape.clone(), DType::F32, a.device.clone())?;
         let elems = a.shape.elem_count() as i32;
         let cfg = LaunchConfig::for_num_elems(elems as u32);
 
@@ -636,7 +632,7 @@ impl CudaKernels {
     /// ReLU activation kernel
     pub fn relu(&self, tensor: &Tensor) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -662,13 +658,12 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
     pub fn floor(&self, tensor: &Tensor) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -694,13 +689,12 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
     pub fn ceil(&self, tensor: &Tensor) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -726,13 +720,12 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
     pub fn round(&self, tensor: &Tensor) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -758,7 +751,6 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
@@ -794,7 +786,7 @@ impl CudaKernels {
                     .ok_or_else(|| Error::Cuda("flip_last_dim_bf16_kernel not found".into()))?;
 
                 let mut out =
-                    Tensor::zeros_dtype(tensor.shape.clone(), DType::BF16, tensor.device.clone())?;
+                    Tensor::empty_dtype(tensor.shape.clone(), DType::BF16, tensor.device.clone())?;
 
                 launch_kernel!(
                     f,
@@ -805,7 +797,6 @@ impl CudaKernels {
                     last_dim as i32
                 )?;
 
-                self.device.synchronize()?;
                 Ok(out)
             }
             DType::F32 => {
@@ -816,7 +807,7 @@ impl CudaKernels {
                     .ok_or_else(|| Error::Cuda("flip_last_dim_f32_kernel not found".into()))?;
 
                 let mut out =
-                    Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+                    Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
 
                 launch_kernel!(
                     f,
@@ -827,7 +818,6 @@ impl CudaKernels {
                     last_dim as i32
                 )?;
 
-                self.device.synchronize()?;
                 Ok(out)
             }
             other => Err(Error::Unsupported(format!(
@@ -840,7 +830,7 @@ impl CudaKernels {
     /// Sigmoid activation kernel
     pub fn sigmoid(&self, tensor: &Tensor) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -866,14 +856,13 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
     /// GELU activation kernel
     pub fn gelu(&self, tensor: &Tensor) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -899,14 +888,13 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
     /// SiLU (Swish) activation kernel
     pub fn silu(&self, tensor: &Tensor) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -932,14 +920,13 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
     /// Tanh activation kernel
     pub fn tanh(&self, tensor: &Tensor) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -965,7 +952,6 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
@@ -998,8 +984,6 @@ impl CudaKernels {
             &output_data,
             n as u32
         )?;
-
-        self.device.synchronize()?;
 
         Ok(Tensor {
             storage: TensorStorage::F32 {
@@ -1037,7 +1021,7 @@ impl CudaKernels {
 
         // Total output elements
         let output_elems: usize = output_shape.iter().product();
-        let mut output = Tensor::zeros_dtype(
+        let mut output = Tensor::empty_dtype(
             Shape::from_dims(&output_shape),
             DType::F32,
             tensor.device.clone(),
@@ -1119,7 +1103,7 @@ impl CudaKernels {
 
         let rows = dims[0];
         let cols = dims[1];
-        let mut output = Tensor::zeros_dtype(
+        let mut output = Tensor::empty_dtype(
             Shape::from_dims(&[cols, rows]),
             crate::DType::F32,
             tensor.device.clone(),
@@ -1150,7 +1134,6 @@ impl CudaKernels {
             cols as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
@@ -1190,14 +1173,13 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
     // Additional activation functions
     pub fn leaky_relu(&self, tensor: &Tensor, negative_slope: f32) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -1224,13 +1206,12 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
     pub fn elu(&self, tensor: &Tensor, alpha: f32) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -1257,7 +1238,6 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
@@ -1270,7 +1250,7 @@ impl CudaKernels {
 
     pub fn pow(&self, tensor: &Tensor, exponent: f32) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -1297,13 +1277,12 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
     pub fn sin(&self, tensor: &Tensor) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -1329,13 +1308,12 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
     pub fn cos(&self, tensor: &Tensor) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -1361,13 +1339,12 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
     pub fn sqrt(&self, tensor: &Tensor) -> Result<Tensor> {
         let mut output =
-            Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
 
         let kernel = self
@@ -1393,7 +1370,6 @@ impl CudaKernels {
             n as u32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
@@ -1532,7 +1508,7 @@ impl CudaKernels {
         let shape = input.shape().dims();
         let (batch, channels, _h_in, _w_in) = (shape[0], shape[1], shape[2], shape[3]);
 
-        let mut output = Tensor::zeros_dtype(
+        let mut output = Tensor::empty_dtype(
             Shape::from_dims(&[batch, channels, h_out, w_out]),
             input.dtype(),
             input.device.clone(),
@@ -1705,7 +1681,7 @@ impl CudaKernels {
                 got: b.shape.clone(),
             });
         }
-        let mut output = Tensor::zeros_dtype(a.shape.clone(), DType::F32, a.device.clone())?;
+        let mut output = Tensor::empty_dtype(a.shape.clone(), DType::F32, a.device.clone())?;
         let n = a.shape.elem_count();
         let kernel = self
             .kernels
@@ -1727,7 +1703,6 @@ impl CudaKernels {
             output.storage.try_as_slice_f32()?,
             n as u32
         )?;
-        self.device.synchronize()?;
         Ok(output)
     }
 
@@ -1819,7 +1794,7 @@ extern "C" __global__ void max_dim_keepdim_kernel_bf16(
                         Error::Cuda("Failed to get max_dim_keepdim_kernel_bf16".into())
                     })?;
 
-                let mut out_bf16 = Tensor::zeros_dtype(
+                let mut out_bf16 = Tensor::empty_dtype(
                     Shape::from_dims(&out_shape_keep),
                     DType::BF16,
                     tensor.device.clone(),
@@ -1836,7 +1811,6 @@ extern "C" __global__ void max_dim_keepdim_kernel_bf16(
                     dim as i32,
                     out_elems as i32
                 )?;
-                self.device.synchronize()?;
                 out_bf16
             }
             _ => {
@@ -1894,7 +1868,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                     .get_func("max_dim_keepdim_kernel", "max_dim_keepdim_kernel")
                     .ok_or_else(|| Error::Cuda("Failed to get max_dim_keepdim_kernel".into()))?;
 
-                let mut out_f32 = Tensor::zeros_dtype(
+                let mut out_f32 = Tensor::empty_dtype(
                     Shape::from_dims(&out_shape_keep),
                     DType::F32,
                     tensor.device.clone(),
@@ -1911,7 +1885,6 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                     dim as i32,
                     out_elems as i32
                 )?;
-                self.device.synchronize()?;
                 out_f32
             }
         };
@@ -1985,7 +1958,6 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                     dim as i32,
                     out_elems as i32
                 )?;
-                self.device.synchronize()?;
                 out_bf16
             }
             _ => {
@@ -2012,7 +1984,6 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                     dim as i32,
                     out_elems as i32
                 )?;
-                self.device.synchronize()?;
                 out_f32
             }
         };
@@ -2036,7 +2007,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                 got: b.shape.clone(),
             });
         }
-        let mut output = Tensor::zeros_dtype(a.shape.clone(), DType::F32, a.device.clone())?;
+        let mut output = Tensor::empty_dtype(a.shape.clone(), DType::F32, a.device.clone())?;
         let n = a.shape.elem_count();
         let kernel = self
             .kernels
@@ -2052,7 +2023,6 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             output.storage.try_as_slice_f32()?,
             n as i32
         )?;
-        self.device.synchronize()?;
         Ok(output)
     }
 
@@ -2075,7 +2045,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         };
         let output_shape = Shape::from_dims(&[n, out_h, out_w, c]);
         let total = n * out_h * out_w * c;
-        let mut out = Tensor::zeros_dtype(output_shape, DType::F32, input.device.clone())?;
+        let mut out = Tensor::empty_dtype(output_shape, DType::F32, input.device.clone())?;
         let k = self
             .kernels
             .get("resize_bilinear_nhwc_kernel")
@@ -2095,7 +2065,6 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             out_w as i32,
             if align_corners { 1 } else { 0 }
         )?;
-        self.device.synchronize()?;
         Ok(out)
     }
 
@@ -2119,7 +2088,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let x0 = ((w - tgt_w) / 2) as i32;
         let output_shape = Shape::from_dims(&[n, tgt_h, tgt_w, c]);
         let total = n * tgt_h * tgt_w * c;
-        let mut out = Tensor::zeros_dtype(output_shape, DType::F32, input.device.clone())?;
+        let mut out = Tensor::empty_dtype(output_shape, DType::F32, input.device.clone())?;
         let k = self
             .kernels
             .get("center_crop_nhwc_kernel")
@@ -2140,7 +2109,6 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             tgt_h as i32,
             tgt_w as i32
         )?;
-        self.device.synchronize()?;
         Ok(out)
     }
 
@@ -2175,7 +2143,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             .map_err(|_| Error::CudaDriver)?;
         let output_shape = input.shape.clone();
         let total = n * h * w * c;
-        let mut out = Tensor::zeros_dtype(output_shape, DType::F32, input.device.clone())?;
+        let mut out = Tensor::empty_dtype(output_shape, DType::F32, input.device.clone())?;
         let k = self
             .kernels
             .get("normalize_nhwc_kernel")
@@ -2194,7 +2162,6 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             w as i32,
             c as i32
         )?;
-        self.device.synchronize()?;
         Ok(out)
     }
 
@@ -2237,7 +2204,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                 )
                 .ok_or_else(|| Error::Cuda("permute_nhwc_to_nchw_kernel_bf16 not found".into()))?;
 
-            let mut output = Tensor::zeros_dtype(output_shape, DType::BF16, tensor.device.clone())?;
+            let mut output = Tensor::empty_dtype(output_shape, DType::BF16, tensor.device.clone())?;
 
             let input_ptr = tensor.as_device_ptr_bf16("permute_nhwc_to_nchw:input")? as u64;
             let output_ptr = output.as_mut_device_ptr_bf16("permute_nhwc_to_nchw:output")? as u64;
@@ -2253,11 +2220,10 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                 channels as u32
             )?;
 
-            self.device.synchronize()?;
             Ok(output)
         } else {
             let tensor_f32 = ensure_f32_tensor(tensor)?;
-            let mut output = Tensor::zeros_dtype(output_shape, DType::F32, tensor.device.clone())?;
+            let mut output = Tensor::empty_dtype(output_shape, DType::F32, tensor.device.clone())?;
 
             let kernel = self
                 .kernels
@@ -2276,7 +2242,6 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                 channels as u32
             )?;
 
-            self.device.synchronize()?;
             Ok(output)
         }
     }
@@ -2315,7 +2280,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                 )
                 .ok_or_else(|| Error::Cuda("permute_nchw_to_nhwc_kernel_bf16 not found".into()))?;
 
-            let mut output = Tensor::zeros_dtype(output_shape, DType::BF16, tensor.device.clone())?;
+            let mut output = Tensor::empty_dtype(output_shape, DType::BF16, tensor.device.clone())?;
 
             let input_ptr = tensor.as_device_ptr_bf16("permute_nchw_to_nhwc:input")? as u64;
             let output_ptr = output.as_mut_device_ptr_bf16("permute_nchw_to_nhwc:output")? as u64;
@@ -2331,11 +2296,10 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                 width as u32
             )?;
 
-            self.device.synchronize()?;
             Ok(output)
         } else {
             let tensor_f32 = ensure_f32_tensor(tensor)?;
-            let mut output = Tensor::zeros_dtype(output_shape, DType::F32, tensor.device.clone())?;
+            let mut output = Tensor::empty_dtype(output_shape, DType::F32, tensor.device.clone())?;
 
             let kernel = self
                 .kernels
@@ -2354,7 +2318,6 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                 width as u32
             )?;
 
-            self.device.synchronize()?;
             Ok(output)
         }
     }
@@ -2429,7 +2392,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                     .device
                     .get_func("permute_generic_f32_kernel", "permute_generic_f32_kernel")
                     .ok_or_else(|| Error::Cuda("permute_generic_f32_kernel not found".into()))?;
-                let mut output = Tensor::zeros_dtype(
+                let mut output = Tensor::empty_dtype(
                     Shape::from_dims(&out_dims),
                     DType::F32,
                     tensor.device.clone(),
@@ -2461,7 +2424,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                         .ok_or_else(|| {
                             Error::Cuda("permute_generic_bf16_kernel not found".into())
                         })?;
-                    let mut output = Tensor::zeros_dtype(
+                    let mut output = Tensor::empty_dtype(
                         Shape::from_dims(&out_dims),
                         DType::BF16,
                         tensor.device.clone(),
@@ -2509,7 +2472,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             return Err(Error::InvalidOperation("weight permute expects 4D".into()));
         }
         let (kh, kw, ic, oc) = (d[0], d[1], d[2], d[3]);
-        let mut out = Tensor::zeros_dtype(
+        let mut out = Tensor::empty_dtype(
             Shape::from_dims(&[oc, ic, kh, kw]),
             DType::F32,
             w.device.clone(),
@@ -2531,7 +2494,6 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             ic as i32,
             oc as i32
         )?;
-        self.device.synchronize()?;
         Ok(out)
     }
 
@@ -2542,7 +2504,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             return Err(Error::InvalidOperation("weight permute expects 4D".into()));
         }
         let (oc, ic, kh, kw) = (d[0], d[1], d[2], d[3]);
-        let mut out = Tensor::zeros_dtype(
+        let mut out = Tensor::empty_dtype(
             Shape::from_dims(&[kh, kw, ic, oc]),
             DType::F32,
             w.device.clone(),
@@ -2564,13 +2526,12 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             kh as i32,
             kw as i32
         )?;
-        self.device.synchronize()?;
         Ok(out)
     }
 
     /// Elementwise exponential
     pub fn exp(&self, tensor: &Tensor) -> Result<Tensor> {
-        let mut out = Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+        let mut out = Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
         let kernel = self
             .kernels
@@ -2585,13 +2546,12 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             out.storage.try_as_slice_f32()?,
             n as i32
         )?;
-        self.device.synchronize()?;
         Ok(out)
     }
 
     /// Elementwise natural logarithm
     pub fn log(&self, tensor: &Tensor) -> Result<Tensor> {
-        let mut out = Tensor::zeros_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
+        let mut out = Tensor::empty_dtype(tensor.shape.clone(), DType::F32, tensor.device.clone())?;
         let n = tensor.shape.elem_count();
         let kernel = self
             .kernels
@@ -2606,7 +2566,6 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             out.storage.try_as_slice_f32()?,
             n as i32
         )?;
-        self.device.synchronize()?;
         Ok(out)
     }
 
@@ -2631,7 +2590,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         out_shape[dim] = num_indices;
         let out_shape_s = Shape::from_dims(&out_shape);
         let mut output =
-            Tensor::zeros_dtype(out_shape_s.clone(), DType::F32, tensor.device.clone())?;
+            Tensor::empty_dtype(out_shape_s.clone(), DType::F32, tensor.device.clone())?;
 
         // Prepare strides and dims arrays
         let ndim = shape.len() as i32;
@@ -2690,7 +2649,6 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             numel as i32
         )?;
 
-        self.device.synchronize()?;
         Ok(output)
     }
 
@@ -2713,7 +2671,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             starts.push(s as i32);
         }
         let out_s = Shape::from_dims(&out_shape);
-        let mut output = Tensor::zeros_dtype(out_s.clone(), tensor.dtype(), tensor.device.clone())?;
+        let mut output = Tensor::empty_dtype(out_s.clone(), tensor.dtype(), tensor.device.clone())?;
 
         // Strides
         let mut in_strides = vec![1i32; shape.len()];
@@ -2800,7 +2758,6 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             }
         }
 
-        self.device.synchronize()?;
         Ok(output)
     }
 }

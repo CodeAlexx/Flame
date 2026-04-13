@@ -1434,7 +1434,7 @@ extern "C" __global__ void masked_fill_kernel(
     fn bmm_3d(&self, batch: usize, m: usize, k: usize, n: usize, other: &Tensor) -> Result<Tensor> {
         let mut output = match self.dtype() {
             DType::F32 => {
-                let mut out = Tensor::zeros_dtype(
+                let mut out = Tensor::empty_dtype(
                     Shape::from_dims(&[batch, m, n]),
                     DType::F32,
                     self.device.clone(),
@@ -1443,7 +1443,7 @@ extern "C" __global__ void masked_fill_kernel(
                 out
             }
             DType::BF16 => {
-                let mut out = Tensor::zeros_dtype(
+                let mut out = Tensor::empty_dtype(
                     Shape::from_dims(&[batch, m, n]),
                     DType::BF16,
                     self.device.clone(),
@@ -1563,7 +1563,7 @@ extern "C" __global__ void masked_fill_kernel(
 
             match self.dtype() {
                 DType::F32 => {
-                    let mut repeated = Tensor::zeros_dtype(
+                    let mut repeated = Tensor::empty_dtype(
                         Shape::from_dims(&[target_batch_prod, m, n]),
                         DType::F32,
                         self.device.clone(),
@@ -1585,7 +1585,7 @@ extern "C" __global__ void masked_fill_kernel(
                 DType::BF16 => {
                     #[cfg(feature = "bf16_u16")]
                     {
-                        let mut repeated = Tensor::zeros_dtype(
+                        let mut repeated = Tensor::empty_dtype(
                             Shape::from_dims(&[target_batch_prod, m, n]),
                             DType::BF16,
                             self.device.clone(),
@@ -3165,7 +3165,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         let cuda_kernels = CudaKernels::new(self.device.clone())?;
 
         // Allocate FP32 output buffer for the kernel
-        let output = Tensor::zeros_dtype(output_shape.clone(), DType::F32, self.device.clone())?;
+        let output = Tensor::empty_dtype(output_shape.clone(), DType::F32, self.device.clone())?;
 
         // Get the narrow kernel
         let kernel = cuda_kernels
@@ -3204,8 +3204,6 @@ extern "C" __global__ void f32_to_bool_kernel(
                 ),
             )?;
         }
-
-        self.device.synchronize()?;
 
         let mut out = if self.dtype() == DType::F32 {
             output

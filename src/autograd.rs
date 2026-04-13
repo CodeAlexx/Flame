@@ -1793,7 +1793,7 @@ fn compute_gradients(
 
             // Try fused kernel path (BF16 or F32)
             let grad = if output_grad.dtype() == DType::BF16 && x.dtype() == DType::BF16 {
-                let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, device.clone())?;
+                let mut out = Tensor::empty_dtype(x.shape().clone(), DType::BF16, device.clone())?;
                 let status = unsafe {
                     crate::cuda::ffi::flame_silu_backward_bf16(
                         tensor_raw_ptr(output_grad)?,
@@ -1807,7 +1807,7 @@ fn compute_gradients(
                 }
                 out
             } else if output_grad.dtype() == DType::F32 && x.dtype() == DType::F32 {
-                let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::F32, device.clone())?;
+                let mut out = Tensor::empty_dtype(x.shape().clone(), DType::F32, device.clone())?;
                 let status = unsafe {
                     crate::cuda::ffi::flame_silu_backward_f32(
                         tensor_raw_ptr(output_grad)?,
@@ -1824,7 +1824,7 @@ fn compute_gradients(
                 // Fallback: mixed dtypes — cast and use f32 kernel
                 let og_f32 = if output_grad.dtype() != DType::F32 { output_grad.to_dtype_no_grad(DType::F32)? } else { output_grad.clone_result()? };
                 let x_f32 = if x.dtype() != DType::F32 { x.to_dtype_no_grad(DType::F32)? } else { x };
-                let mut out = Tensor::zeros_dtype(x_f32.shape().clone(), DType::F32, device.clone())?;
+                let mut out = Tensor::empty_dtype(x_f32.shape().clone(), DType::F32, device.clone())?;
                 let status = unsafe {
                     crate::cuda::ffi::flame_silu_backward_f32(
                         tensor_raw_ptr(&og_f32)?,
@@ -3265,9 +3265,9 @@ fn compute_gradients(
                     let do_3d = output_grad.reshape(&[bh as usize, sq, hd])?;
 
                     // Allocate BF16 output grad tensors
-                    let dq = Tensor::zeros_dtype(q_3d.shape().clone(), DType::BF16, device.clone())?;
-                    let dk = Tensor::zeros_dtype(k_3d.shape().clone(), DType::BF16, device.clone())?;
-                    let dv = Tensor::zeros_dtype(v_3d.shape().clone(), DType::BF16, device.clone())?;
+                    let dq = Tensor::empty_dtype(q_3d.shape().clone(), DType::BF16, device.clone())?;
+                    let dk = Tensor::empty_dtype(k_3d.shape().clone(), DType::BF16, device.clone())?;
+                    let dv = Tensor::empty_dtype(v_3d.shape().clone(), DType::BF16, device.clone())?;
 
                     // Only dQ needs FP32 staging (atomicAdd across KV-tile blocks).
                     // dK, dV are written directly as BF16 by the kernel (register accum).

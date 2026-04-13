@@ -185,7 +185,7 @@ fn default_stream(t: &Tensor) -> CudaStream {
 
 pub fn relu_bf16(x: &Tensor) -> Result<Tensor> {
     ensure_bf16(x, "relu_bf16:x")?;
-    let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
+    let mut out = Tensor::empty_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
     debug_assert_eq!(out.dtype(), DType::BF16);
 
     let stream = default_stream(x);
@@ -199,7 +199,7 @@ pub fn relu_bf16(x: &Tensor) -> Result<Tensor> {
 
 pub fn gelu_bf16(x: &Tensor) -> Result<Tensor> {
     ensure_bf16(x, "gelu_bf16:x")?;
-    let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
+    let mut out = Tensor::empty_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
     debug_assert_eq!(out.dtype(), DType::BF16);
 
     let stream = default_stream(x);
@@ -236,7 +236,7 @@ pub fn gelu_bf16_into(x: &Tensor, out: &mut Tensor) -> Result<()> {
 
 pub fn silu_bf16(x: &Tensor) -> Result<Tensor> {
     ensure_bf16(x, "silu_bf16:x")?;
-    let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
+    let mut out = Tensor::empty_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
     debug_assert_eq!(out.dtype(), DType::BF16);
 
     let stream = default_stream(x);
@@ -265,7 +265,7 @@ pub fn rms_norm_bf16(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> Result<Te
     if let Some(w) = weight {
         ensure_bf16(w, "rms_norm_bf16:weight")?;
     }
-    let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
+    let mut out = Tensor::empty_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
     debug_assert_eq!(out.dtype(), DType::BF16);
 
     let stream = default_stream(x);
@@ -295,7 +295,7 @@ pub fn rms_norm_bf16(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> Result<Te
 /// must happen in F32 precision to match PyTorch's `norm(x.float())`.
 pub fn rms_norm_bf16_to_f32(x: &Tensor, eps: f32) -> Result<Tensor> {
     ensure_bf16(x, "rms_norm_bf16_to_f32:x")?;
-    let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::F32, x.device().clone())?;
+    let mut out = Tensor::empty_dtype(x.shape().clone(), DType::F32, x.device().clone())?;
 
     let stream = default_stream(x);
     let vx = tensor_as_view_bf16(x, "rms_norm_bf16_to_f32:x")?;
@@ -461,7 +461,7 @@ pub fn layer_norm_bf16_with_stats(
     mean_out: &mut cudarc::driver::CudaSlice<f32>,
     rstd_out: &mut cudarc::driver::CudaSlice<f32>,
 ) -> Result<Tensor> {
-    let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
+    let mut out = Tensor::empty_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
     layer_norm_bf16_with_stats_impl(&mut out, x, gamma, beta, norm_size, eps, mean_out, rstd_out)?;
     Ok(out)
 }
@@ -693,7 +693,7 @@ pub fn group_norm_bf16_with_stats(
         ));
     }
 
-    let mut out = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
+    let mut out = Tensor::empty_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
     debug_assert_eq!(out.dtype(), DType::BF16);
 
     let stream = default_stream(x);
@@ -1049,7 +1049,7 @@ pub fn slice_axis_bf16(t: &Tensor, axis: usize, start: usize, len: usize) -> Res
     let mut out_dims = dims.to_vec();
     out_dims[axis] = len;
     let mut out =
-        Tensor::zeros_dtype(Shape::from_dims(&out_dims), DType::BF16, t.device().clone())?;
+        Tensor::empty_dtype(Shape::from_dims(&out_dims), DType::BF16, t.device().clone())?;
 
     if len == 0 {
         return Ok(out);
@@ -1083,7 +1083,7 @@ pub fn broadcast_to_bf16(t: &Tensor, out_shape: &[usize]) -> Result<Tensor> {
     }
 
     let mut out =
-        Tensor::zeros_dtype(Shape::from_dims(out_shape), DType::BF16, t.device().clone())?;
+        Tensor::empty_dtype(Shape::from_dims(out_shape), DType::BF16, t.device().clone())?;
 
     let dims_i64: Vec<i64> = out_shape.iter().map(|&d| d as i64).collect();
     let strides = Shape::from_dims(out_shape).strides();
@@ -1164,7 +1164,7 @@ pub fn repeat_axis_bf16(t: &Tensor, axis: usize, repeats: usize) -> Result<Tenso
     let mut out_dims = dims.to_vec();
     out_dims[axis] = out_dims[axis] * repeats;
     let mut out =
-        Tensor::zeros_dtype(Shape::from_dims(&out_dims), DType::BF16, t.device().clone())?;
+        Tensor::empty_dtype(Shape::from_dims(&out_dims), DType::BF16, t.device().clone())?;
 
     let stream = default_stream(t);
     let vx = tensor_as_view_bf16(t, "repeat_axis_bf16:in")?;
@@ -1427,7 +1427,7 @@ pub fn conv2d_bf16(
         ));
     }
 
-    let mut out = Tensor::zeros_dtype(
+    let mut out = Tensor::empty_dtype(
         Shape::from_dims(&[n, ho as usize, wo as usize, oc]),
         DType::BF16,
         x.device().clone(),
@@ -1707,7 +1707,7 @@ pub fn sdpa_stream_bf16_with_workspace(
 
         let dv = v_dims[3];
         let out_shape = Shape::from_dims(&[b, h, q_len, dv]);
-        let mut out = Tensor::zeros_dtype(out_shape, DType::BF16, q.device().clone())?;
+        let mut out = Tensor::empty_dtype(out_shape, DType::BF16, q.device().clone())?;
 
         let stream = default_stream(q);
         let k_len = k_dims[2];

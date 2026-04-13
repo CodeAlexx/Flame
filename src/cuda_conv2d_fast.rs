@@ -79,7 +79,7 @@ impl CudaConv2dFast {
 
         // Allocate output
         let output_size = batch_size * out_channels * out_height * out_width;
-        let output_data = crate::tensor::alloc_zeros_from_pool(device, output_size)?;
+        let output_data = crate::tensor::alloc_from_pool(device, output_size)?;
 
         // Compile and launch the optimized kernel
         let kernel_code = r###"
@@ -309,8 +309,6 @@ extern "C" __global__ void conv2d_3x3_s1_p1(
                 )
                 .map_err(|e| Error::Cuda(format!("Kernel launch failed: {:?}", e)))?;
         }
-
-        device.synchronize()?;
 
         // Create output tensor
         Ok(Tensor {

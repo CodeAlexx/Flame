@@ -188,7 +188,7 @@ fn group_norm_forward_f32(
         .get_func("group_norm_forward", "group_norm_forward")
         .ok_or_else(|| Error::Cuda("Failed to get group_norm_forward kernel".into()))?;
 
-    let output_data = crate::tensor::alloc_zeros_from_pool(&device, input.shape().elem_count())?;
+    let output_data = crate::tensor::alloc_from_pool(&device, input.shape().elem_count())?;
     let mean_data = crate::tensor::alloc_zeros_from_pool(&device, batch_size * num_groups)?;
     let var_data = crate::tensor::alloc_zeros_from_pool(&device, batch_size * num_groups)?;
 
@@ -212,8 +212,6 @@ fn group_norm_forward_f32(
         channels_per_group as i32,
         spatial_size as i32
     )?;
-
-    device.synchronize()?;
 
     let threads_per_block = if input.shape().elem_count() > 100_000_000 {
         512

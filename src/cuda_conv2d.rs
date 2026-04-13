@@ -311,7 +311,6 @@ impl CudaConv2d {
             spatial_size as i32
         )?;
 
-        device.synchronize()?;
         Ok(result)
     }
 
@@ -414,8 +413,6 @@ impl CudaConv2d {
             )?;
         }
 
-        device.synchronize()?;
-
         // Compute weight gradient
         let input_col_shape = Shape::from_dims(&[
             batch_size * out_height * out_width,
@@ -487,8 +484,6 @@ impl CudaConv2d {
             )?;
         }
 
-        device.synchronize()?;
-
         let grad_input = Tensor {
             storage: TensorStorage::F32 {
                 data: grad_input_data.into(),
@@ -518,8 +513,6 @@ impl CudaConv2d {
                 out_channels as i32,
                 (out_height * out_width) as i32
             )?;
-
-            device.synchronize()?;
 
             Some(Tensor {
                 storage: TensorStorage::F32 {

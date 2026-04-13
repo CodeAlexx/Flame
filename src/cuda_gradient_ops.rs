@@ -302,7 +302,6 @@ impl CudaGradientOps {
             n as i32
         )?;
 
-        self.device.synchronize()?;
         Ok(())
     }
 
@@ -396,7 +395,6 @@ impl CudaGradientOps {
             n as i32
         )?;
 
-        self.device.synchronize()?;
         Ok(())
     }
 
@@ -411,7 +409,6 @@ impl CudaGradientOps {
         let cfg = LaunchConfig::for_num_elems(n as u32);
         launch_kernel!(f, cfg, grad.storage.try_as_slice_f32()?, scale, n as i32)?;
 
-        self.device.synchronize()?;
         Ok(())
     }
 
@@ -433,7 +430,6 @@ impl CudaGradientOps {
             n as i32
         )?;
 
-        self.device.synchronize()?;
         Ok(())
     }
 
@@ -478,7 +474,6 @@ impl CudaGradientOps {
             n as i32
         )?;
 
-        self.device.synchronize()?;
         Ok(())
     }
 
@@ -524,7 +519,6 @@ impl CudaGradientOps {
             n as i32
         )?;
 
-        self.device.synchronize()?;
         Ok(())
     }
 }

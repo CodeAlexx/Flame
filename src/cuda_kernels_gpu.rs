@@ -183,7 +183,7 @@ impl CudaKernels {
         let mut out_dims = indices.shape().dims().to_vec();
         out_dims.extend_from_slice(tail_dims);
         let output_shape = Shape::from_dims(&out_dims);
-        let mut output = Tensor::zeros_dtype(output_shape, input.dtype(), input.device().clone())?;
+        let mut output = Tensor::empty_dtype(output_shape, input.dtype(), input.device().clone())?;
 
         if rows == 0 || row_elems == 0 {
             return Ok(output);
@@ -846,7 +846,6 @@ extern "C" __global__ void floor_kernel(float *out, const float *input, int nume
             numel as i32
         )?;
 
-        tensor.device.synchronize()?;
         Ok(create_output_tensor(
             output_data,
             tensor.shape.clone(),
@@ -883,7 +882,6 @@ extern "C" __global__ void ceil_kernel(float *out, const float *input, int numel
             numel as i32
         )?;
 
-        tensor.device.synchronize()?;
         Ok(create_output_tensor(
             output_data,
             tensor.shape.clone(),
@@ -920,7 +918,6 @@ extern "C" __global__ void round_kernel(float *out, const float *input, int nume
             numel as i32
         )?;
 
-        tensor.device.synchronize()?;
         Ok(create_output_tensor(
             output_data,
             tensor.shape.clone(),
@@ -2463,7 +2460,7 @@ void mul_bc_kernel(const float* __restrict__ A, const float* __restrict__ B,
         let b_str_gpu = alloc_from_pool_and_copy(&a.device, &bo)?;
 
         let out_shape = Shape::from_dims(&out.iter().map(|&x| x as usize).collect::<Vec<_>>());
-        let mut output = Tensor::zeros_dtype(out_shape, crate::DType::F32, a.device.clone())?;
+        let mut output = Tensor::empty_dtype(out_shape, crate::DType::F32, a.device.clone())?;
 
         let cfg = LaunchConfig::for_num_elems(total as u32);
         unsafe {
@@ -2589,7 +2586,7 @@ void add_bc_kernel(const float* __restrict__ A, const float* __restrict__ B,
         let b_str_gpu = alloc_from_pool_and_copy(&a.device, &bo)?;
 
         let out_shape = Shape::from_dims(&out.iter().map(|&x| x as usize).collect::<Vec<_>>());
-        let mut output = Tensor::zeros_dtype(out_shape, crate::DType::F32, a.device.clone())?;
+        let mut output = Tensor::empty_dtype(out_shape, crate::DType::F32, a.device.clone())?;
 
         let cfg = LaunchConfig::for_num_elems(total as u32);
         let ndims = i32::try_from(tr)

@@ -290,7 +290,6 @@ extern "C" __global__ void im2col_3x3_optimized(
                 .map_err(|e| Error::Cuda(format!("Kernel launch failed: {:?}", e)))?;
         }
 
-        device.synchronize()?;
         Ok(())
     }
 
