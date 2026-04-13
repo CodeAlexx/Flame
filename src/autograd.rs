@@ -3240,16 +3240,11 @@ fn compute_gradients(
                     let dk = Tensor::zeros_dtype(k_3d.shape().clone(), DType::BF16, device.clone())?;
                     let dv = Tensor::zeros_dtype(v_3d.shape().clone(), DType::BF16, device.clone())?;
 
-                    // FP32 staging buffers from pool (zeroed) — reused across calls
+                    // Only dQ needs FP32 staging (atomicAdd across KV-tile blocks).
+                    // dK, dV are written directly as BF16 by the kernel (register accum).
                     let dq_f32_n = bh as usize * sq * hd;
-                    let dkv_f32_n = bh as usize * sk * hd;
                     let mut dq_f32 = crate::cuda_memory_alignment::alloc_aligned_f32(device, dq_f32_n)?;
-                    let mut dk_f32 = crate::cuda_memory_alignment::alloc_aligned_f32(device, dkv_f32_n)?;
-                    let mut dv_f32 = crate::cuda_memory_alignment::alloc_aligned_f32(device, dkv_f32_n)?;
-                    // Zero the staging buffers (atomicAdd needs zeroed memory)
                     device.memset_zeros(&mut dq_f32).map_err(|e| Error::Cuda(format!("{e:?}")))?;
-                    device.memset_zeros(&mut dk_f32).map_err(|e| Error::Cuda(format!("{e:?}")))?;
-                    device.memset_zeros(&mut dv_f32).map_err(|e| Error::Cuda(format!("{e:?}")))?;
 
                     use cudarc::driver::DevicePtr;
                     let stream = crate::cuda::device_lt::stream_ptr(device)?;
@@ -3277,8 +3272,6 @@ fn compute_gradients(
                             hd as i32,
                             stream,
                             *dq_f32.device_ptr() as *mut f32,
-                            *dk_f32.device_ptr() as *mut f32,
-                            *dv_f32.device_ptr() as *mut f32,
                         )
                     };
                     if ret == 0 {

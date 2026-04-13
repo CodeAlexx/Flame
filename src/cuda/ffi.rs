@@ -483,6 +483,9 @@ extern "C" {
     /// Q,K,V,O,dO: [B*H, N, HD] BF16. LSE: [B*H, N_q] FP32.
     /// dQ,dK,dV: [B*H, N, HD] BF16 output.
     /// head_dim must be 64, 96, or 128. Returns 0 on success.
+    /// Flash attention backward — wmma tensor core version.
+    /// dK, dV written directly as BF16 (register accumulation, no staging).
+    /// dQ uses FP32 staging buffer (atomicAdd across KV-tile blocks).
     pub fn flame_flash_attention_backward_bf16(
         Q: *const core::ffi::c_void,
         K: *const core::ffi::c_void,
@@ -499,8 +502,6 @@ extern "C" {
         head_dim: i32,
         stream: *mut core::ffi::c_void,
         dQ_f32: *mut f32,  // Pre-allocated FP32 staging [BH, N_q, HD], zeroed
-        dK_f32: *mut f32,  // Pre-allocated FP32 staging [BH, N_kv, HD], zeroed
-        dV_f32: *mut f32,  // Pre-allocated FP32 staging [BH, N_kv, HD], zeroed
     ) -> i32;
 
     /// Fused RMS norm + modulation: out = rms_norm(x, w) * (1+scale) + shift.

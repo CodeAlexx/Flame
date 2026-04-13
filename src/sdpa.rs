@@ -92,14 +92,17 @@ fn allow_sdpa_f32_fallback() -> bool {
 }
 
 pub fn forward(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> SdpaResult<Tensor> {
-    // Training path: use forward_train for fused Op::FlashAttention recording.
-    // Currently disabled: the wmma backward kernel with FP32 atomicAdd staging
-    // is 1.45x slower than the decomposed path. The kernel + infrastructure
-    // is complete and correct — needs optimization (shared-memory dK/dV
-    // accumulation instead of global atomicAdd).
-    // if crate::autograd::AutogradContext::is_recording()
-    //     && (q.requires_grad || k.requires_grad || v.requires_grad)
-    // { return forward_train(q, k, v, mask); }
+    // Fused wmma backward kernel: correct but ~1.4x slower than decomposed
+    // path at small seq_len (1024). Needs profiling — likely the 7-stage
+    // pipeline with per-stage __syncthreads is slower than 12 separate
+    // fully-pipelined kernel launches at this size. May win at larger seq_len.
+    // Enable with FLAME_FUSED_ATTN_BWD=1 for testing.
+    if std::env::var("FLAME_FUSED_ATTN_BWD").ok().as_deref() == Some("1")
+        && crate::autograd::AutogradContext::is_recording()
+        && (q.requires_grad || k.requires_grad || v.requires_grad)
+    {
+        return forward_train(q, k, v, mask);
+    }
     scope("sdpa.forward", GuardMode::env_default(), || {
         let output = forward_inner(q, k, v, mask)?;
         debug_assert_eq!(output.dtype(), DType::BF16);
