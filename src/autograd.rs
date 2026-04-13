@@ -3184,7 +3184,6 @@ fn compute_gradients(
             scale,
             causal: _,
         } => {
-            // Prefer FlashAttention backward; fall back to recompute path on failure.
             let query_tensor = entry
                 .get_saved(query)
                 .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for query".into()))?;
@@ -3195,73 +3194,123 @@ fn compute_gradients(
                 .get_saved(value)
                 .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for value".into()))?;
 
-            let mask_tensor = if let Some(m_id) = mask {
-                entry.get_saved(m_id)
+            // Find saved output and LSE tensors for fused backward
+            let output_tensor = entry
+                .saved_tensors
+                .iter()
+                .map(|(_, t)| t)
+                .find(|t| {
+                    t.shape().dims() == output_grad.shape().dims()
+                        && t.id != query_tensor.id
+                        && t.id != key_tensor.id
+                        && t.id != value_tensor.id
+                });
+
+            // Find LSE tensor: shape [batch_heads, seq_len_q], dtype F32
+            let q_dims = query_tensor.shape().dims();
+            let lse_tensor = if q_dims.len() == 4 {
+                let bh = q_dims[0] * q_dims[1];
+                let sq = q_dims[2];
+                entry.saved_tensors.iter().map(|(_, t)| t).find(|t| {
+                    t.dtype() == DType::F32 && t.shape().dims() == [bh, sq]
+                })
             } else {
                 None
             };
 
-            // Try fused backward first
-            let fused = (|| {
-                // Find saved output (if required by fused path)
-                let output_tensor = entry
-                    .saved_tensors
-                    .iter()
-                    .map(|(_, t)| t)
-                    .find(|t| {
-                        t.shape().dims() == output_grad.shape().dims()
-                            && t.id != query_tensor.id
-                            && t.id != key_tensor.id
-                            && t.id != value_tensor.id
-                    })
-                    .ok_or_else(|| Error::InvalidOperation("Missing saved output tensor".into()))?;
-                crate::flash_attention::flash_attention_backward(
-                    output_grad,
-                    query_tensor,
-                    key_tensor,
-                    value_tensor,
-                    mask_tensor,
-                    output_tensor,
-                    *scale,
-                    false,
-                )
-            })();
+            // Try fused wmma backward kernel (requires output + LSE saved from forward)
+            let fused_result = if let (Some(out_t), Some(lse_t)) = (output_tensor, lse_tensor) {
+                if q_dims.len() == 4
+                    && query_tensor.dtype() == DType::BF16
+                    && output_grad.dtype() == DType::BF16
+                {
+                    let (b, h, sq, hd) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
+                    let sk = key_tensor.shape().dims()[2];
+                    let bh = (b * h) as i32;
 
-            // Look for a cached attn tensor in saved_tensors (shape
-            // [batch, heads, q_len, k_len]). Matches the attn saved by
-            // callers that pre-compute softmax in forward.
-            let expected_attn_shape = {
-                let q_dims = query_tensor.shape().dims();
-                let k_dims = key_tensor.shape().dims();
-                if q_dims.len() == 4 && k_dims.len() == 4 {
-                    Some([q_dims[0], q_dims[1], q_dims[2], k_dims[2]])
+                    // Reshape to [BH, N, HD] for kernel
+                    let q_3d = query_tensor.reshape(&[bh as usize, sq, hd])?;
+                    let k_3d = key_tensor.reshape(&[bh as usize, sk, hd])?;
+                    let v_3d = value_tensor.reshape(&[bh as usize, sk, hd])?;
+                    let o_3d = out_t.reshape(&[bh as usize, sq, hd])?;
+                    let do_3d = output_grad.reshape(&[bh as usize, sq, hd])?;
+
+                    // Allocate BF16 output grad tensors
+                    let dq = Tensor::zeros_dtype(q_3d.shape().clone(), DType::BF16, device.clone())?;
+                    let dk = Tensor::zeros_dtype(k_3d.shape().clone(), DType::BF16, device.clone())?;
+                    let dv = Tensor::zeros_dtype(v_3d.shape().clone(), DType::BF16, device.clone())?;
+
+                    // FP32 staging buffers from pool (zeroed) — reused across calls
+                    let dq_f32_n = bh as usize * sq * hd;
+                    let dkv_f32_n = bh as usize * sk * hd;
+                    let mut dq_f32 = crate::cuda_memory_alignment::alloc_aligned_f32(device, dq_f32_n)?;
+                    let mut dk_f32 = crate::cuda_memory_alignment::alloc_aligned_f32(device, dkv_f32_n)?;
+                    let mut dv_f32 = crate::cuda_memory_alignment::alloc_aligned_f32(device, dkv_f32_n)?;
+                    // Zero the staging buffers (atomicAdd needs zeroed memory)
+                    device.memset_zeros(&mut dq_f32).map_err(|e| Error::Cuda(format!("{e:?}")))?;
+                    device.memset_zeros(&mut dk_f32).map_err(|e| Error::Cuda(format!("{e:?}")))?;
+                    device.memset_zeros(&mut dv_f32).map_err(|e| Error::Cuda(format!("{e:?}")))?;
+
+                    use cudarc::driver::DevicePtr;
+                    let stream = crate::cuda::device_lt::stream_ptr(device)?;
+                    let ret = unsafe {
+                        crate::cuda::ffi::flame_flash_attention_backward_bf16(
+                            q_3d.as_device_ptr_bf16("fa_bwd:q")? as *const core::ffi::c_void,
+                            k_3d.as_device_ptr_bf16("fa_bwd:k")? as *const core::ffi::c_void,
+                            v_3d.as_device_ptr_bf16("fa_bwd:v")? as *const core::ffi::c_void,
+                            o_3d.as_device_ptr_bf16("fa_bwd:o")? as *const core::ffi::c_void,
+                            do_3d.as_device_ptr_bf16("fa_bwd:do")? as *const core::ffi::c_void,
+                            {
+                                match &lse_t.storage {
+                                    crate::tensor_storage::TensorStorage::F32 { data, .. } =>
+                                        *crate::tensor_storage::slice_ref(data).device_ptr()
+                                            as *const core::ffi::c_void,
+                                    _ => core::ptr::null(),
+                                }
+                            },
+                            dq.as_device_ptr_bf16("fa_bwd:dq")? as *mut core::ffi::c_void,
+                            dk.as_device_ptr_bf16("fa_bwd:dk")? as *mut core::ffi::c_void,
+                            dv.as_device_ptr_bf16("fa_bwd:dv")? as *mut core::ffi::c_void,
+                            bh,
+                            sq as i32,
+                            sk as i32,
+                            hd as i32,
+                            stream,
+                            *dq_f32.device_ptr() as *mut f32,
+                            *dk_f32.device_ptr() as *mut f32,
+                            *dv_f32.device_ptr() as *mut f32,
+                        )
+                    };
+                    if ret == 0 {
+                        // Reshape back to [B, H, N, D]
+                        let dq = dq.reshape(&[b, h, sq, hd])?;
+                        let dk = dk.reshape(&[b, h, sk, hd])?;
+                        let dv = dv.reshape(&[b, h, sk, hd])?;
+                        Some((dq, dk, dv))
+                    } else {
+                        eprintln!("[flash_attn_bwd] fused kernel failed (ret={ret}), falling back");
+                        None
+                    }
                 } else {
                     None
                 }
+            } else {
+                None
             };
-            let cached_attn: Option<&Tensor> = expected_attn_shape.and_then(|s| {
-                entry
-                    .saved_tensors
-                    .iter()
-                    .map(|(_, t)| t)
-                    .find(|t| t.shape().dims() == s)
-            });
 
-            let (grad_q, grad_k, grad_v) = match fused {
-                Ok(triple) => triple,
-                Err(_) => {
-                    // Fallback to recompute SDPA backward (local helper)
-                    let (dq, dk, dv) = attention_backward_recompute(
-                        query_tensor,
-                        key_tensor,
-                        value_tensor,
-                        output_grad,
-                        mask_tensor,
-                        *scale,
-                        cached_attn,
-                    )?;
-                    (dq, dk, dv)
-                }
+            let (grad_q, grad_k, grad_v) = if let Some(triple) = fused_result {
+                triple
+            } else {
+                // Fallback to decomposed recompute path
+                let mask_tensor = if let Some(m_id) = mask {
+                    entry.get_saved(m_id)
+                } else {
+                    None
+                };
+                attention_backward_recompute(
+                    query_tensor, key_tensor, value_tensor,
+                    output_grad, mask_tensor, *scale, None,
+                )?
             };
 
             Ok(vec![(*query, grad_q), (*key, grad_k), (*value, grad_v)])

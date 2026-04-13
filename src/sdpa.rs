@@ -92,6 +92,14 @@ fn allow_sdpa_f32_fallback() -> bool {
 }
 
 pub fn forward(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> SdpaResult<Tensor> {
+    // Training path: use forward_train for fused Op::FlashAttention recording.
+    // Currently disabled: the wmma backward kernel with FP32 atomicAdd staging
+    // is 1.45x slower than the decomposed path. The kernel + infrastructure
+    // is complete and correct — needs optimization (shared-memory dK/dV
+    // accumulation instead of global atomicAdd).
+    // if crate::autograd::AutogradContext::is_recording()
+    //     && (q.requires_grad || k.requires_grad || v.requires_grad)
+    // { return forward_train(q, k, v, mask); }
     scope("sdpa.forward", GuardMode::env_default(), || {
         let output = forward_inner(q, k, v, mask)?;
         debug_assert_eq!(output.dtype(), DType::BF16);
@@ -132,9 +140,61 @@ pub fn forward_train(
             1.0
         };
 
-        let output = {
+        // Run forward under no_grad using the wmma kernel, also capture LSE
+        // for the fused backward kernel.
+        let (output, lse_tensor) = {
             let _guard = crate::autograd::AutogradContext::no_grad();
-            forward(q, k, v, mask)?
+            let (b, h, sq, hd) = (dims[0], dims[1], dims[2], head_dim);
+            let sk = k_dims[2];
+            let bh = (b * h) as i32;
+
+            // Try wmma kernel path (needs HD=64/96/128, BF16)
+            if (hd == 64 || hd == 96 || hd == 128)
+                && q.dtype() == DType::BF16
+                && k.dtype() == DType::BF16
+                && v.dtype() == DType::BF16
+            {
+                use crate::cuda::device_lt;
+                use cudarc::driver::DevicePtr;
+
+                let out_tensor = Tensor::empty_dtype(q.shape().clone(), DType::BF16, q.device().clone())?;
+                let lse = Tensor::zeros_dtype(
+                    crate::Shape::from_dims(&[b * h, sq]),
+                    DType::F32,
+                    q.device().clone(),
+                )?;
+
+                // Reshape to [BH, N, HD]
+                let q_3d = q.reshape(&[bh as usize, sq, hd])?;
+                let k_3d = k.reshape(&[bh as usize, sk, hd])?;
+                let v_3d = v.reshape(&[bh as usize, sk, hd])?;
+
+                let q_ptr = q_3d.as_device_ptr_bf16("sdpa_train:q")? as *const core::ffi::c_void;
+                let k_ptr = k_3d.as_device_ptr_bf16("sdpa_train:k")? as *const core::ffi::c_void;
+                let v_ptr = v_3d.as_device_ptr_bf16("sdpa_train:v")? as *const core::ffi::c_void;
+                let o_ptr = out_tensor.as_device_ptr_bf16("sdpa_train:o")? as *mut core::ffi::c_void;
+                let lse_ptr = match &lse.storage {
+                    crate::tensor_storage::TensorStorage::F32 { data, .. } =>
+                        *crate::tensor_storage::slice_ref(data).device_ptr() as *mut f32,
+                    _ => core::ptr::null_mut(),
+                };
+
+                let stream = device_lt::stream_ptr(q.device())?;
+                let ret = unsafe {
+                    crate::cuda::ffi::flame_flash_attention_bf16(
+                        q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr,
+                        bh, sq as i32, sk as i32, hd as i32, stream,
+                    )
+                };
+                if ret == 0 {
+                    (out_tensor, Some(lse))
+                } else {
+                    // Fallback to decomposed forward
+                    (forward_inner(q, k, v, mask)?, None)
+                }
+            } else {
+                (forward_inner(q, k, v, mask)?, None)
+            }
         };
 
         if q.requires_grad() || k.requires_grad() || v.requires_grad() {
@@ -145,7 +205,13 @@ pub fn forward_train(
                 (q.id(), q.clone()),
                 (k.id(), k.clone()),
                 (v.id(), v.clone()),
+                // Save output for fused backward
+                (out.id(), out.clone()),
             ];
+            // Save LSE for fused backward kernel
+            if let Some(ref lse) = lse_tensor {
+                saved.push((lse.id(), lse.clone()));
+            }
             let mask_id = if let Some(mask_tensor) = mask {
                 saved.push((mask_tensor.id(), mask_tensor.clone()));
                 Some(mask_tensor.id())
@@ -558,6 +624,7 @@ fn forward_flash_bf16(
     let ret = unsafe {
         crate::cuda::ffi::flame_flash_attention_bf16(
             q_ptr, k_ptr, v_ptr, o_ptr,
+            core::ptr::null_mut(), // LSE: not needed for inference-only forward
             bh,
             q_len as i32,
             k_len as i32,

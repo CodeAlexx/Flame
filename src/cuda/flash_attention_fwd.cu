@@ -97,6 +97,7 @@ __global__ void flash_attn_fwd_hd##HD(                                        \
     const __nv_bfloat16* __restrict__ K,                                      \
     const __nv_bfloat16* __restrict__ V,                                      \
     __nv_bfloat16* __restrict__ O,                                            \
+    float* __restrict__ LSE,                                                  \
     const int N_q,                                                            \
     const int N_kv,                                                           \
     const float scale                                                         \
@@ -328,6 +329,17 @@ __global__ void flash_attn_fwd_hd##HD(                                        \
         __syncthreads();                                                      \
     }  /* end KV tile loop */                                                 \
                                                                               \
+    /* ---- Write LSE (log-sum-exp) per row for backward pass ---- */          \
+    /* LSE[row] = m[row] + log(l[row])                            */          \
+    /* Needed by the backward kernel to recompute softmax         */          \
+    /* without storing the full attention matrix.                  */          \
+    if (LSE != NULL) {                                                        \
+        float* LSE_base = LSE + (size_t)bh * N_q + q_start;                  \
+        for (int i = tid; i < q_rows; i += THREADS) {                        \
+            LSE_base[i] = s_m[i] + logf(s_l[i]);                             \
+        }                                                                     \
+    }                                                                         \
+                                                                              \
     /* ---- Normalize O by 1/l and write BF16 output ---- */                  \
     for (int i = tid; i < q_rows * HD; i += THREADS) {                        \
         int qi = i / HD;                                                      \
@@ -351,6 +363,7 @@ int flame_flash_attention_bf16(
     const void* K,
     const void* V,
     void* O,
+    float* LSE,
     int batch_heads,
     int seq_len_q,
     int seq_len_kv,
@@ -389,6 +402,7 @@ int flame_flash_attention_bf16(
             (const __nv_bfloat16*)K,                                          \
             (const __nv_bfloat16*)V,                                          \
             (__nv_bfloat16*)O,                                                \
+            LSE,                                                              \
             seq_len_q,                                                        \
             seq_len_kv,                                                       \
             scale_val                                                         \

@@ -85,72 +85,64 @@ pub fn flash_attention_forward(
         ));
     }
 
-    // Compute scale factor
     let scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
+    let bh = (batch_size * num_heads) as i32;
 
-    let query_fp32 = query.to_dtype(DType::F32)?;
-    let key_fp32 = key.to_dtype(DType::F32)?;
-    let value_fp32 = value.to_dtype(DType::F32)?;
-    let attention_mask_fp32 = match attention_mask {
-        Some(mask) => Some(mask.to_dtype(DType::F32)?),
-        None => None,
-    };
+    // Use the fast wmma kernel (same as inference) for supported head dims.
+    // This also outputs LSE needed for the fused backward kernel.
+    let needs_grad = query.requires_grad || key.requires_grad || value.requires_grad;
 
-    let mask_ref = attention_mask_fp32.as_ref();
+    // Allocate output
+    let output = Tensor::empty_dtype(query.shape().clone(), DType::BF16, query.device.clone())?;
 
-    // Use appropriate kernel based on head dimension
-    let output_fp32 = if head_dim <= 64 {
-        flash_attention_forward_kernel_small(
-            &query_fp32,
-            &key_fp32,
-            &value_fp32,
-            mask_ref,
-            scale,
-            causal,
-            batch_size,
-            num_heads,
-            seq_len_q,
-            seq_len_k,
-            head_dim,
-        )?
-    } else if head_dim <= 128 {
-        flash_attention_forward_kernel_medium(
-            &query_fp32,
-            &key_fp32,
-            &value_fp32,
-            mask_ref,
-            scale,
-            causal,
-            batch_size,
-            num_heads,
-            seq_len_q,
-            seq_len_k,
-            head_dim,
-        )?
+    // Allocate LSE if we need backward (FP32, [batch_heads, seq_len_q])
+    let lse_tensor = if needs_grad {
+        Some(Tensor::zeros_dtype(
+            Shape::from_dims(&[batch_size * num_heads, seq_len_q]),
+            DType::F32,
+            query.device.clone(),
+        )?)
     } else {
-        flash_attention_forward_kernel_large(
-            &query_fp32,
-            &key_fp32,
-            &value_fp32,
-            mask_ref,
-            scale,
-            causal,
-            batch_size,
-            num_heads,
-            seq_len_q,
-            seq_len_k,
-            head_dim,
-        )?
+        None
     };
 
-    let mut output = if output_fp32.dtype() == DType::BF16 {
-        output_fp32
+    // Reshape Q,K,V from [B, H, N, D] to [B*H, N, D] for the kernel
+    let q_3d = query.reshape(&[bh as usize, seq_len_q, head_dim])?;
+    let k_3d = key.reshape(&[bh as usize, seq_len_k, head_dim])?;
+    let v_3d = value.reshape(&[bh as usize, seq_len_k, head_dim])?;
+
+    let q_ptr = q_3d.as_device_ptr_bf16("flash_fwd:q")? as *const core::ffi::c_void;
+    let k_ptr = k_3d.as_device_ptr_bf16("flash_fwd:k")? as *const core::ffi::c_void;
+    let v_ptr = v_3d.as_device_ptr_bf16("flash_fwd:v")? as *const core::ffi::c_void;
+    let o_ptr = output.as_device_ptr_bf16("flash_fwd:o")? as *mut core::ffi::c_void;
+    let lse_ptr = if let Some(ref lse) = lse_tensor {
+        use cudarc::driver::DevicePtr;
+        match &lse.storage {
+            TensorStorage::F32 { data, .. } => {
+                *crate::tensor_storage::slice_ref(data).device_ptr() as *mut f32
+            }
+            _ => core::ptr::null_mut(),
+        }
     } else {
-        output_fp32.to_dtype(DType::BF16)?
+        core::ptr::null_mut()
     };
+
+    let stream = crate::cuda::device_lt::stream_ptr(&query.device)?;
+    let ret = unsafe {
+        crate::cuda::ffi::flame_flash_attention_bf16(
+            q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr,
+            bh, seq_len_q as i32, seq_len_k as i32, head_dim as i32, stream,
+        )
+    };
+    if ret != 0 {
+        return Err(Error::Cuda(format!("flash_attention_forward wmma kernel failed: {ret}")));
+    }
+
+    // Reshape output back to [B, H, N, D]
+    let mut output = output.reshape(query.shape().dims())?;
 
     // Record for autograd if needed
-    if query.requires_grad || key.requires_grad || value.requires_grad {
+    if needs_grad {
         let mut output_with_grad = output.clone_result()?;
         output_with_grad.requires_grad = true;
         if AutogradContext::is_recording() {
@@ -158,7 +150,13 @@ pub fn flash_attention_forward(
                 (query.id, query.clone_result()?),
                 (key.id, key.clone_result()?),
                 (value.id, value.clone_result()?),
+                // Save output for backward (needed by some paths)
+                (output.id, output.clone_result()?),
             ];
+            // Save LSE for fused backward
+            if let Some(ref lse) = lse_tensor {
+                saved_tensors.push((lse.id, lse.clone_result()?));
+            }
 
             if let Some(mask) = attention_mask {
                 saved_tensors.push((mask.id, mask.clone_result()?));

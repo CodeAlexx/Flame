@@ -462,18 +462,45 @@ extern "C" {
     ) -> i32;
 
     /// Flash attention forward: BF16 in/out, FP32 accumulation, online softmax.
-    /// Q,K,V: [B*H, N, 128] BF16. O: [B*H, N, 128] BF16.
-    /// head_dim must be 128. Returns 0 on success.
+    /// Q,K,V: [B*H, N, HD] BF16. O: [B*H, N, HD] BF16.
+    /// LSE: [B*H, N_q] FP32, can be null. Outputs log-sum-exp per row for backward pass.
+    /// head_dim must be 64, 96, or 128. Returns 0 on success.
     pub fn flame_flash_attention_bf16(
         Q: *const core::ffi::c_void,
         K: *const core::ffi::c_void,
         V: *const core::ffi::c_void,
         O: *mut core::ffi::c_void,
+        LSE: *mut f32,
         batch_heads: i32,
         seq_len_q: i32,
         seq_len_kv: i32,
         head_dim: i32,
         stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Flash attention backward — wmma tensor core version.
+    /// Computes dQ, dK, dV from Q, K, V, O, dO, and LSE.
+    /// Q,K,V,O,dO: [B*H, N, HD] BF16. LSE: [B*H, N_q] FP32.
+    /// dQ,dK,dV: [B*H, N, HD] BF16 output.
+    /// head_dim must be 64, 96, or 128. Returns 0 on success.
+    pub fn flame_flash_attention_backward_bf16(
+        Q: *const core::ffi::c_void,
+        K: *const core::ffi::c_void,
+        V: *const core::ffi::c_void,
+        O: *const core::ffi::c_void,
+        dO: *const core::ffi::c_void,
+        LSE: *const core::ffi::c_void,
+        dQ: *mut core::ffi::c_void,
+        dK: *mut core::ffi::c_void,
+        dV: *mut core::ffi::c_void,
+        batch_heads: i32,
+        seq_len_q: i32,
+        seq_len_kv: i32,
+        head_dim: i32,
+        stream: *mut core::ffi::c_void,
+        dQ_f32: *mut f32,  // Pre-allocated FP32 staging [BH, N_q, HD], zeroed
+        dK_f32: *mut f32,  // Pre-allocated FP32 staging [BH, N_kv, HD], zeroed
+        dV_f32: *mut f32,  // Pre-allocated FP32 staging [BH, N_kv, HD], zeroed
     ) -> i32;
 
     /// Fused RMS norm + modulation: out = rms_norm(x, w) * (1+scale) + shift.
