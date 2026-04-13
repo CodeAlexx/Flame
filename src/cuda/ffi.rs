@@ -464,6 +464,13 @@ extern "C" {
 
     /// GPU-side FP16 (IEEE half) → BF16 conversion.
     /// In-place safe (both 2 bytes per element).
+    pub fn flame_f32_to_bf16(
+        input: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        n: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     pub fn flame_fp16_to_bf16(
         input: *const core::ffi::c_void,
         output: *mut core::ffi::c_void,
