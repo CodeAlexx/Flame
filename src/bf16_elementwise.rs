@@ -390,8 +390,7 @@ fn launch_bf16_elementwise(
         )));
     }
 
-    let data = unsafe { a.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc {}: {:?}", op_name, e)))?;
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&a.device, n)?;
     let out_dims_usize: Vec<usize> = spec.out_dims.iter().map(|&d| d as usize).collect();
     let mut out = Tensor {
         storage: TensorStorage::BF16 {
@@ -455,68 +454,163 @@ fn launch_bf16_elementwise(
 
 // Fused BF16 softmax along the LAST dim. One block per row, threads cooperate
 // via shared-mem max+sum reductions, then a single normalize pass writes BF16
-// output. No FP32 scratch tensor allocated — replaces the 5-step
-// max → sub → exp → sum → div pipeline that was allocating ~5× the tensor
-// memory and running 175× slower than PyTorch on [30, 4096, 4096].
+// Fused BF16 softmax kernel. Warp-shuffle reductions, vectorized BF16 loads.
+// Each block handles one row. 256 threads (8 warps), elements in registers.
+// 2-pass: (1) online max+sum, (2) normalize+write.
 const CUDA_SOFTMAX_LASTDIM_BF16: &str = r#"
 #include <cuda_bf16.h>
 
-// NVRTC has no <float.h>, use the literal value of FLT_MAX directly.
 #define LOCAL_FLT_MAX 3.402823466e+38f
+#define FULL_MASK 0xFFFFFFFF
+
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, offset));
+    return val;
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_xor_sync(FULL_MASK, val, offset);
+    return val;
+}
 
 extern "C" __global__
 void softmax_lastdim_bf16_kernel(const __nv_bfloat16* __restrict__ X,
                                   __nv_bfloat16* __restrict__ Y,
                                   long rows, long cols) {
-    extern __shared__ float smem[];
+    __shared__ float warp_smem[32];
+    __shared__ float warp_smem2[32];
 
     long row = blockIdx.x;
     if (row >= rows) return;
     int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    int num_warps = blockDim.x / 32;
 
     const __nv_bfloat16* x_row = X + row * cols;
     __nv_bfloat16* y_row = Y + row * cols;
 
-    // Pass 1: max (shared-mem reduction)
+    // Pass 1: online softmax — compute max AND sum in a single pass.
+    // Uses the online trick: when we find a new max, rescale the running sum.
     float local_max = -LOCAL_FLT_MAX;
-    for (long c = tid; c < cols; c += blockDim.x) {
-        float v = __bfloat162float(x_row[c]);
-        if (v > local_max) local_max = v;
-    }
-    smem[tid] = local_max;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            float other = smem[tid + s];
-            if (other > smem[tid]) smem[tid] = other;
-        }
-        __syncthreads();
-    }
-    float row_max = smem[0];
-
-    // Pass 2: exp(x - max), sum (shared-mem reduction)
     float local_sum = 0.0f;
     for (long c = tid; c < cols; c += blockDim.x) {
-        float v = __expf(__bfloat162float(x_row[c]) - row_max);
-        local_sum += v;
+        float v = __bfloat162float(x_row[c]);
+        if (v > local_max) {
+            // Rescale running sum for the new max
+            local_sum *= __expf(local_max - v);
+            local_max = v;
+        }
+        local_sum += __expf(v - local_max);
     }
-    smem[tid] = local_sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) smem[tid] += smem[tid + s];
-        __syncthreads();
-    }
-    float inv_sum = 1.0f / smem[0];
 
-    // Pass 3: write normalized output. Recompute exp to avoid an extra
-    // shared-mem buffer for cols ≤ blockDim case. For cols > blockDim, this
-    // is a memory-bound second read of x_row — same cost as PyTorch.
+    // Cross-thread reduction of (max, sum) pairs.
+    // Warp-level first, then cross-warp via shared memory.
+    // When combining two (max_a, sum_a) and (max_b, sum_b):
+    //   new_max = max(max_a, max_b)
+    //   new_sum = sum_a * exp(max_a - new_max) + sum_b * exp(max_b - new_max)
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other_max = __shfl_xor_sync(FULL_MASK, local_max, offset);
+        float other_sum = __shfl_xor_sync(FULL_MASK, local_sum, offset);
+        float new_max = fmaxf(local_max, other_max);
+        local_sum = local_sum * __expf(local_max - new_max)
+                   + other_sum * __expf(other_max - new_max);
+        local_max = new_max;
+    }
+
+    // Cross-warp reduction
+    if (lane_id == 0) {
+        warp_smem[warp_id] = local_max;
+        warp_smem2[warp_id] = local_sum;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        float m = (lane_id < num_warps) ? warp_smem[lane_id] : -LOCAL_FLT_MAX;
+        float s = (lane_id < num_warps) ? warp_smem2[lane_id] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float om = __shfl_xor_sync(FULL_MASK, m, offset);
+            float os = __shfl_xor_sync(FULL_MASK, s, offset);
+            float nm = fmaxf(m, om);
+            s = s * __expf(m - nm) + os * __expf(om - nm);
+            m = nm;
+        }
+        warp_smem[0] = m;
+        warp_smem2[0] = s;
+    }
+    __syncthreads();
+    float row_max = warp_smem[0];
+    float inv_sum = 1.0f / warp_smem2[0];
+
+    // Pass 2: normalize and write. One read of x_row, one write to y_row.
     for (long c = tid; c < cols; c += blockDim.x) {
         float v = __expf(__bfloat162float(x_row[c]) - row_max) * inv_sum;
         y_row[c] = __float2bfloat16(v);
     }
 }
 "#;
+
+// BF16 abs: clear the sign bit (bit 15). No float math needed.
+const CUDA_ABS_BF16: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void abs_bf16_kernel(const unsigned short* __restrict__ X,
+                     unsigned short* __restrict__ Y,
+                     long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        Y[i] = X[i] & 0x7FFF;  // clear sign bit
+    }
+}
+"#;
+
+/// BF16 absolute value — single kernel, sign-bit clear.
+pub fn abs_bf16(x: &Tensor) -> Result<Tensor> {
+    if x.dtype() != DType::BF16 {
+        return Err(Error::InvalidInput("abs_bf16: input must be BF16".into()));
+    }
+    let n = x.shape().elem_count();
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, n)?;
+    let mut out = Tensor {
+        storage: TensorStorage::BF16 {
+            data: data.into(),
+            numel: n,
+        },
+        shape: x.shape().clone(),
+        device: x.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+    };
+
+    let f = ensure_and_get(&x.device, "abs_bf16_kernel", CUDA_ABS_BF16)?;
+    let block = 256u32;
+    let grid = ((n as u32 + block - 1) / block, 1, 1);
+    let cfg = LaunchConfig {
+        grid_dim: grid,
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let x_ptr = x.as_device_ptr_bf16("abs_bf16:x")? as u64;
+    let o_ptr = out.as_mut_device_ptr_bf16("abs_bf16:out")? as u64;
+    let n_i = n as i64;
+
+    let mut params: [*mut std::ffi::c_void; 3] = [
+        &x_ptr as *const u64 as *mut std::ffi::c_void,
+        &o_ptr as *const u64 as *mut std::ffi::c_void,
+        &n_i as *const i64 as *mut std::ffi::c_void,
+    ];
+    unsafe {
+        f.launch(cfg, &mut params[..])
+            .map_err(|e| Error::Cuda(format!("abs_bf16 launch: {:?}", e)))?;
+    }
+    Ok(out)
+}
 
 /// Fused BF16 softmax along the last dim. Replaces the 5-step pipeline
 /// (max → sub → exp → sum → div) with one kernel and zero extra allocations.
@@ -533,8 +627,7 @@ pub fn softmax_lastdim_bf16(x: &Tensor) -> Result<Tensor> {
     let rows = x.shape().elem_count() / cols;
 
     let n = x.shape().elem_count();
-    let data = unsafe { x.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc softmax: {:?}", e)))?;
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, n)?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 {
             data: data.into(),
@@ -548,17 +641,17 @@ pub fn softmax_lastdim_bf16(x: &Tensor) -> Result<Tensor> {
 
     let f = ensure_and_get(&x.device, "softmax_lastdim_bf16_kernel", CUDA_SOFTMAX_LASTDIM_BF16)?;
 
-    // Pick a power-of-two block size up to 1024.
-    let mut block_size = 1usize;
-    while block_size * 2 <= cols && block_size * 2 <= 1024 {
-        block_size *= 2;
-    }
-    if block_size < 32 { block_size = 32; }
+    // Block size: enough threads for good parallelism, few enough warps
+    // to keep reduction overhead low. 256 threads (8 warps) is the sweet spot.
+    let block_size = if cols <= 128 { 128usize }
+                     else if cols <= 256 { 256 }
+                     else { 256 }; // 256 works well for cols up to 8K+
 
+    // Kernel uses static __shared__ (32 floats) — no dynamic shared memory needed
     let cfg = LaunchConfig {
         grid_dim: (rows as u32, 1, 1),
         block_dim: (block_size as u32, 1, 1),
-        shared_mem_bytes: (block_size * std::mem::size_of::<f32>()) as u32,
+        shared_mem_bytes: 0,
     };
 
     let x_ptr = x.as_device_ptr_bf16("softmax_lastdim_bf16:x")? as u64;
@@ -618,8 +711,7 @@ fn launch_bf16_flat(
     debug_assert_eq!(b.dtype(), DType::BF16);
     let n = a.shape().elem_count();
 
-    let data = unsafe { a.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc {}: {:?}", op_name, e)))?;
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&a.device, n)?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 {
             data: data.into(),

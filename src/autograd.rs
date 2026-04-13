@@ -17,6 +17,7 @@ use crate::cuda_kernels_gpu::CudaKernels;
 use crate::cuda_ops::GpuOps;
 use crate::device::CudaStreamRawPtrExt;
 use crate::gradient::GradientMap;
+use crate::activation_offload::{ActivationOffloadPool, OffloadHandle};
 use crate::gradient_checkpointing::{CHECKPOINT_HAS_ENTRIES, CHECKPOINT_MANAGER};
 use crate::tensor::contracts::assert_nhwc_bf16_public;
 use crate::tensor::TensorId;
@@ -43,6 +44,19 @@ static AUTOGRAD_ENABLED: AtomicBool = AtomicBool::new(true);
 lazy_static::lazy_static! {
     /// Global autograd context - thread-safe
     static ref AUTOGRAD_CONTEXT: Mutex<AutogradContextInner> = Mutex::new(AutogradContextInner::new());
+}
+
+/// Global activation offload pool. Set once via `set_activation_offload_pool`
+/// at training setup, then used by `checkpoint_offload` during forward and
+/// by `Op::CheckpointOffload` backward to push/pull activations.
+static ACTIVATION_POOL: std::sync::OnceLock<Arc<Mutex<ActivationOffloadPool>>> = std::sync::OnceLock::new();
+
+/// Install the activation offload pool for checkpoint_offload to use.
+/// Call once at training setup. Returns Err if already set.
+pub fn set_activation_offload_pool(pool: Arc<Mutex<ActivationOffloadPool>>) -> Result<()> {
+    ACTIVATION_POOL.set(pool).map_err(|_| {
+        Error::InvalidOperation("Activation offload pool already set".into())
+    })
 }
 
 /// Operation types for autograd
@@ -302,6 +316,37 @@ pub enum Op {
         cos: TensorId,
         sin: TensorId,
     },
+    /// Level 2 activation offload: runs forward ONCE with autograd enabled,
+    /// captures the sub-tape, offloads all saved tensors to CPU via the
+    /// ActivationOffloadPool. During backward, pulls saved tensors from CPU
+    /// and walks the stored sub-tape — NO recompute needed.
+    /// Fallback: if pool is full during forward, falls back to standard
+    /// Op::Checkpoint (recompute, no offload).
+    CheckpointOffload {
+        input: TensorId,
+        /// The sub-tape captured during the single forward pass. Each entry's
+        /// saved_tensors have been replaced with empty vecs — the actual data
+        /// lives in the offload pool, keyed by offload_map.
+        sub_tape: Vec<OffloadedTapeEntry>,
+    },
+}
+
+/// A tape entry where saved tensors have been offloaded to CPU. The
+/// tensors themselves are replaced with OffloadHandles; during backward
+/// the CheckpointOffload handler pulls them from the pool before passing
+/// to compute_gradients.
+#[derive(Clone, Debug)]
+pub struct OffloadedTapeEntry {
+    pub output_id: TensorId,
+    pub op: Op,
+    /// Original saved tensor IDs + shapes (needed to rebuild Tensors after pull).
+    pub saved_ids: SmallVec<[TensorId; 3]>,
+    /// Offload handles corresponding 1:1 with saved_ids. If a tensor could
+    /// not be offloaded (e.g. non-BF16), its handle is None and the tensor
+    /// is stored inline in `resident_fallback`.
+    pub offload_handles: SmallVec<[Option<OffloadHandle>; 3]>,
+    /// Tensors that couldn't be offloaded (non-BF16, too large, etc).
+    pub resident_fallback: SmallVec<[(TensorId, Tensor); 3]>,
 }
 
 /// Entry in the computation tape
@@ -825,6 +870,7 @@ impl AutogradContext {
                                 | Op::Clamp { input, .. } | Op::Abs { input }
                                 | Op::Log { input } | Op::Softmax { input, .. }
                                 | Op::LogSoftmax { input, .. } | Op::Checkpoint { input, .. }
+                                | Op::CheckpointOffload { input, .. }
                                 | Op::Cast { input, .. } => {
                                     ids.push(*input);
                                 }
@@ -1022,7 +1068,7 @@ impl AutogradContext {
                         // Accumulate gradients (skip frozen weight IDs to save memory).
                         // Checkpoint backward returns ALL internal gradients (including
                         // LoRA params) that aren't in needed_grad_ids — always accept those.
-                        let is_checkpoint = matches!(&entry.op, Op::Checkpoint { .. });
+                        let is_checkpoint = matches!(&entry.op, Op::Checkpoint { .. } | Op::CheckpointOffload { .. });
                         let t_accum = std::time::Instant::now();
                         for (tensor_id, grad) in input_grads {
                             if is_checkpoint || needed_grad_ids.contains(&tensor_id) {
@@ -1278,6 +1324,157 @@ impl AutogradContext {
 
         Ok(out_with_grad)
     }
+
+    /// Level 2 activation offload checkpoint. Runs `f()` ONCE with autograd
+    /// enabled, captures the sub-tape, then offloads every saved tensor to
+    /// CPU via the global ActivationOffloadPool. During backward, saved
+    /// tensors are pulled from CPU and the stored sub-tape is walked —
+    /// NO recompute needed. This eliminates ~1.5s/step of recompute overhead.
+    ///
+    /// If no pool is set or the pool runs out of slots mid-forward, falls
+    /// back to standard `checkpoint()` (recompute, no offload).
+    ///
+    /// Requires `set_activation_offload_pool()` called at training setup.
+    pub fn checkpoint_offload<F>(inputs: &[Tensor], f: F) -> Result<Tensor>
+    where
+        F: Fn() -> Result<Tensor> + Send + Sync + 'static,
+    {
+        // No pool → fall back to standard checkpoint.
+        let pool_arc = match ACTIVATION_POOL.get() {
+            Some(p) => Arc::clone(p),
+            None => return Self::checkpoint(inputs, f),
+        };
+
+        // No autograd → just run closure (sampling path).
+        let was_enabled = {
+            let ctx = AUTOGRAD_CONTEXT.lock()
+                .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+            ctx.enabled
+        };
+        if !was_enabled {
+            return f();
+        }
+
+        // Record tape position before the forward pass.
+        let tape_start = {
+            let ctx = AUTOGRAD_CONTEXT.lock()
+                .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+            ctx.tape.len()
+        };
+
+        // Run forward ONCE with autograd ENABLED — ops record to the tape.
+        // This is the key difference from checkpoint(): we keep the sub-tape
+        // instead of discarding it and storing a recompute closure.
+        let output = f()?;
+
+        let input_id = inputs.first()
+            .ok_or_else(|| Error::InvalidInput("checkpoint_offload requires at least one input".into()))?
+            .id;
+
+        // Extract the sub-tape entries produced by the forward pass.
+        let sub_tape: Vec<TapeEntry> = {
+            let mut ctx = AUTOGRAD_CONTEXT.lock()
+                .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+            if ctx.tape.len() > tape_start {
+                ctx.tape.drain(tape_start..).collect()
+            } else {
+                Vec::new()
+            }
+        };
+
+        // Offload every saved tensor from the sub-tape to CPU. If any push
+        // fails (pool full), fall back to standard checkpoint for this block.
+        let mut offloaded_entries: Vec<OffloadedTapeEntry> = Vec::with_capacity(sub_tape.len());
+        let mut offload_failed = false;
+        {
+            let mut pool = pool_arc.lock()
+                .map_err(|_| Error::Training("offload pool mutex poisoned".into()))?;
+
+            for entry in &sub_tape {
+                let mut saved_ids = SmallVec::new();
+                let mut handles = SmallVec::new();
+                let mut resident = SmallVec::new();
+
+                for (tid, tensor) in &entry.saved_tensors {
+                    saved_ids.push(*tid);
+                    // Only offload BF16 activations that require grad (intermediates).
+                    // Skip: frozen weights (no grad, already GPU-resident, unchanged
+                    // between forward and backward), non-BF16 tensors (F32 grads etc).
+                    if tensor.dtype() == DType::BF16 && tensor.requires_grad {
+                        match pool.push(tensor) {
+                            Ok(h) => handles.push(Some(h)),
+                            Err(e) => {
+                                // Pool exhausted. Abort offload for this block.
+                                log::warn!("checkpoint_offload: pool push failed ({e}), falling back to recompute. \
+                                    tensor shape={:?} dtype={:?}, {} handles already pushed",
+                                    tensor.shape().dims(), tensor.dtype(), handles.len());
+                                offload_failed = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        handles.push(None);
+                        resident.push((*tid, tensor.clone()));
+                    }
+                }
+
+                if offload_failed {
+                    // Pull back partial handles from the current entry
+                    // (tensors 0..K-1 that succeeded before K failed).
+                    for h in &handles {
+                        if let Some(handle) = h {
+                            let _ = pool.pull(*handle);
+                        }
+                    }
+                    // Pull back all handles from previously completed entries.
+                    for oe in &offloaded_entries {
+                        for h in &oe.offload_handles {
+                            if let Some(handle) = h {
+                                let _ = pool.pull(*handle);
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                offloaded_entries.push(OffloadedTapeEntry {
+                    output_id: entry.output_id,
+                    op: entry.op.clone(),
+                    saved_ids,
+                    offload_handles: handles,
+                    resident_fallback: resident,
+                });
+            }
+        }
+
+        if offload_failed {
+            log::warn!("checkpoint_offload: falling back to recompute checkpoint (pool exhausted after {} entries)",
+                offloaded_entries.len());
+            drop(sub_tape);
+            return Self::checkpoint(inputs, f);
+        }
+
+        log::debug!("checkpoint_offload: offloaded {} sub-tape entries successfully", offloaded_entries.len());
+        // Success: record a single CheckpointOffload op on the outer tape
+        // with the offloaded sub-tape. No recompute closure stored.
+        let mut out_with_grad = output;
+        out_with_grad.requires_grad = true;
+
+        {
+            let mut ctx = AUTOGRAD_CONTEXT.lock()
+                .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+            ctx.record(TapeEntry {
+                output_id: out_with_grad.id,
+                op: Op::CheckpointOffload {
+                    input: input_id,
+                    sub_tape: offloaded_entries,
+                },
+                saved_tensors: SmallVec::new(), // All saved tensors are in the sub-tape
+            });
+        }
+
+        Ok(out_with_grad)
+    }
 }
 
 /// RAII guard for no_grad mode
@@ -1474,6 +1671,57 @@ fn compute_gradients(
                 return Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
             }
 
+            // 3D×2D path: lhs=[B,M,K], rhs=[K,N], out=[B,M,N]
+            // Flatten to 2D, compute grads, reshape back.
+            if lhs_tensor.rank() == 3 && rhs_tensor.rank() == 2 {
+                let ld = lhs_tensor.shape().dims();
+                let (batch, m, k) = (ld[0], ld[1], ld[2]);
+                let n = rhs_tensor.shape().dims()[1];
+                let og_2d = output_grad.reshape(&[batch * m, n])?;
+                let lhs_2d = lhs_tensor.reshape(&[batch * m, k])?;
+
+                let og_cast = if og_2d.dtype() != rhs_tensor.dtype() {
+                    og_2d.to_dtype(rhs_tensor.dtype())?
+                } else { og_2d.clone() };
+                let lhs_cast = if lhs_2d.dtype() != og_cast.dtype() {
+                    lhs_2d.to_dtype(og_cast.dtype())?
+                } else { lhs_2d };
+
+                let rhs_t = GpuOps::transpose(rhs_tensor)?;
+                let grad_lhs_2d = GpuOps::matmul(&og_cast, &rhs_t)?;
+                let grad_lhs = grad_lhs_2d.reshape(&[batch, m, k])?;
+
+                let lhs_t = GpuOps::transpose(&lhs_cast)?;
+                let grad_rhs = GpuOps::matmul(&lhs_t, &og_cast)?;
+
+                return Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+            }
+
+            // 3D×3D path: lhs=[B,M,K], rhs=[B,K,N], out=[B,M,N]
+            // Use matmul_bf16_trans to avoid materializing transposes.
+            // grad_lhs = output_grad @ rhs^T   (trans_b=true)
+            // grad_rhs = lhs^T @ output_grad   (trans_a=true)
+            #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+            if lhs_tensor.rank() == 3 && rhs_tensor.rank() == 3
+                && lhs_tensor.dtype() == DType::BF16
+                && rhs_tensor.dtype() == DType::BF16
+            {
+                let grad_bf16_owned;
+                let grad_bf16: &Tensor = if output_grad.dtype() == DType::BF16 {
+                    output_grad
+                } else {
+                    grad_bf16_owned = output_grad.to_dtype_no_grad(DType::BF16)?;
+                    &grad_bf16_owned
+                };
+                let grad_lhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                    grad_bf16, rhs_tensor, false, true,
+                )?;
+                let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                    lhs_tensor, grad_bf16, true, false,
+                )?;
+                return Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+            }
+
             // Slow / fallback path (non-BF16, non-2D, mixed dtype): materialize
             // transposes and call GpuOps::matmul as before.
             let rhs_for_grad = if rhs_tensor.dtype() != og_dtype {
@@ -1638,11 +1886,22 @@ fn compute_gradients(
         }
 
         Op::Sum { input, input_shape } => {
-            // Gradient of sum: broadcast grad to input shape
-            // Normalize upstream rank to avoid 0-D edge cases in GPU kernels
+            // Gradient of sum: broadcast scalar grad to input shape.
+            // Sum forward accumulates in F32 for precision, but backward is
+            // just a broadcast — no accumulation, so match the input dtype.
             let up_ranked = expand_to_rank(output_grad, input_shape.dims().len())?;
             let expanded = GpuOps::broadcast(&up_ranked, input_shape)?;
-            Ok(vec![(*input, expanded)])
+            let input_tensor = entry.get_saved(input);
+            let result = if let Some(inp) = input_tensor {
+                if expanded.dtype() != inp.dtype() {
+                    expanded.to_dtype_no_grad(inp.dtype())?
+                } else {
+                    expanded
+                }
+            } else {
+                expanded
+            };
+            Ok(vec![(*input, result)])
         }
 
         Op::Cast { input, from, to: _ } => {
@@ -1733,6 +1992,81 @@ fn compute_gradients(
             }
             let _sub_bwd_dt = _sub_bwd_t0.elapsed();
             let _ = sub_op_times;
+
+            let mut result = Vec::new();
+            for (tid, g) in sub_grads.drain_all()? {
+                result.push((tid, g));
+            }
+            Ok(result)
+        }
+
+        Op::CheckpointOffload { input, sub_tape } => {
+            // Level 2: NO recompute. Walk the stored sub-tape, pulling
+            // offloaded saved tensors from CPU as needed.
+            let pool_arc = ACTIVATION_POOL.get()
+                .ok_or_else(|| Error::Training(
+                    "CheckpointOffload backward: no offload pool set".into()
+                ))?;
+
+            // Build the set of tensor IDs we need gradients for.
+            let sub_needed: std::collections::HashSet<TensorId> = {
+                let mut s = std::collections::HashSet::new();
+                s.insert(*input);
+                for oe in sub_tape {
+                    s.insert(oe.output_id);
+                    for sid in &oe.saved_ids {
+                        s.insert(*sid);
+                    }
+                }
+                s
+            };
+
+            // Seed the sub-gradient map with the incoming gradient.
+            let mut sub_grads = crate::gradient::GradientMap::new(device.clone());
+            if let Some(last_oe) = sub_tape.last() {
+                sub_grads.set(last_oe.output_id, output_grad.clone());
+            }
+
+            // Walk the sub-tape in reverse (backward order). For each entry,
+            // pull offloaded saved tensors from CPU, rebuild a TapeEntry,
+            // and call compute_gradients.
+            let mut pool = pool_arc.lock()
+                .map_err(|_| Error::Training("offload pool mutex poisoned".into()))?;
+
+            for oe in sub_tape.iter().rev() {
+                if let Some(sg) = sub_grads.take(oe.output_id) {
+                    // Rebuild saved_tensors by pulling from pool or using
+                    // resident fallback.
+                    let mut saved: SavedTensors = SmallVec::new();
+                    for (i, sid) in oe.saved_ids.iter().enumerate() {
+                        if let Some(Some(handle)) = oe.offload_handles.get(i) {
+                            // Pull from CPU → fresh GPU tensor.
+                            let pulled = pool.pull(*handle)?;
+                            saved.push((*sid, pulled));
+                        } else {
+                            // Resident fallback (non-BF16 tensor).
+                            if let Some((_, t)) = oe.resident_fallback.iter().find(|(id, _)| id == sid) {
+                                saved.push((*sid, t.clone()));
+                            }
+                        }
+                    }
+
+                    // Build a temporary TapeEntry for compute_gradients.
+                    let tmp_entry = TapeEntry {
+                        output_id: oe.output_id,
+                        op: oe.op.clone(),
+                        saved_tensors: saved,
+                    };
+
+                    let input_grads = compute_gradients(&tmp_entry, &sg, device)?;
+                    for (tid, g) in input_grads {
+                        if sub_needed.contains(&tid) {
+                            sub_grads.accumulate(tid, g)?;
+                        }
+                    }
+                }
+            }
+            drop(pool);
 
             let mut result = Vec::new();
             for (tid, g) in sub_grads.drain_all()? {
@@ -2107,13 +2441,16 @@ fn compute_gradients(
         }
 
         Op::Clamp { input, min, max } => {
-            // Use the clamp backward implementation
             let input_tensor = entry
                 .get_saved(input)
                 .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for input".into()))?;
-            guard_tensor("AutogradContext::clamp_backward input", input_tensor)?;
+            let grad_bf16 = if output_grad.dtype() != DType::BF16 {
+                &output_grad.to_dtype_no_grad(DType::BF16)?
+            } else {
+                output_grad
+            };
             let grad = crate::autograd_ops_complete::clamp_backward(
-                output_grad,
+                grad_bf16,
                 input_tensor,
                 *min,
                 *max,
@@ -2515,23 +2852,34 @@ fn compute_gradients(
         }
 
         Op::Softmax { input, dim } => {
-            // Use the complete softmax backward implementation
+            // Use the complete softmax backward implementation.
+            // autograd_ops_complete functions have BF16 guards, but the gradient
+            // chain is F32 by design. Cast to BF16 at the boundary.
             let input_tensor = entry
                 .get_saved(input)
                 .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for input".into()))?;
             let output = input_tensor.softmax(*dim)?;
-            let grad = crate::autograd_ops_complete::softmax_backward(output_grad, &output, *dim)?;
+            let grad_bf16 = if output_grad.dtype() != DType::BF16 {
+                &output_grad.to_dtype_no_grad(DType::BF16)?
+            } else {
+                output_grad
+            };
+            let grad = crate::autograd_ops_complete::softmax_backward(&output, grad_bf16, *dim)?;
             Ok(vec![(*input, grad)])
         }
 
         Op::LogSoftmax { input, dim } => {
-            // Use the complete log_softmax backward implementation
             let input_tensor = entry
                 .get_saved(input)
                 .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for input".into()))?;
             let output = input_tensor.log_softmax(*dim)?;
+            let grad_bf16 = if output_grad.dtype() != DType::BF16 {
+                &output_grad.to_dtype_no_grad(DType::BF16)?
+            } else {
+                output_grad
+            };
             let grad =
-                crate::autograd_ops_complete::log_softmax_backward(output_grad, &output, *dim)?;
+                crate::autograd_ops_complete::log_softmax_backward(grad_bf16, &output, *dim)?;
             Ok(vec![(*input, grad)])
         }
 
@@ -2808,9 +3156,14 @@ fn compute_gradients(
             let weight_tensor = weight.and_then(|w| entry.get_saved(&w));
             let bias_tensor = bias.and_then(|b| entry.get_saved(&b));
 
+            let grad_bf16 = if output_grad.dtype() != DType::BF16 {
+                &output_grad.to_dtype_no_grad(DType::BF16)?
+            } else {
+                output_grad
+            };
             let (grad_input, grad_weight, grad_bias) =
                 crate::autograd_ops_complete::group_norm_backward(
-                    output_grad,
+                    grad_bf16,
                     input_tensor,
                     mean,
                     var,

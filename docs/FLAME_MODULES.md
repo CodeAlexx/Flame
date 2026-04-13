@@ -577,6 +577,195 @@ sanity checks.
 
 ---
 
+## Activation offload
+
+### `activation_offload.rs` — push/pull GPU activations to pinned host RAM
+
+The "offload instead of recompute" path for gradient checkpointing.
+`ActivationOffloadPool` owns a non-blocking CUDA transfer stream and a bank
+of pinned host buffers (one per slot). During forward, `push(tensor)` enqueues
+an async DtoH on the transfer stream, gated by a per-slot event recorded on
+the default stream so the copy cannot start before the producer kernel finishes.
+During backward, `pull(handle)` enqueues the reverse HtoD, records a ready
+event, and makes the default stream wait on it before any consumer touches the
+returned tensor. Same-stream ordering (transfer stream) ensures the DtoH
+completes before the HtoD for the same slot.
+
+Slot allocation is stack-based (LIFO), matching autograd backward's reverse
+consumption order. A per-pool epoch counter invalidated by `clear()` makes
+stale handles fail loudly instead of silently corrupting.
+
+`OffloadCompression::FP8` quantizes BF16 activations to FP8 E4M3 on the
+transfer stream before DtoH (via `flame_bf16_to_fp8` in `src/cuda/fp8_quant.cu`)
+and dequantizes after HtoD (via `flame_fp8_to_bf16` in `src/cuda/fp8_dequant.cu`).
+This halves pinned memory and PCIe bandwidth at ~0.1% relative error.
+
+The autograd integration lives in `autograd.rs`:
+- `set_activation_offload_pool(pool)` installs the global pool (call once at
+  training setup).
+- `AutogradContext::checkpoint_offload(inputs, f)` runs the forward closure
+  with autograd enabled, captures the sub-tape, offloads every saved tensor
+  to CPU, and records a single `Op::CheckpointOffload` on the outer tape.
+  At backward, saved tensors are pulled from CPU and the sub-tape is walked
+  -- no recompute needed. Falls back to standard `checkpoint()` (recompute)
+  if the pool is not set or runs out of slots.
+- `OffloadedTapeEntry` stores the offloaded sub-tape entries with
+  `OffloadHandle` keys replacing the original saved tensors.
+
+The trainer-side setup helper is `flame-diffusion/src/offload.rs`:
+`setup_activation_offload(device, config)` computes slot count from block
+count + headroom, constructs the pool, and installs it via
+`set_activation_offload_pool`.
+
+## VMM intelligence (flame-diffusion)
+
+### `vram_budget.rs` — watermark-based VRAM budget manager
+
+Queries `cudaMemGetInfo` for real driver-level VRAM usage and provides
+predicates for prefetch/eviction decisions. Two watermarks divide VRAM into
+three zones: below low (safe, stop evicting), between low and high (caution),
+above high (must evict before prefetching). The `can_prefetch()` predicate
+gates `SwapCoordinator::try_prefetch_next()` — when VRAM exceeds the high
+watermark, prefetch pauses until eviction frees space.
+
+Note: flame-core uses cudarc (not PyTorch), so `cudaMemGetInfo` is
+authoritative. The mempool's "release threshold = MAX" policy means freed
+allocations stay cached, making `used = total - free` conservatively high.
+This is correct for eviction decisions: better to evict early than OOM.
+
+### `conductor.rs` — SwapCoordinator with VMM
+
+Extended from a simple cursor-based prefetcher to a VMM-aware conductor:
+
+- **`with_budget(budget)`**: enables VRAM budget enforcement. Without this,
+  legacy behavior (blind prefetch) is preserved.
+- **`acquire_block(idx)` / `release_block(idx)`**: refcount protection. A
+  block with refcount > 0 cannot be evicted. Trainers call acquire before
+  block forward and release after.
+- **`set_step(step)`**: updates the current training step for eviction scoring.
+- **`best_eviction_candidate()`**: scores evictable blocks by
+  `(staleness + distance_to_next_use) * size_bytes`. Highest score = best
+  candidate. Only considers blocks with refcount == 0 and non-permanent.
+- **`try_prefetch_next()`**: now checks `budget.can_prefetch()` before issuing
+  H2D. Returns `Ok(false)` if budget is exhausted, pausing the pipeline.
+- **`clear()`**: resets all refcounts to 0 between training phases.
+
+The VMM layer is opt-in via `with_budget()`. Without it, the conductor
+behaves identically to v1 — no VRAM queries, no eviction scoring.
+
+### Remaining wiring (not yet done)
+
+Three things need to happen before activation offload is live in training:
+
+1. **Pool construction in each trainer's `main.rs`**. Call
+   `flame_diffusion::offload::setup_activation_offload(device, config)` after
+   model load, before the training loop. The `OffloadConfig::from_model()`
+   helper computes slot count from block count + headroom. `seq_len` must be
+   the MAXIMUM across the dataset (largest bucket), not a single sample.
+
+2. **`acquire_block` / `release_block`** in each trainer's block loop. One
+   line before block forward (`coord.acquire_block(i)`), one line after
+   (`coord.release_block(i)`). Then pass `SwapCoordinator::new(...).with_budget(VramBudget::default_24gb())`
+   at conductor construction to activate VMM gating.
+
+3. **`FLAME_ACTIVATION_OFFLOAD=1`** env var to switch the block loop from
+   the standard forward path to `checkpoint_offload`. Both Wan and LTX-2
+   trainers already check this variable and branch accordingly.
+
+Without step 1, `checkpoint_offload` falls back to standard `checkpoint()`
+(recompute, no offload) because no pool is installed. Without step 2, VMM
+budget gating and eviction scoring are inert. Without step 3, the block
+loop doesn't use `checkpoint_offload` at all.
+
+### Architecture decisions and known gotchas
+
+**Why Level 2 (no recompute) instead of Level 1 (offload input + recompute):**
+Level 1 was attempted and abandoned. The recompute closure captures input
+tensors via `Arc`, keeping GPU memory alive even after offloading to CPU.
+Net effect: zero VRAM savings plus wasted HtoD on pull. Level 2 runs the
+forward once with autograd enabled, stores the sub-tape, and offloads ALL
+saved tensors. No closure captures, no recompute. The fallback when the
+pool is full is standard `checkpoint()` (recompute, no offload) — NOT a
+broken Level 1.
+
+**Closure captures and `refresh_cache()`:** When `checkpoint_offload` falls
+back to `checkpoint()`, the closure runs with autograd disabled on first
+pass. LoRA adapters cache BF16 views without tape history, causing zero
+gradients. Both Wan and LTX-2 closures call `bundle.refresh_cache()` as
+the first statement inside the closure to prevent this. Any new trainer
+wiring `checkpoint_offload` MUST do the same.
+
+**FP8 compression fixed scale:** The pool uses `scale = 8.0 / 448.0` which
+maps activation range `[-8, 8]` to FP8 E4M3 range. Values beyond `+/-8`
+saturate. For typical transformer activations this is fine. If a model
+shows clipping artifacts, replace with adaptive scale (absmax reduction
+before push — not yet implemented, marked TODO in `activation_offload.rs`).
+
+**Pool sizing for variable resolutions:** `OffloadConfig::from_model()`
+takes a single `seq_len`. This must be the MAXIMUM across the entire
+dataset (the largest bucket's token count). If a later sample exceeds
+`slot_bytes`, `push()` returns an error and `checkpoint_offload` falls
+back to `checkpoint()` for that block. Not a crash — just slower.
+
+**FlameSwap `linear3d` auto-dispatch:** `klein.rs::linear3d` now detects
+weight layout automatically. Pre-transposed `[in, out]` (resident path)
+uses `matmul`. Non-transposed `[out, in]` (swap path) uses
+`fused_linear3d_native` with cuBLASLt TRANSA=T — zero transpose allocation.
+The detection relies on `w_shape[1] == in_features && w_shape[0] != in_features`.
+For square weight matrices (e.g. 3072x3072) this is ambiguous — the swap
+path passes `native_weights=true` explicitly via the `lin` closure inside
+each block forward to avoid misdetection.
+
+**`prepare_block` vs old `materialize`:** The old `materialize` function
+transposed 2D weights (GPU alloc + kernel) and round-tripped 1D weights
+through CPU (`to_vec_bf16` → `copy_from_bf16_slice`). Both are eliminated.
+2D weights pass through as-is (TRANSA=T handles them). 1D weights use
+`clone_result()` (D2D, ~2us). Validated bit-identical against sync path.
+
+**`OffloadedTapeEntry` and sub-tape storage:** `Op::CheckpointOffload`
+stores a `Vec<OffloadedTapeEntry>` — the sub-tape with saved tensors
+replaced by `OffloadHandle`s. Non-BF16 tensors (F32 gradients etc) stay
+GPU-resident in `resident_fallback`. During backward, the pool is locked
+for the entire sub-tape walk (pulls happen under one mutex guard). This is
+fine for single-stream training but would need batched-pull optimization
+for pipeline parallelism.
+
+**Eviction scoring is scaffolding:** `best_eviction_candidate()` is built
+and correct but has no eviction ACTION wired. FlameSwap's pre-allocated
+slots recycle automatically. The real eviction target is the `resident`
+HashMap (permanently loaded blocks). An `evict_resident(block_idx)` that
+removes from the map and drops the `Arc<HashMap<String, Tensor>>` is the
+logical next step. Until then, `with_budget()` gates prefetch but relies
+on slot recycling for VRAM relief.
+
+### Files changed in this session (2026-04-12)
+
+**flame-core:**
+- `src/activation_offload.rs` — pool hardened (stack alloc, keep-alive, FP8)
+- `src/cuda/fp8_quant.cu` — NEW: BF16→FP8 quantize kernel
+- `src/cuda/ffi.rs` — `flame_bf16_to_fp8` FFI
+- `build.rs` — registered fp8_quant.cu
+- `src/autograd.rs` — `Op::CheckpointOffload`, `checkpoint_offload()`,
+  `set_activation_offload_pool()`, `OffloadedTapeEntry`
+- `docs/FLAME_MODULES.md`, `docs/FLAME_INDEX.md`, `docs/FLAME_KERNELS.md`
+
+**flame-diffusion:**
+- `src/offload.rs` — NEW: pool setup helper
+- `src/vram_budget.rs` — NEW: VRAM watermark manager
+- `src/conductor.rs` — VMM intelligence (budget, refcount, eviction)
+- `src/lib.rs` — exports for offload + vram_budget
+- `wan-trainer/src/forward_impl/forward.rs` — checkpoint_offload wiring
+- `wan-trainer/src/model.rs` — WanLoraBundle Clone
+- `wan-trainer/src/forward_impl/rope.rs` — WanRope Clone
+- `ltx-trainer/src/forward_impl/forward.rs` — checkpoint_offload wiring
+- `ltx-trainer/src/model.rs` — LtxLoraBundle Clone
+
+**inference-flame:**
+- `src/models/klein.rs` — killed materialize, TRANSA=T via `linear3d_nt`,
+  `native_weights` flag on block forwards, `prepare_block` zero-alloc
+
+---
+
 ## How to navigate this codebase
 
 1. **Start with the live API**, not the file count. Most of the 80 files are

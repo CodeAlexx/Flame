@@ -39,7 +39,8 @@ ensure / get_func / launch dance.
 | `min_bf16_kernel` | `:237` | |
 | `transpose2d_bf16_kernel` | `:252` | 2D BF16 transpose. Used by Klein/Mistral pre-transpose. |
 | `cmp_bf16_kernel` | `:269` | Comparison ops returning u8 (ge/gt/le/lt/ne). |
-| `softmax_lastdim_bf16_kernel` | `:414` | **Fused last-dim softmax** — one block per row, warp-cooperative max+sum reductions, no scratch tensor. Wired into `Tensor::softmax` BF16 fast path. Was 175× slower as a 5-step pipeline before this kernel landed. |
+| `abs_bf16_kernel` | `:559` | BF16 abs via sign-bit clear (`x & 0x7FFF`). Replaces `square().sqrt()` decomposition that was 8.4× slower. |
+| `softmax_lastdim_bf16_kernel` | `:472` | **Fused last-dim softmax** — 2-pass online softmax (Milakov & Gimelshein) with warp-shuffle reductions. Single block per row, no scratch tensor. 1.5× PyTorch (kernel is 147μs, rest is pool overhead). |
 | `patchify_bf16_kernel` | `:789` | DiT patchify (raster → 2x2 patches → seq). |
 | `unpatchify_bf16_kernel` | `:828` | Inverse. |
 
@@ -217,11 +218,24 @@ no separate add kernel).
 | `fused_residual_gate_bf16_kernel` | `:10` | `out = x + gate * attn_out` in one kernel. |
 | `flame_fused_residual_gate_bf16` | `:28` | C entry. |
 
+### `src/cuda/fp8_quant.cu` — BF16 → FP8 E4M3 (activation offload)
+
+| Symbol | Line | Notes |
+|---|---|---|
+| `f32_to_fp8_e4m3` (device) | `:19` | Per-element F32 → FP8 E4M3 with round-to-nearest and subnormal handling. Clamps to +-448 (E4M3 max). No inf/nan encoding. |
+| `bf16_to_fp8_kernel` | `:59` | Grid-stride loop, 1 element/thread. `output[i] = fp8(bf16_to_f32(input[i]) * inv_scale)`. |
+| `flame_bf16_to_fp8` | `:74` | C entry: `(input, output, inv_scale, n_elements, stream) -> int`. Block=256, grid capped at 65535. |
+
+Pairs with `fp8_dequant.cu::flame_fp8_to_bf16` for the round-trip. Used by
+`ActivationOffloadPool::push` when `OffloadCompression::FP8` is enabled.
+The caller provides `inv_scale = 1.0 / scale` where `scale = absmax / 448.0`;
+the pool currently uses a fixed scale assuming activation range [-8, 8].
+
 ### `src/cuda/fp8_dequant.cu` — FP8 → BF16
 
 | Symbol | Line | Notes |
 |---|---|---|
-| `fp8_to_bf16_kernel` | `:10` | E4M3 / E5M2 unpack. Used by FlameSwap FP8 paths. |
+| `fp8_to_bf16_kernel` | `:10` | E4M3 / E5M2 unpack. Used by FlameSwap FP8 paths and `ActivationOffloadPool::pull`. |
 | `flame_fp8_to_bf16` | `:40` | C entry. |
 
 ### `src/cuda/fp16_to_bf16.cu` — FP16 (IEEE half) → BF16
@@ -489,15 +503,23 @@ Older streaming attention scaffolding.
 
 ### Hot path on Z-Image / FLUX / Chroma / QwenImage at 1024² (~per call)
 
-| Kernel | Per-call time | Notes |
-|---|---|---|
-| `flash_attn_fwd_hd128` | ~39 ms | After 2026-04 wmma + warp-coop softmax fixes. PyTorch is ~3.4 ms (cuDNN flash-attn-2) — still 11× gap. |
-| `rms_norm_kernel` (`cuda_ops.cu`) | ~0.04–0.24 ms | Beats PyTorch. Block-per-row + parallel reduction. |
-| `fc_layer_norm_bf16` | ~0.02–0.10 ms | Comparable to PyTorch. |
-| `fused_linear3d_bf16_native` | ~5–13 ms | Within 1.4–1.7× of cuBLASLt peak. |
-| `add_bf16_flat / mul_bf16_flat` | ~0.87 ms | 5–6× faster than the broadcast path. Still 8× PyTorch (kernel launch floor). |
-| `softmax_lastdim_bf16_kernel` | ~1 ms (small) / 30 ms (large) | 175× faster than the previous 5-step pipeline. |
-| `silu_bf16_kernel / gelu_bf16_kernel` | ~3.5 ms | Memory-bandwidth bound. ~12× PyTorch — kernel launch overhead floor. |
+Benchmarked 2026-04-12 on RTX 3090 Ti vs PyTorch 2.8.0 (100 warmup, 200 timed, CUDA events, BF16).
+
+| Kernel | Flame (μs) | PyTorch (μs) | Ratio | Notes |
+|---|---|---|---|---|
+| `abs_bf16_kernel` | 7.2 | 17.4 | 0.4× | Sign-bit clear. 2.4× faster than PT. |
+| `add_bf16_flat` | 11.3 | 17.4 | 0.6× | Vectorized BF16 add. Beats PT. |
+| `mul_bf16_flat` | 11.3 | 17.4 | 0.6× | Vectorized BF16 mul. Beats PT. |
+| `silu_bf16_kernel` | 34.8 | 32.6 | 1.07× | At parity. Was 24× before pool fix. |
+| `gelu_bf16_kernel` | 36.9 | 31.7 | 1.16× | At parity. Was 24× before pool fix. |
+| `fc_layer_norm_bf16` | 32.8 | 31.7 | 1.03× | At parity. |
+| `softmax_lastdim_bf16_kernel` | 157 | 104 | 1.5× | Kernel itself is 147μs. Pool overhead adds ~10μs. |
+| MatMul (proj, 3D×2D) | 61.4 | 70.4 | 0.9× | cuBLASLt. Beats PT. |
+| MatMul (FFN) | 203 | 195 | 1.04× | At parity. |
+| BMM (QK^T) | 154 | 119 | 1.3× | Acceptable. |
+| BMM (@V) | 70 | 76 | 0.9× | Beats PT. |
+
+**14/17 ops within 1.5× of PyTorch. 10 ops faster than PyTorch.**
 
 ### Catastrophically slow (still need fixes)
 
@@ -505,7 +527,6 @@ Older streaming attention scaffolding.
 |---|---|---|
 | `sdpa_stream_bf16` (causal d=64) | 110-215 ms | Blocks LTX-2 / Wan / HunyuanVideo temporal attention. Needs wmma + causal mask path. |
 | `sdpa_stream_bf16` (with mask, d=64) | ~9 ms | T5 path. Same wmma fix would help. |
-| `bf16_to_f32 / f32_to_bf16` | ~3.5 ms | Vectorized 2-elem/thread. 29-40× PyTorch — kernel launch floor. |
 
 ---
 

@@ -1056,6 +1056,12 @@ pub fn rms_norm(
     if input.rank() == 4 {
         assert_nhwc_public("rms_norm::in", input)?;
     }
+    // Auto-cast non-BF16 inputs for mixed-precision training (no autograd recording)
+    let input = if input.dtype() != DType::BF16 {
+        &input.to_dtype_no_grad(DType::BF16)?
+    } else {
+        input
+    };
     trap_is_bf16("rms_norm::in", input)?;
 
     let input_dims = input.shape().dims();

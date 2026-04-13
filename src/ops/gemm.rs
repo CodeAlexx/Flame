@@ -63,12 +63,16 @@ pub(crate) fn compute_for_storage(dt: DType) -> Result<ComputeType, Error> {
 }
 
 pub(crate) fn launch_gemm(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, Error> {
+    // Auto-cast mismatched dtypes (prefer BF16 for mixed-precision training)
     if lhs.dtype() != rhs.dtype() {
-        return Err(Error::InvalidInput(format!(
-            "dtype mismatch in matmul: lhs={:?} rhs={:?}",
-            lhs.dtype(),
-            rhs.dtype()
-        )));
+        let target = if lhs.dtype() == DType::BF16 || rhs.dtype() == DType::BF16 {
+            DType::BF16
+        } else {
+            lhs.dtype()
+        };
+        let lhs_cast = if lhs.dtype() != target { lhs.to_dtype_no_grad(target)? } else { lhs.clone() };
+        let rhs_cast = if rhs.dtype() != target { rhs.to_dtype_no_grad(target)? } else { rhs.clone() };
+        return launch_gemm(&lhs_cast, &rhs_cast);
     }
 
     let mode = compute_for_storage(lhs.dtype())?;

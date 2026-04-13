@@ -446,6 +446,25 @@ convention (`fc_status_t` returns), different file generation:
 
 ---
 
+## Activation offload — `activation_offload.rs`
+
+Push GPU activations to pinned host RAM during forward, pull them back during
+backward. Foundation of the "offload instead of recompute" checkpoint path.
+
+| Symbol | File:line | Notes |
+|---|---|---|
+| `ActivationOffloadPool` | `activation_offload.rs:319` | Pool of pinned host buffers with a dedicated non-blocking CUDA transfer stream. Construct once at training setup. |
+| `OffloadHandle` | `activation_offload.rs:293` | Opaque `Copy` handle returned by `push`, consumed by `pull`. Carries slot index + epoch for stale-handle detection. |
+| `OffloadCompression` | `activation_offload.rs:89` | `None` (raw BF16/F32) or `FP8` (halves pinned memory + PCIe via BF16-to-FP8 quantize on transfer stream). |
+| `ActivationOffloadPool::push(tensor)` | `activation_offload.rs:465` | Async DtoH on transfer stream. Gates on default-stream event. Returns handle. |
+| `ActivationOffloadPool::pull(handle)` | `activation_offload.rs:619` | Async HtoD on transfer stream. Makes default stream wait via ready event. Frees slot. |
+| `ActivationOffloadPool::clear()` | `activation_offload.rs:742` | Reset all slots to Idle, bump epoch (invalidates all outstanding handles). No host sync. |
+| `OffloadedTapeEntry` | `autograd.rs:339` | Sub-tape entry with saved tensors replaced by `OffloadHandle`s. |
+| `AutogradContext::checkpoint_offload(inputs, f)` | `autograd.rs:1338` | Run forward, capture sub-tape, offload saved tensors, record `Op::CheckpointOffload`. |
+| `set_activation_offload_pool(pool)` | `autograd.rs:56` | Install global pool once at training setup. |
+
+---
+
 ## Autograd — multiple generations, **read carefully**
 
 ### Active engine (`autograd_v3.rs` per the comment in lib.rs:153)
@@ -464,6 +483,18 @@ convention (`fc_status_t` returns), different file generation:
 - ⚠️ `autograd_engine.rs` — older engine
 - ⚠️ `autograd_ops.rs / autograd_ops_complete.rs` — older op set
 - ⚠️ `autograd_debug.rs` — debug helpers
+
+### Activation offload (v2.1)
+- `Op::CheckpointOffload { input, sub_tape }` — `autograd.rs:325` — captures
+  the forward sub-tape and offloads all saved tensors to CPU. Backward pulls
+  them back and walks the sub-tape (no recompute).
+- `AutogradContext::checkpoint_offload(inputs, f)` — `autograd.rs:1338` —
+  public entry. Runs closure with autograd, captures sub-tape, offloads saved
+  tensors. Falls back to standard `checkpoint()` if pool unavailable.
+- `set_activation_offload_pool(pool)` — `autograd.rs:56` — install global pool
+  (once, at training setup). Used by `flame-diffusion/src/offload.rs`.
+- `OffloadedTapeEntry` — `autograd.rs:339` — tape entry with saved tensors
+  replaced by `OffloadHandle`s + optional `resident_fallback` for non-BF16.
 
 ### Gradient utilities
 - `gradient::GradientMap / TensorGradExt` — re-exported as `GradientMap`
@@ -564,3 +595,8 @@ by `.cu` file with launch configs and perf notes.
 - **"Where is the FP8 dequant?"** → `ops::fused_inference::dequant_fp8_to_bf16` →
   `flame_fp8_to_bf16` → `src/cuda/fp8_dequant.cu`
   `flame_fp16_to_bf16` → `src/cuda/fp16_to_bf16.cu`
+- **"Where is the activation offload pool?"** → `activation_offload::ActivationOffloadPool` →
+  autograd integration via `autograd::checkpoint_offload` + `Op::CheckpointOffload`.
+  FP8 quant kernel: `src/cuda/fp8_quant.cu`. Trainer setup: `flame-diffusion/src/offload.rs`.
+- **"Where is the BF16→FP8 quantize kernel?"** → `flame_bf16_to_fp8` →
+  `src/cuda/fp8_quant.cu` (used by activation offload FP8 compression)

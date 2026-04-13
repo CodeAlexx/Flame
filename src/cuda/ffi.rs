@@ -442,6 +442,16 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// GPU-side BF16 → FP8 E4M3 quantize: out[i] = fp8(bf16(in[i]) * inv_scale)
+    /// Caller provides inv_scale = 1.0 / scale where scale = absmax / 448.0.
+    pub fn flame_bf16_to_fp8(
+        input: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        inv_scale: f32,
+        n_elements: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// GPU-side FP16 (IEEE half) → BF16 conversion.
     /// In-place safe (both 2 bytes per element).
     pub fn flame_fp16_to_bf16(

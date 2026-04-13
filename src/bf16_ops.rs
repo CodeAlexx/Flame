@@ -120,8 +120,7 @@ fn lc_pairs(n: usize) -> LaunchConfig {
 pub fn gelu_bf16(x: &Tensor) -> Result<Tensor> {
     debug_assert_eq!(x.dtype(), DType::BF16);
     let n = x.shape().elem_count();
-    let data = unsafe { x.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc gelu bf16: {:?}", e)))?;
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, n)?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 {
             data: data.into(),
@@ -155,8 +154,7 @@ pub fn gelu_bf16(x: &Tensor) -> Result<Tensor> {
 pub fn square_bf16(x: &Tensor) -> Result<Tensor> {
     debug_assert_eq!(x.dtype(), DType::BF16);
     let n = x.shape().elem_count();
-    let data = unsafe { x.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc square bf16: {:?}", e)))?;
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, n)?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 {
             data: data.into(),
@@ -251,8 +249,7 @@ pub fn softmax_last_dim_bf16(x: &Tensor) -> Result<Tensor> {
     let rows: usize = dims[..dims.len() - 1].iter().product();
     let n = rows * cols;
 
-    let data = unsafe { x.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc softmax bf16: {:?}", e)))?;
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, n)?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 {
             data: data.into(),
@@ -303,8 +300,7 @@ pub fn softmax_last_dim_bf16(x: &Tensor) -> Result<Tensor> {
 pub fn silu_bf16(x: &Tensor) -> Result<Tensor> {
     debug_assert_eq!(x.dtype(), DType::BF16);
     let n = x.shape().elem_count();
-    let data = unsafe { x.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc silu bf16: {:?}", e)))?;
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, n)?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 {
             data: data.into(),
@@ -439,8 +435,7 @@ pub fn rope_fused_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor>
     let total = bh * n * half;
     let out_n = bh * n * d;
 
-    let data = unsafe { x.device.alloc::<u16>(out_n) }
-        .map_err(|e| Error::Cuda(format!("alloc rope bf16: {:?}", e)))?;
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, out_n)?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 {
             data: data.into(),
@@ -523,8 +518,7 @@ pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Ten
     let total = bh * n * half;
     let out_n = bh * n * d;
 
-    let data = unsafe { x.device.alloc::<u16>(out_n) }
-        .map_err(|e| Error::Cuda(format!("alloc rope halfsplit bf16: {:?}", e)))?;
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, out_n)?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 {
             data: data.into(),
@@ -664,8 +658,7 @@ pub fn modulate_pre_fused_bf16(
     let rows = b * n;
     let total = rows * dim;
 
-    let data = unsafe { x.device.alloc::<u16>(total) }
-        .map_err(|e| Error::Cuda(format!("alloc modulate_pre: {:?}", e)))?;
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, total)?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 { data: data.into(), numel: total },
         shape: x.shape().clone(),
@@ -748,8 +741,7 @@ pub fn gate_residual_fused_bf16(
     let (b, n, dim) = (dims[0], dims[1], dims[2]);
     let total = b * n * dim;
 
-    let data = unsafe { residual.device.alloc::<u16>(total) }
-        .map_err(|e| Error::Cuda(format!("alloc gate_residual: {:?}", e)))?;
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&residual.device, total)?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 { data: data.into(), numel: total },
         shape: residual.shape().clone(),
@@ -802,8 +794,7 @@ pub fn swiglu_fused_bf16(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     debug_assert_eq!(gate.dtype(), DType::BF16);
     let total = gate.shape().elem_count();
 
-    let data = unsafe { gate.device.alloc::<u16>(total) }
-        .map_err(|e| Error::Cuda(format!("alloc swiglu: {:?}", e)))?;
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&gate.device, total)?;
     let mut out = Tensor {
         storage: TensorStorage::BF16 { data: data.into(), numel: total },
         shape: gate.shape().clone(),

@@ -591,6 +591,22 @@ impl Tensor {
 
     /// Compute absolute value
     pub fn abs(&self) -> Result<Tensor> {
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        if self.dtype() == DType::BF16 {
+            let mut output = crate::bf16_elementwise::abs_bf16(self)?;
+            if self.requires_grad {
+                output.requires_grad = true;
+                if crate::AutogradContext::is_recording() {
+                    crate::AutogradContext::record_op(
+                        output.id,
+                        crate::autograd::Op::Abs { input: self.id },
+                        vec![(self.id, self.clone())],
+                    );
+                }
+            }
+            return Ok(output);
+        }
+        // Fallback for non-BF16
         self.square()?.sqrt()
     }
 

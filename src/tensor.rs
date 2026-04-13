@@ -701,6 +701,18 @@ extern "C" __global__ void masked_fill_kernel(
     }
 
     /// Cast to different dtype
+    /// Cast dtype without recording on the autograd tape.
+    /// Use for internal casts (gemm auto-cast, rms_norm input cast) where
+    /// the gradient should flow through the original tensor, not through
+    /// a Cast op that forces an extra backward allocation.
+    pub fn to_dtype_no_grad(&self, dtype: DType) -> Result<Tensor> {
+        if self.dtype() == dtype && self.storage.dtype() == dtype {
+            return Ok(self.clone());
+        }
+        let _guard = AutogradContext::no_grad();
+        self.to_dtype(dtype)
+    }
+
     pub fn to_dtype(&self, dtype: DType) -> Result<Tensor> {
         if self.dtype() == dtype && self.storage.dtype() == dtype {
             return Ok(self.clone());
@@ -742,8 +754,7 @@ extern "C" __global__ void masked_fill_kernel(
                 #[cfg(feature = "bf16_u16")]
                 {
                     use cudarc::driver::DevicePtr;
-                    let mut bf_data = unsafe { self.device.alloc::<u16>(numel) }
-                        .map_err(|e| Error::Cuda(format!("alloc bf16 cast: {:?}", e)))?;
+                    let mut bf_data = crate::cuda_alloc_pool::pool_alloc_u16(&self.device, numel)?;
                     crate::bf16_convert::f32_to_bf16_u16(
                         self.device.clone(),
                         &f32_data,
@@ -1284,16 +1295,56 @@ extern "C" __global__ void masked_fill_kernel(
                 other.shape().dims()
             );
         }
-        if self.dtype() != other.dtype() {
-            return Err(Error::InvalidInput(format!(
-                "matmul dtype mismatch: lhs {:?} rhs {:?}",
-                self.dtype(),
-                other.dtype()
-            )));
-        }
-        let rhs_tensor = other;
+        let (lhs_ref, rhs_ref);
+        let (lhs_owned, rhs_owned);
+        let (lhs_tensor, rhs_tensor): (&Tensor, &Tensor) = if self.dtype() != other.dtype() {
+            // Auto-cast: prefer BF16 (no autograd recording for the cast itself)
+            let target = if self.dtype() == DType::BF16 || other.dtype() == DType::BF16 {
+                DType::BF16
+            } else {
+                self.dtype()
+            };
+            if self.dtype() != target {
+                lhs_owned = self.to_dtype_no_grad(target)?;
+                lhs_ref = &lhs_owned;
+            } else {
+                lhs_ref = self;
+            }
+            if other.dtype() != target {
+                rhs_owned = other.to_dtype_no_grad(target)?;
+                rhs_ref = &rhs_owned;
+            } else {
+                rhs_ref = other;
+            }
+            (lhs_ref, rhs_ref)
+        } else {
+            (self, other)
+        };
 
-        let mut output = crate::ops::gemm::launch_gemm(self, rhs_tensor)?;
+        let lhs_rank = lhs_tensor.shape().dims().len();
+        let rhs_rank = rhs_tensor.shape().dims().len();
+
+        let (mut output, lhs_for_grad, rhs_for_grad) = if lhs_rank <= 2 && rhs_rank <= 2 {
+            let out = crate::ops::gemm::launch_gemm(lhs_tensor, rhs_tensor)?;
+            (out, lhs_tensor.clone(), rhs_tensor.clone())
+        } else if lhs_rank == 3 && rhs_rank == 2 {
+            // [B, M, K] @ [K, N] → flatten to [B*M, K], gemm, reshape to [B, M, N]
+            let ld = lhs_tensor.shape().dims();
+            let (batch, m, k) = (ld[0], ld[1], ld[2]);
+            let lhs_2d = lhs_tensor.reshape(&[batch * m, k])?;
+            let out_2d = crate::ops::gemm::launch_gemm(&lhs_2d, rhs_tensor)?;
+            let n = rhs_tensor.shape().dims()[1];
+            let out = out_2d.reshape(&[batch, m, n])?;
+            (out, lhs_tensor.clone(), rhs_tensor.clone())
+        } else if lhs_rank == 3 && rhs_rank == 3 {
+            // [B, M, K] @ [B, K, N] → batched GEMM
+            let out = crate::ops::gemm::launch_bmm(lhs_tensor, rhs_tensor)?;
+            (out, lhs_tensor.clone(), rhs_tensor.clone())
+        } else {
+            return Err(Error::InvalidInput(format!(
+                "matmul: unsupported ranks lhs={lhs_rank}D rhs={rhs_rank}D (supported: 2D×2D, 3D×2D, 3D×3D)"
+            )));
+        };
 
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
@@ -1301,10 +1352,10 @@ extern "C" __global__ void masked_fill_kernel(
                 AutogradContext::record_op(
                     output.id,
                     Op::MatMul {
-                        lhs: self.id,
-                        rhs: other.id,
+                        lhs: lhs_for_grad.id,
+                        rhs: rhs_for_grad.id,
                     },
-                    vec![(self.id, self.clone()), (other.id, other.clone())],
+                    vec![(lhs_for_grad.id, lhs_for_grad), (rhs_for_grad.id, rhs_for_grad)],
                 );
             }
         }

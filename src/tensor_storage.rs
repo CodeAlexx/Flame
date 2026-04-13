@@ -632,52 +632,131 @@ unsafe fn make_dummy_slice<T>(device: Arc<CudaDevice>) -> CudaSlice<T> {
     std::mem::transmute(mirror)
 }
 
-#[cfg(not(feature = "shared_storage"))]
 impl Drop for TensorStorage {
     fn drop(&mut self) {
         // Only intercept when the pool is enabled.
         if crate::cuda_alloc_pool::pool_disabled() {
-            return; // Let Rust drop the CudaSlice normally (cudaFree).
+            return;
         }
 
         match self {
             TensorStorage::F32 { data, .. } => {
-                let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
-                let dev = slice.device();
-                crate::cuda_alloc_pool::pool_return_f32(slice);
-                unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+                #[cfg(feature = "shared_storage")]
+                {
+                    let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };
+                    let dev = arc.device();
+                    match Arc::try_unwrap(arc) {
+                        Ok(slice) => crate::cuda_alloc_pool::pool_return_f32(slice),
+                        Err(arc) => drop(arc),
+                    }
+                    unsafe { std::ptr::write(data, Arc::new(make_dummy_slice::<f32>(dev))) };
+                }
+                #[cfg(not(feature = "shared_storage"))]
+                {
+                    let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
+                    let dev = slice.device();
+                    crate::cuda_alloc_pool::pool_return_f32(slice);
+                    unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+                }
             }
             TensorStorage::F16 { data, .. } => {
-                let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
-                let dev = slice.device();
-                crate::cuda_alloc_pool::pool_return_f32(slice);
-                unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+                #[cfg(feature = "shared_storage")]
+                {
+                    let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };
+                    let dev = arc.device();
+                    match Arc::try_unwrap(arc) {
+                        Ok(slice) => crate::cuda_alloc_pool::pool_return_f32(slice),
+                        Err(arc) => drop(arc),
+                    }
+                    unsafe { std::ptr::write(data, Arc::new(make_dummy_slice::<f32>(dev))) };
+                }
+                #[cfg(not(feature = "shared_storage"))]
+                {
+                    let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
+                    let dev = slice.device();
+                    crate::cuda_alloc_pool::pool_return_f32(slice);
+                    unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+                }
             }
             #[cfg(not(feature = "bf16_u16"))]
             TensorStorage::BF16 { data, .. } => {
-                let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
-                let dev = slice.device();
-                crate::cuda_alloc_pool::pool_return_f32(slice);
-                unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+                #[cfg(feature = "shared_storage")]
+                {
+                    let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };
+                    let dev = arc.device();
+                    match Arc::try_unwrap(arc) {
+                        Ok(slice) => crate::cuda_alloc_pool::pool_return_f32(slice),
+                        Err(arc) => drop(arc),
+                    }
+                    unsafe { std::ptr::write(data, Arc::new(make_dummy_slice::<f32>(dev))) };
+                }
+                #[cfg(not(feature = "shared_storage"))]
+                {
+                    let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
+                    let dev = slice.device();
+                    crate::cuda_alloc_pool::pool_return_f32(slice);
+                    unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+                }
             }
             #[cfg(feature = "bf16_u16")]
             TensorStorage::BF16 { data, .. } => {
-                let slice: CudaSlice<u16> = unsafe { std::ptr::read(data) };
-                let dev = slice.device();
-                crate::cuda_alloc_pool::pool_return_u16(slice);
-                unsafe { std::ptr::write(data, make_dummy_slice::<u16>(dev)) };
+                #[cfg(feature = "shared_storage")]
+                {
+                    let arc: Arc<CudaSlice<u16>> = unsafe { std::ptr::read(data) };
+                    let dev = arc.device();
+                    match Arc::try_unwrap(arc) {
+                        Ok(slice) => {
+                            crate::cuda_alloc_pool::pool_return_u16(slice);
+                        }
+                        Err(arc) => drop(arc),
+                    }
+                    unsafe { std::ptr::write(data, Arc::new(make_dummy_slice::<u16>(dev))) };
+                }
+                #[cfg(not(feature = "shared_storage"))]
+                {
+                    let slice: CudaSlice<u16> = unsafe { std::ptr::read(data) };
+                    let dev = slice.device();
+                    crate::cuda_alloc_pool::pool_return_u16(slice);
+                    unsafe { std::ptr::write(data, make_dummy_slice::<u16>(dev)) };
+                }
             }
             TensorStorage::I32 { data, .. } => {
-                let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
-                let dev = slice.device();
-                crate::cuda_alloc_pool::pool_return_f32(slice);
-                unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+                #[cfg(feature = "shared_storage")]
+                {
+                    let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };
+                    let dev = arc.device();
+                    match Arc::try_unwrap(arc) {
+                        Ok(slice) => crate::cuda_alloc_pool::pool_return_f32(slice),
+                        Err(arc) => drop(arc),
+                    }
+                    unsafe { std::ptr::write(data, Arc::new(make_dummy_slice::<f32>(dev))) };
+                }
+                #[cfg(not(feature = "shared_storage"))]
+                {
+                    let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
+                    let dev = slice.device();
+                    crate::cuda_alloc_pool::pool_return_f32(slice);
+                    unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+                }
             }
             TensorStorage::Bool { data, .. } => {
-                let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
-                let dev = slice.device();
-                crate::cuda_alloc_pool::pool_return_f32(slice);
-                unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+                #[cfg(feature = "shared_storage")]
+                {
+                    let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };
+                    let dev = arc.device();
+                    match Arc::try_unwrap(arc) {
+                        Ok(slice) => crate::cuda_alloc_pool::pool_return_f32(slice),
+                        Err(arc) => drop(arc),
+                    }
+                    unsafe { std::ptr::write(data, Arc::new(make_dummy_slice::<f32>(dev))) };
+                }
+                #[cfg(not(feature = "shared_storage"))]
+                {
+                    let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
+                    let dev = slice.device();
+                    crate::cuda_alloc_pool::pool_return_f32(slice);
+                    unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
+                }
             }
             // I8, BF16Arena, BF16View — let Rust drop them normally.
             _ => {}
