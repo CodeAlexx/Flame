@@ -1987,6 +1987,7 @@ fn compute_gradients(
             }
 
             let mut sub_op_times: Vec<(std::time::Duration, &Op)> = Vec::new();
+            let mut n_bf16_casts = 0u32;
             for sub_entry in recomputed_tape.iter().rev() {
                 if let Some(sg) = sub_grads.take(sub_entry.output_id) {
                     let _t0 = std::time::Instant::now();
@@ -1997,6 +1998,7 @@ fn compute_gradients(
                     }
                     for (tid, g) in input_grads {
                         if sub_needed.contains(&tid) {
+                            if g.dtype() != DType::F32 { n_bf16_casts += 1; }
                             sub_grads.accumulate(tid, g)?;
                         }
                     }
@@ -2007,12 +2009,13 @@ fn compute_gradients(
             let ckpt_profile = *CKPT_PROFILE.get_or_init(|| {
                 std::env::var("FLAME_PROFILE").ok().map(|v| v == "1").unwrap_or(false)
             });
-            if ckpt_profile && !sub_op_times.is_empty() {
-                eprintln!("[checkpoint:{}] recomp={:.1}ms sub_bwd={:.1}ms ({} entries) slow ops:",
+            if ckpt_profile {
+                eprintln!("[checkpoint:{}] recomp={:.1}ms sub_bwd={:.1}ms ({} entries, {} bf16_casts) slow ops:",
                     entry.output_id.0,
                     _recomp_dt.as_secs_f64() * 1000.0,
                     _sub_bwd_dt.as_secs_f64() * 1000.0,
-                    recomputed_tape.len());
+                    recomputed_tape.len(),
+                    n_bf16_casts);
                 for (dt, op) in sub_op_times.iter().take(5) {
                     eprintln!("  {:.1}ms {:?}", dt.as_secs_f64() * 1000.0,
                         std::mem::discriminant(*op));

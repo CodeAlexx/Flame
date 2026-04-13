@@ -201,40 +201,38 @@ impl GradientMap {
 
     /// Accumulate gradient (in-place GPU addition — no temporary tensor allocation)
     pub fn accumulate(&mut self, id: TensorId, grad: Tensor) -> Result<()> {
-        // Upcast incoming gradient to FP32 before accumulation (if needed).
-        // Use no_grad cast to avoid any autograd overhead.
-        let grad = if grad.dtype() != DType::F32 {
-            grad.to_dtype_no_grad(DType::F32)?
-        } else {
-            grad
-        };
+        // Fast path helper: cast to F32 only when needed for accumulation.
+        // First gradient stored directly (even if BF16), cast deferred
+        // until a second gradient arrives for the same ID.
+        #[inline]
+        fn ensure_f32(t: &mut Tensor) -> Result<()> {
+            if t.dtype() != DType::F32 {
+                *t = t.to_dtype_no_grad(DType::F32)?;
+            }
+            Ok(())
+        }
 
-        // Try Vec path first
+        #[inline]
+        fn add_to_existing(existing: &mut Tensor, grad: Tensor) -> Result<()> {
+            ensure_f32(existing)?;
+            if grad.dtype() == existing.dtype() {
+                crate::ops::elt::add_inplace_same_dtype(existing, &grad)?;
+            } else {
+                let grad_f32 = grad.to_dtype_no_grad(DType::F32)?;
+                crate::ops::elt::add_inplace_same_dtype(existing, &grad_f32)?;
+            }
+            Ok(())
+        }
+
         if let Some(idx) = self.resolve(id) {
             match &mut self.vec_store[idx] {
-                Some(existing) => {
-                    if existing.dtype() != DType::F32 {
-                        let up = existing.to_dtype_no_grad(DType::F32)?;
-                        *existing = up;
-                    }
-                    crate::ops::elt::add_inplace_same_dtype(existing, &grad)?;
-                }
-                slot @ None => {
-                    *slot = Some(grad);
-                }
+                Some(existing) => add_to_existing(existing, grad)?,
+                slot @ None => { *slot = Some(grad); }
             }
         } else {
             match self.overflow.get_mut(&id) {
-                Some(existing) => {
-                    if existing.dtype() != DType::F32 {
-                        let up = existing.to_dtype_no_grad(DType::F32)?;
-                        *existing = up;
-                    }
-                    crate::ops::elt::add_inplace_same_dtype(existing, &grad)?;
-                }
-                None => {
-                    self.overflow.insert(id, grad);
-                }
+                Some(existing) => add_to_existing(existing, grad)?,
+                None => { self.overflow.insert(id, grad); }
             }
         }
         Ok(())
