@@ -755,7 +755,7 @@ impl AutogradContext {
 
                 if let Some(output_grad) = gradients.get(entry.output_id) {
                     println!("  Output grad shape: {:?}", output_grad.shape());
-                    let output_grad = output_grad.clone_result()?;
+                    let output_grad = output_grad.clone();
 
                     // Process gradients based on operation type
                     match compute_gradients(entry, &output_grad, &device) {
@@ -1565,13 +1565,13 @@ fn compute_gradients(
             let grad_lhs = if lhs_shape != output_grad.shape() {
                 reduce_grad_for_broadcast(output_grad, lhs_shape)?
             } else {
-                output_grad.clone_result()?
+                output_grad.clone()
             };
 
             let grad_rhs = if rhs_shape != output_grad.shape() {
                 reduce_grad_for_broadcast(output_grad, rhs_shape)?
             } else {
-                output_grad.clone_result()?
+                output_grad.clone()
             };
 
             Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
@@ -1580,7 +1580,7 @@ fn compute_gradients(
         Op::Sub { lhs, rhs } => {
             // d/dx(x-y) = 1, d/dy(x-y) = -1
             let neg_grad = GpuOps::mul_scalar(output_grad, -1.0)?;
-            Ok(vec![(*lhs, output_grad.clone_result()?), (*rhs, neg_grad)])
+            Ok(vec![(*lhs, output_grad.clone()), (*rhs, neg_grad)])
         }
 
         Op::Mul { lhs, rhs } => {
@@ -1631,7 +1631,7 @@ fn compute_gradients(
 
         Op::AddScalar { input, scalar: _ } => {
             // d/dx(x+s) = 1
-            Ok(vec![(*input, output_grad.clone_result()?)])
+            Ok(vec![(*input, output_grad.clone())])
         }
 
         Op::MatMul { lhs, rhs } => {
@@ -1853,7 +1853,7 @@ fn compute_gradients(
                 out
             } else {
                 // Fallback: mixed dtypes — cast and use f32 kernel
-                let og_f32 = if output_grad.dtype() != DType::F32 { output_grad.to_dtype_no_grad(DType::F32)? } else { output_grad.clone_result()? };
+                let og_f32 = if output_grad.dtype() != DType::F32 { output_grad.to_dtype_no_grad(DType::F32)? } else { output_grad.clone() };
                 let x_f32 = if x.dtype() != DType::F32 { x.to_dtype_no_grad(DType::F32)? } else { x };
                 let mut out = Tensor::empty_dtype(x_f32.shape().clone(), DType::F32, device.clone())?;
                 let status = unsafe {
@@ -2172,7 +2172,7 @@ fn compute_gradients(
                 let og = if output_grad.dtype() != DType::BF16 {
                     output_grad.to_dtype_no_grad(DType::BF16)?
                 } else {
-                    output_grad.clone_result()?
+                    output_grad.clone()
                 };
                 let gt = if gate_tensor.dtype() != DType::BF16 {
                     gate_tensor.to_dtype_no_grad(DType::BF16)?
@@ -2216,7 +2216,7 @@ fn compute_gradients(
             let grad_bf16 = if output_grad.dtype() != DType::BF16 {
                 output_grad.to_dtype_no_grad(DType::BF16)?
             } else {
-                output_grad.clone_result()?
+                output_grad.clone()
             };
             let cos_tensor = fetch_saved(cos)?;
             let sin_tensor = fetch_saved(sin)?;
@@ -2538,7 +2538,7 @@ fn compute_gradients(
         Op::AddBias { input, bias } => {
             // d/dx(x + b) = grad
             // d/db(x + b) = sum(grad) over batch and spatial dims
-            let grad_input = output_grad.clone_result()?;
+            let grad_input = output_grad.clone();
 
             // Sum over all dimensions except the bias dimension (usually channels)
             let ndims = output_grad.shape().dims().len();
@@ -2640,7 +2640,7 @@ fn compute_gradients(
 
             // Create a mask where input equals max (handling broadcasting)
             let max_broadcast = if *keepdim {
-                max_vals.clone_result()?
+                max_vals.clone()
             } else {
                 max_vals.unsqueeze(*dim)?
             };
@@ -2650,7 +2650,7 @@ fn compute_gradients(
 
             // Broadcast gradient if needed
             let grad_broadcast = if *keepdim {
-                output_grad.clone_result()?
+                output_grad.clone()
             } else {
                 output_grad.unsqueeze(*dim)?
             };
@@ -2681,7 +2681,7 @@ fn compute_gradients(
             let input_shape = input_tensor.shape();
 
             // Starting from output_grad, expand reduced dims as size-1 where needed then broadcast
-            let mut grad = output_grad.clone_result()?;
+            let mut grad = output_grad.clone();
             let mut target = input_shape.dims().to_vec();
             // Create a shape with 1s at reduced dims
             let mut reshape_dims = input_shape.dims().to_vec();
@@ -2706,7 +2706,7 @@ fn compute_gradients(
             })?;
             let input_shape = input_tensor.shape().dims().to_vec();
 
-            let mut grad = output_grad.clone_result()?;
+            let mut grad = output_grad.clone();
             let mut current_shape = grad.shape().dims().to_vec();
 
             if current_shape.len() != repeats.len() {
@@ -2892,7 +2892,7 @@ fn compute_gradients(
                 gpu_scatter_add_narrow(output_grad, &mut grad_in, dim, start)?;
                 Ok(vec![(*input, grad_in)])
             } else if can_gpu_multi_axis(ranges, in_dims) {
-                let mut tmp = output_grad.clone_result()?;
+                let mut tmp = output_grad.clone();
                 let mut axes: Vec<(usize, usize, usize)> = Vec::new();
                 for (i, &(s, e)) in ranges.iter().enumerate() {
                     if !(s == 0 && e == in_dims[i]) {
@@ -2910,7 +2910,7 @@ fn compute_gradients(
                 Ok(vec![(*input, tmp)])
             } else {
                 // Fallback: same as multi-axis
-                let mut tmp = output_grad.clone_result()?;
+                let mut tmp = output_grad.clone();
                 let mut axes: Vec<(usize, usize, usize)> = Vec::new();
                 for (i, &(s, e)) in ranges.iter().enumerate() {
                     if !(s == 0 && e == in_dims[i]) {
@@ -3057,7 +3057,7 @@ fn compute_gradients(
             let f_tensor = entry.get_saved(f).ok_or_else(|| {
                 Error::InvalidOperation("Missing saved tensor for false tensor in Where".into())
             })?;
-            let mask_t = cond_tensor.clone_result()?; // 1 where true
+            let mask_t = cond_tensor.clone(); // 1 where true
             let mask_f = mask_t.neg()?.add_scalar(1.0)?; // 1 - mask
             let mut grad_t = output_grad.mul(&mask_t)?;
             let mut grad_f = output_grad.mul(&mask_f)?;
@@ -3158,7 +3158,7 @@ fn compute_gradients(
             let mask = abs_diff.le(&delta_tensor)?;
 
             // Quadratic gradient: diff
-            let quad_grad = diff.clone_result()?;
+            let quad_grad = diff.clone();
 
             // Linear gradient: delta * sign(diff)
             let linear_grad = diff.sign()?.mul_scalar(*delta)?;
@@ -3594,7 +3594,7 @@ fn reduce_grad_for_broadcast(grad: &Tensor, target_shape: &Shape) -> Result<Tens
     let mut result = if orig_dtype != DType::F32 {
         grad.to_dtype_no_grad(DType::F32)?
     } else {
-        grad.clone_result()?
+        grad.clone()
     };
     for axis in 0..g_rank {
         if padded_td[axis] == 1 && gd[axis] != 1 {
@@ -3639,7 +3639,7 @@ fn relu_backward(grad_output: &Tensor, input: &Tensor) -> Result<Tensor> {
 /// delegates to the GPU broadcast kernel. Kept as utility.
 fn broadcast_to(tensor: &Tensor, target_shape: &Shape) -> Result<Tensor> {
     if tensor.shape == *target_shape {
-        return tensor.clone_result();
+        return Ok(tensor.clone());
     }
     // Delegate to the Tensor method which uses GPU broadcast_to_impl
     tensor.broadcast_to(target_shape)
@@ -3650,7 +3650,7 @@ fn broadcast_to(tensor: &Tensor, target_shape: &Shape) -> Result<Tensor> {
 fn expand_to_rank(tensor: &Tensor, target_rank: usize) -> Result<Tensor> {
     let mut dims = tensor.shape().dims().to_vec();
     if dims.len() == target_rank {
-        return tensor.clone_result();
+        return Ok(tensor.clone());
     }
     while dims.len() < target_rank {
         dims.push(1);
