@@ -1969,7 +1969,19 @@ fn compute_gradients(
             };
 
             let _sub_bwd_t0 = std::time::Instant::now();
-            let mut sub_grads = crate::gradient::GradientMap::new(device.clone());
+            // Build compact index for the sub-tape (O(1) gradient lookups
+            // instead of HashMap — same optimization as the main backward).
+            let sub_compact = {
+                use crate::gradient::CompactIndex;
+                let ids = recomputed_tape.iter().flat_map(|e| {
+                    let mut ids = vec![e.output_id];
+                    for (sid, _) in &e.saved_tensors { ids.push(*sid); }
+                    ids
+                }).chain(std::iter::once(*input));
+                CompactIndex::from_tensor_ids(ids)
+            };
+            let mut sub_grads = crate::gradient::GradientMap::with_index(
+                device.clone(), sub_compact);
             if let Some(last_entry) = recomputed_tape.last() {
                 sub_grads.set(last_entry.output_id, output_grad.clone());
             }
@@ -1980,7 +1992,7 @@ fn compute_gradients(
                     let _t0 = std::time::Instant::now();
                     let input_grads = compute_gradients(sub_entry, &sg, device)?;
                     let _dt = _t0.elapsed();
-                    if _dt.as_millis() > 5 {
+                    if _dt.as_micros() > 500 {
                         sub_op_times.push((_dt, &sub_entry.op));
                     }
                     for (tid, g) in input_grads {
@@ -1991,7 +2003,21 @@ fn compute_gradients(
                 }
             }
             let _sub_bwd_dt = _sub_bwd_t0.elapsed();
-            let _ = sub_op_times;
+            static CKPT_PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let ckpt_profile = *CKPT_PROFILE.get_or_init(|| {
+                std::env::var("FLAME_PROFILE").ok().map(|v| v == "1").unwrap_or(false)
+            });
+            if ckpt_profile && !sub_op_times.is_empty() {
+                eprintln!("[checkpoint:{}] recomp={:.1}ms sub_bwd={:.1}ms ({} entries) slow ops:",
+                    entry.output_id.0,
+                    _recomp_dt.as_secs_f64() * 1000.0,
+                    _sub_bwd_dt.as_secs_f64() * 1000.0,
+                    recomputed_tape.len());
+                for (dt, op) in sub_op_times.iter().take(5) {
+                    eprintln!("  {:.1}ms {:?}", dt.as_secs_f64() * 1000.0,
+                        std::mem::discriminant(*op));
+                }
+            }
 
             let mut result = Vec::new();
             for (tid, g) in sub_grads.drain_all()? {
