@@ -561,15 +561,15 @@ fn attention_backward_recompute(
     cached_attn: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     // All ops in BF16 (bmm requires matching dtypes)
-    let q = if q.dtype() != DType::BF16 { &q.to_dtype(DType::BF16)? } else { q };
-    let k = if k.dtype() != DType::BF16 { &k.to_dtype(DType::BF16)? } else { k };
-    let v = if v.dtype() != DType::BF16 { &v.to_dtype(DType::BF16)? } else { v };
-    let dout = if dout.dtype() != DType::BF16 { &dout.to_dtype(DType::BF16)? } else { dout };
+    let q = if q.dtype() != DType::BF16 { &q.to_dtype_no_grad(DType::BF16)? } else { q };
+    let k = if k.dtype() != DType::BF16 { &k.to_dtype_no_grad(DType::BF16)? } else { k };
+    let v = if v.dtype() != DType::BF16 { &v.to_dtype_no_grad(DType::BF16)? } else { v };
+    let dout = if dout.dtype() != DType::BF16 { &dout.to_dtype_no_grad(DType::BF16)? } else { dout };
 
     let attn_owned;
     let attn: &Tensor = if let Some(cached) = cached_attn {
         let cached = if cached.dtype() != DType::BF16 {
-            attn_owned = cached.to_dtype(DType::BF16)?;
+            attn_owned = cached.to_dtype_no_grad(DType::BF16)?;
             &attn_owned
         } else {
             cached
@@ -1651,7 +1651,7 @@ fn compute_gradients(
                 let grad_bf16: &Tensor = if output_grad.dtype() == DType::BF16 {
                     output_grad
                 } else {
-                    grad_bf16_owned = output_grad.to_dtype(DType::BF16)?;
+                    grad_bf16_owned = output_grad.to_dtype_no_grad(DType::BF16)?;
                     &grad_bf16_owned
                 };
                 // grad_lhs = output_grad @ rhs^T
@@ -1681,10 +1681,10 @@ fn compute_gradients(
                 let lhs_2d = lhs_tensor.reshape(&[batch * m, k])?;
 
                 let og_cast = if og_2d.dtype() != rhs_tensor.dtype() {
-                    og_2d.to_dtype(rhs_tensor.dtype())?
+                    og_2d.to_dtype_no_grad(rhs_tensor.dtype())?
                 } else { og_2d.clone() };
                 let lhs_cast = if lhs_2d.dtype() != og_cast.dtype() {
-                    lhs_2d.to_dtype(og_cast.dtype())?
+                    lhs_2d.to_dtype_no_grad(og_cast.dtype())?
                 } else { lhs_2d };
 
                 let rhs_t = GpuOps::transpose(rhs_tensor)?;
@@ -1725,7 +1725,7 @@ fn compute_gradients(
             // Slow / fallback path (non-BF16, non-2D, mixed dtype): materialize
             // transposes and call GpuOps::matmul as before.
             let rhs_for_grad = if rhs_tensor.dtype() != og_dtype {
-                let cast = rhs_tensor.to_dtype(og_dtype)?;
+                let cast = rhs_tensor.to_dtype_no_grad(og_dtype)?;
                 GpuOps::transpose(&cast)?
             } else if og_dtype == DType::BF16 && rhs_tensor.rank() == 2 {
                 crate::bf16_elementwise::transpose2d_bf16(rhs_tensor)?
@@ -1735,7 +1735,7 @@ fn compute_gradients(
             let grad_lhs = GpuOps::matmul(output_grad, &rhs_for_grad)?;
 
             let lhs_for_grad = if lhs_tensor.dtype() != og_dtype {
-                let cast = lhs_tensor.to_dtype(og_dtype)?;
+                let cast = lhs_tensor.to_dtype_no_grad(og_dtype)?;
                 GpuOps::transpose(&cast)?
             } else if og_dtype == DType::BF16 && lhs_tensor.rank() == 2 {
                 crate::bf16_elementwise::transpose2d_bf16(lhs_tensor)?
@@ -1822,8 +1822,8 @@ fn compute_gradients(
                 out
             } else {
                 // Fallback: mixed dtypes — cast and use f32 kernel
-                let og_f32 = if output_grad.dtype() != DType::F32 { output_grad.to_dtype(DType::F32)? } else { output_grad.clone_result()? };
-                let x_f32 = if x.dtype() != DType::F32 { x.to_dtype(DType::F32)? } else { x };
+                let og_f32 = if output_grad.dtype() != DType::F32 { output_grad.to_dtype_no_grad(DType::F32)? } else { output_grad.clone_result()? };
+                let x_f32 = if x.dtype() != DType::F32 { x.to_dtype_no_grad(DType::F32)? } else { x };
                 let mut out = Tensor::zeros_dtype(x_f32.shape().clone(), DType::F32, device.clone())?;
                 let status = unsafe {
                     crate::cuda::ffi::flame_silu_backward_f32(
@@ -1906,7 +1906,7 @@ fn compute_gradients(
 
         Op::Cast { input, from, to: _ } => {
             // Gradient of cast passes through; cast grad back to input dtype
-            let g = output_grad.to_dtype(*from)?;
+            let g = output_grad.to_dtype_no_grad(*from)?;
             Ok(vec![(*input, g)])
         }
 
@@ -2082,7 +2082,7 @@ fn compute_gradients(
             // the same kernel the klein-trainer forward uses, so fwd/bwd
             // stay numerically consistent.
             let grad_bf16 = if output_grad.dtype() != DType::BF16 {
-                output_grad.to_dtype(DType::BF16)?
+                output_grad.to_dtype_no_grad(DType::BF16)?
             } else {
                 output_grad.clone_result()?
             };
@@ -2224,14 +2224,14 @@ fn compute_gradients(
             let grad_bf16: &Tensor = if output_grad.dtype() == DType::BF16 {
                 output_grad
             } else {
-                grad_bf16_owned = output_grad.to_dtype(DType::BF16)?;
+                grad_bf16_owned = output_grad.to_dtype_no_grad(DType::BF16)?;
                 &grad_bf16_owned
             };
             let input_bf16_owned;
             let input_bf16: &Tensor = if input_tensor.dtype() == DType::BF16 {
                 input_tensor
             } else {
-                input_bf16_owned = input_tensor.to_dtype(DType::BF16)?;
+                input_bf16_owned = input_tensor.to_dtype_no_grad(DType::BF16)?;
                 &input_bf16_owned
             };
             let (grad_input, grad_weight, grad_bias) =
@@ -2361,7 +2361,7 @@ fn compute_gradients(
                 let grad_bf16: &Tensor = if output_grad.dtype() == DType::BF16 {
                     output_grad
                 } else {
-                    grad_bf16_owned = output_grad.to_dtype(DType::BF16)?;
+                    grad_bf16_owned = output_grad.to_dtype_no_grad(DType::BF16)?;
                     &grad_bf16_owned
                 };
                 let grad_lhs = crate::ops::gemm_bf16::matmul_bf16_trans(
@@ -2373,25 +2373,17 @@ fn compute_gradients(
                 return Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
             }
 
-            // Fallback: materialize transposes via transpose_batch().
-            let og_dtype = output_grad.dtype();
-            let rhs_matched = if rhs_tensor.dtype() != og_dtype {
-                rhs_tensor.to_dtype(og_dtype)?
-            } else {
-                (*rhs_tensor).clone()
-            };
-            let lhs_matched = if lhs_tensor.dtype() != og_dtype {
-                lhs_tensor.to_dtype(og_dtype)?
-            } else {
-                (*lhs_tensor).clone()
-            };
-
-            let rhs_t = rhs_matched.transpose_batch()?;
-            let grad_lhs = output_grad.batch_matmul(&rhs_t)?;
-
-            let lhs_t = lhs_matched.transpose_batch()?;
-            let grad_rhs = lhs_t.batch_matmul(output_grad)?;
-
+            // Fallback for non-BF16 3D×3D: cast to BF16, use the fast path above.
+            // This is rare — only hits when operands are F32/F16.
+            let lhs_bf16 = lhs_tensor.to_dtype_no_grad(DType::BF16)?;
+            let rhs_bf16 = rhs_tensor.to_dtype_no_grad(DType::BF16)?;
+            let grad_bf16 = output_grad.to_dtype_no_grad(DType::BF16)?;
+            let grad_lhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                &grad_bf16, &rhs_bf16, false, true,
+            )?;
+            let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                &lhs_bf16, &grad_bf16, true, false,
+            )?;
             Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
         }
 
@@ -2675,7 +2667,7 @@ fn compute_gradients(
             let weight_grad = if weight_tensor.dtype() == DType::F32 {
                 weight_grad_f32
             } else {
-                weight_grad_f32.to_dtype(weight_tensor.dtype())?
+                weight_grad_f32.to_dtype_no_grad(weight_tensor.dtype())?
             };
 
             Ok(vec![(*weight, weight_grad)])
@@ -2706,7 +2698,7 @@ fn compute_gradients(
             let grad_input = if input_tensor.dtype() == DType::F32 {
                 grad_input_f32
             } else {
-                grad_input_f32.to_dtype(input_tensor.dtype())?
+                grad_input_f32.to_dtype_no_grad(input_tensor.dtype())?
             };
 
             Ok(vec![(*input, grad_input)])
@@ -3426,7 +3418,7 @@ fn reduce_grad_for_broadcast(grad: &Tensor, target_shape: &Shape) -> Result<Tens
     // (e.g., summing 24×768=18432 elements exceeds BF16 max ~65504).
     let orig_dtype = grad.dtype();
     let mut result = if orig_dtype != DType::F32 {
-        grad.to_dtype(DType::F32)?
+        grad.to_dtype_no_grad(DType::F32)?
     } else {
         grad.clone_result()?
     };
@@ -3436,11 +3428,9 @@ fn reduce_grad_for_broadcast(grad: &Tensor, target_shape: &Shape) -> Result<Tens
         }
     }
 
-    // Reshape to exact target dims (drops leading 1s if target has lower rank)
     let mut result = result.reshape(&td)?;
-    // Cast back to original dtype
     if result.dtype() != orig_dtype {
-        result = result.to_dtype(orig_dtype)?;
+        result = result.to_dtype_no_grad(orig_dtype)?;
     }
     Ok(result)
 }
@@ -3505,10 +3495,11 @@ fn inverse_permutation(perm: &[usize]) -> Vec<usize> {
 
 // Comparison operations are implemented in tensor_ops_extended.rs
 #[inline]
-fn ensure_bf16(mut tensor: Tensor) -> Result<Tensor> {
-    if tensor.dtype() != DType::BF16 {
-        tensor = tensor.to_dtype(DType::BF16)?;
-    }
+/// Identity function — previously cast every gradient to BF16, but accumulate()
+/// immediately casts back to FP32. Removing the round-trip saves ~40 CUDA kernels
+/// + allocations per backward pass.
+#[inline]
+fn ensure_bf16(tensor: Tensor) -> Result<Tensor> {
     Ok(tensor)
 }
 

@@ -201,9 +201,10 @@ impl GradientMap {
 
     /// Accumulate gradient (in-place GPU addition — no temporary tensor allocation)
     pub fn accumulate(&mut self, id: TensorId, grad: Tensor) -> Result<()> {
-        // Always upcast incoming gradient to FP32 before accumulation
+        // Upcast incoming gradient to FP32 before accumulation (if needed).
+        // Use no_grad cast to avoid any autograd overhead.
         let grad = if grad.dtype() != DType::F32 {
-            grad.to_dtype(DType::F32)?
+            grad.to_dtype_no_grad(DType::F32)?
         } else {
             grad
         };
@@ -212,12 +213,10 @@ impl GradientMap {
         if let Some(idx) = self.resolve(id) {
             match &mut self.vec_store[idx] {
                 Some(existing) => {
-                    // Ensure existing buffer is FP32
                     if existing.dtype() != DType::F32 {
-                        let up = existing.to_dtype(DType::F32)?;
+                        let up = existing.to_dtype_no_grad(DType::F32)?;
                         *existing = up;
                     }
-                    // In-place add: existing += grad (no new tensor allocation)
                     crate::ops::elt::add_inplace_same_dtype(existing, &grad)?;
                 }
                 slot @ None => {
@@ -225,11 +224,10 @@ impl GradientMap {
                 }
             }
         } else {
-            // Overflow / HashMap fallback
             match self.overflow.get_mut(&id) {
                 Some(existing) => {
                     if existing.dtype() != DType::F32 {
-                        let up = existing.to_dtype(DType::F32)?;
+                        let up = existing.to_dtype_no_grad(DType::F32)?;
                         *existing = up;
                     }
                     crate::ops::elt::add_inplace_same_dtype(existing, &grad)?;
