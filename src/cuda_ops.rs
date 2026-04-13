@@ -237,18 +237,21 @@ impl GpuOps {
             ));
         }
         let target = a.shape().broadcast_shape_binary_op(b.shape())?;
-        let a_bc = Self::broadcast_clone_bf16(a, &target)?;
-        let b_bc = Self::broadcast_clone_bf16(b, &target)?;
-        crate::ops::elt::add_same_dtype(&a_bc, &b_bc)
-    }
-
-    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-    fn broadcast_clone_bf16(tensor: &Tensor, target: &crate::Shape) -> Result<Tensor> {
-        if tensor.shape() == target {
-            tensor.clone_result()
-        } else {
-            tensor.broadcast_to(target)
+        if a.shape() == &target && b.shape() == &target {
+            // Same shape — no broadcast, no copy needed
+            return crate::ops::elt::add_same_dtype(a, b);
         }
+        let a_bc_owned;
+        let a_ref = if a.shape() != &target {
+            a_bc_owned = a.broadcast_to(&target)?;
+            &a_bc_owned
+        } else { a };
+        let b_bc_owned;
+        let b_ref = if b.shape() != &target {
+            b_bc_owned = b.broadcast_to(&target)?;
+            &b_bc_owned
+        } else { b };
+        crate::ops::elt::add_same_dtype(a_ref, b_ref)
     }
 
     /// Element-wise multiplication
@@ -296,9 +299,20 @@ impl GpuOps {
             ));
         }
         let target = a.shape().broadcast_shape_binary_op(b.shape())?;
-        let a_bc = Self::broadcast_clone_bf16(a, &target)?;
-        let b_bc = Self::broadcast_clone_bf16(b, &target)?;
-        crate::ops::elt::mul_same_dtype(&a_bc, &b_bc)
+        if a.shape() == &target && b.shape() == &target {
+            return crate::ops::elt::mul_same_dtype(a, b);
+        }
+        let a_bc_owned;
+        let a_ref = if a.shape() != &target {
+            a_bc_owned = a.broadcast_to(&target)?;
+            &a_bc_owned
+        } else { a };
+        let b_bc_owned;
+        let b_ref = if b.shape() != &target {
+            b_bc_owned = b.broadcast_to(&target)?;
+            &b_bc_owned
+        } else { b };
+        crate::ops::elt::mul_same_dtype(a_ref, b_ref)
     }
 
     /// Scalar multiplication

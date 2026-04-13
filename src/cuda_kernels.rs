@@ -392,22 +392,24 @@ impl CudaKernels {
     /// Element-wise addition kernel (rank-safe broadcasting)
     pub fn add(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
         // Normalize via broadcast if shapes differ (NumPy semantics)
+        let (a_owned, b_owned);
         let (a_t, b_t) = if a.shape != b.shape {
             let target = a.shape.broadcast_shape_binary_op(&b.shape)?;
-            // Use CPU-safe broadcast to handle rank differences robustly
             let a_bc = if a.shape != target {
-                crate::cuda_kernels::CudaKernels::broadcast(a, &target)?
+                a_owned = crate::cuda_kernels::CudaKernels::broadcast(a, &target)?;
+                &a_owned
             } else {
-                a.clone_result()?
+                a
             };
             let b_bc = if b.shape != target {
-                crate::cuda_kernels::CudaKernels::broadcast(b, &target)?
+                b_owned = crate::cuda_kernels::CudaKernels::broadcast(b, &target)?;
+                &b_owned
             } else {
-                b.clone_result()?
+                b
             };
             (a_bc, b_bc)
         } else {
-            (a.clone_result()?, b.clone_result()?)
+            (a, b)
         };
 
         let mut output =
@@ -444,21 +446,24 @@ impl CudaKernels {
     /// Element-wise multiplication kernel (rank-safe broadcasting)
     pub fn mul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
         // Normalize via broadcast if shapes differ (NumPy semantics)
+        let (a_owned, b_owned);
         let (a_t, b_t) = if a.shape != b.shape {
             let target = a.shape.broadcast_shape_binary_op(&b.shape)?;
             let a_bc = if a.shape != target {
-                crate::cuda_kernels::CudaKernels::broadcast(a, &target)?
+                a_owned = crate::cuda_kernels::CudaKernels::broadcast(a, &target)?;
+                &a_owned
             } else {
-                a.clone_result()?
+                a
             };
             let b_bc = if b.shape != target {
-                crate::cuda_kernels::CudaKernels::broadcast(b, &target)?
+                b_owned = crate::cuda_kernels::CudaKernels::broadcast(b, &target)?;
+                &b_owned
             } else {
-                b.clone_result()?
+                b
             };
             (a_bc, b_bc)
         } else {
-            (a.clone_result()?, b.clone_result()?)
+            (a, b)
         };
 
         let mut output =
