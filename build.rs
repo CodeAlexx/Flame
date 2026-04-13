@@ -96,6 +96,7 @@ fn main() {
     cuda_sources.push("kernels/sdpa_kernels.cu");
     cuda_sources.push("kernels/geglu_kernels.cu");
     cuda_sources.push("kernels/silu_backward.cu");
+    cuda_sources.push("kernels/swiglu_backward.cu");
 
     // Fused inference kernels (flame-swap / LTX-2 perf)
     cuda_sources.push("src/cuda/fused_rms_norm.cu");

@@ -251,6 +251,16 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    pub fn flame_swiglu_backward_bf16(
+        grad_out: *const core::ffi::c_void,
+        gate: *const core::ffi::c_void,
+        up: *const core::ffi::c_void,
+        d_gate: *mut core::ffi::c_void,
+        d_up: *mut core::ffi::c_void,
+        n: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     pub fn flame_rope_precomputed_bf16(
         x: *const core::ffi::c_void,
         cos_buf: *const core::ffi::c_void,

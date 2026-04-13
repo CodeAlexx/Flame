@@ -1956,6 +1956,34 @@ extern "C" __global__ void f32_to_bool_kernel(
         Ok(output)
     }
 
+    /// Fused SwiGLU: silu(self) * up in a single kernel.
+    /// Records Op::FusedSwiGLU for autograd backward.
+    pub fn swiglu(&self, up: &Tensor) -> Result<Tensor> {
+        let mut output = if self.dtype() == DType::BF16 && up.dtype() == DType::BF16 {
+            crate::bf16_ops::swiglu_fused_bf16(self, up)?
+        } else {
+            // Fallback: separate silu + mul
+            let s = self.silu()?;
+            return s.mul(up);
+        };
+
+        if self.requires_grad || up.requires_grad {
+            output.requires_grad = true;
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::FusedSwiGLU {
+                        gate: self.id,
+                        up: up.id,
+                    },
+                    vec![(self.id, self.clone()), (up.id, up.clone())],
+                );
+            }
+        }
+
+        Ok(output)
+    }
+
     /// Tanh activation
     pub fn tanh(&self) -> Result<Tensor> {
         // Use CUDA kernel for GPU-accelerated Tanh

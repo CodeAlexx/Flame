@@ -309,6 +309,12 @@ pub enum Op {
         /// Number of tape entries the original forward produced (for validation).
         original_tape_len: usize,
     },
+    /// Fused SwiGLU: silu(gate) * up in one kernel.
+    /// Backward: d_gate = dsilu(gate) * up * dout, d_up = silu(gate) * dout
+    FusedSwiGLU {
+        gate: TensorId,
+        up: TensorId,
+    },
     /// Fused RoPE with precomputed cos/sin.
     /// Backward: apply_rope(grad, cos, -sin) via same fused kernel.
     RoPePrecomputed {
@@ -913,6 +919,9 @@ impl AutogradContext {
                                 }
                                 Op::SageAttention { query_id, key_id, value_id, .. } => {
                                     ids.push(*query_id); ids.push(*key_id); ids.push(*value_id);
+                                }
+                                Op::FusedSwiGLU { gate, up } => {
+                                    ids.push(*gate); ids.push(*up);
                                 }
                                 Op::RoPePrecomputed { input, cos, sin } => {
                                     ids.push(*input); ids.push(*cos); ids.push(*sin);
@@ -2124,6 +2133,78 @@ fn compute_gradients(
                 result.push((tid, g));
             }
             Ok(result)
+        }
+
+        Op::FusedSwiGLU { gate, up } => {
+            // SwiGLU forward: out = silu(gate) * up
+            // Fused backward kernel: 1 kernel computes both d_gate and d_up.
+            let gate_tensor = fetch_saved(gate)?;
+            let up_tensor = fetch_saved(up)?;
+            let n = gate_tensor.shape().elem_count() as i64;
+            let stream = device.cuda_stream_raw_ptr();
+
+            if output_grad.dtype() == DType::BF16
+                && gate_tensor.dtype() == DType::BF16
+                && up_tensor.dtype() == DType::BF16
+            {
+                let mut d_gate_t = Tensor::empty_dtype(
+                    gate_tensor.shape().clone(), DType::BF16, device.clone(),
+                )?;
+                let mut d_up_t = Tensor::empty_dtype(
+                    up_tensor.shape().clone(), DType::BF16, device.clone(),
+                )?;
+                let status = unsafe {
+                    crate::cuda::ffi::flame_swiglu_backward_bf16(
+                        tensor_raw_ptr(output_grad)?,
+                        tensor_raw_ptr(&gate_tensor)?,
+                        tensor_raw_ptr(&up_tensor)?,
+                        tensor_raw_ptr_mut(&mut d_gate_t)?,
+                        tensor_raw_ptr_mut(&mut d_up_t)?,
+                        n, stream,
+                    )
+                };
+                if status != 0 {
+                    return Err(Error::Cuda("flame_swiglu_backward_bf16 failed".into()));
+                }
+                Ok(vec![(*gate, d_gate_t), (*up, d_up_t)])
+            } else {
+                // Fallback: decompose into individual ops
+                let og = if output_grad.dtype() != DType::BF16 {
+                    output_grad.to_dtype_no_grad(DType::BF16)?
+                } else {
+                    output_grad.clone_result()?
+                };
+                let gt = if gate_tensor.dtype() != DType::BF16 {
+                    gate_tensor.to_dtype_no_grad(DType::BF16)?
+                } else {
+                    gate_tensor
+                };
+                let ut = if up_tensor.dtype() != DType::BF16 {
+                    up_tensor.to_dtype_no_grad(DType::BF16)?
+                } else {
+                    up_tensor
+                };
+                let mut d_gate_t = Tensor::empty_dtype(
+                    gt.shape().clone(), DType::BF16, device.clone(),
+                )?;
+                let mut d_up_t = Tensor::empty_dtype(
+                    ut.shape().clone(), DType::BF16, device.clone(),
+                )?;
+                let status = unsafe {
+                    crate::cuda::ffi::flame_swiglu_backward_bf16(
+                        tensor_raw_ptr(&og)?,
+                        tensor_raw_ptr(&gt)?,
+                        tensor_raw_ptr(&ut)?,
+                        tensor_raw_ptr_mut(&mut d_gate_t)?,
+                        tensor_raw_ptr_mut(&mut d_up_t)?,
+                        gt.shape().elem_count() as i64, stream,
+                    )
+                };
+                if status != 0 {
+                    return Err(Error::Cuda("flame_swiglu_backward_bf16 (fallback) failed".into()));
+                }
+                Ok(vec![(*gate, d_gate_t), (*up, d_up_t)])
+            }
         }
 
         Op::RoPePrecomputed { input, cos, sin } => {
