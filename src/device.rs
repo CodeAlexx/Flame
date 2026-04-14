@@ -9,6 +9,30 @@ static GLOBAL_DEV: OnceLock<Arc<CudarcDevice>> = OnceLock::new();
 extern "C" {
     fn cudaDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
     fn cudaMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
+    fn cudaMemPoolTrimTo(pool: *mut c_void, min_bytes_to_keep: usize) -> i32;
+}
+
+/// Trim the CUDA mempool: release cached (freed) GPU memory back to the driver.
+///
+/// `min_bytes_to_keep`: minimum bytes of cached memory to retain. Pass 0 to
+/// release everything that's not currently in-use.
+///
+/// Safe to call during training between steps (e.g. after backward + optimizer step).
+/// Particularly important for models with gradient checkpointing, where the
+/// checkpoint recompute creates temporary allocations that the mempool caches
+/// indefinitely with MAX threshold.
+pub fn trim_cuda_mempool(min_bytes_to_keep: usize) {
+    unsafe {
+        let mut pool: *mut c_void = std::ptr::null_mut();
+        let status = cudaDeviceGetDefaultMemPool(&mut pool, 0);
+        if status != 0 || pool.is_null() {
+            return;
+        }
+        let status = cudaMemPoolTrimTo(pool, min_bytes_to_keep);
+        if status != 0 {
+            log::warn!("cudaMemPoolTrimTo failed (status={})", status);
+        }
+    }
 }
 
 /// Configure CUDA memory pool to cache aggressively (never release to OS).

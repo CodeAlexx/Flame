@@ -219,7 +219,7 @@ pub use autograd::{AutogradContext, Op};
 pub use config::{
     default_dtype, set_default_dtype, set_force_cudnn, should_use_cudnn, FlameConfig,
 };
-pub use device::{global_cuda_device, Device};
+pub use device::{global_cuda_device, trim_cuda_mempool, Device};
 pub use dtype::DType;
 pub use error::{Error, Result};
 pub type FlameError = Error;

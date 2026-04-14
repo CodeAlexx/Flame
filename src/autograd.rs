@@ -2059,9 +2059,31 @@ fn compute_gradients(
                 }
             }
 
+            // Drop the recomputed tape BEFORE collecting results so its
+            // saved tensors free GPU memory. Then trim the CUDA mempool to
+            // reclaim cached allocations immediately — essential for models
+            // with many checkpoint blocks (e.g. Chroma 57 blocks).
+            drop(recomputed_tape);
+            crate::device::trim_cuda_mempool(0);
+
+            // Only return the checkpoint input gradient (chain propagation)
+            // and gradients for tensors that were saved with requires_grad=true
+            // (trainable params like LoRA weights). Drop intermediate chain
+            // gradients from the sub-backward to prevent O(blocks) VRAM growth.
             let mut result = Vec::new();
             for (tid, g) in sub_grads.drain_all()? {
-                result.push((tid, g));
+                // Always keep the chain gradient (checkpoint input)
+                if tid == *input {
+                    result.push((tid, g));
+                    continue;
+                }
+                // Keep gradients for tensors that had requires_grad=true
+                // in the recomputed sub-tape (these are trainable params).
+                let is_trainable = entry.saved_tensors.iter()
+                    .any(|(sid, st)| *sid == tid && st.requires_grad());
+                if is_trainable {
+                    result.push((tid, g));
+                }
             }
             Ok(result)
         }
