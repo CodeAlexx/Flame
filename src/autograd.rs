@@ -2371,12 +2371,43 @@ fn compute_gradients(
                 input_bf16_owned = input_tensor.to_dtype_no_grad(DType::BF16)?;
                 &input_bf16_owned
             };
+            // Extract weight and bias from saved_tensors if present.
+            // Forward saves: [input, weight?, bias?, mean, rstd]
+            // Weight is at index 1 if it was saved (affine LayerNorm).
+            // Bias is at index 2 if both weight and bias were saved.
+            let weight_tensor = if entry.saved_tensors.len() > 3 {
+                // 5 entries: input, weight, bias, mean, rstd
+                // OR 4 entries: input, weight, mean, rstd (weight-only, no bias)
+                Some(&entry.saved_tensors[1].1)
+            } else {
+                None
+            };
+            let bias_tensor = if entry.saved_tensors.len() > 4 {
+                // 5 entries: input, weight, bias, mean, rstd
+                Some(&entry.saved_tensors[2].1)
+            } else {
+                None
+            };
+
+            let w_bf16_owned;
+            let w_bf16: Option<&Tensor> = match weight_tensor {
+                Some(w) if w.dtype() == DType::BF16 => Some(w),
+                Some(w) => { w_bf16_owned = w.to_dtype_no_grad(DType::BF16)?; Some(&w_bf16_owned) }
+                None => None,
+            };
+            let b_bf16_owned;
+            let b_bf16: Option<&Tensor> = match bias_tensor {
+                Some(b) if b.dtype() == DType::BF16 => Some(b),
+                Some(b) => { b_bf16_owned = b.to_dtype_no_grad(DType::BF16)?; Some(&b_bf16_owned) }
+                None => None,
+            };
+
             let (grad_input, grad_weight, grad_bias) =
                 crate::cuda_ops_bf16::layer_norm_backward_bf16(
                     input_bf16,
                     grad_bf16,
-                    None, // weight: TODO lookup from saved[1]
-                    None, // bias: TODO lookup from saved[2]
+                    w_bf16,
+                    b_bf16,
                     normalized_shape,
                     1e-5, // eps (match forward)
                 )?;
