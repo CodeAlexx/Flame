@@ -600,3 +600,8 @@ by `.cu` file with launch configs and perf notes.
   FP8 quant kernel: `src/cuda/fp8_quant.cu`. Trainer setup: `flame-diffusion/src/offload.rs`.
 - **"Where is the BF16→FP8 quantize kernel?"** → `flame_bf16_to_fp8` →
   `src/cuda/fp8_quant.cu` (used by activation offload FP8 compression)
+- **"Where are the QwenImage trainer parity tests?"** →
+  Forward: `flame-diffusion/qwenimage-trainer/src/bin/parity_test.rs` +
+  `tools/dump_forward.py`.
+  Training: `src/bin/train_parity_test.rs` + `tools/dump_training_steps.py`.
+  Sampler: `tools/compare_sampler.py`. See CONVENTIONS §7-9 for bugs found.

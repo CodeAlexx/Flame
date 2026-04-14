@@ -617,3 +617,47 @@ pattern 2 with bit-cast reads denormalized floats that truncate to 0.
 
 **Rule:** Always check the kernel source before choosing. Grep for
 `int\*.*dims` vs `float\*.*dims` in the kernel declaration.
+
+---
+
+### QwenImage-specific conventions (2026-04-14 parity audit)
+
+Three bugs found and fixed in `qwenimage-trainer/src/model.rs` during
+parity testing against musubi-tuner. All three are "silent wrong answer"
+failures — the code ran without errors but produced wrong results.
+
+**7. Sinusoidal timestep embedding requires `scale=1000`.**
+The QwenImage model's `QwenTimestepProjEmbeddings` uses
+`Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000)`.
+The `scale=1000` multiplies the timestep BEFORE computing sin/cos. Without
+it, the sinusoidal frequencies see values in [0,1] instead of [0,1000] — a
+1000× error in the conditioning signal. Reference: `qwen_image_model.py:256`.
+The inference-flame implementation (`qwenimage_dit.rs:242`) already had
+this correct: `t_f32.mul_scalar(1000.0)`.
+
+**8. Text RoPE offset with `scale_rope=True` must divide by 2.**
+When `scale_rope=True` (QwenImage default), image positions use symmetric
+centering `[-H/2, H/2)`. The text position offset must match:
+`max_vid_index = max(height // 2, width // 2)` (Python `qwen_image_model.py:342`).
+The Rust code was using `max(height, width)` without dividing by 2, placing
+text tokens at 2× the correct offset. This shifts all text-image cross-
+attention RoPE relationships.
+
+**9. `AdaLayerNormContinuous` output chunk order is `(scale, shift)`.**
+Python (`qwen_image_model.py:547`): `scale, shift = torch.chunk(emb, 2, dim=1)`.
+Scale is first, shift is second. The Rust `norm_out` code had them swapped.
+This caused cosine similarity to drop from 0.9999 to 0.62 on the final
+prediction — catastrophic but only affecting the output layer. Per-block
+modulation uses a *different* chunk order (`shift, scale, gate`) and was
+already correct.
+
+**Parity test location:** `qwenimage-trainer/src/bin/parity_test.rs` (forward)
+and `qwenimage-trainer/src/bin/train_parity_test.rs` (20-step training).
+Run with `python tools/dump_forward.py` first, then the Rust binary.
+
+**Timestep sampling:** QwenImage uses `qwen_shift` mode:
+`sigmoid(randn * sigmoid_scale)` pushed through the shift formula. This
+is NOT uniform sampling. See `hv_train_network.py:1192-1201`.
+
+**Loss precision:** Cast prediction and target to F32 BEFORE computing
+squared difference. BF16 squared errors can overflow for large residuals.
