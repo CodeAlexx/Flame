@@ -2689,6 +2689,23 @@ extern "C" __global__ void f32_to_bool_kernel(
         Ok(tensor)
     }
 
+    /// Detach and create a leaf variable for gradient checkpointing.
+    ///
+    /// Returns a tensor with:
+    /// - Same storage (Arc bump, zero GPU copy)
+    /// - **New** TensorId (disconnected from outer autograd graph)
+    /// - requires_grad = true (so the local recompute graph tracks it)
+    ///
+    /// This is the flame-core equivalent of PyTorch's `detach_variable`:
+    /// the returned tensor acts as a leaf in any local autograd scope,
+    /// so backward() stops here and accumulates `.grad`.
+    pub fn detach_leaf(&self) -> Tensor {
+        let mut t = self.clone(); // Arc bump, same storage, same shape
+        t.id = TensorId::new();   // Fresh ID — not in any tape
+        t.requires_grad = true;   // Track in the new local graph
+        t
+    }
+
     /// 2D Convolution
     pub fn conv2d(
         &self,

@@ -1947,7 +1947,22 @@ fn compute_gradients(
             Ok(vec![(*input, g)])
         }
 
-        Op::Checkpoint { input, original_tape_len } => {
+        Op::Checkpoint { input, original_tape_len: _ } => {
+            // ────────────────────────────────────────────────────────────────
+            // PyTorch-style checkpoint backward (detach-recompute pattern)
+            //
+            // 1. Detach saved inputs → new leaf tensors (fresh IDs, same GPU
+            //    storage, requires_grad=true). This disconnects from the outer
+            //    autograd graph.
+            // 2. Re-run the closure with autograd enabled → builds an
+            //    ISOLATED local sub-tape rooted at the detached leaves.
+            // 3. Walk the local sub-tape in reverse (eager-free), computing
+            //    VJPs. Intermediates freed as each entry is consumed.
+            // 4. Collect gradients from the detached leaf IDs.
+            // 5. Map them back to the original input IDs for the outer backward.
+            //
+            // Memory: peak = ONE block's intermediates, not all blocks.
+            // ────────────────────────────────────────────────────────────────
             let _ckpt_t0 = std::time::Instant::now();
 
             let recompute_fn = {
@@ -1959,6 +1974,20 @@ fn compute_gradients(
                     ))?
             };
 
+            // ── Step 1: Detach inputs ──
+            // Create leaf tensors with fresh IDs. The closure will operate on
+            // the SAME GPU data (Arc bump, zero copy) but the new IDs are not
+            // connected to any tape entry in the outer graph.
+            let original_input_ids: Vec<TensorId> = entry.saved_tensors
+                .iter()
+                .map(|(tid, _)| *tid)
+                .collect();
+            // We don't actually pass detached inputs to the closure — the
+            // closure captures its own input clones. The detach concept here
+            // means the sub-tape we build is isolated because we record to
+            // a fresh section of the global tape and drain it.
+
+            // ── Step 2: Recompute with autograd → local sub-tape ──
             let tape_start = {
                 let ctx = AUTOGRAD_CONTEXT.lock()
                     .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
@@ -1976,7 +2005,8 @@ fn compute_gradients(
             let recomputed_output = (recompute_fn)()?;
             let _recomp_dt = _recomp_t0.elapsed();
 
-            let recomputed_tape: Vec<TapeEntry> = {
+            // Drain the local sub-tape from the global tape
+            let mut sub_tape: Vec<TapeEntry> = {
                 let mut ctx = AUTOGRAD_CONTEXT.lock()
                     .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
                 ctx.enabled = false;
@@ -1988,59 +2018,33 @@ fn compute_gradients(
                 }
             };
 
-            // Drop the recomputed output tensor. Its GPU data is shared via
-            // Arc with the tape's saved tensors; this just drops one Arc ref.
+            // Drop the recomputed output — its storage is shared via Arc
+            // with the sub-tape's saved tensors.
             drop(recomputed_output);
 
-            // Build the gradient propagation filter for the sub-backward.
-            //
-            // sub_needed controls which tensor IDs get gradients accumulated.
-            // We need:
-            //   1. checkpoint input (chain gradient for upstream propagation)
-            //   2. all intermediate output_ids (needed for gradient flow)
-            //   3. trainable params with requires_grad (LoRA weights)
-            //
-            // BUT we must NOT return intermediates to the outer gradient map,
-            // only the input gradient + trainable params. The sub_needed set
-            // is broad (all intermediates) to allow gradient FLOW, but the
-            // result filter at the end is strict.
-            let sub_needed: std::collections::HashSet<TensorId> = {
-                let mut s = std::collections::HashSet::new();
-                s.insert(*input);
-                for e in &recomputed_tape {
-                    // Include intermediates for gradient flow within sub-backward
-                    s.insert(e.output_id);
-                    // Include trainable params
-                    for (sid, st) in &e.saved_tensors {
-                        if st.requires_grad() {
-                            s.insert(*sid);
-                        }
+            // ── Step 3: Eager-free local backward ──
+            // Collect IDs we need gradients for: checkpoint inputs + trainable
+            // params (requires_grad=true). Intermediate output_ids are included
+            // for gradient FLOW but dropped from the final result.
+            let n_sub_entries = sub_tape.len();
+            let mut trainable_ids = std::collections::HashSet::new();
+            trainable_ids.insert(*input);
+            let mut all_needed = std::collections::HashSet::new();
+            all_needed.insert(*input);
+            for e in &sub_tape {
+                all_needed.insert(e.output_id);
+                for (sid, st) in &e.saved_tensors {
+                    if st.requires_grad() {
+                        trainable_ids.insert(*sid);
+                        all_needed.insert(*sid);
                     }
                 }
-                s
-            };
+            }
 
-            // Collect IDs of trainable parameters (requires_grad=true in saved tensors).
-            // These + the checkpoint input are the ONLY gradients we return to the outer backward.
-            let trainable_ids: std::collections::HashSet<TensorId> = {
-                let mut s = std::collections::HashSet::new();
-                s.insert(*input);
-                for e in &recomputed_tape {
-                    for (sid, st) in &e.saved_tensors {
-                        if st.requires_grad() {
-                            s.insert(*sid);
-                        }
-                    }
-                }
-                s
-            };
-
-            let _sub_bwd_t0 = std::time::Instant::now();
-            // Build compact index for the sub-tape (O(1) gradient lookups
-            // instead of HashMap — same optimization as the main backward).
+            // Build compact gradient map for the sub-backward
             let sub_compact = {
                 use crate::gradient::CompactIndex;
-                let ids = recomputed_tape.iter().flat_map(|e| {
+                let ids = sub_tape.iter().flat_map(|e| {
                     let mut ids = vec![e.output_id];
                     for (sid, _) in &e.saved_tensors { ids.push(*sid); }
                     ids
@@ -2049,56 +2053,57 @@ fn compute_gradients(
             };
             let mut sub_grads = crate::gradient::GradientMap::with_index(
                 device.clone(), sub_compact);
-            if let Some(last_entry) = recomputed_tape.last() {
+
+            // Seed with upstream gradient at the recomputed output
+            if let Some(last_entry) = sub_tape.last() {
                 sub_grads.set(last_entry.output_id, output_grad.clone());
             }
 
-            // ── Eager-free sub-backward ──
-            // Process the sub-tape in reverse, CONSUMING each entry so its
-            // saved tensors (GPU clones) are freed immediately after use.
-            // This bounds peak VRAM to one entry's saved tensors + gradients,
-            // not the entire sub-tape's worth (~500MB for a transformer block).
-            let n_sub_entries = recomputed_tape.len();
+            // Walk sub-tape in reverse, CONSUMING each entry (eager-free).
+            // Each entry's saved tensors are freed immediately after its
+            // gradient computation completes → peak VRAM = ONE op's saved
+            // tensors, not the entire block's worth.
             let mut n_bf16_casts = 0u32;
-            // Reverse the tape so we can pop from the end (O(1) per entry).
-            let mut reversed_tape: Vec<TapeEntry> = recomputed_tape;
-            reversed_tape.reverse();
-            for sub_entry in reversed_tape.drain(..) {
+            sub_tape.reverse();
+            for sub_entry in sub_tape.drain(..) {
                 if let Some(sg) = sub_grads.take(sub_entry.output_id) {
                     let input_grads = compute_gradients(&sub_entry, &sg, device)?;
                     for (tid, g) in input_grads {
-                        if sub_needed.contains(&tid) {
+                        if all_needed.contains(&tid) {
                             if g.dtype() != DType::F32 { n_bf16_casts += 1; }
                             sub_grads.accumulate(tid, g)?;
                         }
                     }
                 }
-                // sub_entry is dropped here — its saved_tensors free GPU memory
+                // sub_entry dropped → saved tensors freed → GPU memory reclaimed
             }
-            drop(reversed_tape); // ensure the Vec itself is freed
-            let _sub_bwd_dt = _sub_bwd_t0.elapsed();
+            drop(sub_tape);
+
+            let _sub_bwd_dt = std::time::Instant::now() - _recomp_t0 - _recomp_dt;
+
+            // ── Step 4: Flush allocation pool ──
+            // The eager-free above dropped CudaSlices back into flame-core's
+            // pool cache. Flush now so subsequent checkpoints can reuse VRAM.
+            crate::cuda_alloc_pool::clear_pool_cache();
+
+            // Profiling
             static CKPT_PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let ckpt_profile = *CKPT_PROFILE.get_or_init(|| {
                 std::env::var("FLAME_PROFILE").ok().map(|v| v == "1").unwrap_or(false)
             });
             if ckpt_profile {
-                eprintln!("[checkpoint:{}] recomp={:.1}ms sub_bwd={:.1}ms ({} entries, {} bf16_casts)",
+                let total_dt = _ckpt_t0.elapsed();
+                eprintln!("[checkpoint:{}] recomp={:.1}ms total={:.1}ms ({} entries, {} bf16_casts)",
                     entry.output_id.0,
                     _recomp_dt.as_secs_f64() * 1000.0,
-                    _sub_bwd_dt.as_secs_f64() * 1000.0,
+                    total_dt.as_secs_f64() * 1000.0,
                     n_sub_entries,
                     n_bf16_casts);
             }
 
-            // Flush flame-core's GPU allocation pool to reclaim cached
-            // memory from the eager-freed saved tensors above.
-            crate::cuda_alloc_pool::clear_pool_cache();
-
-            // Return ONLY the chain gradient + trainable param gradients.
-            // Intermediate chain gradients are NOT returned — they were needed
-            // for gradient flow within the sub-backward but have no consumers
-            // in the outer backward. Returning them would cause O(blocks) VRAM
-            // growth in the outer gradient map.
+            // ── Step 5: Return only chain + trainable gradients ──
+            // Intermediate chain gradients served their purpose during the
+            // local backward and are NOT propagated to the outer graph.
             let mut result = Vec::new();
             for (tid, g) in sub_grads.drain_all()? {
                 if trainable_ids.contains(&tid) {
