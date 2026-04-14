@@ -200,6 +200,11 @@ The kernel itself is in `cuda/cuda_ops.cu` (`layer_norm_forward_bf16_kernel`),
 with backward in `cuda/src/flame_norm_bf16.cu`. Used by Z-Image / SD3 model
 code.
 
+**Fix (2026-04-13):** Autograd backward now correctly passes saved weight/bias
+tensors to `layer_norm_backward_bf16` instead of `None`. Previously affine
+LayerNorm silently produced zero gradients for weight/bias parameters.
+Found by Codex read-only audit.
+
 ### ⭐ `group_norm.rs`
 `group_norm(x, groups, gamma, beta, eps)` functional and the `GroupNorm`
 struct. Used by SDXL UNet, Klein VAE, LDM VAE, LTX-2 audio VAE, LTX-2
@@ -347,6 +352,12 @@ tape of `(out_id, Op, saved_inputs)` triples and walks it backward when
 `Tensor::backward()` is called. `Op` is a wide enum covering all the ops
 flame-core supports (Add, Sub, Mul, Div, Matmul, Bmm, Reshape, View, Permute,
 Narrow, Cat, Softmax, Sdpa, LayerNorm, GroupNorm, Conv2d, Conv3d, ...).
+
+**Autograd bug fixes (2026-04-13):**
+- SDPA: always route to `forward_train` when autograd is recording (was gated on env var)
+- RoPE: record `Op::RoPePrecomputed` when input requires_grad (was inference-only)
+- RMSNorm: use autograd-aware `to_dtype` (not `to_dtype_no_grad`) when input requires_grad
+- LayerNorm backward: pass saved weight/bias to backward kernel (was `None, None`)
 
 **Training performance caveat (2026-04-09):** The tape-based backward is
 synchronous and has ~1s overhead per entry on 3090 Ti (HashMap lookup + GPU
