@@ -628,6 +628,37 @@ The trainer-side setup helper is `flame-diffusion/src/offload.rs`:
 count + headroom, constructs the pool, and installs it via
 `set_activation_offload_pool`.
 
+## Block offloading (flame-diffusion)
+
+### `block_offload.rs` — BlockOffloader + BlockFacilitator
+
+Sequential block weight offloader for LoRA training. Loads ALL block weights
+into `cudaMallocHost` pinned CPU memory at init (via safetensors mmap), copies
+one block at a time to GPU on demand via `ensure_block(block_idx)`. No file I/O
+on the hot path, no policy engine — the training loop drives the sequence.
+
+**Replaces FlameSwap for training.** FlameSwap opens and reads safetensors from
+disk on every block access (60+ open/close cycles per step on a 30-block model).
+BlockOffloader reads once at init and never touches disk again.
+
+**`BlockFacilitator` trait**: model-specific geometry provider. Each trainer
+implements `block_count()` and `classify_key(&str) -> Option<usize>` to describe
+its block structure. Implementations:
+- `KleinFacilitator` (klein-trainer): `double_blocks.{i}.*` + `single_blocks.{i}.*`
+- `ChromaFacilitator` (chroma-trainer): `transformer_blocks.{i}.*` + `single_transformer_blocks.{i}.*`
+- `WanFacilitator` (wan-trainer): `blocks.{i}.*`
+
+**Trainers using BlockOffloader:**
+- klein-trainer: `--block-swap` flag, verified Klein 4B 3.4s/step, loss 0.6
+- chroma-trainer: `--block-swap` flag
+- wan-trainer: automatic for 14B+ (dim > 4096). Uses `Wan22Dit::load_shared_only`
+  to avoid FlameSwap VRAM overhead.
+
+**Convention:** Training-path block offloading uses `BlockOffloader`
+(`flame_diffusion::block_offload`), not FlameSwap. FlameSwap remains in
+flame-core for inference use. `SwapCoordinator` in `conductor.rs` is preserved
+but deprecated for new trainers.
+
 ## VMM intelligence (flame-diffusion)
 
 ### `vram_budget.rs` — watermark-based VRAM budget manager

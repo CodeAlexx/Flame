@@ -496,6 +496,14 @@ backward. Foundation of the "offload instead of recompute" checkpoint path.
 - `OffloadedTapeEntry` — `autograd.rs:339` — tape entry with saved tensors
   replaced by `OffloadHandle`s + optional `resident_fallback` for non-BF16.
 
+### Block offloading (flame-diffusion)
+- `BlockOffloader` — `flame-diffusion/src/block_offload.rs` — pinned CPU→GPU sequential block offloader
+- `BlockFacilitator` trait — `flame-diffusion/src/block_offload.rs` — model geometry provider
+- `KleinFacilitator` — `klein-trainer/src/facilitator.rs`
+- `ChromaFacilitator` — `chroma-trainer/src/facilitator.rs`
+- `WanFacilitator` — `wan-trainer/src/facilitator.rs`
+- `Wan22Dit::load_shared_only` — `inference-flame/src/models/wan22_dit.rs` — no-FlameSwap constructor
+
 ### Gradient utilities
 - `gradient::GradientMap / TensorGradExt` — re-exported as `GradientMap`
 - `gradient_clip::*` — gradient clipping

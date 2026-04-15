@@ -567,6 +567,20 @@ gradient checkpointing it makes per-step backward ~45 min for DiT models.
 
 ---
 
+## Block offloading conventions
+
+- **Training** uses `BlockOffloader` (`flame-diffusion::block_offload`), not FlameSwap.
+  FlameSwap remains in flame-core for inference. `SwapCoordinator` in `conductor.rs`
+  is preserved for back-compat but deprecated for new trainers.
+- **klein-trainer**: `--block-swap` flag triggers BlockOffloader.
+  `--resident-blocks` and `--prefetch-depth` are removed.
+- **chroma-trainer**: `--block-swap` flag triggers BlockOffloader.
+- **wan-trainer**: 14B+ (dim > 4096) automatically uses BlockOffloader +
+  `Wan22Dit::load_shared_only` (no FlameSwap VRAM overhead). 5B preloads all
+  blocks resident — no per-step offloading.
+
+---
+
 ## Quick "where do I X" reference
 
 | I want to... | Look at |
