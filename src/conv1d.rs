@@ -54,6 +54,25 @@ pub fn conv1d(
     let (b, c_in, l) = (in_dims[0], in_dims[1], in_dims[2]);
     let (c_out, c_in_g, k) = (w_dims[0], w_dims[1], w_dims[2]);
 
+    // Fast path: k=1, stride=1, pad=0, dilation=1, groups=1 → matmul.
+    // Conv1d with kernel_size=1 is just a linear transform along the channel
+    // dimension: output[b,:,l] = W @ input[b,:,l] + bias, where W is [C_out, C_in].
+    // This avoids cuDNN overhead entirely.
+    if k == 1 && stride == 1 && padding == 0 && dilation == 1 && groups == 1 {
+        // [B, C_in, L] → permute → [B, L, C_in] @ W^T [C_in, C_out] → [B, L, C_out] → permute
+        let w_2d = weight.reshape(&[c_out, c_in_g])?;
+        let x_t = input.permute(&[0, 2, 1])?; // [B, L, C_in]
+        let w_t = w_2d.permute(&[1, 0])?;     // [C_in, C_out]
+        let out = x_t.matmul(&w_t)?;           // [B, L, C_out]
+        let mut result = out.permute(&[0, 2, 1])?; // [B, C_out, L]
+        if let Some(b_tensor) = bias {
+            // bias: [C_out] → [1, C_out, 1] for broadcasting
+            let b_3d = b_tensor.reshape(&[1, c_out, 1])?;
+            result = result.add(&b_3d)?;
+        }
+        return Ok(result);
+    }
+
     // Unsqueeze to 4D: [B, C, L] → [B, C, 1, L]
     let input_4d = input.reshape(&[b, c_in, 1, l])?;
     // Weight: [C_out, C_in/g, K] → [C_out, C_in/g, 1, K]
@@ -88,6 +107,69 @@ pub fn conv1d(
     let out_dims = out_4d.shape().dims();
     let l_out = out_dims[3];
     out_4d.reshape(&[out_dims[0], out_dims[1], l_out])
+}
+
+/// Pre-compute the flipped+transposed weight for ConvTranspose1d.
+///
+/// Converts `[C_in, C_out/groups, K]` (ConvTranspose layout) into
+/// `[C_out, C_in/groups, K]` (regular Conv1d layout) with flipped kernel.
+/// Call this once at load time, then use `conv_transpose1d_with_prepared_weight`
+/// to skip the flip+permute on every forward pass.
+pub fn conv_transpose1d_prepare_weight(
+    weight: &Tensor,
+    groups: usize,
+) -> Result<Tensor> {
+    let w_dims = weight.shape().dims();
+    if w_dims.len() != 3 {
+        return Err(Error::InvalidInput(format!(
+            "conv_transpose1d_prepare_weight: weight must be 3D [C_in,C_out/g,K], got {:?}", w_dims
+        )));
+    }
+    let (c_in, c_out_per_group, k) = (w_dims[0], w_dims[1], w_dims[2]);
+    let c_out = c_out_per_group * groups;
+    let c_in_per_group = c_in / groups;
+
+    let w_flipped = flip_last_axis(weight)?;
+    let w_grouped = w_flipped.reshape(&[groups, c_in_per_group, c_out_per_group, k])?;
+    let w_perm = w_grouped.permute(&[0, 2, 1, 3])?;
+    w_perm.reshape(&[c_out, c_in_per_group, k])
+}
+
+/// ConvTranspose1d using a pre-prepared weight (from `conv_transpose1d_prepare_weight`).
+///
+/// The `prepared_weight` is already in `[C_out, C_in/groups, K]` format with
+/// flipped kernels — skips the flip+permute that `conv_transpose1d` does
+/// on every call.
+pub fn conv_transpose1d_with_prepared_weight(
+    input: &Tensor,
+    prepared_weight: &Tensor,
+    bias: Option<&Tensor>,
+    stride: usize,
+    padding: usize,
+    output_padding: usize,
+    dilation: usize,
+    groups: usize,
+) -> Result<Tensor> {
+    let in_dims = input.shape().dims();
+    let w_dims = prepared_weight.shape().dims();
+    let k = w_dims[2];
+
+    if dilation * (k - 1) < padding {
+        return Err(Error::InvalidInput(format!(
+            "conv_transpose1d: padding ({}) exceeds dilation*(K-1) ({})",
+            padding, dilation * (k - 1)
+        )));
+    }
+    let side_pad_left = dilation * (k - 1) - padding;
+    let side_pad_right = side_pad_left + output_padding;
+    let x_padded = if input.dtype() == DType::BF16 {
+        conv_transpose1d_prepare(input, stride, side_pad_left, side_pad_right)?
+    } else {
+        let x_zi = zero_insert_last_axis(input, stride)?;
+        x_zi.pad1d(side_pad_left, side_pad_right)?
+    };
+
+    conv1d(&x_padded, prepared_weight, bias, 1, 0, dilation, groups)
 }
 
 /// 1D transposed convolution — implemented as zero-insert + regular cuDNN conv1d.
@@ -201,19 +283,14 @@ pub fn conv_transpose1d_dilated(
     conv1d(&x_padded, &w_reg, bias, 1, 0, dilation, groups)
 }
 
-/// Reverse the last axis of a tensor via narrow + cat.
+/// Reverse the last axis of a tensor via the GPU flip kernel.
 fn flip_last_axis(x: &Tensor) -> Result<Tensor> {
     let dims = x.shape().dims();
     let k = dims[dims.len() - 1];
     if k <= 1 {
         return Ok(x.clone());
     }
-    let mut parts: Vec<Tensor> = Vec::with_capacity(k);
-    for i in (0..k).rev() {
-        parts.push(x.narrow(dims.len() - 1, i, 1)?);
-    }
-    let refs: Vec<&Tensor> = parts.iter().collect();
-    Tensor::cat(&refs, dims.len() - 1)
+    x.flip(&[dims.len() - 1])
 }
 
 /// Insert `(stride - 1)` zeros between each element on the last axis of a
