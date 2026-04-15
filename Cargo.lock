@@ -300,6 +300,7 @@ dependencies = [
  "half",
  "image",
  "lazy_static",
+ "libc",
  "libloading",
  "libm",
  "log",

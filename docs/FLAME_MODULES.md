@@ -162,13 +162,23 @@ code.
 
 ### ⭐ `sdpa.rs` (top-level)
 Lower-level dispatcher used by `attention::sdpa::sdpa` and called directly
-by some inference code (`vae::ldm_decoder`, `vae::wan21_vae`,
-`ltx2_model.rs`). `forward(q, k, v, mask)`, `forward_with_bias(...)`,
-`forward_v4(...)` (feature-gated). Chooses between the wmma flash kernel
-(`forward_flash_bf16` → `flame_flash_attention_bf16` C entry), the cuBLASLt
-materialized fallback (`forward_bf16_fallback`), and the streaming SDPA
-(`sdpa_stream_bf16`) based on env vars and shape. Caches dispatch decisions
-via `use_flash_attn()` / `force_stream_sdpa()` / `chunk_limit_from_env()`.
+by some inference code. `forward(q, k, v, mask)`, `forward_with_bias(...)`,
+`forward_v4(...)` (feature-gated). Dispatch order:
+1. **PyTorch CUTLASS flash** (`torch_sdpa.rs`) — ~4ms at S=4352, requires
+   libtorch_cuda.so on LD_LIBRARY_PATH. Auto-detected via dlopen.
+2. **In-tree wmma flash** (`forward_flash_bf16`) — scalar FP32, slow.
+3. **cuBLASLt materialized fallback** (`forward_bf16_fallback`) — tensor
+   cores but full S×S matrix allocation.
+4. **Streaming SDPA** (`sdpa_stream_bf16`) — chunked.
+
+### ⭐ `torch_sdpa.rs`
+Bridge to PyTorch's built-in CUTLASS FlashAttention-2 via the AOTI C shim.
+At runtime, dlopen's `libtorch_cuda.so` and resolves `extern "C"` symbols
+(`aoti_torch_cuda__scaled_dot_product_flash_attention`, etc.). Wraps
+flame-core BF16 tensors as AOTI handles, calls flash attention, copies
+output back. Zero hard dependency — falls back silently if libtorch is
+not found. Measured ~4ms at [1,32,4352,128] on RTX 3090 Ti vs ~1150ms
+for the cuBLASLt fallback (287x speedup).
 
 ### `attention/rope.rs`
 RoPE precompute + apply helpers. Most callers use the inline `rope_fused_bf16`
@@ -331,7 +341,7 @@ Pinned host memory: `PinnedHostBuffer / PinnedHostBufferView /
 PinnedHostBufferViewMut`, `PinnedAllocFlags`, `StagingDeviceBuf` (a paired
 host pinned + device staging buffer for async H2D), `register_slice_as_pinned`,
 `unregister_pinned`, and the `memcpy_async_device_to_host /
-memcpy_async_host_to_device` helpers. Used by FlameSwap and the safetensors
+memcpy_async_host_to_device` helpers. Used by BlockOffloader and the safetensors
 loader for fast H2D.
 
 ### `pinned_pool.rs`
@@ -558,7 +568,7 @@ in `attention/sdpa.rs`).
 cuBLASLt-specific helpers — descriptors, layout setup, algo selection.
 
 ### `borrowed/mod.rs` (feature-gated)
-"Borrowed weights" feature for FlameSwap-style streaming where the tensor
+"Borrowed weights" feature for BlockOffloader-style streaming where the tensor
 data is owned externally.
 
 ### `python/*` (feature-gated)
@@ -632,68 +642,26 @@ count + headroom, constructs the pool, and installs it via
 
 ### `block_offload.rs` — BlockOffloader + BlockFacilitator
 
-Sequential block weight offloader for LoRA training. Loads ALL block weights
-into `cudaMallocHost` pinned CPU memory at init (via safetensors mmap), copies
-one block at a time to GPU on demand via `ensure_block(block_idx)`. No file I/O
-on the hot path, no policy engine — the training loop drives the sequence.
+Double-buffered sequential block offloader. Loads ALL block weights into
+`cudaMallocHost` pinned CPU memory at init (via safetensors mmap). Two GPU
+slots for prefetch overlap — prefetch block N+1 while computing block N.
+Sole block offloading mechanism across training and inference.
 
-**Replaces FlameSwap for training.** FlameSwap opens and reads safetensors from
-disk on every block access (60+ open/close cycles per step on a 30-block model).
-BlockOffloader reads once at init and never touches disk again.
+**Public API:**
+- `prefetch_block(idx)` — start async H2D into non-active slot (non-blocking)
+- `await_block(idx)` — wait for H2D, prepare weights, return `Arc<HashMap<String, Tensor>>`
+- `ensure_block(idx)` — sync API: `prefetch_block + await_block` (backward-compat)
+- `evict_block()` — drop GPU tensors from both slots
+- `block_count()` / `pinned_bytes()` — accessors
 
-**`BlockFacilitator` trait**: model-specific geometry provider. Each trainer
-implements `block_count()` and `classify_key(&str) -> Option<usize>` to describe
-its block structure. Implementations:
+**`BlockFacilitator` trait**: model-specific geometry provider. Implementations:
 - `KleinFacilitator` (klein-trainer): `double_blocks.{i}.*` + `single_blocks.{i}.*`
-- `ChromaFacilitator` (chroma-trainer): `transformer_blocks.{i}.*` + `single_transformer_blocks.{i}.*`
-- `WanFacilitator` (wan-trainer): `blocks.{i}.*`
+- `ChromaFacilitator` (chroma-trainer, inference): double + single offset
+- `WanFacilitator` (wan-trainer, inference): `blocks.{i}.*`
+- `Gemma3Facilitator`, `MistralFacilitator`, `Flux1Facilitator`, etc. (inference)
 
-**Trainers using BlockOffloader:**
-- klein-trainer: `--block-swap` flag, verified Klein 4B 3.4s/step, loss 0.6
-- chroma-trainer: `--block-swap` flag
-- wan-trainer: automatic for 14B+ (dim > 4096). Uses `Wan22Dit::load_shared_only`
-  to avoid FlameSwap VRAM overhead.
-
-**Convention:** Training-path block offloading uses `BlockOffloader`
-(`flame_diffusion::block_offload`), not FlameSwap. FlameSwap remains in
-flame-core for inference use. `SwapCoordinator` in `conductor.rs` is preserved
-but deprecated for new trainers.
-
-## VMM intelligence (flame-diffusion)
-
-### `vram_budget.rs` — watermark-based VRAM budget manager
-
-Queries `cudaMemGetInfo` for real driver-level VRAM usage and provides
-predicates for prefetch/eviction decisions. Two watermarks divide VRAM into
-three zones: below low (safe, stop evicting), between low and high (caution),
-above high (must evict before prefetching). The `can_prefetch()` predicate
-gates `SwapCoordinator::try_prefetch_next()` — when VRAM exceeds the high
-watermark, prefetch pauses until eviction frees space.
-
-Note: flame-core uses cudarc (not PyTorch), so `cudaMemGetInfo` is
-authoritative. The mempool's "release threshold = MAX" policy means freed
-allocations stay cached, making `used = total - free` conservatively high.
-This is correct for eviction decisions: better to evict early than OOM.
-
-### `conductor.rs` — SwapCoordinator with VMM
-
-Extended from a simple cursor-based prefetcher to a VMM-aware conductor:
-
-- **`with_budget(budget)`**: enables VRAM budget enforcement. Without this,
-  legacy behavior (blind prefetch) is preserved.
-- **`acquire_block(idx)` / `release_block(idx)`**: refcount protection. A
-  block with refcount > 0 cannot be evicted. Trainers call acquire before
-  block forward and release after.
-- **`set_step(step)`**: updates the current training step for eviction scoring.
-- **`best_eviction_candidate()`**: scores evictable blocks by
-  `(staleness + distance_to_next_use) * size_bytes`. Highest score = best
-  candidate. Only considers blocks with refcount == 0 and non-permanent.
-- **`try_prefetch_next()`**: now checks `budget.can_prefetch()` before issuing
-  H2D. Returns `Ok(false)` if budget is exhausted, pausing the pipeline.
-- **`clear()`**: resets all refcounts to 0 between training phases.
-
-The VMM layer is opt-in via `with_budget()`. Without it, the conductor
-behaves identically to v1 — no VRAM queries, no eviction scoring.
+**Used by:** all trainers (klein, chroma, wan, ltx, qwenimage, etc.) and all
+inference models (Klein, Chroma, Flux1, Wan22, LTX2, Gemma3, Mistral, etc.).
 
 ### Remaining wiring (not yet done)
 
@@ -705,10 +673,9 @@ Three things need to happen before activation offload is live in training:
    helper computes slot count from block count + headroom. `seq_len` must be
    the MAXIMUM across the dataset (largest bucket), not a single sample.
 
-2. **`acquire_block` / `release_block`** in each trainer's block loop. One
-   line before block forward (`coord.acquire_block(i)`), one line after
-   (`coord.release_block(i)`). Then pass `SwapCoordinator::new(...).with_budget(VramBudget::default_24gb())`
-   at conductor construction to activate VMM gating.
+2. **Activation offload integration** in each trainer's block loop. Wrap
+   the block forward in `checkpoint_offload` to offload activations between
+   forward and backward passes.
 
 3. **`FLAME_ACTIVATION_OFFLOAD=1`** env var to switch the block loop from
    the standard forward path to `checkpoint_offload`. Both Wan and LTX-2
@@ -749,7 +716,7 @@ dataset (the largest bucket's token count). If a later sample exceeds
 `slot_bytes`, `push()` returns an error and `checkpoint_offload` falls
 back to `checkpoint()` for that block. Not a crash — just slower.
 
-**FlameSwap `linear3d` auto-dispatch:** `klein.rs::linear3d` now detects
+**`linear3d` auto-dispatch:** `klein.rs::linear3d` now detects
 weight layout automatically. Pre-transposed `[in, out]` (resident path)
 uses `matmul`. Non-transposed `[out, in]` (swap path) uses
 `fused_linear3d_native` with cuBLASLt TRANSA=T — zero transpose allocation.
@@ -772,13 +739,10 @@ for the entire sub-tape walk (pulls happen under one mutex guard). This is
 fine for single-stream training but would need batched-pull optimization
 for pipeline parallelism.
 
-**Eviction scoring is scaffolding:** `best_eviction_candidate()` is built
-and correct but has no eviction ACTION wired. FlameSwap's pre-allocated
-slots recycle automatically. The real eviction target is the `resident`
-HashMap (permanently loaded blocks). An `evict_resident(block_idx)` that
-removes from the map and drops the `Arc<HashMap<String, Tensor>>` is the
-logical next step. Until then, `with_budget()` gates prefetch but relies
-on slot recycling for VRAM relief.
+**Note:** `conductor.rs` and `vram_budget.rs` have been DELETED. All block
+offloading now uses `BlockOffloader` exclusively (two fixed GPU slots, no
+eviction policy needed). The eviction scoring and VMM intelligence described
+in earlier versions of this doc are no longer present.
 
 ### Files changed in this session (2026-04-12)
 
@@ -793,9 +757,7 @@ on slot recycling for VRAM relief.
 
 **flame-diffusion:**
 - `src/offload.rs` — NEW: pool setup helper
-- `src/vram_budget.rs` — NEW: VRAM watermark manager
-- `src/conductor.rs` — VMM intelligence (budget, refcount, eviction)
-- `src/lib.rs` — exports for offload + vram_budget
+- `src/lib.rs` — exports for offload
 - `wan-trainer/src/forward_impl/forward.rs` — checkpoint_offload wiring
 - `wan-trainer/src/model.rs` — WanLoraBundle Clone
 - `wan-trainer/src/forward_impl/rope.rs` — WanRope Clone

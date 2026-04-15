@@ -343,7 +343,7 @@ to see what kernels are linked in. Notable groups:
 - `flame_geglu_pointwise_fp32` (`:313`) — GeGLU
 - `fc_upsample2d_nearest_bf16 / fc_upsample2d_nearest_f32` (`:382,394`) — VAE upsample
 - `flame_fp8_to_bf16` (`:409`) — FP8 dequant
-- `flame_fp16_to_bf16` (`:416`) — FP16 → BF16 conversion (in-place safe). Used by FlameSwap for FP16 checkpoints.
+- `flame_fp16_to_bf16` (`:416`) — FP16 → BF16 conversion (in-place safe). Used by BlockOffloader for FP16 checkpoints.
 - `flame_flash_attention_bf16` (`:424`) — wmma flash attention
 - `flame_fused_rms_norm_modulate_bf16` (`:434`)
 - `flame_fused_residual_gate_bf16` (`:448`)
@@ -497,12 +497,20 @@ backward. Foundation of the "offload instead of recompute" checkpoint path.
   replaced by `OffloadHandle`s + optional `resident_fallback` for non-BF16.
 
 ### Block offloading (flame-diffusion)
-- `BlockOffloader` — `flame-diffusion/src/block_offload.rs` — pinned CPU→GPU sequential block offloader
+- `BlockOffloader` — `flame-diffusion/src/block_offload.rs` — double-buffered pinned CPU→GPU block offloader
 - `BlockFacilitator` trait — `flame-diffusion/src/block_offload.rs` — model geometry provider
+- `prefetch_block(idx)` — async H2D to non-active slot
+- `await_block(idx)` → `Arc<HashMap<String, Tensor>>` — wait + prepare
+- `ensure_block(idx)` — sync API (prefetch + await)
 - `KleinFacilitator` — `klein-trainer/src/facilitator.rs`
 - `ChromaFacilitator` — `chroma-trainer/src/facilitator.rs`
 - `WanFacilitator` — `wan-trainer/src/facilitator.rs`
-- `Wan22Dit::load_shared_only` — `inference-flame/src/models/wan22_dit.rs` — no-FlameSwap constructor
+- `Wan22Dit::load_shared_only` — `inference-flame/src/models/wan22_dit.rs` — shared-only constructor (no block weights)
+
+### PyTorch SDPA bridge (flame-core)
+- `torch_sdpa::torch_flash_sdpa(q, k, v)` — `flame-core/src/torch_sdpa.rs` — dlopen libtorch_cuda.so CUTLASS flash attention via AOTI C shim
+- `torch_sdpa::is_available()` — check if libtorch is loadable
+- Auto-dispatched from `sdpa::forward_bf16` when mask is None
 
 ### Gradient utilities
 - `gradient::GradientMap / TensorGradExt` — re-exported as `GradientMap`

@@ -559,7 +559,7 @@ gradient checkpointing it makes per-step backward ~45 min for DiT models.
 | `flash_attn` | Enable external flash-attn FFI shim | off (in-tree wmma is the real path) |
 | `autograd_v4` | Enable v4 autograd engine | off |
 | `shared_storage` | Arc-wrap BF16 storage for cheap `clone()` (training perf) | off |
-| `borrowed_weights` | Enable borrowed-weight tensor variant (FlameSwap) | off |
+| `borrowed_weights` | Enable borrowed-weight tensor variant (BlockOffloader) | off |
 | `python` | Build PyO3 bindings | off |
 | `capi` | Build C API surface | off |
 | `dtype_trace` | Compile in dtype trace prints (slow) | off |
@@ -569,15 +569,18 @@ gradient checkpointing it makes per-step backward ~45 min for DiT models.
 
 ## Block offloading conventions
 
-- **Training** uses `BlockOffloader` (`flame-diffusion::block_offload`), not FlameSwap.
-  FlameSwap remains in flame-core for inference. `SwapCoordinator` in `conductor.rs`
-  is preserved for back-compat but deprecated for new trainers.
+FlameSwap is deleted. All block offloading uses `BlockOffloader` with
+`prefetch_block`/`await_block` for transfer-compute overlap. No exceptions.
+
+- **`BlockOffloader`** (`flame-diffusion::block_offload`): sole mechanism for
+  both training and inference. Double-buffered GPU slots, dedicated transfer
+  stream, pinned CPU storage for all block weights.
 - **klein-trainer**: `--block-swap` flag triggers BlockOffloader.
-  `--resident-blocks` and `--prefetch-depth` are removed.
 - **chroma-trainer**: `--block-swap` flag triggers BlockOffloader.
 - **wan-trainer**: 14B+ (dim > 4096) automatically uses BlockOffloader +
-  `Wan22Dit::load_shared_only` (no FlameSwap VRAM overhead). 5B preloads all
-  blocks resident — no per-step offloading.
+  `Wan22Dit::load_shared_only`. 5B preloads all blocks resident.
+- **Inference models**: each implements `BlockFacilitator` and creates a
+  `BlockOffloader` at load time. Forward loops use prefetch/await pattern.
 
 ---
 
