@@ -1,7 +1,7 @@
 use crate::cuda_memory_alignment::alloc_aligned_f32;
 use crate::cuda_ops_ffi::CudaStream;
 use crate::device::CudaStreamRawPtrExt;
-use crate::staging::bf16_copy_async;
+use crate::staging::bf16_copy_async_tagged;
 use crate::{DType, Error, Result, Shape};
 #[cfg(feature = "shared_storage")]
 use cudarc::driver::DeviceRepr;
@@ -315,11 +315,12 @@ impl TensorStorage {
                     let mut staging = unsafe { arena_device.alloc::<u16>(*numel) }
                         .map_err(|e| Error::Cuda(format!("alloc bf16 arena staging: {:?}", e)))?;
                     let stream = CudaStream::from_raw(arena_device.cuda_stream_raw_ptr());
-                    bf16_copy_async(
+                    bf16_copy_async_tagged(
                         (*staging.device_ptr_mut()) as *mut c_void,
                         ptr.as_ptr() as *const c_void,
                         *numel,
                         &stream,
+                        "as_f32_slice:BF16Arena",
                     )?;
                     let mut out = alloc_aligned_f32(device, *numel)?;
                     crate::bf16_convert::bf16_u16_to_f32(
@@ -554,11 +555,12 @@ impl TensorStorage {
                 let mut staging = unsafe { arena_device.alloc::<u16>(*numel) }
                     .map_err(|e| Error::Cuda(format!("alloc bf16 arena staging: {:?}", e)))?;
                 let stream = CudaStream::from_raw(arena_device.cuda_stream_raw_ptr());
-                bf16_copy_async(
+                bf16_copy_async_tagged(
                     (*staging.device_ptr_mut()) as *mut c_void,
                     ptr.as_ptr() as *const c_void,
                     *numel,
                     &stream,
+                    "to_vec_bf16:BF16Arena",
                 )?;
                 arena_device
                     .dtoh_sync_copy(&staging)
@@ -570,11 +572,12 @@ impl TensorStorage {
                 let mut staging = unsafe { device.alloc::<u16>(*numel) }
                     .map_err(|e| Error::Cuda(format!("alloc bf16 view staging: {:?}", e)))?;
                 let stream = CudaStream::from_raw(device.cuda_stream_raw_ptr());
-                bf16_copy_async(
+                bf16_copy_async_tagged(
                     (*staging.device_ptr_mut()) as *mut c_void,
                     ptr.as_ptr() as *const c_void,
                     *numel,
                     &stream,
+                    "to_vec_bf16:BF16View",
                 )?;
                 device
                     .dtoh_sync_copy(&staging)

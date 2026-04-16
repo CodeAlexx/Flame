@@ -37,27 +37,16 @@ fn parse_env_flag(name: &str) -> Option<bool> {
 /// {64, 96, 128} inputs without a mask.
 ///
 /// **Default: true.** The kernel at `src/cuda/flash_attention_fwd.cu`
-/// is a scalar FP32 dot-product implementation with 32×32 tiles — no
-/// `wmma`, no tensor cores — and runs ~230 ms per Z-Image 1024² block
-/// vs the theoretical ~3 ms. It's the worst flash implementation in
-/// the tree, BUT it's the best option we have today because:
-///
-///   1. The cuBLASLt materialized fallback (`forward_bf16_fallback`)
-///      is *faster per call* (87 ms on the same Z-Image shape on a
-///      fresh allocator), but allocates a 2 GB F32 softmax staging
-///      tensor that the cudarc mempool fragments across steps and
-///      OOMs on a 24 GB card by step 2.
-///   2. Q-tiling the fallback to 4×128M-elem chunks was measured at
-///      410 ms/call — worse than the naive flash — because per-tile
-///      allocator and kernel-launch overhead eats the memory savings.
-///
-/// The right fix is to rewrite this kernel with `wmma` / `mma.sync` on
-/// SM_80+ so it hits tensor core throughput. That's ~1 day of careful
-/// CUDA work. See `PERF_SDPA_FLASH_KERNEL.md` for the full diagnosis
-/// and `PERF_SDPA_QTILE_ATTEMPT.md` for the Option-2 post-mortem.
+/// is a WMMA/tensor-core FlashAttention-2 implementation: BF16 fragments,
+/// FP32 accumulation, online softmax, BQ=32/BKV=64 tiling sized for the
+/// SM_86 (RTX 3090/Ti) 100 KB shared-memory limit. No atomics — the
+/// warp tile map is disjoint for QK^T, softmax, and PV stages, so output
+/// is deterministic given identical inputs. The scalar FP32 predecessor
+/// is preserved at `flash_attention_fwd_scalar.cu.bak` for reference.
 ///
 /// Disable with `FLAME_NO_FLASH_ATTN=1` (e.g. when profiling the
-/// fallback path on a bigger GPU where OOM isn't a concern).
+/// cuBLASLt materialized fallback on a GPU with enough VRAM to tolerate
+/// the 2 GB F32 softmax staging).
 #[inline]
 fn use_flash_attn() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -528,9 +517,32 @@ fn forward_bf16(
 ) -> SdpaResult<Tensor> {
     let scale = 1.0 / (d_q as f32).sqrt();
 
-    // Best path: PyTorch CUTLASS flash attention via AOTI bridge.
-    // ~4ms at [1,32,4352,128] vs ~1150ms for the cuBLAS fallback.
-    if mask.is_none() {
+    // Opt-in bridge to PyTorch's CUTLASS flash attention via AOTI. **Default:
+    // off** — the in-tree WMMA kernel (`flash_attention_fwd.cu`) is at parity
+    // or faster for N ≤ ~1024 and is deterministic cross-process, and the
+    // torch bridge requires two `cuCtxSynchronize` calls per SDPA that
+    // serialize the whole CUDA context (blocking BlockOffloader prefetch).
+    //
+    // Known scaling gap (measured H=12 D=128 on 3090 Ti, ms/call):
+    //   N=256  : wmma 0.28  torch 0.23  (1.2×)
+    //   N=512  : wmma 0.62  torch 0.44  (1.4×)
+    //   N=1024 : wmma 1.72  torch 0.85  (2.0×)
+    //   N=2048 : wmma 5.50  torch 1.78  (3.1×)
+    //   N=4096 : wmma 17.51 torch 4.09  (4.3×)
+    // For large-N inference (Z-image / FLUX 1024², ~30 blocks × N=4096),
+    // enabling torch saves ~400 ms/forward. The WMMA kernel's BQ=32 tiling
+    // is the bottleneck at large N — a future mma.sync rewrite with larger
+    // tiles would close this gap.
+    //
+    // Set `FLAME_USE_TORCH_SDPA=1` to opt in. Legacy `FLAME_NO_TORCH_SDPA=0`
+    // (double-negative opt-in) honored for back-compat scripts.
+    let legacy_no_torch = parse_env_flag("FLAME_NO_TORCH_SDPA");
+    let use_torch = match legacy_no_torch {
+        Some(false) => true,                               // explicit opt-in via old var
+        Some(true) => false,                               // explicit opt-out via old var
+        None => parse_env_flag("FLAME_USE_TORCH_SDPA").unwrap_or(false),
+    };
+    if mask.is_none() && use_torch {
         let t0 = std::time::Instant::now();
         match crate::torch_sdpa::torch_flash_sdpa(q, k, v) {
             Ok(out) => {

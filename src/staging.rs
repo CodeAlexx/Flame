@@ -373,8 +373,45 @@ pub fn bf16_copy_async(
     elems: usize,
     stream: &CudaStream,
 ) -> Result<()> {
+    bf16_copy_async_tagged(dst, src, elems, stream, "unknown")
+}
+
+/// Per-call-site counters for `bf16_copy_async`. Accessible via
+/// [`bf16_copy_stats_snapshot`] for profiling. Each call-site should pass a
+/// static string literal tag; unknown tags are aggregated into "unknown".
+static COPY_STATS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<&'static str, (u64, u64)>>
+> = std::sync::OnceLock::new();
+
+fn copy_stats() -> &'static std::sync::Mutex<std::collections::HashMap<&'static str, (u64, u64)>> {
+    COPY_STATS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Snapshot and optionally reset the per-tag (`calls`, `elems`) counters.
+pub fn bf16_copy_stats_snapshot(reset: bool) -> Vec<(&'static str, u64, u64)> {
+    let mut g = copy_stats().lock().unwrap();
+    let out: Vec<_> = g.iter().map(|(k, (c, e))| (*k, *c, *e)).collect();
+    if reset {
+        g.clear();
+    }
+    out
+}
+
+pub fn bf16_copy_async_tagged(
+    dst: *mut c_void,
+    src: *const c_void,
+    elems: usize,
+    stream: &CudaStream,
+    tag: &'static str,
+) -> Result<()> {
     if elems == 0 {
         return Ok(());
+    }
+    if std::env::var_os("FLAME_COPY_TRACE").is_some() {
+        let mut g = copy_stats().lock().unwrap();
+        let entry = g.entry(tag).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += elems as u64;
     }
     flame_status_to_result(
         unsafe { flame_bf16_copy_async(dst, src, elems as u64, stream.as_raw()) },
