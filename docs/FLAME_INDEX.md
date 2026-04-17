@@ -522,7 +522,6 @@ backward. Foundation of the "offload instead of recompute" checkpoint path.
 ## Optimizers
 
 - `adam::AdamW` — re-exported as `nn::AdamW`. Standard AdamW with BF16 master / F32 moments; `set_lr()` supports runtime schedulers.
-- `optimizers::*` — additional optimizers (SGD variants, Lion, etc.)
 - `sgd::*` — basic SGD
 - `parameter::Parameter` — re-exported as `Var` and `Parameter`. Wraps a `Tensor` with `requires_grad=true`.
 - `nn::Optimizer` trait — `lib.rs:258` — `step()` + `zero_grad()`

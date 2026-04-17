@@ -45,6 +45,7 @@ Always check `build.rs` to see which copy is actually built.
   kernel registries.
 - Multiple conv2d implementations: `conv::Conv2d` (use this), `cuda_conv2d*.rs`
   (older direct CUDA), `ops/conv2d*.rs` (alternative entry points).
+- Never add a second optimizer struct alongside the canonical one. New optimizer variants go into the canonical file as methods or as a new named type.
 
 When you find yourself with two functions with the same name in different
 files: the canonical one is whichever `inference-flame` actually calls.

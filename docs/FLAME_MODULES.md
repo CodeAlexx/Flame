@@ -454,9 +454,7 @@ This reduces the global tape from ~2700 to ~50 entries for Klein 4B.
 `AdamW` implementation. BF16 master weights, F32 moments by default
 (configurable via `select_optimizer_state_dtype`). Re-exported as `nn::AdamW`.
 Includes `set_lr()` for step-wise schedulers.
-
-### `optimizers.rs`
-Additional optimizer variants (Lion, RAdam, etc.).
+Canonical Adam: src/adam.rs (fused BF16 CUDA kernel). Canonical SGD: src/sgd/mod.rs.
 
 ### `sgd/mod.rs`
 Basic SGD with momentum + weight decay. F32 implementation with an inline

@@ -164,7 +164,6 @@ pub mod autograd_v3; // Primary autograd engine
 pub mod autograd_v4;
 pub mod image_ops_nhwc;
 pub mod mixed_precision;
-pub mod optimizers;
 pub mod perf_telemetry;
 pub mod pooling;
 pub mod pooling_impl;
