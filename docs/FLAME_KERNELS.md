@@ -156,27 +156,114 @@ locations are:
 - **`kernels/`** at repo root — duplicates of `src/kernels/` (some legacy
   copies; check `build.rs` for which is actually compiled)
 
-### `src/cuda/flash_attention_fwd.cu` — wmma flash attention (LIVE)
+### `src/cuda/flash_attention_fwd.cu` — FA2-style wmma flash attention (LIVE)
 
-The single most-important file in this directory.
+The single most-important file in this directory. Phase-1 FA2 rewrite (2026-04)
+— doubles the query tile from `BQ=32` to `BQ=64` under the SM_86 100 KB
+per-block shared-mem budget. Phase 1.6 (2026-04) adds `cp.async` loads for
+both K and V, with V's prefetch overlapping the online-softmax compute for
+partial HBM-latency hiding (full KV double-buffering is pending — see
+`FA2_CP_ASYNC_DESIGN.md` for the investigation and reverted attempt).
 
 | Symbol | Line | Notes |
 |---|---|---|
-| `flash_attn_fwd_hd64 / hd96 / hd128` | `:95` (macro-generated) | wmma BF16 attention forward. Compile-time specialized per head_dim. Uses `nvcuda::wmma` 16x16x16 BF16 fragments + FP32 accumulation + online softmax. **SM_80+** required (3090 / Ada / Hopper). |
-| `flame_flash_attention_bf16` | `:349` | C entry point: `(Q, K, V, O, batch_heads, seq_q, seq_kv, head_dim, stream)` — same signature as the legacy scalar version. |
+| `fa2_fwd_hd64 / hd96 / hd128` | `:134` (macro-generated) | wmma BF16 attention forward. Compile-time specialized per head_dim. Uses `nvcuda::wmma` 16x16x16 BF16 fragments + FP32 accumulation + online softmax. **SM_80+** required (3090 / Ada / Hopper). |
+| `flame_flash_attention_bf16` | `:362` | C entry point: `(Q, K, V, O, LSE, batch_heads, seq_q, seq_kv, head_dim, stream)` — signature unchanged from the pre-Phase-1 kernel. |
 
-**Tile sizes**: `BQ=32, BKV=64, NUM_WARPS=8` (was `BQ=64, NUM_WARPS=16` in the
-original FA2; halved on SM_86 because of the 100 KB shared-mem opt-in limit).
-Stage 3 (P@V) uses one warp per (qi_base, hd_base) tile — **no atomicAdd**
-to s_O (the warp tile map proves zero collision).
+**Tile sizes**: `BQ=64, BKV=64, NUM_WARPS=4, THREADS=128`. Warp layout is
+`WARPS_M=4, WARPS_N=1` — each warp exclusively owns 16 Q rows so softmax is
+entirely within-warp (no cross-warp max/sum scratch).
 
-**Stage 2 softmax**: warp-cooperative — one warp per row, lanes do `__shfl_xor_sync`
-max+sum reductions across BKV. Was scalar (224/256 threads idle) before 2026-04.
+**Shared-memory layout** (HD=128 worst case, ≤ SM_86's 100 KB opt-in):
+| Region | Dtype | Size (HD=128) | Role |
+|---|---|---|---|
+| `s_Q`  | BF16  | 16 KB  | Q tile, persists across KV iters |
+| `s_KV` | BF16  | 16 KB  | **Reused** for K_j then V_j each iter |
+| `s_S`  | FP32  | 16 KB  | QK^T scores for this iter |
+| `s_P`  | BF16  | 8 KB   | Softmax probs for this iter (separate region) |
+| `s_O`  | FP32  | 32 KB  | Running output accumulator |
+| `s_m`, `s_l` | FP32 | 0.5 KB | Per-row running max & denom |
+| **Total**   |       | **88.5 KB** | — |
 
-**`load_tile_bf16`** (line 59): pads K/V to **buffer dimension** (BKV=64), not
-valid_rows. Critical: an earlier dead-code zero-pad branch left padding rows
-uninitialized, which made the kernel run-to-run nondeterministic. Fixed
-2026-04 — pad to `buf_rows` is now mandatory.
+**The `s_KV` sharing is the budget trick**: the original FA2 keeps separate
+`s_K` and `s_V` resident so V is ready immediately after softmax. We drop
+that and reload V into `s_KV` after QK^T completes (K is dead by then). Saves
+16 KB — which is exactly what lets `BQ=64` fit on SM_86.
+
+**Stage 3 (P@V)** writes fragment outputs into a per-warp FP32 scratch placed
+at `s_S + warp_id * 256` (s_S is dead for this iter after softmax consumed
+it), then each warp does an in-place `+=` into its disjoint 16-row slab of
+`s_O`. No atomic ops; no cross-warp collisions.
+
+**Softmax (Stage 2)**: per-row, each warp handles its 16 rows; lanes
+cooperate via `__shfl_xor_sync` butterfly reductions over BKV=64 cols. Handles
+partial last-Q-tile (`qi >= q_rows`) by zero-padding `s_P` so the subsequent
+PV wmma sees zeros.
+
+**`load_tile_bf16_v8`** (line 99): vectorized `uint4` BF16 load (8 bf16 per
+thread per iter). Pads to **buffer rows** (not `valid_rows`) so trailing KV
+tiles and partial Q tiles zero-fill correctly. Without this the kernel was
+nondeterministic run-to-run; the pad-full-buffer pattern is mandatory.
+
+**LSE output**: when `LSE != nullptr`, writes `LSE[row] = m[row] + log(l[row])`
+for use by the (Phase 2) backward kernel.
+
+**Parity**: `tests/fa2_parity.rs` compares the new kernel against
+`flash_attention_fwd_legacy.cu`'s preserved BQ=32 symbol
+(`flame_flash_attention_bf16_wmma_legacy`) across a 60-case matrix (head_dim
+∈ {64,96,128} × num_heads ∈ {8,16} × batch ∈ {1,2} × seq_len ∈
+{128,512,1024,4096,16384}). As of Phase 1.6 the two kernels remain
+bit-identical (`max_abs = max_rel = 0.0` on every case) — the `cp.async`
+rewrite preserves the K accumulation order within each tile. The naive
+FP32 parity test at `tests/fa2_parity_naive.rs` also passes at
+`cos_sim ≥ 0.9999`, `max_abs ≤ 1e-2` on all 4 `{N, HD}` configs.
+
+**`cp.async` pipeline (Phase 1.6)**: K_j is loaded via `cp.async.cg.shared.global`
++ `cp.async.commit_group` + `cp.async.wait_group<0>`. V_j's prefetch is
+issued immediately after QK^T finishes reading K_j (K_j is dead; V_j
+overwrites the same `s_KV` slot) and a `wait_group<0>` sits just before
+PV. The softmax stage runs while V_j's HBM read is in flight, hiding that
+latency. Full double-buffered KV would require reclaiming ~6.5 KB of SMEM
+for a second `s_KV` slot; the attempted fold of `s_P` into the dead half
+of `s_S` introduced a subtle correctness regression not resolved in this
+phase. Single-buffer `cp.async` delivers a 1.35×–1.62× speedup over the
+legacy BQ=32 kernel but only ~1.05× over the synchronous Phase 1 kernel —
+the real win awaits the K-prefetch overlap that double-buffering unlocks.
+
+**Perf (Phase 1.6, B=1 H=16 HD=128, RTX 3090 Ti)**: median of 20 trials,
+5 warmup. `legacy BQ=32` and `fa2 (new)` are timed in the same process.
+
+```
+N        legacy BQ=32   Phase 1 ref   Phase 1.6 (cp.async)   vs Phase 1   vs legacy
+1024     1.463 ms       1.12 ms*      1.072 ms               1.04×        1.36×
+4096     19.43 ms       13.3 ms*      13.75 ms               0.97×        1.41×
+16384    303.9 ms       198 ms*       190.2 ms               1.04×        1.60×
+65536    4994.8 ms      3200 ms*      3073.4 ms              1.04×        1.63×
+```
+
+*Phase 1 ref: carried over from task prompt, not re-timed this run. The
+vs-Phase-1 speedup is noise-level (±3%), because single-buffer cp.async
+only hides V's HBM read behind softmax — a small window at HD=128. The
+large vs-legacy speedup (1.36×–1.63×) comes from Phase 1's BQ=32→64
+tile widening. See `FA2_CP_ASYNC_DESIGN.md` for the investigation into
+why full double-buffered KV (the real perf lever) was reverted.
+
+Torch-SDPA column is absent in the bench because libtorch fails to load
+in the current env (CUDA 12.8 symbol mismatch against the CUDA 12.4 runtime).
+Once libtorch loads, `FLAME_USE_TORCH_SDPA=1 cargo bench --bench fa2_forward`
+will fill that column automatically.
+
+### `src/cuda/flash_attention_fwd_legacy.cu` — preserved BQ=32 kernel (PHASE 1 ONLY)
+
+| Symbol | Line | Notes |
+|---|---|---|
+| `flash_attn_fwd_legacy_hd64 / hd96 / hd128` | — | Legacy BQ=32 WMMA kernel body, unchanged from pre-Phase-1 HEAD. |
+| `flame_flash_attention_bf16_wmma_legacy` | — | FFI symbol used only by `tests/fa2_parity.rs`. Do not call from production code. |
+
+**This file will be deleted in Phase 3** once the FA2 kernel's backward
+(Phase 2) is in place and we've run workload-level validation. Keep it
+around through Phase 2 so we can A/B any regression against the known-good
+BQ=32 baseline.
 
 ### `src/cuda/fused_linear3d.cu` — cuBLASLt 3D linear (LIVE)
 
@@ -188,6 +275,42 @@ uninitialized, which made the kernel run-to-run nondeterministic. Fixed
 Both use `CUBLAS_COMPUTE_32F` accumulation, BF16 inputs/outputs, and the
 `CUBLASLT_EPILOGUE_BIAS` epilogue (so the bias add is fused into the GEMM —
 no separate add kernel).
+
+### `src/cuda/grouped_mm.cu` — grouped BF16 matmul (MoE)
+
+| Symbol | Line | Notes |
+|---|---|---|
+| `grouped_mm_bf16_kernel` | `:120` | Single fused kernel covering all E experts. Grid: `(ceil(N/128), ceil(T_max/128), E)`. Tile: `BM=128 BN=128 BK=32`, warp tile `64x64`, WMMA 16x16x16 BF16→FP32 fragments. 4 warps per block (128 threads). Matches `torch.nn.functional.grouped_mm(x, w, offs=offsets)`. |
+| `flame_grouped_mm_bf16` | `:255` | C entry. Used by `ops::grouped_mm::grouped_mm` and `Tensor::grouped_mm`. |
+
+Offset semantics: `offsets: (E,) i32` is **exclusive cumulative end indices** (expert `e` covers rows `[offsets[e-1] .. offsets[e])`, with `offsets[-1] := 0`). This matches PyTorch's `F.grouped_mm`.
+
+Phase-1 perf (RTX 3090 Ti, T=32768 K=2048 N=2688 E=64 uniform, BF16):
+- for-loop of 64 cuBLASLt matmuls: ~12 ms → ~30 TFLOPS
+- `grouped_mm`:                    ~15 ms → ~23 TFLOPS (0.78x of cuBLASLt-per-expert)
+
+The cuBLASLt-per-expert baseline is already close to tensor-core peak for this shape (~18% of hardware peak due to tall-skinny T_e=512 dimension), so a single fused kernel cannot provide the ≥5x speedup over the baseline that would apply against a naive launch-overhead-dominated for-loop. The win is removing 64 separate tensor allocations + 64 launches; at this shape, ~1-3 ms.
+
+### `src/cuda/fused_gated_scatter_add.cu` — fused MoE unpermute
+
+| Symbol | Line | Notes |
+|---|---|---|
+| `fused_gated_scatter_add_kernel` | `:30` | `accum[indices[t]] += expert_out[t] * gating[t]` in one kernel. F32 `atomicAdd` because multiple `t`s may collide on the same output row (MoE top-K with K>1). Grid: `(ceil(D/256), T, 1)`, block = 256. `expert_out` is BF16, `gating` and `accum` are F32, `indices` is I32. |
+| `flame_fused_gated_scatter_add_bf16` | `:57` | C entry. Used by `ops::fused_gated_scatter_add` and `Tensor::fused_gated_scatter_add`. |
+
+Phase-1 perf (RTX 3090 Ti, T=32768 D=2048 N=4096 BF16 → F32 accum):
+- cast BF16→F32 + F32 broadcast-mul (no scatter): 2603 μs
+- `fused_gated_scatter_add` (incl. scatter):        794 μs  →  **3.28× speedup, 845 GB/s**
+
+### NVRTC: `fused_swiglu_bf16_kernel` (in `ops/fused_swiglu.rs`)
+
+| Kernel | Purpose / notes |
+|---|---|
+| `fused_swiglu_bf16_kernel` | Takes `(..., 2I) BF16` with first `I` cols = `up` and last `I` cols = `gate`; returns `up * silu(gate) : (..., I) BF16`. FP32 sigmoid math with a BF16 round on `silu(gate)` between the sigmoid and the multiply so the output matches PyTorch eager `up * F.silu(gate)` bit-for-bit. Launch: `grid=(ceil(I/256), rows, 1)`, block=256, grid-strided along the inner dim. Used by MoE FFN forward after `grouped_mm` of the `gate_up_proj`. |
+
+Phase-1 perf (RTX 3090 Ti, T=32768 I=2688 BF16):
+- narrow + silu + mul (unfused):  3300 μs
+- `fused_swiglu`:                  647 μs  →  **5.10× speedup, 817 GB/s**
 
 ### `src/cuda/fused_rms_norm.cu` — fused RMSNorm
 

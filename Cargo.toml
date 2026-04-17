@@ -73,6 +73,20 @@ python = ["pyo3", "numpy"]
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+# Exclude pre-existing broken bin from default test/build graph.
+# (This bin has unrelated compilation errors that block `cargo test`; gating
+# it behind a feature keeps the rest of the crate buildable.)
+[[bin]]
+name = "zimage_inference"
+required-features = ["legacy_examples"]
+
+# FA2 forward-kernel throughput bench (Phase 1, 2026-04). `harness = false`
+# because we use our own minimal timing harness — criterion has heavy startup
+# overhead relative to these sub-millisecond kernels.
+[[bench]]
+name = "fa2_forward"
+harness = false
+
 [build-dependencies]
 cbindgen = "0.26"
 cc = "1.0"

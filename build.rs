@@ -104,6 +104,7 @@ fn main() {
     cuda_sources.push("src/cuda/fused_modulate.cu");
     cuda_sources.push("src/cuda/fused_linear3d.cu");
     cuda_sources.push("src/cuda/flash_attention_fwd.cu");
+    cuda_sources.push("src/cuda/flash_attention_fwd_legacy.cu");
     cuda_sources.push("src/cuda/flash_attention_bwd.cu");
     cuda_sources.push("src/cuda/fp8_dequant.cu");
     cuda_sources.push("src/cuda/fp8_quant.cu");
@@ -111,6 +112,8 @@ fn main() {
     cuda_sources.push("src/cuda/fused_norm_modulate.cu");
     cuda_sources.push("src/cuda/fused_residual_gate.cu");
     cuda_sources.push("src/cuda/fused_dequant_transpose.cu");
+    cuda_sources.push("src/cuda/grouped_mm.cu");
+    cuda_sources.push("src/cuda/fused_gated_scatter_add.cu");
 
     if !cuda_sources.iter().all(|p| Path::new(p).exists()) {
         panic!("CUDA sources missing; ensure submodules are synced");

@@ -495,6 +495,22 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// Legacy BQ=32 WMMA forward kernel. Preserved for Phase 1 parity testing
+    /// (`tests/fa2_parity.rs`) — same signature as `flame_flash_attention_bf16`.
+    /// Will be deleted in Phase 3. Do not use in production paths.
+    pub fn flame_flash_attention_bf16_wmma_legacy(
+        Q: *const core::ffi::c_void,
+        K: *const core::ffi::c_void,
+        V: *const core::ffi::c_void,
+        O: *mut core::ffi::c_void,
+        LSE: *mut f32,
+        batch_heads: i32,
+        seq_len_q: i32,
+        seq_len_kv: i32,
+        head_dim: i32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// Flash attention backward — wmma tensor core version.
     /// Computes dQ, dK, dV from Q, K, V, O, dO, and LSE.
     /// Q,K,V,O,dO: [B*H, N, HD] BF16. LSE: [B*H, N_q] FP32.
@@ -614,6 +630,50 @@ extern "C" {
         out_features: i32,
         workspace: *mut core::ffi::c_void,
         workspace_size: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Fused gated scatter-add for MoE unpermute:
+    /// `accum[indices[t]] += expert_out[t] * gating[t]`, in-place.
+    ///
+    /// - `expert_out`: BF16 (T, D), per-token expert outputs in expert-major order
+    /// - `gating`:     F32  (T,)    per-token gating weight
+    /// - `indices`:    I32  (T,)    global token indices (out-of-range rows skipped)
+    /// - `accum`:      F32  (N, D)  running accumulator, updated in-place
+    ///
+    /// Uses F32 `atomicAdd` since multiple t's may collide on the same row
+    /// (MoE top-K with K>1). Returns cudaError_t (0 on success).
+    pub fn flame_fused_gated_scatter_add_bf16(
+        expert_out: *const core::ffi::c_void,
+        gating: *const core::ffi::c_void,
+        indices: *const core::ffi::c_void,
+        accum: *mut core::ffi::c_void,
+        T: i32,
+        D: i32,
+        N: i32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Grouped BF16 matmul for MoE: one kernel computes all E experts.
+    ///
+    /// Semantics mirror `torch.nn.functional.grouped_mm(x, w, offs=offsets)`:
+    /// - `x`: (T, K) BF16, expert-major ordered tokens
+    /// - `w`: (E, K, N) BF16, stacked weights (PyTorch layout)
+    /// - `offsets`: (E,) i32, EXCLUSIVE cumulative end indices into x
+    ///   (expert e covers rows [offsets[e-1] .. offsets[e]), with offsets[-1] := 0)
+    /// - `y`: (T, N) BF16 output
+    /// - `T_max`: max rows across experts (used to size grid.y)
+    ///
+    /// Accumulation is FP32. Returns 0 on success, cudaError_t otherwise.
+    pub fn flame_grouped_mm_bf16(
+        x: *const core::ffi::c_void,
+        w: *const core::ffi::c_void,
+        offsets: *const core::ffi::c_void,
+        y: *mut core::ffi::c_void,
+        T_max: i32,
+        K: i32,
+        N: i32,
+        E: i32,
         stream: *mut core::ffi::c_void,
     ) -> i32;
 

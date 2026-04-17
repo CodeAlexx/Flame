@@ -395,6 +395,103 @@ path). If you edit `cuda/cuda_ops.cu`'s silu/gelu kernels, NOTHING in
 
 This bit me during the elementwise perf work.
 
+### SM_86 shared-memory budget — opt in to 100 KB
+
+RTX 3090 / 3090 Ti are `sm_86`. The per-thread-block static shared memory
+on sm_86 is 48 KB. To use up to **100 KB dynamic** shared memory per block
+(which any nontrivial flash-attention tile layout needs) you must opt in:
+
+```cpp
+cudaError_t err = cudaFuncSetAttribute(
+    my_kernel,
+    cudaFuncAttributeMaxDynamicSharedMemorySize,
+    (int)requested_bytes          // must be <= 100 * 1024 on sm_86
+);
+if (err != cudaSuccess) return (int)err;
+my_kernel<<<grid, block, requested_bytes, stream>>>(...);
+```
+
+Above 100 KB → `cudaFuncSetAttribute` returns `cudaErrorInvalidValue` and
+the launch never happens. Under-budget launches are silently fine.
+
+`src/cuda/flash_attention_fwd.cu` uses this to request 88.5 KB for HD=128.
+`sm_89+` (Ada, Hopper) have larger per-block budgets (164 KB / 228 KB) —
+if you write a kernel tuned for those, gate the larger layout behind
+`__CUDA_ARCH__ >= 890`.
+
+### `cp.async` pipelining pattern (SM_80+)
+
+`src/cuda/flash_attention_fwd.cu` is the reference for the cp.async pattern
+in flame-core. The idiom:
+
+```cpp
+// Outside extern "C" — templated wait_group cannot have C linkage.
+__device__ __forceinline__ void cp_async_cg_16(void* smem, const void* gmem) {
+    unsigned smem_int = __cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                 :: "r"(smem_int), "l"(gmem));
+}
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+template<int N> __device__ __forceinline__ void cp_async_wait_group() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+```
+
+Rules of engagement:
+
+1. **cp.async.cg needs 16-byte alignment** on both shared and global
+   pointers. A uint4 vectorized layout enforces this for free.
+2. **Always pair a group of issued loads with exactly one `cp_async_commit`**.
+   The commit demarcates the group boundary for `wait_group`.
+3. **`wait_group(N)` is per-thread**. After it returns, only *this thread*'s
+   cp.async writes are visible to *this thread*. For cross-thread visibility,
+   **always follow `wait_group` with `__syncthreads()`**.
+4. **Group ordering**: PTX `wait_group(N)` forces the OLDEST pending groups
+   to complete until ≤N remain. To guarantee a specific group is done,
+   issue it FIRST so it's the oldest, then `wait_group(K-1)` where K is
+   the total number of groups you've committed since that one. If you only
+   care that a specific group is done AND don't mind waiting for everything
+   newer, `wait_group(0)` is the simple path.
+5. **No masked cp.async**. Out-of-bounds rows in a tile must be handled
+   with a separate regular STS zero-store; mixing mask and cp.async in one
+   loop is messy but correct.
+6. **Overlap opportunities**: the canonical FA2 pattern is to prefetch
+   the next KV tile during the current tile's compute. Even without a
+   second buffer, you can overlap V's load with softmax because K is dead
+   after QK^T and V can reuse the same SMEM slot; the `cp.async V →
+   s_KV` issues right after the QK^T `__syncthreads` and the matching
+   `wait_group(0) + __syncthreads` sits just before PV.
+
+See `FA2_CP_ASYNC_DESIGN.md` at crate root for the full byte-math rationale
+behind the FA2 forward kernel's cp.async pipeline, and the ladder of
+attempted optimizations and what broke at each step. Future kernels that
+want cp.async should follow the same commit/wait discipline — don't
+invent new idioms.
+
+### Shared-memory region reuse (s_K/s_V → s_KV)
+
+When SMEM is tight, look for tiles that are **live in disjoint stages**.
+In `flash_attention_fwd.cu` the K tile is only needed for QK^T (stage 1);
+V is only needed for PV (stage 3); they never coexist. So instead of two
+16 KB slots we have one 16 KB `s_KV` slot that's reloaded between stages.
+Costs one extra global-mem barrier per KV iteration, saves 16 KB that
+pays for the BQ=64 tile vs BQ=32. The "reusable SMEM region" pattern
+comes up elsewhere too (backward kernels can reuse the stashed P/dP/dS
+pad) — look for it before cutting tile sizes.
+
+### Alias-casting shared memory: race if the strides differ
+
+Aliasing a `float* s_S` region as a `__nv_bfloat16* s_P` reinterpret_cast
+of the *same* bytes is only safe if you never interleave reads/writes
+within a stage AND the row strides under the two views cover the same
+addresses for each logical row. In `flash_attention_fwd.cu`'s first
+attempt, `s_S[qi*BKV*4 bytes]` vs `s_P[qi*BKV*2 bytes]` rows landed at
+*different* byte offsets — writes to row N of P corrupted row N/2 of S
+in another warp. Always allocate `s_P` as a separate region or prove the
+stride equivalence before aliasing.
+
 ### `Tensor::softmax` has a fast path
 
 For `dtype == BF16` and `dim == last_dim` and `!requires_grad`, `Tensor::softmax`

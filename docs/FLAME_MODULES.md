@@ -171,6 +171,17 @@ by some inference code. `forward(q, k, v, mask)`, `forward_with_bias(...)`,
    cores but full S×S matrix allocation.
 4. **Streaming SDPA** (`sdpa_stream_bf16`) — chunked.
 
+The in-tree wmma flash path calls FFI `flame_flash_attention_bf16` whose
+implementation (`src/cuda/flash_attention_fwd.cu`) was rewritten to
+**FA2-style tiling** in Phase 1 (2026-04): BQ=32→64, with `s_KV` shared
+between K and V across stages to fit SM_86's 100 KB shared-mem budget.
+Phase 1.6 (2026-04) switched the K and V global→shared loads to
+`cp.async.cg` and issues V's prefetch in parallel with the online-softmax
+pass, hiding part of V's HBM latency. See `FLAME_KERNELS.md` and
+`FA2_CP_ASYNC_DESIGN.md`. The pre-Phase-1 kernel is preserved in
+`flash_attention_fwd_legacy.cu` for A/B testing and will be deleted in
+Phase 3.
+
 ### ⭐ `torch_sdpa.rs`
 Bridge to PyTorch's built-in CUTLASS FlashAttention-2 via the AOTI C shim.
 At runtime, dlopen's `libtorch_cuda.so` and resolves `extern "C"` symbols
