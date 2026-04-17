@@ -170,7 +170,6 @@ pub mod pooling_impl;
 pub mod regularization;
 pub mod sdpa;
 pub mod serialization;
-pub mod torch_sdpa;
 pub mod strict;
 pub mod upsampling;
 pub mod vae;

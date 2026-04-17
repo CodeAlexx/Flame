@@ -11,8 +11,8 @@
 // seqs where softmax compute is non-trivial relative to a V-tile memcpy.
 //
 // Algorithm (online softmax with running max m, denominator l, correction
-// alpha = exp(m_old - m_new)) is unchanged from Phase 1. Legacy BQ=32 kernel
-// remains at flash_attention_fwd_legacy.cu for A/B parity testing.
+// alpha = exp(m_old - m_new)) is unchanged from Phase 1. Parity validated
+// against an FP32 materialized reference in tests/fa2_parity_naive.rs.
 //
 // Supports head_dim = 64, 96, 128 via compile-time specialization. Architecture
 // SM_80+. FFI symbol `flame_flash_attention_bf16` is unchanged.

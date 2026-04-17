@@ -9,14 +9,15 @@ KV); the reduced scope reflects a correctness regression that was not
 resolved when attempting the fold-s_P-into-s_S SMEM reclaim required for
 the double buffer. Details in "Attempted but reverted" below.
 
-**Correctness:** all 4 naive-FP32 configs PASS at cos_sim ≥ 0.9999; all 60
-bit-exact-vs-legacy configs PASS. Same correctness envelope as Phase 1.
+**Correctness:** all 4 naive-FP32 configs PASS at cos_sim ≥ 0.9999,
+max_abs ≤ 1e-2, validated against a pure-Rust FP32 materialized reference
+in `tests/fa2_parity_naive.rs`.
 
-**Perf:** 1.35× – 1.62× over the legacy BQ=32 kernel (bench table below).
-Against Phase 1's own baseline (BQ=64, synchronous loads) the speedup is
-~1.02× – 1.05× — the V-load/softmax overlap is the only thing cp.async buys
-in a single-buffer kernel, and V loads are only a fraction of total kernel
-time.
+**Perf:** 1.35× – 1.62× over the pre-Phase-1 BQ=32 WMMA kernel (now
+deleted). Against Phase 1's own baseline (BQ=64, synchronous loads) the
+speedup is ~1.02× – 1.05× — the V-load/softmax overlap is the only
+thing cp.async buys in a single-buffer kernel, and V loads are only a
+fraction of total kernel time.
 
 ## Pipeline (as shipped)
 
@@ -156,21 +157,23 @@ configuration does not depend on the fold and is fully correct.
 B=1, H=16, HD=128, BF16, RTX 3090 Ti. Median over 20 trials after 5 warmup.
 
 ```
-N        legacy BQ=32     Phase 1 (ref)   Phase 1.6 (cp.async)   vs Phase 1   vs legacy
-1024     1.463 ms         1.12 ms*        1.072 ms              1.04×        1.36×
-4096    19.427 ms        13.3 ms*         13.748 ms             0.97×        1.41×
-16384   303.905 ms        198 ms*         190.204 ms            1.04×        1.60×
-65536  4994.822 ms       3200 ms*         3073.436 ms           1.04×        1.63×
+N        pre-Phase-1 BQ=32   Phase 1 (ref)   Phase 1.5 (cp.async)   vs Phase 1   vs pre-Phase-1
+1024      1.463 ms           1.12 ms*        1.072 ms               1.04×        1.36×
+4096     19.427 ms          13.3 ms*        13.748 ms               0.97×        1.41×
+16384   303.905 ms          198 ms*         190.204 ms              1.04×        1.60×
+65536  4994.822 ms         3200 ms*        3073.436 ms              1.04×        1.63×
 
 * Phase 1 reference numbers from the task prompt; not re-measured in this run.
 Torch-SDPA column empty: libtorch has a CUDA 12.8 symbol mismatch in this env.
+The pre-Phase-1 BQ=32 kernel has been deleted — numbers here are
+historical, kept for reference.
 ```
 
 **The vs-Phase-1 speedup is noise-level (0.97×–1.04×).** V-cp.async overlap
 with softmax alone buys very little — V's HBM read is small (~16 KB per
 iter at HD=128) and softmax compute is brief, so the overlap window is
-correspondingly small. The vs-legacy speedup (1.36×–1.63×) comes almost
-entirely from Phase 1's BQ=32→64 tile widening.
+correspondingly small. The vs-pre-Phase-1 speedup (1.36×–1.63×) comes
+almost entirely from Phase 1's BQ=32→64 tile widening.
 
 **This phase misses the task's ≥1.3× over-Phase-1 speedup target** because
 the K-prefetch overlap that would deliver it requires double-buffered KV,

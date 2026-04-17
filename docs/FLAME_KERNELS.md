@@ -223,62 +223,36 @@ nondeterministic run-to-run; the pad-full-buffer pattern is mandatory.
 **LSE output**: when `LSE != nullptr`, writes `LSE[row] = m[row] + log(l[row])`
 for use by the (Phase 2) backward kernel.
 
-**Parity**: `tests/fa2_parity.rs` compares the new kernel against
-`flash_attention_fwd_legacy.cu`'s preserved BQ=32 symbol
-(`flame_flash_attention_bf16_wmma_legacy`) across a 60-case matrix (head_dim
-∈ {64,96,128} × num_heads ∈ {8,16} × batch ∈ {1,2} × seq_len ∈
-{128,512,1024,4096,16384}). As of Phase 1.6 the two kernels remain
-bit-identical (`max_abs = max_rel = 0.0` on every case) — the `cp.async`
-rewrite preserves the K accumulation order within each tile. The naive
-FP32 parity test at `tests/fa2_parity_naive.rs` also passes at
-`cos_sim ≥ 0.9999`, `max_abs ≤ 1e-2` on all 4 `{N, HD}` configs.
+**Parity**: `tests/fa2_parity_naive.rs` validates the kernel against a
+pure-Rust FP32-materialized reference (no shared tiling with FA2) across
+4 configs (`N ∈ {512, 4096} × HD ∈ {64, 128}`, H=8, B=1). Passes at
+`cos_sim ≥ 0.9999`, `max_abs ≤ 1e-2` — kernel numerics verified against
+an independent reference.
 
-**`cp.async` pipeline (Phase 1.6)**: K_j is loaded via `cp.async.cg.shared.global`
+**`cp.async` pipeline**: K_j is loaded via `cp.async.cg.shared.global`
 + `cp.async.commit_group` + `cp.async.wait_group<0>`. V_j's prefetch is
 issued immediately after QK^T finishes reading K_j (K_j is dead; V_j
 overwrites the same `s_KV` slot) and a `wait_group<0>` sits just before
-PV. The softmax stage runs while V_j's HBM read is in flight, hiding that
-latency. Full double-buffered KV would require reclaiming ~6.5 KB of SMEM
-for a second `s_KV` slot; the attempted fold of `s_P` into the dead half
-of `s_S` introduced a subtle correctness regression not resolved in this
-phase. Single-buffer `cp.async` delivers a 1.35×–1.62× speedup over the
-legacy BQ=32 kernel but only ~1.05× over the synchronous Phase 1 kernel —
-the real win awaits the K-prefetch overlap that double-buffering unlocks.
+PV. The softmax stage runs while V_j's HBM read is in flight, hiding
+that latency. Full double-buffered KV (K-prefetch overlapping PV) would
+require reclaiming another SMEM slot and hit unresolved correctness
+issues in two separate attempts (BKV=48 regressed 0.83×, s_P/s_S fold
+corrupts `store_matrix_sync` writes). Single-buffer `cp.async` delivers
+1.35×–1.62× over the pre-Phase-1 BQ=32 kernel. The gap-to-torch at
+typical sequence lengths remains — see `FA2_CP_ASYNC_DESIGN.md` for
+the investigation trail.
 
-**Perf (Phase 1.6, B=1 H=16 HD=128, RTX 3090 Ti)**: median of 20 trials,
-5 warmup. `legacy BQ=32` and `fa2 (new)` are timed in the same process.
+**Perf (B=1 H=16 HD=128, RTX 3090 Ti, median of 20 trials, 5 warmup)**:
 
 ```
-N        legacy BQ=32   Phase 1 ref   Phase 1.6 (cp.async)   vs Phase 1   vs legacy
-1024     1.463 ms       1.12 ms*      1.072 ms               1.04×        1.36×
-4096     19.43 ms       13.3 ms*      13.75 ms               0.97×        1.41×
-16384    303.9 ms       198 ms*       190.2 ms               1.04×        1.60×
-65536    4994.8 ms      3200 ms*      3073.4 ms              1.04×        1.63×
+N        Phase 1.5 (current)
+1024     1.07 ms
+4096    13.75 ms
+16384    190.2 ms
+65536   3073 ms
 ```
 
-*Phase 1 ref: carried over from task prompt, not re-timed this run. The
-vs-Phase-1 speedup is noise-level (±3%), because single-buffer cp.async
-only hides V's HBM read behind softmax — a small window at HD=128. The
-large vs-legacy speedup (1.36×–1.63×) comes from Phase 1's BQ=32→64
-tile widening. See `FA2_CP_ASYNC_DESIGN.md` for the investigation into
-why full double-buffered KV (the real perf lever) was reverted.
-
-Torch-SDPA column is absent in the bench because libtorch fails to load
-in the current env (CUDA 12.8 symbol mismatch against the CUDA 12.4 runtime).
-Once libtorch loads, `FLAME_USE_TORCH_SDPA=1 cargo bench --bench fa2_forward`
-will fill that column automatically.
-
-### `src/cuda/flash_attention_fwd_legacy.cu` — preserved BQ=32 kernel (PHASE 1 ONLY)
-
-| Symbol | Line | Notes |
-|---|---|---|
-| `flash_attn_fwd_legacy_hd64 / hd96 / hd128` | — | Legacy BQ=32 WMMA kernel body, unchanged from pre-Phase-1 HEAD. |
-| `flame_flash_attention_bf16_wmma_legacy` | — | FFI symbol used only by `tests/fa2_parity.rs`. Do not call from production code. |
-
-**This file will be deleted in Phase 3** once the FA2 kernel's backward
-(Phase 2) is in place and we've run workload-level validation. Keep it
-around through Phase 2 so we can A/B any regression against the known-good
-BQ=32 baseline.
+~1.36×–1.63× over the pre-Phase-1 BQ=32 WMMA kernel (now deleted).
 
 ### `src/cuda/fused_linear3d.cu` — cuBLASLt 3D linear (LIVE)
 

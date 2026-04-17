@@ -507,11 +507,6 @@ backward. Foundation of the "offload instead of recompute" checkpoint path.
 - `WanFacilitator` — `wan-trainer/src/facilitator.rs`
 - `Wan22Dit::load_shared_only` — `inference-flame/src/models/wan22_dit.rs` — shared-only constructor (no block weights)
 
-### PyTorch SDPA bridge (flame-core)
-- `torch_sdpa::torch_flash_sdpa(q, k, v)` — `flame-core/src/torch_sdpa.rs` — dlopen libtorch_cuda.so CUTLASS flash attention via AOTI C shim
-- `torch_sdpa::is_available()` — check if libtorch is loadable
-- Auto-dispatched from `sdpa::forward_bf16` when mask is None
-
 ### Gradient utilities
 - `gradient::GradientMap / TensorGradExt` — re-exported as `GradientMap`
 - `gradient_clip::*` — gradient clipping
@@ -585,7 +580,6 @@ backward. Foundation of the "offload instead of recompute" checkpoint path.
 - `debug_autograd.rs / test_backward.rs / test_complex_backward.rs / test_grad_propagation.rs / test_sum_backward.rs` — autograd tests
 - `flame_backward_probe.rs` — backward debugging
 - `perf_test.rs` — perf bench
-- `zimage_inference.rs` — Z-Image inference test (calls into the main lib)
 
 ---
 

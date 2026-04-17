@@ -164,32 +164,20 @@ code.
 Lower-level dispatcher used by `attention::sdpa::sdpa` and called directly
 by some inference code. `forward(q, k, v, mask)`, `forward_with_bias(...)`,
 `forward_v4(...)` (feature-gated). Dispatch order:
-1. **PyTorch CUTLASS flash** (`torch_sdpa.rs`) — ~4ms at S=4352, requires
-   libtorch_cuda.so on LD_LIBRARY_PATH. Auto-detected via dlopen.
-2. **In-tree wmma flash** (`forward_flash_bf16`) — scalar FP32, slow.
-3. **cuBLASLt materialized fallback** (`forward_bf16_fallback`) — tensor
+1. **In-tree wmma flash** (`forward_flash_bf16`) — the single fast path.
+2. **cuBLASLt materialized fallback** (`forward_bf16_fallback`) — tensor
    cores but full S×S matrix allocation.
-4. **Streaming SDPA** (`sdpa_stream_bf16`) — chunked.
+3. **Streaming SDPA** (`sdpa_stream_bf16`) — chunked.
 
 The in-tree wmma flash path calls FFI `flame_flash_attention_bf16` whose
-implementation (`src/cuda/flash_attention_fwd.cu`) was rewritten to
-**FA2-style tiling** in Phase 1 (2026-04): BQ=32→64, with `s_KV` shared
-between K and V across stages to fit SM_86's 100 KB shared-mem budget.
-Phase 1.6 (2026-04) switched the K and V global→shared loads to
-`cp.async.cg` and issues V's prefetch in parallel with the online-softmax
-pass, hiding part of V's HBM latency. See `FLAME_KERNELS.md` and
-`FA2_CP_ASYNC_DESIGN.md`. The pre-Phase-1 kernel is preserved in
-`flash_attention_fwd_legacy.cu` for A/B testing and will be deleted in
-Phase 3.
-
-### ⭐ `torch_sdpa.rs`
-Bridge to PyTorch's built-in CUTLASS FlashAttention-2 via the AOTI C shim.
-At runtime, dlopen's `libtorch_cuda.so` and resolves `extern "C"` symbols
-(`aoti_torch_cuda__scaled_dot_product_flash_attention`, etc.). Wraps
-flame-core BF16 tensors as AOTI handles, calls flash attention, copies
-output back. Zero hard dependency — falls back silently if libtorch is
-not found. Measured ~4ms at [1,32,4352,128] on RTX 3090 Ti vs ~1150ms
-for the cuBLASLt fallback (287x speedup).
+implementation (`src/cuda/flash_attention_fwd.cu`) uses **FA2-style tiling**
+(BQ=64, with `s_KV` shared between K and V across stages to fit SM_86's
+100 KB shared-mem budget) plus `cp.async.cg` loads with V-prefetch
+overlapping the online-softmax pass. 1.36×–1.63× over the pre-Phase-1
+BQ=32 kernel. Further double-buffering of K is an open investment —
+two attempts (BKV=48, s_P/s_S fold) either regressed perf or hit
+`store_matrix_sync` corruption; see `FA2_CP_ASYNC_DESIGN.md` for
+the investigation trail.
 
 ### `attention/rope.rs`
 RoPE precompute + apply helpers. Most callers use the inline `rope_fused_bf16`
@@ -480,10 +468,7 @@ both `Var` and `Parameter`.
 
 ### `linear.rs`
 The `Linear` nn layer (`nn::Linear`). Used in training; inference paths
-mostly use `ops::fused_inference::fused_linear3d_native` directly. Forward
-and backward route through `ops::gemm_bf16::matmul_bf16_trans` — zero
-materialized transposes. Weight is stored as `[out_features, in_features]`
-and used directly via `trans_b=true`.
+mostly use `ops::fused_inference::fused_linear3d_native` directly.
 
 ### `embedding.rs`
 `Embedding` table (`nn::Embedding`). Token embedding lookup.

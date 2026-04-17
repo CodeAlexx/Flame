@@ -517,47 +517,10 @@ fn forward_bf16(
 ) -> SdpaResult<Tensor> {
     let scale = 1.0 / (d_q as f32).sqrt();
 
-    // Opt-in bridge to PyTorch's CUTLASS flash attention via AOTI. **Default:
-    // off** — the in-tree WMMA kernel (`flash_attention_fwd.cu`) is at parity
-    // or faster for N ≤ ~1024 and is deterministic cross-process, and the
-    // torch bridge requires two `cuCtxSynchronize` calls per SDPA that
-    // serialize the whole CUDA context (blocking BlockOffloader prefetch).
-    //
-    // Known scaling gap (measured H=12 D=128 on 3090 Ti, ms/call):
-    //   N=256  : wmma 0.28  torch 0.23  (1.2×)
-    //   N=512  : wmma 0.62  torch 0.44  (1.4×)
-    //   N=1024 : wmma 1.72  torch 0.85  (2.0×)
-    //   N=2048 : wmma 5.50  torch 1.78  (3.1×)
-    //   N=4096 : wmma 17.51 torch 4.09  (4.3×)
-    // For large-N inference (Z-image / FLUX 1024², ~30 blocks × N=4096),
-    // enabling torch saves ~400 ms/forward. The WMMA kernel's BQ=32 tiling
-    // is the bottleneck at large N — a future mma.sync rewrite with larger
-    // tiles would close this gap.
-    //
-    // Set `FLAME_USE_TORCH_SDPA=1` to opt in. Legacy `FLAME_NO_TORCH_SDPA=0`
-    // (double-negative opt-in) honored for back-compat scripts.
-    let legacy_no_torch = parse_env_flag("FLAME_NO_TORCH_SDPA");
-    let use_torch = match legacy_no_torch {
-        Some(false) => true,                               // explicit opt-in via old var
-        Some(true) => false,                               // explicit opt-out via old var
-        None => parse_env_flag("FLAME_USE_TORCH_SDPA").unwrap_or(false),
-    };
-    if mask.is_none() && use_torch {
-        let t0 = std::time::Instant::now();
-        match crate::torch_sdpa::torch_flash_sdpa(q, k, v) {
-            Ok(out) => {
-                log::info!("[sdpa] torch flash: {:.1}ms (BH={} Q={} K={} d={})",
-                    t0.elapsed().as_secs_f64() * 1000.0, b * h, q_len, k_len, d_q);
-                return Ok(out);
-            }
-            Err(Error::Unsupported(reason)) => {
-                log::info!("[sdpa] torch flash unavailable: {reason}");
-            }
-            Err(e) => {
-                log::warn!("[sdpa] torch flash failed (falling back): {e:?}");
-            }
-        }
-    }
+    // Single SDPA path: the in-tree FA2 WMMA kernel (`flash_attention_fwd.cu`).
+    // The former opt-in libtorch/AOTI bridge has been removed — FA2 Phase 1.6
+    // is the canonical fast path and there is no libtorch linkage anywhere in
+    // flame-core. See FA2 kernel docs for perf characteristics.
 
     // Fallback path 1: in-tree flash kernel (scalar FP32, slow but memory-efficient).
     #[cfg(all(feature = "cuda", feature = "bf16_u16"))]

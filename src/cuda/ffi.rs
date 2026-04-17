@@ -495,22 +495,6 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
-    /// Legacy BQ=32 WMMA forward kernel. Preserved for Phase 1 parity testing
-    /// (`tests/fa2_parity.rs`) — same signature as `flame_flash_attention_bf16`.
-    /// Will be deleted in Phase 3. Do not use in production paths.
-    pub fn flame_flash_attention_bf16_wmma_legacy(
-        Q: *const core::ffi::c_void,
-        K: *const core::ffi::c_void,
-        V: *const core::ffi::c_void,
-        O: *mut core::ffi::c_void,
-        LSE: *mut f32,
-        batch_heads: i32,
-        seq_len_q: i32,
-        seq_len_kv: i32,
-        head_dim: i32,
-        stream: *mut core::ffi::c_void,
-    ) -> i32;
-
     /// Flash attention backward — wmma tensor core version.
     /// Computes dQ, dK, dV from Q, K, V, O, dO, and LSE.
     /// Q,K,V,O,dO: [B*H, N, HD] BF16. LSE: [B*H, N_q] FP32.
