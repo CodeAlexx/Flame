@@ -132,6 +132,21 @@ pub fn cudnn_conv2d_bf16(
 |---|---|---|
 | `sgd_f32` | `:13` | `p -= lr * g`. Used by the F32 training SGD. |
 
+### `adam.rs` — fused Adam / AdamW step
+
+Four NVRTC kernels, concatenated into a single translation unit, compiled
+once on first call, loaded into the `adam_fused` module. All kernels are
+single-pass: read `(param, grad, m, v)`, write `(param, m, v)` in place,
+no temporaries. All implement decoupled weight decay (AdamW). Launch
+config: `block=256, grid=(n+255)/256`.
+
+| Kernel | Param / Grad dtype | Purpose |
+|---|---|---|
+| `adam_fused_bf16_kernel` | BF16 param, BF16 grad, F32 m/v | BF16-param fast path. |
+| `adam_fused_f32grad_kernel` | BF16 param, F32 grad, F32 m/v | BF16-param with F32 grad (default path — `Parameter::set_grad` casts grads to F32). |
+| `adam_fused_f32param_f32grad_kernel` | F32 param, F32 grad, F32 m/v | F32-param fast path (biases, F32 embeddings, F32 LoRA alphas). |
+| `adam_fused_f32param_bf16grad_kernel` | F32 param, BF16 grad, F32 m/v | F32-param with BF16 grad for callers that bypass `Parameter::set_grad`. |
+
 ### `cuda_kernels_gpu.rs` — F32 framework kernels (training)
 
 Two notable broadcast kernels:

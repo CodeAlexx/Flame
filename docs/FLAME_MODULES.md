@@ -462,10 +462,13 @@ This reduces the global tape from ~2700 to ~50 entries for Klein 4B.
 ## Optimizers + nn
 
 ### `adam.rs`
-`AdamW` implementation. BF16 master weights, F32 moments by default
-(configurable via `select_optimizer_state_dtype`). Re-exported as `nn::AdamW`.
-Includes `set_lr()` for step-wise schedulers.
-Canonical Adam: src/adam.rs (fused BF16 CUDA kernel). Canonical SGD: src/sgd/mod.rs.
+Canonical Adam: `src/adam.rs` (fused BF16 and F32 CUDA kernels). Canonical SGD: `src/sgd/mod.rs`.
+All param dtypes except BF16 and F32 return an error — no silent fallback.
+BF16 master weights use F32 moments; F32 params use F32 moments. Re-exported as
+`nn::AdamW`. Includes `set_lr()` for step-wise schedulers. Four NVRTC kernels
+are compiled once on first call and loaded into the `adam_fused` module:
+`adam_fused_bf16_kernel`, `adam_fused_f32grad_kernel` (BF16 param + F32 grad),
+`adam_fused_f32param_f32grad_kernel`, and `adam_fused_f32param_bf16grad_kernel`.
 
 ### `sgd/mod.rs`
 Basic SGD with momentum + weight decay. F32 implementation with an inline

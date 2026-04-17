@@ -776,3 +776,27 @@ is NOT uniform sampling. See `hv_train_network.py:1192-1201`.
 
 **Loss precision:** Cast prediction and target to F32 BEFORE computing
 squared difference. BF16 squared errors can overflow for large residuals.
+
+## Optimizer step — fused kernels only
+
+All optimizer steps must use a fused CUDA kernel. No scalar-ops fallbacks
+in optimizer code — the previous `step_scalar_ops` path in `src/adam.rs`
+allocated ~14 full-size tensors per param per step (mul_scalar, add,
+mul_scalar, add, div_scalar, div_scalar, sqrt, add_scalar, div,
+mul_scalar, and optional decoupled-wd mul/add), which is allocator churn
+at full-tune or F32-embedding-heavy scale. `src/adam.rs` dispatches to
+four NVRTC kernels covering `{BF16, F32}` params × `{BF16, F32}` grads.
+
+Unsupported dtype combinations return `Err(Error::InvalidInput(...))` —
+conversion is the trainer's responsibility. Never add a silent-cast
+fallback to a scalar-op chain. If you need a new dtype (F16, I8, …),
+add a dedicated fused kernel, not a fallback.
+
+The `adam_fused` module must preserve the decoupled weight decay
+(Loshchilov & Hutter 2017) bug-prevention receipt verbatim at the top of
+each kernel source. The `m = β₁m + (1-β₁)g / v = β₂v + (1-β₂)g² / p -=
+lr·m̂/(√v̂+ε) / p -= lr·wd·p` shape is load-bearing. Folding `wd` into
+`grad` before the moment updates collapses the Adam step to
+`~sign(param)` for freshly-initialized LoRA_A matrices (whose B partner
+is zero) and unlearns them at uniform `lr·sign(p)` per step. That bug
+destroyed Klein 4B LoRA_A training in April 2026 — do not reintroduce it.
