@@ -480,7 +480,10 @@ both `Var` and `Parameter`.
 
 ### `linear.rs`
 The `Linear` nn layer (`nn::Linear`). Used in training; inference paths
-mostly use `ops::fused_inference::fused_linear3d_native` directly.
+mostly use `ops::fused_inference::fused_linear3d_native` directly. Forward
+and backward route through `ops::gemm_bf16::matmul_bf16_trans` — zero
+materialized transposes. Weight is stored as `[out_features, in_features]`
+and used directly via `trans_b=true`.
 
 ### `embedding.rs`
 `Embedding` table (`nn::Embedding`). Token embedding lookup.

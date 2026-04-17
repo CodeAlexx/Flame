@@ -1,9 +1,3 @@
-use crate::cuda_ops_bf16::{self, FC_ERR_UNSUPPORTED, FC_STATUS_LT_FALLBACK};
-use crate::cuda_ops_ffi::{
-    fc_gemm_bf16, flame_status_to_result, tensor_as_flat_view_bf16, tensor_as_flat_view_bf16_mut,
-    tensor_as_view_bf16, CudaStream,
-};
-use crate::device::CudaStreamRawPtrExt;
 use crate::memory_pool::MEMORY_POOL;
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 use crate::staging::ArenaScratch;
@@ -11,7 +5,7 @@ use crate::strict::{scope, GuardMode};
 use crate::tensor::contracts::{assert_nhwc_public, trap_is_bf16};
 use crate::{DType, Error, Result, Shape, Tensor};
 use cudarc::driver::CudaDevice;
-use std::{ptr, sync::Arc};
+use std::sync::Arc;
 
 /// Create a linear layer (convenience function)
 pub fn linear(in_features: usize, out_features: usize, device: &Arc<CudaDevice>) -> Result<Linear> {
@@ -22,9 +16,6 @@ pub fn linear(in_features: usize, out_features: usize, device: &Arc<CudaDevice>)
 pub struct Linear {
     pub weight: Tensor,
     pub bias: Option<Tensor>,
-    /// Cached transposed weight [in_features, out_features] for inference.
-    /// Populated on `copy_weight_from` / `refresh_weight_t_cache`.
-    weight_t_cache: Option<Tensor>,
     in_features: usize,
     out_features: usize,
 }
@@ -70,7 +61,6 @@ impl Linear {
         Ok(Self {
             weight,
             bias,
-            weight_t_cache: None,
             in_features,
             out_features,
         })
@@ -135,29 +125,11 @@ impl Linear {
         Ok(tensor)
     }
 
-    /// Rebuild the cached transposed weight from `self.weight`.
-    /// Called after weight changes (init, copy_weight_from, etc.).
-    fn refresh_weight_t_cache(&mut self) {
-        if self.weight.dtype() == DType::BF16 && self.weight.storage_dtype() == DType::BF16 {
-            let weight_2d = match self.weight.reshape(&[self.out_features, self.in_features]) {
-                Ok(w) => w,
-                Err(_) => { self.weight_t_cache = None; return; }
-            };
-            match crate::bf16_elementwise::transpose2d_bf16(&weight_2d) {
-                Ok(wt) => { self.weight_t_cache = Some(wt.requires_grad_(false)); }
-                Err(_) => { self.weight_t_cache = None; }
-            }
-        } else {
-            self.weight_t_cache = None;
-        }
-    }
-
     /// Copy the weight tensor from an external source (shape/dtype checked).
     pub fn copy_weight_from(&mut self, source: &Tensor) -> Result<()> {
         let requires_grad = self.weight.requires_grad();
         let tensor = Self::convert_param(&self.weight, source, "Linear::copy_weight_from")?;
         self.weight = tensor.requires_grad_(requires_grad);
-        self.refresh_weight_t_cache();
         Ok(())
     }
 
@@ -272,31 +244,42 @@ impl Linear {
 
             let input_2d = input.reshape(&[batch_size, self.in_features])?;
             trap_is_bf16("Linear::forward weight", &self.weight)?;
-            let weight_t = if let Some(ref cached) = self.weight_t_cache {
-                cached.clone()
-            } else {
-                let weight_2d = self
-                    .weight
-                    .reshape(&[self.out_features, self.in_features])?;
-                crate::bf16_elementwise::transpose2d_bf16(&weight_2d)?
-            };
+            let weight_2d = self
+                .weight
+                .reshape(&[self.out_features, self.in_features])?;
 
+            // BF16 fast path: cuBLASLt GEMM with TRANSB=T (no materialized
+            // transpose). Weight stays in row-major [out, in] and is read
+            // transposed inside the GEMM. See ops::gemm_bf16::matmul_bf16_trans.
             let mut output = if input_2d.storage_dtype() == DType::BF16
-                && weight_t.storage_dtype() == DType::BF16
+                && weight_2d.storage_dtype() == DType::BF16
             {
-                input_2d.matmul(&weight_t)?
+                #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+                {
+                    crate::ops::gemm_bf16::matmul_bf16_trans(
+                        &input_2d, &weight_2d, false, true,
+                    )?
+                }
+                #[cfg(not(all(feature = "cuda", feature = "bf16_u16")))]
+                {
+                    // Without the fused path available, transpose once then matmul.
+                    let weight_t = crate::bf16_elementwise::transpose2d_bf16(&weight_2d)?;
+                    input_2d.matmul(&weight_t)?
+                }
             } else {
+                // Non-BF16 fallback: cast to F32 and materialize the transpose.
                 let input_cast = if input_2d.dtype() == DType::F32 {
                     input_2d
                 } else {
                     input_2d.to_dtype(DType::F32)?
                 };
-                let weight_cast = if weight_t.dtype() == DType::F32 {
-                    weight_t
+                let weight_cast = if weight_2d.dtype() == DType::F32 {
+                    weight_2d
                 } else {
-                    weight_t.to_dtype(DType::F32)?
+                    weight_2d.to_dtype(DType::F32)?
                 };
-                input_cast.matmul(&weight_cast)?
+                let weight_t = weight_cast.transpose()?;
+                input_cast.matmul(&weight_t)?
             };
 
             if let Some(bias) = &self.bias {
@@ -502,64 +485,24 @@ impl Linear {
                 trap_is_bf16("Linear::forward_into bias", bias)?;
             }
 
-            let stream = CudaStream::from_raw(input.device().cuda_stream_raw_ptr());
-            let vx = tensor_as_flat_view_bf16(
-                input,
-                batch_size,
-                self.in_features,
-                "Linear::forward.input",
-            )?;
-            let mut vy = tensor_as_flat_view_bf16_mut(
-                output,
-                batch_size,
-                self.out_features,
-                "Linear::forward.output",
-            )?;
+            // matmul_bf16_trans path: [batch, in] @ weight^T (fused TRANSB=T),
+            // no materialized transpose. The cost is one GEMM-sized alloc
+            // (previously amortized via `output` pre-allocation); the trans-flag
+            // FFI variant of fc_gemm_bf16 is out of scope for this phase.
+            let input_2d = input.reshape(&[batch_size, self.in_features])?;
+            let weight_2d = self
+                .weight
+                .reshape(&[self.out_features, self.in_features])?;
+            let mut result =
+                crate::ops::gemm_bf16::matmul_bf16_trans(&input_2d, &weight_2d, false, true)?;
 
-            let weight_t_owned;
-            let weight_t_ref = if let Some(ref cached) = self.weight_t_cache {
-                cached
-            } else {
-                weight_t_owned = crate::bf16_elementwise::transpose2d_bf16(&self.weight)?;
-                &weight_t_owned
-            };
-            let vw = tensor_as_view_bf16(weight_t_ref, "Linear::forward.weight_t")?;
-            let vb = self
-                .bias
-                .as_ref()
-                .map(|b| tensor_as_view_bf16(b, "Linear::forward.bias"))
-                .transpose()?;
-
-            let status = unsafe {
-                fc_gemm_bf16(
-                    &vx,
-                    &vw,
-                    vb.as_ref()
-                        .map(|view| view as *const _)
-                        .unwrap_or(ptr::null()),
-                    &mut vy,
-                    stream.as_raw(),
-                )
-            };
-
-            if status == FC_STATUS_LT_FALLBACK {
-                let out_shape = Shape::from_dims(&[batch_size, self.out_features]);
-                crate::strict::record_layout_fix("linear.forward.lt_fallback", &out_shape);
-                log::warn!(
-                    "Linear::forward: cuBLASLt fell back to strided BF16 helper (M={}, N={}, K={})",
-                    batch_size,
-                    self.out_features,
-                    self.in_features
-                );
-            } else if status == cuda_ops_bf16::FC_OK {
-                // nothing to do
-            } else {
-                if status == FC_ERR_UNSUPPORTED {
-                    let out_shape = Shape::from_dims(&[batch_size, self.out_features]);
-                    crate::strict::record_layout_fix("linear.forward.unsupported", &out_shape);
-                }
-                flame_status_to_result(status, "fc_gemm_bf16")?;
+            if let Some(bias) = &self.bias {
+                let bias_view = bias.reshape(&[1, self.out_features])?;
+                result = result.add(&bias_view)?;
             }
+
+            let result = result.reshape(&expected)?;
+            output.copy_(&result)?;
 
             trap_is_bf16("Linear::forward_into out", output)?;
             if output.rank() == 4 {

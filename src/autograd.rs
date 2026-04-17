@@ -2525,21 +2525,85 @@ fn compute_gradients(
             weight,
             bias,
         } => {
-            // d/dx(Wx + b) = W^T @ grad
-            // d/dW(Wx + b) = grad @ x^T
-            // d/db(Wx + b) = grad
+            // Forward: output = input @ weight^T + bias
+            //   input:  [..., in_features]
+            //   weight: [out_features, in_features]
+            //   output: [..., out_features]
+            // Backward:
+            //   grad_input  = grad_output @ weight                  (no transposes)
+            //   grad_weight = grad_output^T @ input                 (already [out, in])
+            //   grad_bias   = sum over all dims except last
+            //
+            // Matches Op::BatchMatMul path: one fused cuBLASLt call per grad
+            // via `matmul_bf16_trans` — no materialized transposes.
             let input_tensor = &fetch_saved(input)?;
             let weight_tensor = &fetch_saved(weight)?;
             guard_tensor("AutogradContext::linear_backward input", input_tensor)?;
             guard_tensor("AutogradContext::linear_backward weight", weight_tensor)?;
 
-            // Gradient w.r.t. input: W^T @ grad
-            let weight_t = weight_tensor.transpose()?;
-            let grad_input = output_grad.matmul(&weight_t)?;
+            let input_shape = input_tensor.shape().dims().to_vec();
+            let grad_shape = output_grad.shape().dims().to_vec();
+            if input_shape.is_empty() || grad_shape.is_empty() {
+                return Err(Error::InvalidOperation(
+                    "Op::Linear backward: scalar tensors not supported".into(),
+                ));
+            }
+            let in_features = input_shape[input_shape.len() - 1];
+            let out_features = grad_shape[grad_shape.len() - 1];
+            let batch: usize = input_shape[..input_shape.len() - 1].iter().product();
+            // Sanity: leading-dim product must match between input and grad.
+            let grad_batch: usize = grad_shape[..grad_shape.len() - 1].iter().product();
+            if batch != grad_batch {
+                return Err(Error::InvalidOperation(format!(
+                    "Op::Linear backward: leading-dim mismatch input {:?} vs grad {:?}",
+                    input_shape, grad_shape
+                )));
+            }
 
-            // Gradient w.r.t. weight: grad @ input^T
-            let input_t = input_tensor.transpose()?;
-            let grad_weight = output_grad.transpose()?.matmul(&input_t)?.transpose()?;
+            #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+            let (grad_input, grad_weight) = if input_tensor.dtype() == DType::BF16
+                && weight_tensor.dtype() == DType::BF16
+                && output_grad.dtype() == DType::BF16
+            {
+                let input_2d = input_tensor.reshape(&[batch, in_features])?;
+                let grad_2d = output_grad.reshape(&[batch, out_features])?;
+                let weight_2d = weight_tensor.reshape(&[out_features, in_features])?;
+
+                // grad_input = grad @ weight (both non-transposed) → [batch, in]
+                let grad_input_2d =
+                    crate::ops::gemm_bf16::matmul_bf16_trans(&grad_2d, &weight_2d, false, false)?;
+                // grad_weight = grad^T @ input → [out, in] directly (no final transpose)
+                let grad_weight_2d =
+                    crate::ops::gemm_bf16::matmul_bf16_trans(&grad_2d, &input_2d, true, false)?;
+                let grad_input = grad_input_2d.reshape(&input_shape)?;
+                (grad_input, grad_weight_2d)
+            } else {
+                // Fallback for non-BF16 saved tensors: cast to BF16 and reuse the
+                // fast path, matching Op::BatchMatMul's behavior at line ~2591.
+                let input_bf16 = input_tensor.to_dtype_no_grad(DType::BF16)?;
+                let weight_bf16 = weight_tensor.to_dtype_no_grad(DType::BF16)?;
+                let grad_bf16 = output_grad.to_dtype_no_grad(DType::BF16)?;
+                let input_2d = input_bf16.reshape(&[batch, in_features])?;
+                let grad_2d = grad_bf16.reshape(&[batch, out_features])?;
+                let weight_2d = weight_bf16.reshape(&[out_features, in_features])?;
+                let grad_input_2d =
+                    crate::ops::gemm_bf16::matmul_bf16_trans(&grad_2d, &weight_2d, false, false)?;
+                let grad_weight_2d =
+                    crate::ops::gemm_bf16::matmul_bf16_trans(&grad_2d, &input_2d, true, false)?;
+                let grad_input = grad_input_2d.reshape(&input_shape)?;
+                (grad_input, grad_weight_2d)
+            };
+
+            #[cfg(not(all(feature = "cuda", feature = "bf16_u16")))]
+            let (grad_input, grad_weight) = {
+                // No fused BF16 path available — fall back to materialized transposes.
+                let weight_t = weight_tensor.transpose()?;
+                let grad_input = output_grad.matmul(&weight_t)?;
+                let input_t = input_tensor.transpose()?;
+                let grad_weight = output_grad.transpose()?.matmul(&input_t)?.transpose()?;
+                (grad_input, grad_weight)
+            };
+
             let grad_input = ensure_bf16(grad_input)?;
             let grad_weight = ensure_bf16(grad_weight)?;
 

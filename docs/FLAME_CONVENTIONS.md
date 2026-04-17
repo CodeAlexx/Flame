@@ -516,6 +516,20 @@ use `fused_linear3d_native` instead — it takes the standard PyTorch
 `[Cout, Cin]` layout and uses cuBLASLt `TRANSA=T` to do the transpose
 inside the GEMM (no extra pass over memory).
 
+### Linear layers must not materialize transposed weights
+
+`nn::Linear` stores weight as `[out_features, in_features]` (PyTorch
+layout) and uses `ops::gemm_bf16::matmul_bf16_trans(input, weight, false,
+true)` — the `trans_b=true` flag routes through cuBLASLt with TRANSB=T, so
+the transpose lives inside the GEMM. Do NOT materialize transposed weights
+via `transpose2d_bf16` on the forward hot path: that creates a separate
+GPU buffer which grows stale after optimizer steps (the fused Adam kernel
+writes `self.weight` in place through a raw pointer, bypassing any cache).
+Backward follows the same rule — `Op::Linear` backward uses
+`matmul_bf16_trans(grad, weight, false, false)` for `grad_input` and
+`matmul_bf16_trans(grad, input, true, false)` for `grad_weight`, mirroring
+the `Op::BatchMatMul` fast path.
+
 ### `.unsqueeze(1)` for broadcasting modulation
 
 In every DiT block forward, the modulation params are `[B, dim]` and need
