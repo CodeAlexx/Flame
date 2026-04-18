@@ -368,6 +368,42 @@ void rope_fused_bf16_kernel(
     }
 }
 
+// FP32-COS/SIN variant: same interleaved RoPE math, but cos/sin tables are
+// F32. Removes the ~4e-3 BF16 quantization floor on pe_cos/pe_sin. Used for
+// Klein/Flux where the 1140 RoPE applications per inference accumulate that
+// floor error into visible quality degradation. Table size is tiny (~1 MiB
+// for FLUX at 1024²) so storing PE as F32 is free.
+extern "C" __global__
+void rope_fused_bf16_f32pe_kernel(
+    const __nv_bfloat16* __restrict__ X,
+    const float*         __restrict__ COS,  // [1, N, half] F32
+    const float*         __restrict__ SIN,  // [1, N, half] F32
+    __nv_bfloat16*       __restrict__ Y,
+    long bh, long n, long half)
+{
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    long total = bh * n * half;
+    while (idx < total) {
+        long tmp = idx;
+        long d = tmp % half; tmp /= half;
+        long seq = tmp % n;   tmp /= n;
+        long b = tmp;
+
+        long base = (b * n + seq) * (2 * half);
+        long cos_idx = seq * half + d;
+
+        float x_even = __bfloat162float(X[base + 2*d]);
+        float x_odd  = __bfloat162float(X[base + 2*d + 1]);
+        float c = COS[cos_idx];
+        float s = SIN[cos_idx];
+
+        Y[base + 2*d]     = __float2bfloat16(x_even * c - x_odd * s);
+        Y[base + 2*d + 1] = __float2bfloat16(x_even * s + x_odd * c);
+
+        idx += gridDim.x * blockDim.x;
+    }
+}
+
 extern "C" __global__
 void rope_halfsplit_bf16_kernel(
     const __nv_bfloat16* __restrict__ X,   // [BH, N, D]  (D = 2*half)
@@ -464,6 +500,98 @@ pub fn rope_fused_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor>
     let ss = match &sin_flat.storage {
         TensorStorage::BF16 { data, .. } => data,
         _ => return Err(Error::InvalidOperation("rope sin expects BF16".into())),
+    };
+    let ys = match &mut out.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
+    let ys = ensure_unique_slice(ys)?;
+
+    unsafe {
+        f.launch(
+            lc(total),
+            (
+                slice_ref(xs),
+                slice_ref(cs),
+                slice_ref(ss),
+                ys,
+                bh as i64,
+                n as i64,
+                half as i64,
+            ),
+        )?;
+    }
+
+    out.reshape(&[b, h, n, d])
+}
+
+/// Interleaved-pairs RoPE with F32 cos/sin tables.
+///
+/// Identical math to `rope_fused_bf16` but keeps the position-embedding tables
+/// in FP32, eliminating the ~4e-3 BF16 quantization floor on cos/sin that
+/// accumulates across FLUX's 1140+ RoPE applications per inference.
+///
+/// `x`:   [B, H, N, D] BF16 (D even).
+/// `cos`: [1, 1, N, D/2] **F32** cos table.
+/// `sin`: [1, 1, N, D/2] **F32** sin table.
+///
+/// Returns [B, H, N, D] BF16.
+pub fn rope_fused_bf16_f32pe(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    debug_assert_eq!(x.dtype(), DType::BF16);
+    if cos.dtype() != DType::F32 || sin.dtype() != DType::F32 {
+        return Err(Error::InvalidOperation(format!(
+            "rope_fused_bf16_f32pe: cos/sin must be F32, got cos={:?} sin={:?}",
+            cos.dtype(),
+            sin.dtype()
+        )));
+    }
+    let x_dims = x.shape().dims();
+    if x_dims.len() != 4 {
+        return Err(Error::InvalidOperation(format!(
+            "rope_fused_bf16_f32pe: expected 4D [B,H,N,D], got {:?}",
+            x_dims
+        )));
+    }
+    let (b, h, n, d) = (x_dims[0], x_dims[1], x_dims[2], x_dims[3]);
+    let half = d / 2;
+    let bh = b * h;
+
+    let x_flat = x.reshape(&[bh, n, d])?;
+    let cos_flat = cos.reshape(&[1, n, half])?;
+    let sin_flat = sin.reshape(&[1, n, half])?;
+
+    let total = bh * n * half;
+    let out_n = bh * n * d;
+
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, out_n)?;
+    let mut out = Tensor {
+        storage: TensorStorage::BF16 {
+            data: data.into(),
+            numel: out_n,
+        },
+        shape: Shape::from_dims(&[bh, n, d]),
+        device: x.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+    };
+
+    ensure(&x.device, "rope_fused_bf16_f32pe_kernel", CUDA_ROPE_FUSED)?;
+    let f = x
+        .device
+        .get_func("rope_fused_bf16_f32pe_kernel", "rope_fused_bf16_f32pe_kernel")
+        .ok_or_else(|| Error::Cuda("rope_fused_bf16_f32pe_kernel missing".into()))?;
+
+    let xs = match &x_flat.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("rope expects BF16".into())),
+    };
+    let cs = match &cos_flat.storage {
+        TensorStorage::F32 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("rope_fused_bf16_f32pe cos expects F32".into())),
+    };
+    let ss = match &sin_flat.storage {
+        TensorStorage::F32 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("rope_fused_bf16_f32pe sin expects F32".into())),
     };
     let ys = match &mut out.storage {
         TensorStorage::BF16 { data, .. } => data,
