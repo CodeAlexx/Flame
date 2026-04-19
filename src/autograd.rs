@@ -24,7 +24,7 @@ use crate::tensor::TensorId;
 use crate::tensor_storage::TensorStorage;
 use crate::{DType, Error, Result, Shape, Tensor};
 use cudarc::driver::CudaDevice;
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,6 +34,10 @@ use std::sync::{Arc, Mutex};
 /// heap allocation per recorded op — and with ~2660 tape entries per Klein
 /// 4B step that adds up.
 pub type SavedTensors = SmallVec<[(TensorId, Tensor); 3]>;
+
+/// Return type of `compute_gradients` per tape entry. Most ops produce 1-3
+/// grads, so inlining up to 3 avoids per-op heap allocation during backward.
+pub type GradVec = SmallVec<[(TensorId, Tensor); 3]>;
 
 /// Atomic mirror of `AutogradContextInner::enabled`. Checked by tensor ops
 /// BEFORE constructing Op enums or cloning saved_tensors, avoiding GPU memcpys
@@ -1615,7 +1619,7 @@ fn compute_gradients(
     entry: &TapeEntry,
     output_grad_raw: &Tensor,
     device: &Arc<CudaDevice>,
-) -> Result<Vec<(TensorId, Tensor)>> {
+) -> Result<GradVec> {
     // Keep gradients in their incoming dtype (typically F32 from GradientMap).
     // GpuOps handles mixed F32×BF16 operations internally by casting.
     // Forcing BF16 here caused overflow (Inf) in deep checkpoint backward chains.
@@ -1671,13 +1675,13 @@ fn compute_gradients(
                 output_grad.clone()
             };
 
-            Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
+            Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
         }
 
         Op::Sub { lhs, rhs } => {
             // d/dx(x-y) = 1, d/dy(x-y) = -1
             let neg_grad = GpuOps::mul_scalar(output_grad, -1.0)?;
-            Ok(vec![(*lhs, output_grad.clone()), (*rhs, neg_grad)])
+            Ok(smallvec![(*lhs, output_grad.clone()), (*rhs, neg_grad)])
         }
 
         Op::Mul { lhs, rhs } => {
@@ -1717,18 +1721,18 @@ fn compute_gradients(
                 println!("  Both gradients computed");
             }
 
-            Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
+            Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
         }
 
         Op::MulScalar { input, scalar } => {
             // d/dx(s*x) = s
             let grad = output_grad.mul_scalar(*scalar)?;
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::AddScalar { input, scalar: _ } => {
             // d/dx(x+s) = 1
-            Ok(vec![(*input, output_grad.clone())])
+            Ok(smallvec![(*input, output_grad.clone())])
         }
 
         Op::MatMul { lhs, rhs } => {
@@ -1774,7 +1778,7 @@ fn compute_gradients(
                     true,
                     false,
                 )?;
-                return Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+                return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
             }
 
             // 3D×2D path: lhs=[B,M,K], rhs=[K,N], out=[B,M,N]
@@ -1804,7 +1808,7 @@ fn compute_gradients(
                     let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
                         &lhs_2d, &og_bf16, true, false,
                     )?;
-                    return Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+                    return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
                 }
 
                 // Fallback for non-BF16
@@ -1822,7 +1826,7 @@ fn compute_gradients(
                 let lhs_t = GpuOps::transpose(&lhs_cast)?;
                 let grad_rhs = GpuOps::matmul(&lhs_t, &og_cast)?;
 
-                return Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+                return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
             }
 
             // 3D×3D path: lhs=[B,M,K], rhs=[B,K,N], out=[B,M,N]
@@ -1847,7 +1851,7 @@ fn compute_gradients(
                 let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
                     lhs_tensor, grad_bf16, true, false,
                 )?;
-                return Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+                return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
             }
 
             // Slow / fallback path (non-BF16, non-2D, mixed dtype): materialize
@@ -1872,7 +1876,7 @@ fn compute_gradients(
             };
             let grad_rhs = GpuOps::matmul(&lhs_for_grad, output_grad)?;
 
-            Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
+            Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
         }
 
         Op::ReLU { input } => {
@@ -1886,7 +1890,7 @@ fn compute_gradients(
                 crate::cuda::ffi::flame_relu_backward_bf16,
                 crate::cuda::ffi::flame_relu_backward_f32,
             )?;
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::GELU { input } => {
@@ -1900,7 +1904,7 @@ fn compute_gradients(
                 crate::cuda::ffi::flame_gelu_backward_bf16,
                 crate::cuda::ffi::flame_gelu_backward_f32,
             )?;
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::SiLU { input } => {
@@ -1957,7 +1961,7 @@ fn compute_gradients(
                 }
                 out
             };
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::Tanh { input } => {
@@ -1971,7 +1975,7 @@ fn compute_gradients(
                 crate::cuda::ffi::flame_tanh_backward_bf16,
                 crate::cuda::ffi::flame_tanh_backward_f32,
             )?;
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::Sigmoid { input } => {
@@ -1985,7 +1989,7 @@ fn compute_gradients(
                 crate::cuda::ffi::flame_sigmoid_backward_bf16,
                 crate::cuda::ffi::flame_sigmoid_backward_f32,
             )?;
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::Square { input } => {
@@ -1993,7 +1997,7 @@ fn compute_gradients(
             let input_tensor = &fetch_saved(input)?;
             let two_x = GpuOps::mul_scalar(input_tensor, 2.0)?;
             let grad = GpuOps::mul(output_grad, &two_x)?;
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::Sqrt { input } => {
@@ -2005,7 +2009,7 @@ fn compute_gradients(
                 &GpuOps::mul_scalar(output_grad, 0.5)?,
                 &sqrt_x,
             )?;
-            Ok(vec![(*input, half_inv_sqrt)])
+            Ok(smallvec![(*input, half_inv_sqrt)])
         }
 
         Op::Sum { input, input_shape } => {
@@ -2024,13 +2028,13 @@ fn compute_gradients(
             } else {
                 expanded
             };
-            Ok(vec![(*input, result)])
+            Ok(smallvec![(*input, result)])
         }
 
         Op::Cast { input, from, to: _ } => {
             // Gradient of cast passes through; cast grad back to input dtype
             let g = output_grad.to_dtype_no_grad(*from)?;
-            Ok(vec![(*input, g)])
+            Ok(smallvec![(*input, g)])
         }
 
         Op::Checkpoint { input, original_tape_len: _ } => {
@@ -2190,7 +2194,7 @@ fn compute_gradients(
             // ── Step 5: Return only chain + trainable gradients ──
             // Intermediate chain gradients served their purpose during the
             // local backward and are NOT propagated to the outer graph.
-            let mut result = Vec::new();
+            let mut result: GradVec = SmallVec::new();
             for (tid, g) in sub_grads.drain_all()? {
                 if trainable_ids.contains(&tid) {
                     result.push((tid, g));
@@ -2267,7 +2271,7 @@ fn compute_gradients(
             }
             drop(pool);
 
-            let mut result = Vec::new();
+            let mut result: GradVec = SmallVec::new();
             for (tid, g) in sub_grads.drain_all()? {
                 result.push((tid, g));
             }
@@ -2305,7 +2309,7 @@ fn compute_gradients(
                 if status != 0 {
                     return Err(Error::Cuda("flame_swiglu_backward_bf16 failed".into()));
                 }
-                Ok(vec![(*gate, d_gate_t), (*up, d_up_t)])
+                Ok(smallvec![(*gate, d_gate_t), (*up, d_up_t)])
             } else {
                 // Fallback: decompose into individual ops
                 let og = if output_grad.dtype() != DType::BF16 {
@@ -2342,7 +2346,7 @@ fn compute_gradients(
                 if status != 0 {
                     return Err(Error::Cuda("flame_swiglu_backward_bf16 (fallback) failed".into()));
                 }
-                Ok(vec![(*gate, d_gate_t), (*up, d_up_t)])
+                Ok(smallvec![(*gate, d_gate_t), (*up, d_up_t)])
             }
         }
 
@@ -2361,7 +2365,7 @@ fn compute_gradients(
             let neg_sin = GpuOps::mul_scalar(&sin_tensor, -1.0)?;
             let grad_input =
                 crate::bf16_ops::rope_halfsplit_bf16(&grad_bf16, &cos_tensor, &neg_sin)?;
-            Ok(vec![(*input, grad_input)])
+            Ok(smallvec![(*input, grad_input)])
         }
 
         Op::Mean { input, input_shape } => {
@@ -2371,7 +2375,7 @@ fn compute_gradients(
             // Normalize upstream rank before GPU broadcast
             let up_ranked = expand_to_rank(&grad_scaled, input_shape.dims().len())?;
             let expanded = GpuOps::broadcast(&up_ranked, input_shape)?;
-            Ok(vec![(*input, expanded)])
+            Ok(smallvec![(*input, expanded)])
         }
 
         Op::Transpose { input } => {
@@ -2380,7 +2384,7 @@ fn compute_gradients(
             } else {
                 GpuOps::transpose(output_grad)?
             };
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::Conv2d {
@@ -2406,7 +2410,7 @@ fn compute_gradients(
                     (*padding, *padding),
                 )?;
 
-            let mut grads = vec![(*input, grad_input), (*weight, grad_weight)];
+            let mut grads: GradVec = smallvec![(*input, grad_input), (*weight, grad_weight)];
 
             // Handle bias gradient if present
             if let Some(grad_bias) = grad_bias {
@@ -2460,7 +2464,7 @@ fn compute_gradients(
             let grad_weight = crate::cuda_ops::GpuOps::weight_ocickhkw_to_khwkicoc(&grad_w_ocic)?;
             let grad_weight = ensure_bf16(grad_weight)?;
 
-            let mut grads = vec![(*input, grad_input), (*weight, grad_weight)];
+            let mut grads: GradVec = smallvec![(*input, grad_input), (*weight, grad_weight)];
             if let Some(gb) = grad_b {
                 let gb = ensure_bf16(gb)?;
                 grads.push((
@@ -2546,7 +2550,7 @@ fn compute_gradients(
                 )?;
 
             let grad_input = ensure_bf16(grad_input)?;
-            let mut gradients = vec![(*input, grad_input)];
+            let mut gradients: GradVec = smallvec![(*input, grad_input)];
 
             // Add weight and bias gradients if they exist
             if let Some(grad_w) = grad_weight {
@@ -2595,7 +2599,7 @@ fn compute_gradients(
                 normalized_shape,
             )?;
 
-            let mut grads = vec![(*input, ensure_bf16(grad_input)?)];
+            let mut grads: GradVec = smallvec![(*input, ensure_bf16(grad_input)?)];
 
             if let Some(&w_id) = weight.as_ref() {
                 if let Some(gw) = grad_weight {
@@ -2693,7 +2697,7 @@ fn compute_gradients(
             let grad_input = ensure_bf16(grad_input)?;
             let grad_weight = ensure_bf16(grad_weight)?;
 
-            let mut grads = vec![(*input, grad_input), (*weight, grad_weight)];
+            let mut grads: GradVec = smallvec![(*input, grad_input), (*weight, grad_weight)];
 
             // Gradient w.r.t. bias (if present)
             if let Some(bias_id) = bias {
@@ -2735,7 +2739,7 @@ fn compute_gradients(
                 let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
                     lhs_tensor, grad_bf16, true, false,
                 )?;
-                return Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+                return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
             }
 
             // Fallback for non-BF16 3D×3D: cast to BF16, use the fast path above.
@@ -2749,7 +2753,7 @@ fn compute_gradients(
             let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
                 &lhs_bf16, &grad_bf16, true, false,
             )?;
-            Ok(vec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
+            Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
         }
 
         Op::Reshape { input, .. } => {
@@ -2758,14 +2762,14 @@ fn compute_gradients(
                 .get_saved(input)
                 .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for input".into()))?;
             let grad = output_grad.reshape(input_tensor.shape().dims())?;
-            Ok(vec![(*input, ensure_bf16(grad)?)])
+            Ok(smallvec![(*input, ensure_bf16(grad)?)])
         }
 
         Op::Permute { input, dims } => {
             // Gradient of permute is inverse permute
             let inverse_dims = inverse_permutation(dims);
             let grad = output_grad.permute(&inverse_dims)?;
-            Ok(vec![(*input, ensure_bf16(grad)?)])
+            Ok(smallvec![(*input, ensure_bf16(grad)?)])
         }
 
         Op::AddBias { input, bias } => {
@@ -2782,7 +2786,7 @@ fn compute_gradients(
             }
             let grad_bias = ensure_bf16(output_grad.sum_dims(&sum_dims)?)?;
 
-            Ok(vec![(*input, ensure_bf16(grad_input)?), (*bias, grad_bias)])
+            Ok(smallvec![(*input, ensure_bf16(grad_input)?), (*bias, grad_bias)])
         }
 
         Op::SumDim { input, dim } => {
@@ -2794,7 +2798,7 @@ fn compute_gradients(
             grad_shape[*dim] = 1;
             let grad_reshaped = output_grad.reshape(&grad_shape)?;
             let grad = grad_reshaped.broadcast_to(input_tensor.shape())?;
-            Ok(vec![(*input, ensure_bf16(grad)?)])
+            Ok(smallvec![(*input, ensure_bf16(grad)?)])
         }
 
         Op::Clamp { input, min, max } => {
@@ -2812,7 +2816,7 @@ fn compute_gradients(
                 *min,
                 *max,
             )?;
-            Ok(vec![(*input, ensure_bf16(grad)?)])
+            Ok(smallvec![(*input, ensure_bf16(grad)?)])
         }
 
         Op::Div { lhs, rhs, lhs_shape, rhs_shape } => {
@@ -2852,7 +2856,7 @@ fn compute_gradients(
                 grad_rhs = reduce_grad_for_broadcast(&grad_rhs, rhs_shape)?;
             }
 
-            Ok(vec![
+            Ok(smallvec![
                 (*lhs, ensure_bf16(grad_lhs)?),
                 (*rhs, ensure_bf16(grad_rhs)?),
             ])
@@ -2891,7 +2895,7 @@ fn compute_gradients(
             // Apply mask
             let grad = grad_broadcast.mul(&mask)?;
 
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::SumDimKeepdim { input, dim } => {
@@ -2903,7 +2907,7 @@ fn compute_gradients(
 
             // Broadcast gradient back to input shape
             let grad = output_grad.broadcast_to(input_shape)?;
-            Ok(vec![(*input, ensure_bf16(grad)?)])
+            Ok(smallvec![(*input, ensure_bf16(grad)?)])
         }
 
         Op::SumDims { input, dims } => {
@@ -2930,7 +2934,7 @@ fn compute_gradients(
                 grad
             };
             let grad = grad.broadcast_to(input_shape)?;
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::Repeat { input, repeats } => {
@@ -3002,7 +3006,7 @@ fn compute_gradients(
 
             debug_assert_eq!(current_shape, input_shape);
 
-            Ok(vec![(*input, ensure_bf16(grad)?)])
+            Ok(smallvec![(*input, ensure_bf16(grad)?)])
         }
 
         Op::Embedding { weight, indices } => {
@@ -3035,7 +3039,7 @@ fn compute_gradients(
                 weight_grad_f32.to_dtype_no_grad(weight_tensor.dtype())?
             };
 
-            Ok(vec![(*weight, weight_grad)])
+            Ok(smallvec![(*weight, weight_grad)])
         }
 
         Op::IndexSelect {
@@ -3066,12 +3070,12 @@ fn compute_gradients(
                 grad_input_f32.to_dtype_no_grad(input_tensor.dtype())?
             };
 
-            Ok(vec![(*input, grad_input)])
+            Ok(smallvec![(*input, grad_input)])
         }
 
         Op::Cat { inputs, dim } => {
             // Split gradient back to original tensors
-            let mut grads = Vec::new();
+            let mut grads: GradVec = SmallVec::new();
             let mut offset = 0;
 
             for &input_id in inputs {
@@ -3123,7 +3127,7 @@ fn compute_gradients(
 
             if let Some((dim, start, _length)) = narrow_dim {
                 gpu_scatter_add_narrow(output_grad, &mut grad_in, dim, start)?;
-                Ok(vec![(*input, grad_in)])
+                Ok(smallvec![(*input, grad_in)])
             } else if can_gpu_multi_axis(ranges, in_dims) {
                 let mut tmp = output_grad.clone();
                 let mut axes: Vec<(usize, usize, usize)> = Vec::new();
@@ -3140,7 +3144,7 @@ fn compute_gradients(
                     gpu_scatter_add_narrow(&tmp, &mut expanded, axis, s)?;
                     tmp = expanded;
                 }
-                Ok(vec![(*input, tmp)])
+                Ok(smallvec![(*input, tmp)])
             } else {
                 // Fallback: same as multi-axis
                 let mut tmp = output_grad.clone();
@@ -3158,7 +3162,7 @@ fn compute_gradients(
                     gpu_scatter_add_narrow(&tmp, &mut expanded, axis, s)?;
                     tmp = expanded;
                 }
-                Ok(vec![(*input, tmp)])
+                Ok(smallvec![(*input, tmp)])
             }
         }
 
@@ -3183,7 +3187,7 @@ fn compute_gradients(
             // This is correct when all splits have gradients flowing back
             combined_grad = combined_grad.add(output_grad)?;
 
-            Ok(vec![(*input, combined_grad)])
+            Ok(smallvec![(*input, combined_grad)])
         }
 
         Op::Abs { input } => {
@@ -3193,7 +3197,7 @@ fn compute_gradients(
                 .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for input".into()))?;
             let sign = input_tensor.sign()?;
             let grad = output_grad.mul(&sign)?;
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::Log { input } => {
@@ -3205,7 +3209,7 @@ fn compute_gradients(
                 Tensor::ones(input_tensor.shape().clone(), input_tensor.device().clone())?
                     .div(input_tensor)?;
             let grad = output_grad.mul(&reciprocal)?;
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::Softmax { input, dim } => {
@@ -3222,7 +3226,7 @@ fn compute_gradients(
                 output_grad
             };
             let grad = crate::autograd_ops_complete::softmax_backward(&output, grad_bf16, *dim)?;
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::LogSoftmax { input, dim } => {
@@ -3237,7 +3241,7 @@ fn compute_gradients(
             };
             let grad =
                 crate::autograd_ops_complete::log_softmax_backward(grad_bf16, &output, *dim)?;
-            Ok(vec![(*input, grad)])
+            Ok(smallvec![(*input, grad)])
         }
 
         Op::Maximum { a, b } => {
@@ -3257,7 +3261,7 @@ fn compute_gradients(
             if grad_b.shape() != b_tensor.shape() {
                 grad_b = reduce_grad_for_broadcast(&grad_b, b_tensor.shape())?;
             }
-            Ok(vec![(*a, grad_a), (*b, grad_b)])
+            Ok(smallvec![(*a, grad_a), (*b, grad_b)])
         }
 
         Op::Minimum { a, b } => {
@@ -3277,7 +3281,7 @@ fn compute_gradients(
             if grad_b.shape() != b_tensor.shape() {
                 grad_b = reduce_grad_for_broadcast(&grad_b, b_tensor.shape())?;
             }
-            Ok(vec![(*a, grad_a), (*b, grad_b)])
+            Ok(smallvec![(*a, grad_a), (*b, grad_b)])
         }
 
         Op::Where { cond, t, f } => {
@@ -3300,7 +3304,7 @@ fn compute_gradients(
             if grad_f.shape() != f_tensor.shape() {
                 grad_f = reduce_grad_for_broadcast(&grad_f, f_tensor.shape())?;
             }
-            Ok(vec![(*t, grad_t), (*f, grad_f)])
+            Ok(smallvec![(*t, grad_t), (*f, grad_f)])
         }
 
         Op::MSELoss {
@@ -3334,7 +3338,7 @@ fn compute_gradients(
             let grad_predictions = GpuOps::mul(&up_broadcast, &diff)?;
             let grad_targets = grad_predictions.mul_scalar(-1.0)?;
 
-            Ok(vec![
+            Ok(smallvec![
                 (*predictions, grad_predictions),
                 (*targets, grad_targets),
             ])
@@ -3359,7 +3363,7 @@ fn compute_gradients(
             let grad_predictions = output_grad.mul_scalar(scale)?.mul(&sign)?;
             let grad_targets = grad_predictions.mul_scalar(-1.0)?;
 
-            Ok(vec![
+            Ok(smallvec![
                 (*predictions, grad_predictions),
                 (*targets, grad_targets),
             ])
@@ -3403,7 +3407,7 @@ fn compute_gradients(
             let grad_predictions = output_grad.mul_scalar(scale)?.mul(&combined_grad)?;
             let grad_targets = grad_predictions.mul_scalar(-1.0)?;
 
-            Ok(vec![
+            Ok(smallvec![
                 (*predictions, grad_predictions),
                 (*targets, grad_targets),
             ])
@@ -3436,7 +3440,7 @@ fn compute_gradients(
             let grad_predictions = output_grad.mul_scalar(scale)?.mul(&grad_base)?;
 
             // No gradient w.r.t targets for BCE
-            Ok(vec![(*predictions, grad_predictions)])
+            Ok(smallvec![(*predictions, grad_predictions)])
         }
 
         Op::NLLLoss {
@@ -3478,7 +3482,7 @@ fn compute_gradients(
 
             let final_grad = output_grad.mul(&grad_log_probs)?;
 
-            Ok(vec![(*log_probs, final_grad)])
+            Ok(smallvec![(*log_probs, final_grad)])
         }
 
         Op::GroupNorm {
@@ -3529,7 +3533,7 @@ fn compute_gradients(
                     1e-5,
                 )?;
 
-            let mut grads = vec![(*input, grad_input)];
+            let mut grads: GradVec = smallvec![(*input, grad_input)];
             if let (Some(w_id), Some(gw)) = (*weight, grad_weight) {
                 grads.push((w_id, gw));
             }
@@ -3671,7 +3675,7 @@ fn compute_gradients(
                 )?
             };
 
-            Ok(vec![(*query, grad_q), (*key, grad_k), (*value, grad_v)])
+            Ok(smallvec![(*query, grad_q), (*key, grad_k), (*value, grad_v)])
         }
         #[cfg(not(feature = "flash_attn"))]
         Op::FlashAttention {
@@ -3728,7 +3732,7 @@ fn compute_gradients(
                 *scale,
                 cached_attn,
             )?;
-            Ok(vec![(*query, grad_q), (*key, grad_k), (*value, grad_v)])
+            Ok(smallvec![(*query, grad_q), (*key, grad_k), (*value, grad_v)])
         }
 
         Op::SageAttention {
@@ -3777,7 +3781,7 @@ fn compute_gradients(
                 *quantized,
             )?;
 
-            Ok(vec![
+            Ok(smallvec![
                 (*query_id, grad_q),
                 (*key_id, grad_k),
                 (*value_id, grad_v),
