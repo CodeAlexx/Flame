@@ -420,6 +420,20 @@ fallback.
 | `geglu_kernel` | `:14` | F32 GeGLU `gelu(gate) * up`. |
 | `flame_geglu_pointwise_fp32` | `:30` | C entry. |
 
+### `src/kernels/silu_backward.cu` — fused SiLU backward
+- `flame_silu_backward_bf16` / `flame_silu_backward_f32` — single-kernel `g * sig(x) * (1 + x*(1-sig(x)))`. Same ABI as every fused unary backward kernel: `(grad_out, input, grad_in, n, stream) -> i32`.
+
+### `src/kernels/swiglu_backward.cu` — fused SwiGLU backward
+- `flame_swiglu_backward_bf16` — two outputs (`d_gate`, `d_up`) from a single kernel.
+
+### `src/kernels/{relu,gelu,tanh,sigmoid}_backward.cu` (2026-04-18)
+- Fused unary-activation backward kernels, BF16 + F32 entrypoints each.
+- GELU uses the **tanh-approximation** derivative to match the forward path.
+- Signatures: `flame_<op>_backward_{bf16,f32}(grad_out, input, grad_in, n, stream) -> i32`.
+- Called from `autograd.rs::fused_unary_backward` (main compute path) and
+  `autograd_ops.rs::launch_unary_backward` (the `BackwardOps` façade).
+- Parity tests in `flame-core/tests/activation_backward_fused_kernels.rs`.
+
 ### `src/kernels/mul_bwd_bf16.cu` — BF16 mul backward
 - Single-purpose backward for the BF16 mul op.
 

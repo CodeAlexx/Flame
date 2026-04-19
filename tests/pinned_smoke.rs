@@ -9,7 +9,9 @@ fn pinned_alloc_and_async_copy() -> Result<()> {
         "CUDA GPU required. Set CUDA_HOME=/usr/local/cuda and export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH.",
     );
 
-    let stream = dev.fork_default_stream()?;
+    let stream = dev
+        .fork_default_stream()
+        .map_err(|e| anyhow::anyhow!("fork_default_stream: {:?}", e))?;
 
     // Use the public API you added:
     use flame_core::{PinnedAllocFlags, PinnedHostBuffer, StagingDeviceBuf};
@@ -29,6 +31,7 @@ fn pinned_alloc_and_async_copy() -> Result<()> {
 
     let devbuf = StagingDeviceBuf::<u32>::new(dev.clone(), n)?;
     devbuf.async_upload_from(&host, &stream)?;
-    dev.synchronize()?; // ensure copy completes before assertions
+    dev.synchronize()
+        .map_err(|e| anyhow::anyhow!("synchronize: {:?}", e))?;
     Ok(())
 }

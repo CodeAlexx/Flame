@@ -213,7 +213,7 @@ This means the recomputed forward DOES record new tape entries. But these are im
 
 ### 3.4 CPU Fallback in autograd_ops.rs
 
-`BackwardOps` in `autograd_ops.rs` uses `Tensor::mul()`, `Tensor::mul_scalar()` etc. which DO go through autograd checks. However, since backward disables autograd globally, these calls don't record. **But**: several methods in `autograd_ops.rs` download data to CPU via `.to_vec()` (e.g., `relu_backward` line 87-88, `gelu_backward` lines 174-175, `silu_backward` lines 211-212, `tanh_backward` lines 237-238). These are the **legacy CPU fallback paths** and are NOT used by the main `compute_gradients()` dispatcher, which calls into `autograd_ops_complete.rs` GPU implementations or direct `GpuOps` calls instead.
+`BackwardOps` in `autograd_ops.rs` uses `Tensor::mul()`, `Tensor::mul_scalar()` etc. which DO go through autograd checks. However, since backward disables autograd globally, these calls don't record. As of 2026-04-18 the legacy CPU round-trip paths for {`relu_backward`, `gelu_backward`, `silu_backward`, `tanh_backward`} have been replaced with direct calls to the fused `flame_{relu,gelu,silu,tanh,sigmoid}_backward_{bf16,f32}` CUDA kernels via a shared `launch_unary_backward()` helper. A new `sigmoid_backward` was added to match. The only remaining host reads in `autograd_ops.rs` are the single-element peeks in `sum_backward`/`mean_backward` (one `f32` each) which only run when the dispatcher calls into those paths.
 
 ---
 
@@ -281,11 +281,11 @@ Every gradient produced by compute_gradients is cast to BF16 before being return
 | `MulScalar` | `autograd.rs:1237-1240` | GPU (Tensor::mul_scalar) | |
 | `AddScalar` | `autograd.rs:1243-1246` | GPU (clone_result) | Identity gradient |
 | `MatMul` | `autograd.rs:1248-1263` | GPU (GpuOps::transpose, GpuOps::matmul) | Saves both operands |
-| `ReLU` | `autograd.rs:1266-1270` | GPU (custom relu_backward, line 2669) | Saves input |
-| `GELU` | `autograd.rs` | GPU (GpuOps::mul, GpuOps::tanh, GpuOps::add_scalar, GpuOps::mul_scalar) | Inline impl using GpuOps; saves input |
-| `SiLU` | `autograd.rs` | GPU (GpuOps::sigmoid, GpuOps::mul, GpuOps::add, GpuOps::mul_scalar) | Inline impl using GpuOps; saves input |
-| `Tanh` | `autograd.rs` | GPU (GpuOps::tanh, GpuOps::mul, GpuOps::add) | Inline impl: 1-tanh²(x); saves input |
-| `Sigmoid` | `autograd.rs` | GPU (GpuOps::sigmoid, GpuOps::mul, GpuOps::add) | Inline impl: sig*(1-sig); saves input |
+| `ReLU` | `autograd.rs` | GPU fused kernel (`flame_relu_backward_{bf16,f32}` via `fused_unary_backward`) | Saves input |
+| `GELU` | `autograd.rs` | GPU fused kernel (`flame_gelu_backward_{bf16,f32}`, tanh-approx) | Saves input |
+| `SiLU` | `autograd.rs` | GPU fused kernel (`flame_silu_backward_{bf16,f32}`) | Saves input |
+| `Tanh` | `autograd.rs` | GPU fused kernel (`flame_tanh_backward_{bf16,f32}`) | Saves input |
+| `Sigmoid` | `autograd.rs` | GPU fused kernel (`flame_sigmoid_backward_{bf16,f32}`) | Saves input |
 | `Square` | `autograd.rs` | GPU (GpuOps::mul_scalar, GpuOps::mul) | Saves input |
 | `Sqrt` | `autograd.rs` | GPU (GpuOps::sqrt, GpuOps::mul_scalar, GpuOps::div) | d/dx sqrt(x) = 0.5/sqrt(x); saves input |
 | `Sum` | `autograd.rs:1313-1318` | GPU (GpuOps::broadcast) | |
@@ -331,19 +331,17 @@ Every gradient produced by compute_gradients is cast to BF16 before being return
 
 ### 5.2 CPU Fallback Flags
 
-The following ops in `autograd_ops.rs` (the LEGACY module) download to CPU via `.to_vec()`:
-- `relu_backward` (line 87-88) -- **NOT USED** by main backward; custom GPU impl at autograd.rs:2669
-- `gelu_backward` (line 174-175)
-- `silu_backward` (line 211-212)
-- `tanh_backward` (line 237-238)
+**Status as of 2026-04-18:** the legacy CPU-roundtrip paths for `{relu, gelu, silu, tanh}_backward` in `autograd_ops.rs` have been replaced with fused CUDA kernels. A new `sigmoid_backward` was added and wired the same way. A shared helper `launch_unary_backward()` dispatches `flame_{relu,gelu,silu,tanh,sigmoid}_backward_{bf16,f32}` and falls back to F32 only for mixed-dtype inputs.
 
-These are all in `BackwardOps` which is the OLD implementation. The main `compute_gradients()` dispatcher calls `autograd_ops_complete.rs` versions or direct GpuOps calls, which are all GPU.
+Host reads remaining in `autograd_ops.rs`:
+- `sum_backward` (one-element `to_vec()?[0]`)
+- `mean_backward` (one-element `to_vec()?[0]`)
 
-**The `autograd_ops.rs` file header confirms this**: `#[allow(dead_code)]` and the comment says "Legacy autograd ops; keep compiled but unused until rewritten."
+Both of those only activate when the `BackwardOps` sum/mean paths are invoked; the main `autograd.rs` dispatcher uses GPU broadcast instead.
 
-### 5.3 One CPU Download Remaining
+### 5.3 Main-path Fused Dispatch
 
-The custom `relu_backward` at `autograd.rs:2669-2689` constructs a zero tensor and uses `input.gt(&zero)` which dispatches through GpuOps comparison -- this is GPU. No CPU download in the active code path.
+`autograd.rs::compute_gradients` now calls the fused unary-activation kernels directly through the local `fused_unary_backward()` helper for `Op::{ReLU, GELU, SiLU, Tanh, Sigmoid}`. The previous decomposed GpuOps sequences and the `fn relu_backward(...)` helper (formerly at `autograd.rs:~3760`) have been removed. Saved-input semantics are unchanged — each of these ops continues to save its input tensor on the tape during forward.
 
 ---
 

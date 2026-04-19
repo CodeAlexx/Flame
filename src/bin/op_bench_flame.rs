@@ -11,7 +11,7 @@
 //!     ./target/release/op_bench_flame --csv
 
 use flame_core::{
-    AutogradContext, CudaDevice, DType, GradientMap, Shape, Tensor,
+    CudaDevice, DType, Shape, Tensor,
     config::set_default_dtype,
     layer_norm::LayerNorm,
 };

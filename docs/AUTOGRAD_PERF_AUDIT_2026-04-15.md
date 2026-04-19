@@ -19,8 +19,13 @@ The autograd engine has significant optimizations already in place. These are wo
 | In-place gradient accumulation | `gradient.rs:219` | `add_inplace_same_dtype` — no temporary tensor for accumulation |
 | Lazy F32 upcast in accumulate | `gradient.rs:207-213` | First grad stored as-is, cast deferred until second arrives |
 | `matmul_bf16_trans` for matmul backward | `autograd.rs:1658-1760` | cuBLASLt TRANSA/TRANSB flags — 0 transposes materialized |
-| Fused SiLU backward kernel | `autograd.rs:1824-1878` | Single CUDA kernel via `flame_silu_backward_bf16` |
-| Fused SwiGLU backward kernel | `autograd.rs:2191-2261` | Single CUDA kernel via `flame_swiglu_backward_bf16` |
+| Fused SiLU backward kernel | `autograd.rs` Op::SiLU arm | Single CUDA kernel via `flame_silu_backward_bf16` |
+| Fused SwiGLU backward kernel | `autograd.rs` Op::SwiGLU arm | Single CUDA kernel via `flame_swiglu_backward_bf16` |
+| Fused ReLU backward kernel (2026-04-18) | `autograd.rs` Op::ReLU arm | Single CUDA kernel via `flame_relu_backward_{bf16,f32}`; `fn relu_backward` helper deleted |
+| Fused GELU backward kernel (2026-04-18) | `autograd.rs` Op::GELU arm | Single CUDA kernel via `flame_gelu_backward_{bf16,f32}` (tanh-approx); was 12 GpuOps calls |
+| Fused Tanh backward kernel (2026-04-18) | `autograd.rs` Op::Tanh arm | Single CUDA kernel via `flame_tanh_backward_{bf16,f32}`; was 5 GpuOps calls |
+| Fused Sigmoid backward kernel (2026-04-18) | `autograd.rs` Op::Sigmoid arm | Single CUDA kernel via `flame_sigmoid_backward_{bf16,f32}`; was 5 GpuOps calls |
+| Shared fused dispatcher `fused_unary_backward` (2026-04-18) | `autograd.rs` near top | Picks BF16→BF16 fast path or F32 fallback for mixed dtypes; also replaces `BackwardOps::{relu,gelu,silu,tanh}_backward` CPU round-trips in `autograd_ops.rs` (new `launch_unary_backward`) |
 | Fused RoPE backward | `autograd.rs:2263-2279` | Reuses `rope_halfsplit_bf16` with negated sin |
 | Checkpoint forward disables autograd | `autograd.rs:1294-1310` | Avoids hundreds of wasted GPU memcpys per block |
 | CUDA graph capture/replay for backward | `autograd.rs:978-1029` | Entire backward as single graph launch on repeat steps |
@@ -31,6 +36,10 @@ The autograd engine has significant optimizations already in place. These are wo
 ---
 
 ## High Impact — Fuse These Backward Kernels
+
+> **Update 2026-04-18:** items 1–3 below (GELU, Tanh, Sigmoid backward fusions) are now implemented and exercised by
+> `flame-core/tests/activation_backward_fused_kernels.rs` + the existing `activation_backward.rs` suite. ReLU backward
+> was also fused in the same pass. Kept here for historical context.
 
 ### 1. GELU Backward: 12 kernel launches → 1
 

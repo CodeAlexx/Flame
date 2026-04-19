@@ -530,6 +530,15 @@ Image-space ops in NHWC layout (resize, etc).
 2D nearest/bilinear upsample. Used by VAE decoders and the LTX-2 latent
 upsampler.
 
+Also hosts `ConvTranspose2d` (`forward` / `backward`). As of 2026-04-18 the
+forward GPU path is real — implemented in `cuda_kernels.rs::conv_transpose2d_forward`
+by reducing to `conv2d_forward` via **zero-insert on H/W** (per-stride dilation),
+**transposed-conv math padding**, **spatial kernel flip**, and an **in/out channel
+axis transpose** of the weight. Supports `groups=1` and `dilation=(1,1)` only;
+other configurations return `Error::Unsupported`. Backward still routes to the
+pre-existing `conv_transpose2d_backward` stub. BF16 and F32 tensors both flow
+through unchanged — the path is dtype-agnostic.
+
 ---
 
 ## Misc
