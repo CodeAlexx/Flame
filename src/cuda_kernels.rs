@@ -1381,18 +1381,235 @@ impl CudaKernels {
     // Transposed convolution operations
     pub fn conv_transpose2d_forward(
         &self,
-        _input: &Tensor,
-        _weight: &Tensor,
-        _bias: Option<&Tensor>,
-        _stride: (usize, usize),
-        _padding: (usize, usize),
-        _output_padding: (usize, usize),
-        _groups: usize,
-        _dilation: (usize, usize),
+        input: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        output_padding: (usize, usize),
+        groups: usize,
+        dilation: (usize, usize),
     ) -> Result<Tensor> {
-        Err(Error::InvalidOperation(
-            "ConvTranspose2d forward GPU kernel not yet implemented".into(),
-        ))
+        fn zero_insert_width(x: &Tensor, stride_w: usize) -> Result<Tensor> {
+            if stride_w <= 1 {
+                return Ok(x.clone());
+            }
+            let dims = x.shape().dims();
+            if dims.len() != 4 {
+                return Err(Error::InvalidOperation(format!(
+                    "conv_transpose2d zero_insert_width expects 4D input, got {:?}",
+                    dims
+                )));
+            }
+            let (b, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
+            let x5 = x.reshape(&[b, c, h, w, 1])?;
+            let zeros = Tensor::zeros_dtype(
+                Shape::from_dims(&[b, c, h, w, stride_w - 1]),
+                x.dtype(),
+                x.device().clone(),
+            )?;
+            let cat = Tensor::cat(&[&x5, &zeros], 4)?;
+            let flat = cat.reshape(&[b, c, h, w * stride_w])?;
+            flat.narrow(3, 0, (w - 1) * stride_w + 1)
+        }
+
+        fn zero_insert_height(x: &Tensor, stride_h: usize) -> Result<Tensor> {
+            if stride_h <= 1 {
+                return Ok(x.clone());
+            }
+            let dims = x.shape().dims();
+            if dims.len() != 4 {
+                return Err(Error::InvalidOperation(format!(
+                    "conv_transpose2d zero_insert_height expects 4D input, got {:?}",
+                    dims
+                )));
+            }
+            let (b, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
+            let x5 = x.reshape(&[b, c, h, 1, w])?;
+            let zeros = Tensor::zeros_dtype(
+                Shape::from_dims(&[b, c, h, stride_h - 1, w]),
+                x.dtype(),
+                x.device().clone(),
+            )?;
+            let cat = Tensor::cat(&[&x5, &zeros], 3)?;
+            let flat = cat.reshape(&[b, c, h * stride_h, w])?;
+            flat.narrow(2, 0, (h - 1) * stride_h + 1)
+        }
+
+        fn zero_insert_hw(x: &Tensor, stride: (usize, usize)) -> Result<Tensor> {
+            let x = zero_insert_height(x, stride.0)?;
+            zero_insert_width(&x, stride.1)
+        }
+
+        fn pad_h(x: &Tensor, top: usize, bottom: usize) -> Result<Tensor> {
+            if top == 0 && bottom == 0 {
+                return Ok(x.clone());
+            }
+            let dims = x.shape().dims();
+            if dims.len() != 4 {
+                return Err(Error::InvalidOperation(format!(
+                    "conv_transpose2d pad_h expects 4D input, got {:?}",
+                    dims
+                )));
+            }
+            let (b, c, _h, w) = (dims[0], dims[1], dims[2], dims[3]);
+            let mut parts: Vec<Tensor> = Vec::new();
+            if top > 0 {
+                parts.push(Tensor::zeros_dtype(
+                    Shape::from_dims(&[b, c, top, w]),
+                    x.dtype(),
+                    x.device().clone(),
+                )?);
+            }
+            parts.push(x.clone());
+            if bottom > 0 {
+                parts.push(Tensor::zeros_dtype(
+                    Shape::from_dims(&[b, c, bottom, w]),
+                    x.dtype(),
+                    x.device().clone(),
+                )?);
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            Tensor::cat(&refs, 2)
+        }
+
+        fn pad_w(x: &Tensor, left: usize, right: usize) -> Result<Tensor> {
+            if left == 0 && right == 0 {
+                return Ok(x.clone());
+            }
+            let dims = x.shape().dims();
+            if dims.len() != 4 {
+                return Err(Error::InvalidOperation(format!(
+                    "conv_transpose2d pad_w expects 4D input, got {:?}",
+                    dims
+                )));
+            }
+            let (b, c, h, _w) = (dims[0], dims[1], dims[2], dims[3]);
+            let mut parts: Vec<Tensor> = Vec::new();
+            if left > 0 {
+                parts.push(Tensor::zeros_dtype(
+                    Shape::from_dims(&[b, c, h, left]),
+                    x.dtype(),
+                    x.device().clone(),
+                )?);
+            }
+            parts.push(x.clone());
+            if right > 0 {
+                parts.push(Tensor::zeros_dtype(
+                    Shape::from_dims(&[b, c, h, right]),
+                    x.dtype(),
+                    x.device().clone(),
+                )?);
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            Tensor::cat(&refs, 3)
+        }
+
+        fn pad_hw(x: &Tensor, top: usize, bottom: usize, left: usize, right: usize) -> Result<Tensor> {
+            let x = pad_h(x, top, bottom)?;
+            pad_w(&x, left, right)
+        }
+
+        fn flip_hw(weight: &Tensor) -> Result<Tensor> {
+            let w = weight.flip(&[3])?;
+            let w = w.permute(&[0, 1, 3, 2])?;
+            let w = w.flip(&[3])?;
+            w.permute(&[0, 1, 3, 2])
+        }
+
+        let in_dims = input.shape().dims();
+        let w_dims = weight.shape().dims();
+        if in_dims.len() != 4 {
+            return Err(Error::InvalidOperation(format!(
+                "ConvTranspose2d requires 4D input, got {:?}",
+                in_dims
+            )));
+        }
+        if w_dims.len() != 4 {
+            return Err(Error::InvalidOperation(format!(
+                "ConvTranspose2d requires 4D weight, got {:?}",
+                w_dims
+            )));
+        }
+        if input.dtype() != weight.dtype() {
+            return Err(Error::InvalidOperation(format!(
+                "ConvTranspose2d dtype mismatch: input={:?} weight={:?}",
+                input.dtype(),
+                weight.dtype()
+            )));
+        }
+        if let Some(b) = bias {
+            if b.dtype() != input.dtype() {
+                return Err(Error::InvalidOperation(format!(
+                    "ConvTranspose2d bias dtype mismatch: input={:?} bias={:?}",
+                    input.dtype(),
+                    b.dtype()
+                )));
+            }
+        }
+        if groups != 1 {
+            return Err(Error::Unsupported(
+                "ConvTranspose2d forward currently supports groups=1 only".into(),
+            ));
+        }
+        if dilation != (1, 1) {
+            return Err(Error::Unsupported(format!(
+                "ConvTranspose2d forward currently supports dilation=(1,1) only, got {:?}",
+                dilation
+            )));
+        }
+        if stride.0 == 0 || stride.1 == 0 {
+            return Err(Error::InvalidOperation(
+                "ConvTranspose2d stride must be >= 1".into(),
+            ));
+        }
+        if output_padding.0 >= stride.0 || output_padding.1 >= stride.1 {
+            return Err(Error::InvalidOperation(format!(
+                "ConvTranspose2d output_padding {:?} must be smaller than stride {:?}",
+                output_padding, stride
+            )));
+        }
+
+        let in_channels = in_dims[1];
+        let in_ch_w = w_dims[0];
+        let out_channels = w_dims[1] * groups;
+        let kh = w_dims[2];
+        let kw = w_dims[3];
+        if in_channels != in_ch_w {
+            return Err(Error::InvalidOperation(format!(
+                "ConvTranspose2d input channels {} does not match weight {}",
+                in_channels, in_ch_w
+            )));
+        }
+        if bias.is_some_and(|b| b.shape().dims() != [out_channels]) {
+            return Err(Error::InvalidOperation(format!(
+                "ConvTranspose2d bias must have shape [{}]",
+                out_channels
+            )));
+        }
+        if kh == 0 || kw == 0 {
+            return Err(Error::InvalidOperation(
+                "ConvTranspose2d kernel dimensions must be non-zero".into(),
+            ));
+        }
+        if kh - 1 < padding.0 || kw - 1 < padding.1 {
+            return Err(Error::InvalidOperation(format!(
+                "ConvTranspose2d padding {:?} exceeds kernel-1 {:?}",
+                padding,
+                (kh - 1, kw - 1)
+            )));
+        }
+
+        let pad_top = (kh - 1) - padding.0;
+        let pad_bottom = pad_top + output_padding.0;
+        let pad_left = (kw - 1) - padding.1;
+        let pad_right = pad_left + output_padding.1;
+
+        let x_zi = zero_insert_hw(input, stride)?;
+        let x_padded = pad_hw(&x_zi, pad_top, pad_bottom, pad_left, pad_right)?;
+        let weight_reg = flip_hw(weight)?.permute(&[1, 0, 2, 3])?;
+
+        crate::ops::conv2d::conv2d_forward(&x_padded, &weight_reg, bias, (1, 1), (0, 0), 1)
     }
 
     pub fn conv_transpose2d_backward(
