@@ -27,6 +27,7 @@ pub enum Op {
     GELU { input: TensorId },
     SiLU { input: TensorId },
     Tanh { input: TensorId },
+    Sigmoid { input: TensorId },
     Square { input: TensorId },
     Sum { input: TensorId, input_shape: Shape },
     Mean { input: TensorId, input_shape: Shape },
@@ -266,7 +267,15 @@ impl AutogradEngine {
                         *input_grad = input_grad.add(&grad_input)?;
                     }
                 }
-                
+
+                Op::Sigmoid { input } => {
+                    if let Some(input_tensor) = entry.saved_tensors.get(input) {
+                        let grad_input = crate::autograd_ops::BackwardOps::sigmoid_backward(&grad_output, input_tensor)?;
+                        let input_grad = self.get_or_create_grad(*input, input_tensor.shape(), device)?;
+                        *input_grad = input_grad.add(&grad_input)?;
+                    }
+                }
+
                 Op::BatchMatMul { lhs, rhs } => {
                     // Same as MatMul but for batched tensors
                     if let (Some(lhs_tensor), Some(rhs_tensor)) = 
