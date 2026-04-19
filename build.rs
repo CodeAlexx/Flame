@@ -90,6 +90,7 @@ fn main() {
     cuda_sources.push("cuda/src/flame_sdpa_stub.cu");
     cuda_sources.push("cuda/src/flame_norm_bf16.cu");
     cuda_sources.push("cuda/upsample_nearest.cu");
+    cuda_sources.push("cuda/upsample_bilinear.cu");
 
     cuda_sources.push("kernels/adaln_layernorm_bf16.cu");
     cuda_sources.push("kernels/rope_kernels.cu");

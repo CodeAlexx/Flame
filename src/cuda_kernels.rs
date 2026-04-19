@@ -1813,10 +1813,86 @@ impl CudaKernels {
         output_size: (usize, usize),
         align_corners: bool,
     ) -> Result<Tensor> {
-        let _ = (input, output_size, align_corners);
-        Err(Error::InvalidOperation(
-            "Upsample2d bilinear GPU kernel not yet implemented".into(),
-        ))
+        let (h_out, w_out) = output_size;
+        let shape = input.shape().dims();
+        let (batch, channels, h_in, w_in) = (shape[0], shape[1], shape[2], shape[3]);
+
+        let mut output = Tensor::empty_dtype(
+            Shape::from_dims(&[batch, channels, h_out, w_out]),
+            input.dtype(),
+            input.device.clone(),
+        )?;
+
+        let stream = self.device.cuda_stream_raw_ptr();
+
+        unsafe {
+            match input.dtype() {
+                DType::F32 => {
+                    let src = input.storage.try_as_slice_f32()?;
+                    let dst = output.storage_mut().try_as_mut_slice_f32()?;
+                    let src_ptr = *src.device_ptr() as *const core::ffi::c_void;
+                    let dst_ptr = *dst.device_ptr() as *mut core::ffi::c_void;
+                    let status = ffi::fc_upsample2d_bilinear_f32(
+                        src_ptr,
+                        dst_ptr,
+                        batch as i32,
+                        channels as i32,
+                        h_in as i32,
+                        w_in as i32,
+                        h_out as i32,
+                        w_out as i32,
+                        align_corners as i32,
+                        stream,
+                    );
+                    if status != 0 {
+                        return Err(Error::Cuda(format!(
+                            "upsample2d_bilinear_f32 failed: {}",
+                            status
+                        )));
+                    }
+                }
+                DType::BF16 => {
+                    #[cfg(feature = "bf16_u16")]
+                    {
+                        let src_ptr = input.as_device_ptr_bf16("upsample2d_bilinear:src")?
+                            as *const core::ffi::c_void;
+                        let dst_ptr = output.as_mut_device_ptr_bf16("upsample2d_bilinear:dst")?
+                            as *mut core::ffi::c_void;
+                        let status = ffi::fc_upsample2d_bilinear_bf16(
+                            src_ptr,
+                            dst_ptr,
+                            batch as i32,
+                            channels as i32,
+                            h_in as i32,
+                            w_in as i32,
+                            h_out as i32,
+                            w_out as i32,
+                            align_corners as i32,
+                            stream,
+                        );
+                        if status != 0 {
+                            return Err(Error::Cuda(format!(
+                                "upsample2d_bilinear_bf16 failed: {}",
+                                status
+                            )));
+                        }
+                    }
+                    #[cfg(not(feature = "bf16_u16"))]
+                    {
+                        return Err(Error::Unsupported(
+                            "BF16 bilinear upsample requires bf16_u16 feature".into(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(Error::Unsupported(format!(
+                        "upsample2d_bilinear unsupported dtype {:?}",
+                        input.dtype()
+                    )))
+                }
+            }
+        }
+        Ok(output)
     }
 
     pub fn upsample2d_nearest_backward(

@@ -505,6 +505,32 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    pub fn fc_upsample2d_bilinear_bf16(
+        input: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        batch: i32,
+        channels: i32,
+        h_in: i32,
+        w_in: i32,
+        h_out: i32,
+        w_out: i32,
+        align_corners: i32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn fc_upsample2d_bilinear_f32(
+        input: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        batch: i32,
+        channels: i32,
+        h_in: i32,
+        w_in: i32,
+        h_out: i32,
+        w_out: i32,
+        align_corners: i32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     // ── Fused inference kernels ──────────────────────────────────────
 
     /// GPU-side FP8 E4M3 → BF16 dequant: out[i] = bf16(fp8(in[i]) * scale)
