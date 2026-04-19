@@ -1,50 +1,31 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! FIXME: kernel bug at Sk > BKV=64 tile size (regardless of alignment).
+//! Regression test for the multi-K-tile softmax-tail bug in
+//! `flame_core::sdpa::forward_flash_bf16` (FA2 WMMA kernel at
+//! `src/cuda/flash_attention_fwd.cu`).
 //!
-//! Minimal repro for an under-scaling bug in `flame_core::sdpa::forward_flash_bf16`
-//! — the FA2 WMMA kernel at `src/cuda/flash_attention_fwd.cu` — surfaced by
-//! the Stable Cascade AttnBlock parity test.
+//! ## The bug (fixed 2026-04-19)
 //!
-//! ## What we observed
+//! The kernel zero-padded invalid tail columns in the second K tile with
+//! `0.0f` before per-row softmax. `exp(0 - new_max)` then contributed ~56
+//! spurious terms to the online-softmax denominator for `Sk=72`
+//! (`kv_rows=8` in the second tile), inflating it by ~25-30% and
+//! under-scaling output by a matching amount.
 //!
-//! Running Q `[1, 32, 64, 64]` and K/V `[1, 32, Sk, 64]` against a materialized
-//! FP32 reference:
+//! Observed before fix:
 //!
 //! ```text
-//! Sk=64  cos_sim=0.999995  abs_mean(flash)=0.153  abs_mean(ref)=0.153    OK (1 tile)
-//! Sk=71  cos_sim=0.997969  abs_mean(flash)=0.100  abs_mean(ref)=0.149    BAD (flash ≈ 67% of ref)
-//! Sk=72  cos_sim=0.998328  abs_mean(flash)=0.099  abs_mean(ref)=0.147    BAD (flash ≈ 68% of ref)
+//! Sk=64  cos_sim=0.999995  mag_ratio=1.000   OK (1 tile, no tail)
+//! Sk=71  cos_sim=0.997969  mag_ratio=0.672   BAD
+//! Sk=72  cos_sim=0.998328  mag_ratio=0.678   BAD
 //! ```
 //!
-//! The skeptic initially hypothesized "Sk not a multiple of 16", but Sk=72
-//! (divisible by 16, 8, and 72) exhibits the same ~32% under-scale as Sk=71.
-//! The actual pattern is **Sk > BKV=64 tile size** — i.e. any second K tile
-//! collapses/under-contributes to the online softmax denominator, which
-//! makes the output magnitude about 2/3 of correct.
+//! Fix: mask invalid tail cells with `-INFINITY` instead of `0.0f`.
+//! `exp(-inf - m) == 0` exactly, and `max(x, -inf) == x` so tile_max
+//! stays correct. See `mask_tail_2d_float_neg_inf` in the kernel.
 //!
-//! The per-element cos_sim ≈ 0.998 means the *direction* of the vectors is
-//! close but the *magnitude* is off — consistent with a scale bug rather
-//! than a full correctness failure.
-//!
-//! ## Why this is `#[ignore]`d
-//!
-//! The kernel bug is real and blocks Stable Cascade inference (CLIP seq=77
-//! and arbitrary H*W resolutions regularly exceed 64 K tokens). This test
-//! is kept as a *failing* test, gated by `#[ignore]`, so the bug remains
-//! visible without breaking CI. Run explicitly to check repro:
-//!
-//! ```bash
-//! cargo test --release -p flame-core --test sdpa_ragged_sk -- --ignored --nocapture
-//! ```
-//!
-//! The follow-up work for the flame-core maintainer is to fix the online
-//! softmax denominator accumulation across K tiles in
-//! `src/cuda/flash_attention_fwd.cu`. Until then, any caller that needs
-//! SDPA with `Sk > 64` must route through the materialized path by either:
-//!   - setting `FLAME_NO_FLASH_ATTN=1` for the whole process, or
-//!   - calling `sdpa::forward_with_bias(q, k, v, None, None)` explicitly,
-//!     which always uses the FP32 materialized path.
+//! After fix all three sizes return `mag_ratio=1.000` and
+//! `cos_sim ≥ 0.9999`.
 
 use anyhow::Result;
 use flame_core::{sdpa, DType, Device, Shape, Tensor};
@@ -126,14 +107,12 @@ fn mag_ratio(flash_abs_mean: f32, ref_abs_mean: f32) -> f32 {
     }
 }
 
-/// FIXME: kernel bug at Sk > BKV=64 tile size.
+/// Regression: multi-K-tile softmax under-scale bug (fixed 2026-04-19).
 ///
-/// Explicitly `#[ignore]`d because the kernel is broken: Sk=71 and Sk=72
-/// both fail, demonstrating the bug is NOT about tile alignment but about
-/// any multi-tile K. This test is the canonical repro; it stays committed
-/// so the bug remains visible until fixed in `src/cuda/flash_attention_fwd.cu`.
+/// Covers both Sk > BKV=64 with tail (Sk=71, 72) and Sk exactly at the
+/// tile boundary (Sk=64). All three must return `mag_ratio ≥ 0.95` and
+/// `cos_sim ≥ 0.999`.
 #[test]
-#[ignore = "FIXME: kernel bug at non-aligned Sk (actually: any Sk > BKV=64 tile) — see module doc"]
 fn sdpa_ragged_sk_minimal_repro() -> Result<()> {
     let device = match Device::cuda(0) {
         Ok(dev) => dev.cuda_device_arc(),
@@ -166,6 +145,23 @@ fn sdpa_ragged_sk_minimal_repro() -> Result<()> {
         cs_71, am_f_71, am_r_71, mag_ratio(am_f_71, am_r_71)
     );
 
+    // Sk=128 — two full tiles, no tail. Should have been healthy even
+    // under the old bug, but locks the common case.
+    let (cs_128, am_f_128, am_r_128) = run_one(128, &device)?;
+    println!(
+        "[sdpa_ragged_sk] Sk=128 cos_sim={:.6}  abs_mean(flash)={:.4e}  abs_mean(ref)={:.4e}  mag_ratio={:.4}",
+        cs_128, am_f_128, am_r_128, mag_ratio(am_f_128, am_r_128)
+    );
+
+    // Sk=200 — three K tiles, last one ragged (kv_rows=8). Catches a
+    // hypothetical off-by-one in the num_kv_tiles loop that two-tile
+    // coverage alone could miss.
+    let (cs_200, am_f_200, am_r_200) = run_one(200, &device)?;
+    println!(
+        "[sdpa_ragged_sk] Sk=200 cos_sim={:.6}  abs_mean(flash)={:.4e}  abs_mean(ref)={:.4e}  mag_ratio={:.4}",
+        cs_200, am_f_200, am_r_200, mag_ratio(am_f_200, am_r_200)
+    );
+
     // Single-tile control must pass. If this fails, the reference path
     // itself is broken; bail with a different message so we don't mis-
     // diagnose as a kernel bug.
@@ -176,21 +172,25 @@ fn sdpa_ragged_sk_minimal_repro() -> Result<()> {
         cs_64
     );
 
-    // These are the bug: multi-tile K produces ~32% magnitude shortfall.
-    // We assert they should hold; this test is #[ignore]d so CI stays
-    // green, but running it must demonstrate the failure.
-    let ratio_72 = mag_ratio(am_f_72, am_r_72);
-    let ratio_71 = mag_ratio(am_f_71, am_r_71);
-    assert!(
-        ratio_72 >= 0.95,
-        "Sk=72 mag_ratio {:.4} — FA2 under-scales by ~{:.0}% (kernel bug)",
-        ratio_72, (1.0 - ratio_72) * 100.0
-    );
-    assert!(
-        ratio_71 >= 0.95,
-        "Sk=71 mag_ratio {:.4} — FA2 under-scales by ~{:.0}% (kernel bug)",
-        ratio_71, (1.0 - ratio_71) * 100.0
-    );
+    // Multi-tile K regressions. Each must be within BF16 precision of
+    // the materialized reference.
+    for (label, cs, ratio) in [
+        ("Sk=72",  cs_72,  mag_ratio(am_f_72,  am_r_72)),
+        ("Sk=71",  cs_71,  mag_ratio(am_f_71,  am_r_71)),
+        ("Sk=128", cs_128, mag_ratio(am_f_128, am_r_128)),
+        ("Sk=200", cs_200, mag_ratio(am_f_200, am_r_200)),
+    ] {
+        assert!(
+            ratio >= 0.95,
+            "{label} mag_ratio {:.4} — FA2 under-scales by ~{:.0}% (regression)",
+            ratio, (1.0 - ratio) * 100.0
+        );
+        assert!(
+            cs >= 0.999,
+            "{label} cos_sim {:.6} < 0.999 — FA2 disagrees with reference (regression)",
+            cs
+        );
+    }
 
     Ok(())
 }

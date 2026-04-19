@@ -1,23 +1,20 @@
-// flash_attention_fwd_fixed.cu
+// flash_attention_fwd.cu — LIVE FA2 forward kernel.
 //
-// User-provided (2026-04-17) alternative FA2 forward kernel.
+// Templated WMMA flash attention with K/V-reuse shared memory layout
+// (s_K and s_V alias the same buffer; K is used for QK^T, then overwritten
+// by V for PV). Supports head_dim ∈ {64, 96, 128} via runtime dispatch.
+// Tiles: TILE_Q=64, TILE_KV=64, NUM_WARPS=16.
 //
-// Purpose: reduced KV tile (32) for HD=128 to fit shared-memory budget on
-// 3090/4090-class cards; adds ragged-tail padding/zeroing and lifts the
-// specialization into a single generic templated kernel with runtime
-// head_dim dispatch (64/96/128).
+// Swapped in 2026-04-17 (replaced the prior Phase 1.6 `cp.async`-vectorized
+// kernel — see `flash_attention_fwd.phase16.cu.bak` on disk). The K/V-reuse
+// trick fits HD=128 into SM_86's 100 KB opt-in shared-mem budget that the
+// prior layout blew through.
 //
-// STATUS: saved as backup. Current in-tree kernel
-// (`flash_attention_fwd.cu`, Phase 1.6) already passes
-// `tests/fa2_parity_naive.rs` and runs clean end-to-end for FLUX.1-dev and
-// ERNIE-Image in the inference-flame harness (see commit history
-// 2026-04-17). No live swap performed — kept on disk for reference, future
-// porting, or if later work exposes a shape that the current kernel can't
-// service.
-//
-// DO NOT include this file in build.rs as-is. It defines the same
-// extern-C symbol `flame_flash_attention_bf16` as the live kernel and will
-// conflict at link time if both are compiled.
+// 2026-04-19: fixed multi-tile softmax under-scale. Invalid K-tile tail
+// columns were masked with 0.0f before per-row softmax, leaving ~56
+// spurious exp(-new_max) terms in the denominator for Sk=72 (second tile
+// kv_rows=8) — output under-scaled ~32%. Now masked with -INFINITY via
+// `mask_tail_2d_float_neg_inf`. Regression: `tests/sdpa_ragged_sk.rs`.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -65,6 +62,28 @@ __device__ __forceinline__ void zero_tail_2d_float(
         int r = i / TILE_COLS;
         int c = i % TILE_COLS;
         if (r >= valid_rows || c >= valid_cols) ptr[i] = 0.0f;
+    }
+}
+
+// Softmax-safe tail mask: invalid positions become -infinity so they do not
+// affect tile_max (max(x,-inf)=x) and exp(-inf-m)=0 (no contribution to the
+// per-row denominator). Using 0.0f as the fill value — the standard
+// "zero-pad" approach — is WRONG for softmax: it leaves 56 spurious
+// exp(-new_max) terms in `tile_sum` at Sk=72 (kv_rows=8 in the second
+// tile), inflating the denominator ~25-30% and under-scaling output.
+template<int TILE_ROWS, int TILE_COLS>
+__device__ __forceinline__ void mask_tail_2d_float_neg_inf(
+    float* ptr,
+    int valid_rows,
+    int valid_cols,
+    int tid,
+    int num_threads
+) {
+    const int total = TILE_ROWS * TILE_COLS;
+    for (int i = tid; i < total; i += num_threads) {
+        int r = i / TILE_COLS;
+        int c = i % TILE_COLS;
+        if (r >= valid_rows || c >= valid_cols) ptr[i] = -INFINITY;
     }
 }
 
@@ -179,7 +198,7 @@ __global__ void flash_attn_fwd_kernel(
             s_V, V_base + (size_t)kv_start * HD, kv_rows, HD, HD, tid, THREADS
         );
 
-        zero_tail_2d_float<TILE_Q, TILE_KV>(s_S, q_rows, kv_rows, tid, THREADS);
+        mask_tail_2d_float_neg_inf<TILE_Q, TILE_KV>(s_S, q_rows, kv_rows, tid, THREADS);
         __syncthreads();
 
         for (int qi = tid; qi < q_rows; qi += THREADS) {
