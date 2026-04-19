@@ -80,6 +80,11 @@ crate-type = ["rlib", "cdylib"]
 name = "fa2_forward"
 harness = false
 
+# Activation-backward fused-vs-decomposed microbench (2026-04-18).
+[[bench]]
+name = "activation_bwd"
+harness = false
+
 [build-dependencies]
 cbindgen = "0.26"
 cc = "1.0"
