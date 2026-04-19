@@ -488,17 +488,27 @@ fn load_tensors_safetensors(
             }
             "F8_E4M3" => {
                 // FP8 E4M3: 1 byte per element. Dequant with per-tensor scale.
-                let scale_key = format!("{name}_scale");
-                let scale = if let Some(scale_info) = metadata.get(&scale_key) {
-                    let s_offsets = scale_info["data_offsets"].as_array()
-                        .and_then(|a| Some((a[0].as_u64()? as usize, a[1].as_u64()? as usize)));
-                    if let Some((s_start, _)) = s_offsets {
-                        f32::from_le_bytes([
-                            all_data[s_start], all_data[s_start+1],
-                            all_data[s_start+2], all_data[s_start+3],
-                        ])
-                    } else { 1.0 }
-                } else { 1.0 };
+                // Two naming conventions in the wild:
+                //   LTX-2:         `foo.weight_scale` (suffix on the key)
+                //   Comfy-scaled:  `foo.scale_weight` (replaces `.weight` with `.scale_weight`)
+                let read_scale = |s_start: usize| -> f32 {
+                    f32::from_le_bytes([
+                        all_data[s_start], all_data[s_start+1],
+                        all_data[s_start+2], all_data[s_start+3],
+                    ])
+                };
+                let lookup_scale = |key: &str| -> Option<f32> {
+                    let info = metadata.get(key)?;
+                    let off = info["data_offsets"].as_array()?;
+                    let s_start = off[0].as_u64()? as usize;
+                    Some(read_scale(s_start))
+                };
+                let scale = lookup_scale(&format!("{name}_scale"))
+                    .or_else(|| {
+                        name.strip_suffix(".weight")
+                            .and_then(|base| lookup_scale(&format!("{base}.scale_weight")))
+                    })
+                    .unwrap_or(1.0);
                 let num_elems = end - start;
                 let mut bf16_u16 = vec![0u16; num_elems];
                 for (value, &byte) in bf16_u16.iter_mut().zip(all_data[start..end].iter()) {
@@ -638,18 +648,22 @@ where
                 tensor
             }
             "F8_E4M3" => {
-                // FP8 E4M3: 1 byte per element. Dequant: value * weight_scale → BF16
-                let scale_key = format!("{name}_scale");
-                let scale = if let Some(scale_info) = metadata_obj.get(&scale_key) {
-                    let s_offsets = scale_info["data_offsets"].as_array()
-                        .and_then(|a| Some((
-                            data_start + a[0].as_u64()? as usize,
-                            data_start + a[1].as_u64()? as usize,
-                        )));
-                    if let Some((s_start, _s_end)) = s_offsets {
-                        f32::from_le_bytes([mmap[s_start], mmap[s_start+1], mmap[s_start+2], mmap[s_start+3]])
-                    } else { 1.0 }
-                } else { 1.0 };
+                // FP8 E4M3: 1 byte per element. Dequant: value * weight_scale → BF16.
+                // Two naming conventions (see load_tensors for details).
+                let lookup_scale = |key: &str| -> Option<f32> {
+                    let si = metadata_obj.get(key)?;
+                    let off = si["data_offsets"].as_array()?;
+                    let s_start = data_start + off[0].as_u64()? as usize;
+                    Some(f32::from_le_bytes([
+                        mmap[s_start], mmap[s_start+1], mmap[s_start+2], mmap[s_start+3],
+                    ]))
+                };
+                let scale = lookup_scale(&format!("{name}_scale"))
+                    .or_else(|| {
+                        name.strip_suffix(".weight")
+                            .and_then(|base| lookup_scale(&format!("{base}.scale_weight")))
+                    })
+                    .unwrap_or(1.0);
                 let num_elems = data.len();
                 let mut bf16_u16 = vec![0u16; num_elems];
                 for (value, &byte) in bf16_u16.iter_mut().zip(data.iter()) {
