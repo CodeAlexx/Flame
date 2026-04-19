@@ -251,6 +251,70 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    pub fn flame_relu_backward_bf16(
+        grad_out: *const core::ffi::c_void,
+        input: *const core::ffi::c_void,
+        grad_in: *mut core::ffi::c_void,
+        n: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn flame_relu_backward_f32(
+        grad_out: *const core::ffi::c_void,
+        input: *const core::ffi::c_void,
+        grad_in: *mut core::ffi::c_void,
+        n: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn flame_gelu_backward_bf16(
+        grad_out: *const core::ffi::c_void,
+        input: *const core::ffi::c_void,
+        grad_in: *mut core::ffi::c_void,
+        n: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn flame_gelu_backward_f32(
+        grad_out: *const core::ffi::c_void,
+        input: *const core::ffi::c_void,
+        grad_in: *mut core::ffi::c_void,
+        n: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn flame_tanh_backward_bf16(
+        grad_out: *const core::ffi::c_void,
+        input: *const core::ffi::c_void,
+        grad_in: *mut core::ffi::c_void,
+        n: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn flame_tanh_backward_f32(
+        grad_out: *const core::ffi::c_void,
+        input: *const core::ffi::c_void,
+        grad_in: *mut core::ffi::c_void,
+        n: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn flame_sigmoid_backward_bf16(
+        grad_out: *const core::ffi::c_void,
+        input: *const core::ffi::c_void,
+        grad_in: *mut core::ffi::c_void,
+        n: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn flame_sigmoid_backward_f32(
+        grad_out: *const core::ffi::c_void,
+        input: *const core::ffi::c_void,
+        grad_in: *mut core::ffi::c_void,
+        n: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     pub fn flame_swiglu_backward_bf16(
         grad_out: *const core::ffi::c_void,
         gate: *const core::ffi::c_void,
