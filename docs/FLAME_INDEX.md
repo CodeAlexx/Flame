@@ -342,6 +342,7 @@ to see what kernels are linked in. Notable groups:
 - `flame_sdpa_add_mask_tile_fp32` / `flame_sdpa_softmax_from_lse_tile` / `flame_sdpa_lse_from_logits_tile` / `flame_sdpa_lse_merge_rows` / `flame_sdpa_dropout_bf16_inplace` (`:259-303`) — chunked SDPA primitives
 - `flame_geglu_pointwise_fp32` (`:313`) — GeGLU
 - `fc_upsample2d_nearest_bf16 / fc_upsample2d_nearest_f32` (`:382,394`) — VAE upsample
+- `fc_upsample2d_bilinear_bf16 / fc_upsample2d_bilinear_f32` (`:509,522`) — bilinear 2D upsample (BF16 + F32), PyTorch-matching index math with `align_corners`. Added 2026-04-19 to unblock Cascade.
 - `flame_fp8_to_bf16` (`:409`) — FP8 dequant
 - `flame_fp16_to_bf16` (`:416`) — FP16 → BF16 conversion (in-place safe). Used by BlockOffloader for FP16 checkpoints.
 - `flame_flash_attention_bf16` (`:424`) — wmma flash attention
@@ -545,7 +546,7 @@ backward. Foundation of the "offload instead of recompute" checkpoint path.
 - `mixed_precision::*` — fp16/bf16 amp helpers
 - `embedding::Embedding` — token embedding
 - `image_ops_nhwc::*` — image space ops in NHWC
-- `upsampling::*` — 2D upsample (nearest / bilinear)
+- `upsampling::*` — 2D upsample (nearest / bilinear — both BF16 + F32). Bilinear kernel `cuda/upsample_bilinear.cu` added 2026-04-19; backed `UpsampleMode::Bilinear` was an `Err("not yet implemented")` prior.
 - `vae::autoencoder_kl::*` / `vae::zimage_decoder::*` — generic VAE pieces (Z-Image specific)
 - `kernels::adaln::*` — AdaLN kernel (feature-gated)
 - `fused_kernels::*` — older fused kernel registry (training)

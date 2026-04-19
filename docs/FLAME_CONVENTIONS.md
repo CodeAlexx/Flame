@@ -500,6 +500,23 @@ no scratch alloc). For everything else it falls back to the slow 5-step
 pipeline `max_dim → sub → exp → sum → div`. If you need fast softmax for a
 non-last dim, you'll need to permute first.
 
+### Softmax tail masking: `-INFINITY`, not `0.0f`
+
+When a kernel has to mask invalid tail positions before an online
+softmax (ragged sequence lengths, KV-tile boundaries, padding), fill
+with `-INFINITY` rather than `0.0f`. Reason: `exp(0 - new_max)` is
+small but **nonzero**, so masked cells contribute spurious terms to
+the softmax denominator. `exp(-∞ - m) == 0` exactly, and
+`max(x, -∞) == x` so the running max stays correct.
+
+The flash-attn forward (`src/cuda/flash_attention_fwd.cu`) got bitten
+by this — 0.0f-masked invalid cells in the second K tile inflated
+the denominator ~25-30% at Sk=72, under-scaling output ~32%. Fixed
+2026-04-19 via `mask_tail_2d_float_neg_inf`; regression test
+`tests/sdpa_ragged_sk.rs`. Any new online-softmax kernel should reach
+for this helper (or write its own equivalent) — don't reuse
+`zero_tail_2d_float`.
+
 ### Group norm layout trap
 
 `cuda_ops_bf16::group_norm_bf16` takes **NHWC** (`[N, H, W, C]`), not NCHW.

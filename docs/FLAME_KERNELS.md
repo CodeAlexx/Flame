@@ -173,86 +173,78 @@ locations are:
 
 ### `src/cuda/flash_attention_fwd.cu` — FA2-style wmma flash attention (LIVE)
 
-The single most-important file in this directory. Phase-1 FA2 rewrite (2026-04)
-— doubles the query tile from `BQ=32` to `BQ=64` under the SM_86 100 KB
-per-block shared-mem budget. Phase 1.6 (2026-04) adds `cp.async` loads for
-both K and V, with V's prefetch overlapping the online-softmax compute for
-partial HBM-latency hiding (full KV double-buffering is pending — see
-`FA2_CP_ASYNC_DESIGN.md` for the investigation and reverted attempt).
+The single most-important file in this directory. Current kernel is a
+templated K/V-reuse WMMA design swapped in 2026-04-17 (replacing the
+Phase 1.6 `cp.async`-vectorized kernel, kept on disk as
+`flash_attention_fwd.phase16.cu.bak`). Supports HD ∈ {64, 96, 128}
+via runtime dispatch.
 
 | Symbol | Line | Notes |
 |---|---|---|
-| `fa2_fwd_hd64 / hd96 / hd128` | `:134` (macro-generated) | wmma BF16 attention forward. Compile-time specialized per head_dim. Uses `nvcuda::wmma` 16x16x16 BF16 fragments + FP32 accumulation + online softmax. **SM_80+** required (3090 / Ada / Hopper). |
-| `flame_flash_attention_bf16` | `:362` | C entry point: `(Q, K, V, O, LSE, batch_heads, seq_q, seq_kv, head_dim, stream)` — signature unchanged from the pre-Phase-1 kernel. |
+| `flash_attn_fwd_kernel<TILE_Q, TILE_KV, HD, NUM_WARPS>` | `:87` | Templated WMMA kernel — FP32 accumulators, online softmax, K/V-reuse shared buffer. |
+| `flame_flash_attention_bf16` | `:333` | C entry point: `(Q, K, V, O, LSE, batch_heads, seq_q, seq_kv, head_dim, stream)`. LSE output unused (backward path stores it separately). |
+| `launch_fwd` | `:263` | Per-head_dim dispatch into the template specialization. |
+| `mask_tail_2d_float_neg_inf` | `:71` | Softmax-safe tail mask — fills invalid cells with `-INFINITY`. See gotcha in CONVENTIONS. |
 
-**Tile sizes**: `BQ=64, BKV=64, NUM_WARPS=4, THREADS=128`. Warp layout is
-`WARPS_M=4, WARPS_N=1` — each warp exclusively owns 16 Q rows so softmax is
-entirely within-warp (no cross-warp max/sum scratch).
+**Tile sizes**: `TILE_Q=64, TILE_KV=64, NUM_WARPS=16, THREADS=512`.
+Warp layout is 4 row-groups × 4 col-groups (each warp owns one 16×16
+QK^T block). PV matmul scatters across `row_group × hd_tile` pairs
+with an atomicAdd into `s_O`.
 
-**Shared-memory layout** (HD=128 worst case, ≤ SM_86's 100 KB opt-in):
+**Shared-memory layout** (HD=128 worst case):
 | Region | Dtype | Size (HD=128) | Role |
 |---|---|---|---|
 | `s_Q`  | BF16  | 16 KB  | Q tile, persists across KV iters |
-| `s_KV` | BF16  | 16 KB  | **Reused** for K_j then V_j each iter |
+| `s_K ≡ s_V` | BF16 | 16 KB | **Aliased** — K is used for QK^T then overwritten by V for PV |
 | `s_S`  | FP32  | 16 KB  | QK^T scores for this iter |
 | `s_P`  | BF16  | 8 KB   | Softmax probs for this iter (separate region) |
 | `s_O`  | FP32  | 32 KB  | Running output accumulator |
 | `s_m`, `s_l` | FP32 | 0.5 KB | Per-row running max & denom |
-| **Total**   |       | **88.5 KB** | — |
 
-**The `s_KV` sharing is the budget trick**: the original FA2 keeps separate
-`s_K` and `s_V` resident so V is ready immediately after softmax. We drop
-that and reload V into `s_KV` after QK^T completes (K is dead by then). Saves
-16 KB — which is exactly what lets `BQ=64` fit on SM_86.
+**K/V-reuse is the budget trick**: aliasing `s_K` and `s_V` (K is
+dead after QK^T, V gets loaded into the same slot before PV) saves
+one `TILE_KV*HD` BF16 region. That's exactly what fits HD=128,
+TILE_KV=64 within SM_86's 100 KB opt-in budget.
 
-**Stage 3 (P@V)** writes fragment outputs into a per-warp FP32 scratch placed
-at `s_S + warp_id * 256` (s_S is dead for this iter after softmax consumed
-it), then each warp does an in-place `+=` into its disjoint 16-row slab of
-`s_O`. No atomic ops; no cross-warp collisions.
+**2026-04-19 fix — multi-tile softmax under-scale at Sk > BKV=64.**
+Invalid K-tile tail columns were initially masked with `0.0f` before
+the per-row online softmax. `exp(0 - new_max)` then contributed ~56
+spurious terms to `tile_sum` at Sk=72 (kv_rows=8 in the second
+tile), inflating the denominator ~25-30% and under-scaling output
+~32%. Fix: mask invalid cells with `-INFINITY` via
+`mask_tail_2d_float_neg_inf`. Regression:
+`tests/sdpa_ragged_sk.rs` covers Sk ∈ {64, 71, 72, 128, 200}, all
+cos_sim ≥ 0.999995 and mag_ratio = 1.0000.
 
-**Softmax (Stage 2)**: per-row, each warp handles its 16 rows; lanes
-cooperate via `__shfl_xor_sync` butterfly reductions over BKV=64 cols. Handles
-partial last-Q-tile (`qi >= q_rows`) by zero-padding `s_P` so the subsequent
-PV wmma sees zeros.
+**Stage 3 (P@V)** each warp computes a 16×16 output block into a
+per-warp FP32 scratch placed at `s_S + warp_id * 256` (s_S is dead
+for this iter after softmax consumed it). Lanes then atomicAdd their
+scratch slots into `s_O`. The warp partitioning (`row_group × col_group`)
+already guarantees disjoint s_O targets, so the atomicAdd is conservative
+rather than necessary, but it keeps the code simple.
 
-**`load_tile_bf16_v8`** (line 99): vectorized `uint4` BF16 load (8 bf16 per
-thread per iter). Pads to **buffer rows** (not `valid_rows`) so trailing KV
-tiles and partial Q tiles zero-fill correctly. Without this the kernel was
-nondeterministic run-to-run; the pad-full-buffer pattern is mandatory.
+**Softmax (Stage 2)**: one thread per Q row in the valid-row loop
+(`for qi = tid; qi < q_rows; qi += THREADS`). Each thread scans its
+row's TILE_KV=64 cols serially to build `tile_max` and
+`tile_sum = Σ exp(s_S[qi,j] - new_max)`. Since all invalid tail cols
+are now `-INFINITY` (2026-04-19 fix), the serial scan can run the full
+TILE_KV without branching on validity.
 
-**LSE output**: when `LSE != nullptr`, writes `LSE[row] = m[row] + log(l[row])`
-for use by the (Phase 2) backward kernel.
+**Load helper `load_tile_bf16_zero_padded`** (`:37`): scalar BF16 load
+with a `valid_rows` clamp. Invalid rows are written as `__float2bfloat16(0)`
+— safe for Q (zero-padding doesn't contaminate the WMMA output since
+corresponding softmax scores are also tail-masked) and for V (zero V
+rows contribute zero through PV).
+
+**LSE output**: unused by this kernel. The `LSE` argument is kept in
+the C entry for signature compatibility with the backward kernel in
+`src/cuda/flash_attention_bwd.cu`, which stores its own LSE from
+scratch.
 
 **Parity**: `tests/fa2_parity_naive.rs` validates the kernel against a
-pure-Rust FP32-materialized reference (no shared tiling with FA2) across
-4 configs (`N ∈ {512, 4096} × HD ∈ {64, 128}`, H=8, B=1). Passes at
-`cos_sim ≥ 0.9999`, `max_abs ≤ 1e-2` — kernel numerics verified against
-an independent reference.
-
-**`cp.async` pipeline**: K_j is loaded via `cp.async.cg.shared.global`
-+ `cp.async.commit_group` + `cp.async.wait_group<0>`. V_j's prefetch is
-issued immediately after QK^T finishes reading K_j (K_j is dead; V_j
-overwrites the same `s_KV` slot) and a `wait_group<0>` sits just before
-PV. The softmax stage runs while V_j's HBM read is in flight, hiding
-that latency. Full double-buffered KV (K-prefetch overlapping PV) would
-require reclaiming another SMEM slot and hit unresolved correctness
-issues in two separate attempts (BKV=48 regressed 0.83×, s_P/s_S fold
-corrupts `store_matrix_sync` writes). Single-buffer `cp.async` delivers
-1.35×–1.62× over the pre-Phase-1 BQ=32 kernel. The gap-to-torch at
-typical sequence lengths remains — see `FA2_CP_ASYNC_DESIGN.md` for
-the investigation trail.
-
-**Perf (B=1 H=16 HD=128, RTX 3090 Ti, median of 20 trials, 5 warmup)**:
-
-```
-N        Phase 1.5 (current)
-1024     1.07 ms
-4096    13.75 ms
-16384    190.2 ms
-65536   3073 ms
-```
-
-~1.36×–1.63× over the pre-Phase-1 BQ=32 WMMA kernel (now deleted).
+pure-Rust FP32-materialized reference. `tests/sdpa_ragged_sk.rs`
+covers the Sk > BKV regression at Sk ∈ {64, 71, 72, 128, 200} —
+the bug fixed on 2026-04-19.
 
 ### `src/cuda/fused_linear3d.cu` — cuBLASLt 3D linear (LIVE)
 
@@ -515,6 +507,26 @@ from Rust; included in the `gemm_bf16_cublaslt.cu` translation unit).
 | `upsample2d_nearest_nchw_kernel` | `:17` | Nearest upsample, NCHW BF16. |
 | `fc_upsample2d_nearest_bf16` | `:52` | BF16 entry |
 | `fc_upsample2d_nearest_f32` | `:87` | F32 entry |
+
+### `cuda/upsample_bilinear.cu`
+
+2D bilinear upsample over NCHW tensors, matches PyTorch's
+`F.interpolate(mode='bilinear')` (both `align_corners=True` and
+`=False`). Templated over element type; BF16 inputs are upcast to F32
+for the weighted-sum compute and rounded back on store (don't
+accumulate 4 taps in a 7-bit mantissa). Parity vs a CPU reference in
+`tests/upsample_bilinear_parity.rs`: F32 cos_sim = 1.0, BF16 cos_sim
+= 0.999999 / max_abs ≤ 8e-3.
+
+Reached through `CudaKernels::upsample2d_bilinear` (the F32/BF16
+dtype-dispatch wrapper in `src/cuda_kernels.rs:1810`), which is what
+`upsampling::Upsample2d { mode: Bilinear }` dispatches into.
+
+| Symbol | Line | Notes |
+|---|---|---|
+| `upsample2d_bilinear_nchw_kernel` | `:29` | Templated BF16/F32 bilinear kernel. |
+| `fc_upsample2d_bilinear_bf16` | `:108` | BF16 entry |
+| `fc_upsample2d_bilinear_f32` | `:141` | F32 entry |
 
 ### `cuda/permute0213.cu`
 
