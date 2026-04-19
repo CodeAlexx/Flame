@@ -479,6 +479,97 @@ fn tensor_raw_ptr_mut(t: &mut Tensor) -> Result<*mut core::ffi::c_void> {
     }
 }
 
+/// Function-pointer signature of the fused unary-activation backward kernels.
+/// All four (relu/gelu/tanh/sigmoid) + silu share this ABI:
+/// `(grad_out, input, grad_in, n, stream) -> i32`.
+type UnaryBwdKernelFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    i64,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// Launch a fused unary-activation backward kernel and return the new gradient tensor.
+///
+/// BF16→BF16 is the fast path. Anything else is cast to F32 and served by the
+/// F32 kernel (output remains F32; parameter-grad accumulation handles the dtype
+/// match downstream).
+fn fused_unary_backward(
+    op_name: &str,
+    output_grad: &Tensor,
+    input: &Tensor,
+    device: &Arc<CudaDevice>,
+    bf16_kernel: UnaryBwdKernelFn,
+    f32_kernel: UnaryBwdKernelFn,
+) -> Result<Tensor> {
+    let n = input.shape().elem_count() as i64;
+    if n == 0 {
+        return Tensor::empty_dtype(input.shape().clone(), input.dtype(), device.clone());
+    }
+    let stream = device.cuda_stream_raw_ptr();
+
+    if output_grad.dtype() == DType::BF16 && input.dtype() == DType::BF16 {
+        let mut out = Tensor::empty_dtype(input.shape().clone(), DType::BF16, device.clone())?;
+        let status = unsafe {
+            bf16_kernel(
+                tensor_raw_ptr(output_grad)?,
+                tensor_raw_ptr(input)?,
+                tensor_raw_ptr_mut(&mut out)?,
+                n,
+                stream,
+            )
+        };
+        if status != 0 {
+            return Err(Error::Cuda(format!("{op_name} bf16 kernel failed")));
+        }
+        return Ok(out);
+    }
+
+    if output_grad.dtype() == DType::F32 && input.dtype() == DType::F32 {
+        let mut out = Tensor::empty_dtype(input.shape().clone(), DType::F32, device.clone())?;
+        let status = unsafe {
+            f32_kernel(
+                tensor_raw_ptr(output_grad)?,
+                tensor_raw_ptr(input)?,
+                tensor_raw_ptr_mut(&mut out)?,
+                n,
+                stream,
+            )
+        };
+        if status != 0 {
+            return Err(Error::Cuda(format!("{op_name} f32 kernel failed")));
+        }
+        return Ok(out);
+    }
+
+    // Mixed dtypes: cast to F32, run F32 kernel.
+    let og_f32 = if output_grad.dtype() != DType::F32 {
+        output_grad.to_dtype_no_grad(DType::F32)?
+    } else {
+        output_grad.clone()
+    };
+    let x_f32 = if input.dtype() != DType::F32 {
+        input.to_dtype_no_grad(DType::F32)?
+    } else {
+        input.clone()
+    };
+    let mut out = Tensor::empty_dtype(x_f32.shape().clone(), DType::F32, device.clone())?;
+    let status = unsafe {
+        f32_kernel(
+            tensor_raw_ptr(&og_f32)?,
+            tensor_raw_ptr(&x_f32)?,
+            tensor_raw_ptr_mut(&mut out)?,
+            n,
+            stream,
+        )
+    };
+    if status != 0 {
+        return Err(Error::Cuda(format!("{op_name} f32 kernel failed (mixed dtype)")));
+    }
+    Ok(out)
+}
+
 // Local GPU narrow scatter-add (single-axis). No cross-crate deps.
 fn gpu_scatter_add_narrow(
     grad_out: &Tensor,
@@ -1785,39 +1876,30 @@ fn compute_gradients(
         }
 
         Op::ReLU { input } => {
-            // d/dx ReLU(x) = 1 if x > 0, else 0
-            let input_tensor = &fetch_saved(input)?;
-            let grad = relu_backward(output_grad, input_tensor)?;
+            // Fused ReLU backward: single CUDA kernel (grad * 1[x > 0]).
+            let x = fetch_saved(input)?;
+            let grad = fused_unary_backward(
+                "relu_backward",
+                output_grad,
+                &x,
+                &device,
+                crate::cuda::ffi::flame_relu_backward_bf16,
+                crate::cuda::ffi::flame_relu_backward_f32,
+            )?;
             Ok(vec![(*input, grad)])
         }
 
         Op::GELU { input } => {
-            // GELU'(x) ≈ 0.5*(1+tanh(k)) + 0.5*x*(1-tanh²(k)) * dk/dx
-            // where k = sqrt(2/π) * (x + 0.044715*x³), dk/dx = sqrt(2/π)*(1+3*0.044715*x²)
-            // Use GpuOps only — no high-level Tensor methods (deadlock in backward).
+            // Fused GELU backward (tanh-approx): single CUDA kernel.
             let x = fetch_saved(input)?;
-            let x2 = GpuOps::mul(&x, &x)?;
-            let x3 = GpuOps::mul(&x2, &x)?;
-            let inner = GpuOps::add(
+            let grad = fused_unary_backward(
+                "gelu_backward",
+                output_grad,
                 &x,
-                &GpuOps::mul_scalar(&x3, 0.044715)?,
+                &device,
+                crate::cuda::ffi::flame_gelu_backward_bf16,
+                crate::cuda::ffi::flame_gelu_backward_f32,
             )?;
-            let k = GpuOps::mul_scalar(&inner, (2.0f32 / std::f32::consts::PI).sqrt())?;
-            let tanh_k = GpuOps::tanh(&k)?;
-            let one_plus_tanh = GpuOps::add_scalar(&tanh_k, 1.0)?;
-            let tanh_k_sq = GpuOps::mul(&tanh_k, &tanh_k)?;
-            let sech2 = GpuOps::add(
-                &Tensor::ones_dtype(tanh_k.shape().clone(), tanh_k.dtype(), device.clone())?,
-                &GpuOps::mul_scalar(&tanh_k_sq, -1.0)?,
-            )?;
-            let dk_dx_inner = GpuOps::add_scalar(
-                &GpuOps::mul_scalar(&x2, 3.0 * 0.044715)?,
-                1.0,
-            )?;
-            let dk_dx = GpuOps::mul_scalar(&dk_dx_inner, (2.0f32 / std::f32::consts::PI).sqrt())?;
-            let term2 = GpuOps::mul(&GpuOps::mul(&x, &sech2)?, &dk_dx)?;
-            let derivative = GpuOps::mul_scalar(&GpuOps::add(&one_plus_tanh, &term2)?, 0.5)?;
-            let grad = GpuOps::mul(output_grad, &derivative)?;
             Ok(vec![(*input, grad)])
         }
 
@@ -1879,26 +1961,30 @@ fn compute_gradients(
         }
 
         Op::Tanh { input } => {
-            // tanh'(x) = 1 - tanh²(x)
-            // Use GpuOps only — no high-level Tensor methods (deadlock in backward).
+            // Fused Tanh backward: single CUDA kernel (grad * (1 - tanh(x)^2)).
             let x = fetch_saved(input)?;
-            let tanh_x = GpuOps::tanh(&x)?;
-            let tanh_sq = GpuOps::mul(&tanh_x, &tanh_x)?;
-            let ones = Tensor::ones_dtype(tanh_sq.shape().clone(), tanh_sq.dtype(), device.clone())?;
-            let derivative = GpuOps::add(&ones, &GpuOps::mul_scalar(&tanh_sq, -1.0)?)?;
-            let grad = GpuOps::mul(output_grad, &derivative)?;
+            let grad = fused_unary_backward(
+                "tanh_backward",
+                output_grad,
+                &x,
+                &device,
+                crate::cuda::ffi::flame_tanh_backward_bf16,
+                crate::cuda::ffi::flame_tanh_backward_f32,
+            )?;
             Ok(vec![(*input, grad)])
         }
 
         Op::Sigmoid { input } => {
-            // sigmoid'(x) = sig(x) * (1 - sig(x))
-            // Use GpuOps only — no high-level Tensor methods (deadlock in backward).
+            // Fused Sigmoid backward: single CUDA kernel (grad * sig * (1 - sig)).
             let x = fetch_saved(input)?;
-            let sig = GpuOps::sigmoid(&x)?;
-            let ones = Tensor::ones_dtype(sig.shape().clone(), sig.dtype(), device.clone())?;
-            let one_minus_sig = GpuOps::add(&ones, &GpuOps::mul_scalar(&sig, -1.0)?)?;
-            let derivative = GpuOps::mul(&sig, &one_minus_sig)?;
-            let grad = GpuOps::mul(output_grad, &derivative)?;
+            let grad = fused_unary_backward(
+                "sigmoid_backward",
+                output_grad,
+                &x,
+                &device,
+                crate::cuda::ffi::flame_sigmoid_backward_bf16,
+                crate::cuda::ffi::flame_sigmoid_backward_f32,
+            )?;
             Ok(vec![(*input, grad)])
         }
 
@@ -3756,31 +3842,6 @@ fn reduce_grad_for_broadcast(grad: &Tensor, target_shape: &Shape) -> Result<Tens
     Ok(result)
 }
 
-/// ReLU backward pass
-fn relu_backward(grad_output: &Tensor, input: &Tensor) -> Result<Tensor> {
-    // ReLU backward: gradient passes through where input > 0
-    // We need to create a mask without using tensor operations that record to autograd
-
-    // Create zero tensor for comparison
-    let zero_data = crate::tensor::alloc_zeros_from_pool(&input.device, input.shape.elem_count())?;
-    let zero = Tensor {
-        storage: TensorStorage::F32 {
-            data: zero_data.into(),
-            numel: input.shape.elem_count(),
-        },
-        shape: input.shape.clone(),
-        device: input.device.clone(),
-        id: TensorId::new(),
-        requires_grad: false,
-    };
-
-    // Use comparison to create mask
-    let mask = input.gt(&zero)?;
-
-    // Apply mask to gradient using GPU ops
-    GpuOps::mul(grad_output, &mask)
-}
-
 /// Broadcast tensor to target shape (GPU-only, no CPU sync).
 /// NOTE: currently unused — backward path uses Tensor::broadcast_to() which
 /// delegates to the GPU broadcast kernel. Kept as utility.
@@ -3815,7 +3876,6 @@ fn inverse_permutation(perm: &[usize]) -> Vec<usize> {
 }
 
 // Comparison operations are implemented in tensor_ops_extended.rs
-#[inline]
 /// Identity function — previously cast every gradient to BF16, but accumulate()
 /// immediately casts back to FP32. Removing the round-trip saves ~40 CUDA kernels
 /// + allocations per backward pass.
