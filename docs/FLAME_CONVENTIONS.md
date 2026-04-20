@@ -831,3 +831,79 @@ lr·m̂/(√v̂+ε) / p -= lr·wd·p` shape is load-bearing. Folding `wd` into
 `~sign(param)` for freshly-initialized LoRA_A matrices (whose B partner
 is zero) and unlearns them at uniform `lr·sign(p)` per step. That bug
 destroyed Klein 4B LoRA_A training in April 2026 — do not reintroduce it.
+
+---
+
+## Conv3d — cuDNN-first dispatch, im2vol as fallback (2026-04)
+
+`Conv3dBF16::forward()` tries `cudnn::cudnn_conv3d_bf16` first and falls
+back to the legacy im2vol+GEMM path only when cuDNN refuses. That's
+because the im2vol path materializes a `col_rows × col_cols` BF16
+columns tensor explicitly, and at LTX-2.3 LatentUpsampler shapes
+(`[1, 1024, 33, 14, 24]`, 3³ kernel) that's ~60 GB. It OOMs every GPU
+short of an H100. cuDNN picks implicit-GEMM / Winograd and never
+materializes the columns — the whole upsampler runs in ~1.6 s with
+<100 MB of workspace.
+
+### Env knobs
+- `FLAME_CUDNN_CONV3D_WS_LIMIT_MB` — cuDNN workspace ceiling in MiB.
+  Default 256. Raise if you hit algo-refused-by-workspace; lower if
+  you're near the VRAM ceiling elsewhere.
+- `FLAME_CUDNN_CONV3D_STRICT=1` — fail fast with the cuDNN error
+  instead of falling back to im2vol. Useful during parity verification
+  so you never silently slip onto the legacy path.
+- `BF16_CONV_DEBUG=1` — prints to stderr when the cuDNN path bails,
+  including the error and the shape that failed.
+
+### Gotcha: grouped Conv3d only via cuDNN
+The legacy im2vol+GEMM path has never supported `groups ≠ 1`. The new
+cuDNN path does, and the dispatcher returns a clean `Unsupported`
+error when grouped Conv3d is called without cuDNN available. If you
+add grouped Conv3d to a model and disable cuDNN, you'll trip this.
+
+### Gotcha: bias is not fused
+Today we apply bias via a separate `cudnnAddTensor`. Fusing into
+`cudnnConvolutionBiasActivationForward` is a follow-up — don't assume
+bias is a free add.
+
+---
+
+## SDPA — auto-stream on large shapes (2026-04)
+
+`sdpa::forward_bf16` now auto-routes to the streaming kernel
+(`cuda_ops_bf16::sdpa_stream_bf16`, which uses online softmax + tiled
+Q/K/V and never materializes scores) whenever
+`B * H * Q * K > FLAME_SDPA_STREAM_THRESHOLD` (default `2_000_000_000`
+elements). The materialized fallback still handles small shapes because
+it's slightly faster when the peak is well under a GB.
+
+### Why the threshold exists
+The materialized path allocates an FP32 `[B, H, Q, K]` scores tensor plus
+a BF16 copy plus temporary softmax state, peaking near 8 bytes/element.
+For LTX-2.3 stage-2 self-attention at 768×448 (B=1, H=30, Q=K=11088)
+that's 3.68 G elements ≈ 29 GB — OOMs every 24 GB card. Streaming kernel
+peaks at the tile scratch (~hundreds of MB), not GB.
+
+### Env knobs
+- `FLAME_SDPA_STREAM_THRESHOLD=<elements>` — override the auto-stream
+  threshold (`B*H*Q*K` element count). Set lower if you want streaming
+  earlier, higher if your card has enough VRAM to eat the materialized
+  peak at intermediate shapes.
+- `FLAME_SDPA_FORCE_STREAM=1` — unconditional stream path for ANY
+  shape. Pre-existing env; the auto-threshold is an additive layer.
+- `FLAME_SDPA_CHUNK_MAX=<q_chunk>` — per-Q chunk size used by the
+  stream kernel. Default 2048. Lower it if you're tight on workspace.
+
+### Mask handling on the stream path
+`sdpa_stream_bf16` already accepts `mask: Option<&Tensor>`. The
+auto-stream path passes the mask through untouched — no caller change
+required. Common causal / padding masks work; custom attention biases
+that needed the materialized-scores path still fit because the stream
+applies the mask tile-by-tile.
+
+### What does NOT fix this
+- Faster GEMM for QK^T alone (the scores tensor is the OOM).
+- Pool trimming (only helps cached-free memory).
+- Chunking the sampler step (unchanged token count per call).
+The stream kernel is the fix; the threshold dispatcher routes to it
+automatically.

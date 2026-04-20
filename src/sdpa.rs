@@ -69,6 +69,16 @@ fn chunk_limit_from_env() -> Option<usize> {
     })
 }
 
+fn stream_threshold_from_env() -> Option<usize> {
+    static CACHED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FLAME_SDPA_STREAM_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+    })
+}
+
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 fn allow_sdpa_f32_fallback() -> bool {
     if crate::strict::is_enabled() {
@@ -533,9 +543,31 @@ fn forward_bf16(
         }
     }
 
+    // Auto-stream policy: the materialized fallback allocates an FP32 scores
+    // tensor of `B * H * Q * K` elements plus a BF16 copy, peaking at
+    // ~8 B/elem. For LTX-2.3 second-pass self-attn (B=1, H=30, Q=K=11088)
+    // that's 3.68 G elements ≈ 29 GB. Anything past ~2 G elements must go
+    // through the tiled/streaming kernel or we OOM on a 24 GB card. The
+    // streaming path handles `mask` (full self-attn masks included) via
+    // `cuda_ops_bf16::sdpa_stream_bf16`, so we can route masked + unmasked
+    // large shapes to it uniformly.
+    //
+    // Threshold is overridable via FLAME_SDPA_STREAM_THRESHOLD (elements,
+    // default 2_000_000_000). The legacy FLAME_SDPA_FORCE_STREAM=1 still
+    // forces the stream path for any shape.
     let force_stream = force_stream_sdpa();
-    if !force_stream {
+    let auto_stream = {
+        let threshold = stream_threshold_from_env().unwrap_or(2_000_000_000usize);
+        b.saturating_mul(h).saturating_mul(q_len).saturating_mul(k_len) > threshold
+    };
+    if !force_stream && !auto_stream {
         return forward_bf16_fallback(q, k, v, mask, b, h, q_len, k_len, d_q, scale);
+    }
+    if auto_stream && !force_stream {
+        log::debug!(
+            "sdpa: auto-routing to stream path (B={} H={} Q={} K={} elems={})",
+            b, h, q_len, k_len, b * h * q_len * k_len,
+        );
     }
 
     #[cfg(all(feature = "cuda", feature = "bf16_u16"))]

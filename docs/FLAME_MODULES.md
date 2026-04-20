@@ -236,9 +236,18 @@ new code.
 
 ### ⭐ `conv3d_bf16.rs`
 3D conv with `Conv3dBF16::from_weights(weight, bias, stride, padding)` +
-`forward(input)`. NCDHW layout. Implementation uses an im2vol → cuBLASLt
-GEMM → bias add pipeline. Used by LTX-2 audio VAE and the (planned)
-Wan / QwenImage 3D VAE ports.
+`forward(input)` and the new `from_weights_with_config(..)` ctor that
+accepts `dilation` + `groups`. NCDHW layout. Used by LTX-2 audio VAE,
+LTX-2 LatentUpsampler, and the planned Wan / QwenImage 3D VAE ports.
+
+`forward()` dispatches to `cudnn::cudnn_conv3d_bf16` first (FP32
+accumulate, algo cache, workspace capped by
+`FLAME_CUDNN_CONV3D_WS_LIMIT_MB`, default 256). The legacy
+im2vol → cuBLASLt GEMM → bias add pipeline remains as a fallback and
+is taken only when cuDNN refuses; `FLAME_CUDNN_CONV3D_STRICT=1` turns
+the fallback into a hard error for parity verification. See
+`FLAME_CONVENTIONS.md` for why (im2vol materialization OOMs at LTX-2
+LatentUpsampler shapes).
 
 ### ⭐ `conv1d.rs`
 1D conv + 1D transposed conv, both BF16-via-cuDNN. The `[B, C, L]` tensors
@@ -596,10 +605,18 @@ Global RNG — `global_rng()`, `set_seed(seed)`. Used by `Tensor::randn`.
 ⚠️ Old per-device tensor wrapper. Predates the unified `Tensor`.
 
 ### `cudnn/*` (feature-gated)
-cuDNN integration — separate handle, conv2d, layer_norm, attention. The
-`cudnn::cudnn_conv2d_bf16` entry is used by inference code. The other modules
-(`activation`, `algorithms`, `descriptors`, `linear`, `matmul`, `matmul_simple`,
-`norm`, `attention`) are training-side.
+cuDNN integration — separate handle, conv2d, conv3d, layer_norm, attention.
+Live inference entry points:
+- `cudnn::cudnn_conv2d_bf16` (via `cudnn::conv2d`)
+- `cudnn::cudnn_conv3d_bf16` (via `cudnn::conv3d`, 2026-04) — called by
+  `Conv3dBF16::forward` as the preferred path. Algo cache, BF16 NCDHW
+  tensors, FP32 accumulate, workspace capped by
+  `FLAME_CUDNN_CONV3D_WS_LIMIT_MB`.
+
+`descriptors` has been extended with `FilterDescriptor::set_nd` and
+`ConvolutionDescriptor::set_nd` for the 5D descriptors Conv3d needs.
+The other modules (`activation`, `algorithms`, `linear`, `matmul`,
+`matmul_simple`, `norm`, `attention`) are training-side.
 
 ### `tests/*` and `bin/*`
 Test modules and standalone test/debug binaries. See `bin/` for runnable

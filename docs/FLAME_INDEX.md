@@ -127,6 +127,12 @@ This is a critical area with several implementations. **Use these for inference*
 - `flame_core::sdpa::forward(q, k, v, mask)` — `sdpa.rs:94`
   Used directly by `inference-flame::vae::ldm_decoder` and `vae::wan21_vae`
   for cases where the dispatch overhead isn't wanted.
+  **2026-04 update**: the BF16 path now auto-routes to the streaming kernel
+  when `B * H * Q * K > FLAME_SDPA_STREAM_THRESHOLD` (default 2·10⁹
+  elements). Materialized fallback would allocate a multi-GB F32 scores
+  tensor and OOM on 24 GB cards for LTX-2 stage-2 self-attn (11 k tokens).
+  The threshold is env-tunable. `FLAME_SDPA_FORCE_STREAM=1` still forces
+  the stream for any shape.
 - `flame_core::sdpa::forward_with_bias(...)` — `sdpa.rs:125`
 - `flame_core::cuda_ops_bf16::sdpa_stream_bf16(q, k, v, mask, chunk, causal, scale)` — `cuda_ops_bf16.rs:1599`
   The chunked streaming SDPA used by LTX-2. Takes a `causal` flag and chunk size.
@@ -248,7 +254,18 @@ This is a critical area with several implementations. **Use these for inference*
   grouped anti-alias filters.
 - `conv1d::conv1d_grouped(x, w, stride, padding, groups)` — thin no-bias wrapper over `conv1d`.
 - ⭐ `conv3d_bf16::Conv3dBF16` — `conv3d_bf16.rs:183` — 3D conv used by LTX-2 audio VAE +
-  Wan / QwenImage 3D VAEs (when ported).
+  Wan / QwenImage 3D VAEs and the LatentUpsampler. `forward()` now dispatches to
+  cuDNN first (2026-04), falls back to im2vol+GEMM only on cuDNN refusal.
+  Supports `dilation` and `groups` (groups only via cuDNN; fallback rejects).
+  - `Conv3dBF16::from_weights(..)` / `from_weights_with_config(..)` — new
+    config ctor accepts `dilation` + `groups`.
+- ⭐ `cudnn::cudnn_conv3d_bf16(input, weight, bias, stride, padding, dilation, groups)`
+  — `cudnn/conv3d.rs` — direct cuDNN NCDHW BF16 Conv3d forward. FP32
+  accumulate, algo cache keyed by full descriptor fingerprint, workspace
+  capped by `FLAME_CUDNN_CONV3D_WS_LIMIT_MB` (default 256). Used by the
+  Conv3dBF16 dispatch; call directly for lower-level control.
+- `cudnn::descriptors::FilterDescriptor::set_nd(..)` / `ConvolutionDescriptor::set_nd(..)`
+  — 5D descriptors needed for Conv3d.
 - `conv3d_simple::*` — F32 conv3d fallback
 - `conv3d::*` — older conv3d (training)
 
