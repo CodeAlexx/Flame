@@ -81,6 +81,30 @@ pub fn sample_normal(len: usize, mean: f32, std: f32) -> Result<Vec<f32>, Error>
     Ok((0..len).map(|_| normal.sample(&mut *guard)).collect())
 }
 
+/// Draw `len` samples from `N(mean, std^2)` using a locally-seeded
+/// `StdRng`. Unlike [`sample_normal`], this is independent of the global
+/// RNG state and is fully deterministic in `seed`. Uses CPU Box-Muller
+/// (paired output) so two samples are drawn per iteration.
+pub fn sample_normal_seeded(len: usize, mean: f32, std: f32, seed: u64) -> Vec<f32> {
+    use rand::Rng;
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut data = Vec::with_capacity(len);
+    while data.len() < len {
+        // Guard against log(0). 1.0e-6 matches the pattern used in
+        // ernie-trainer's Box-Muller noise sampler.
+        let u1 = rng.gen::<f32>().max(1.0e-6);
+        let u2 = rng.gen::<f32>();
+        let mag = (-2.0 * u1.ln()).sqrt() * std;
+        let theta = 2.0 * std::f32::consts::PI * u2;
+        data.push(mag * theta.cos() + mean);
+        if data.len() < len {
+            data.push(mag * theta.sin() + mean);
+        }
+    }
+    data
+}
+
 fn ensure_module(dev: &Arc<CudaDevice>) -> Result<(), Error> {
     if dev.get_func("flame_rng", "fill_rand_f32").is_some() {
         return Ok(());

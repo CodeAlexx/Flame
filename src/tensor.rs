@@ -1125,6 +1125,35 @@ extern "C" __global__ void masked_fill_kernel(
         }
     }
 
+    /// Create a random tensor whose samples are fully determined by `seed`.
+    ///
+    /// Unlike [`Tensor::randn`] (which consumes the global RNG stream set by
+    /// [`crate::rng::set_seed`]), this uses a locally-seeded `StdRng` and
+    /// CPU Box-Muller. Calling `randn_seeded(shape, mean, std, seed, device)`
+    /// twice with identical arguments always yields bit-identical output —
+    /// useful for element-wise parity against Python/torch references
+    /// (LanPaint, diffusers, etc.) where reproducible noise is required.
+    ///
+    /// Output dtype matches [`Tensor::randn`]: F32 unless the workspace
+    /// default dtype is otherwise.
+    pub fn randn_seeded(
+        shape: Shape,
+        mean: f32,
+        std: f32,
+        seed: u64,
+        device: Arc<CudaDevice>,
+    ) -> Result<Self> {
+        let size = shape.elem_count();
+        let cpu_data = rng::sample_normal_seeded(size, mean, std, seed);
+        let t = Self::from_vec(cpu_data, shape, device)?;
+        let dd = default_dtype();
+        if dd != DType::F32 {
+            t.to_dtype(dd)
+        } else {
+            Ok(t)
+        }
+    }
+
     /// Create a tensor with random values like another tensor
     pub fn rand_like(tensor: &Tensor) -> Result<Self> {
         Self::randn(tensor.shape.clone(), 0.0, 1.0, tensor.device.clone())

@@ -56,6 +56,12 @@
 - `Tensor::empty_dtype(shape, dtype, device)` — uninitialized (use only after explicit fill)
 - `Tensor::ones(shape, device)`
 - `Tensor::randn(shape, mean, std, device)` — F32 (or default dtype)
+- `Tensor::randn_seeded(shape, mean, std, seed, device)` — `tensor.rs:1128`.
+  Deterministic Box-Muller sibling of `randn` using
+  `rand::rngs::StdRng::seed_from_u64(seed)`. Two calls with identical args
+  produce bit-identical output, independent of the global RNG state set by
+  `rng::set_seed`. Use when matching a Python/torch reference (LanPaint,
+  diffusers, element-wise parity tests). Output dtype mirrors `randn`.
 - `Tensor::from_vec(data, shape, device)` — F32
 - `Tensor::from_vec_dtype(data, shape, device, dtype)` — typed
 - `Tensor::from_f32_to_bf16(data, shape, device)` — convenience
@@ -87,6 +93,13 @@
 - `.bmm(&Tensor)` — 3D batched matmul
 - `.silu / .gelu / .relu / .exp / .log / .sin / .cos / .sqrt / .pow / .tanh / .neg / .abs`
 - `.softmax(dim)` — fast-path dispatches to `bf16_elementwise::softmax_lastdim_bf16` for BF16 last-dim
+- `.clamp(min, max)` — `tensor_ops_extended.rs:677`. Element-wise clamp via
+  `maximum`/`minimum`. Output dtype always equals source dtype (fix 2026-04:
+  previously built min/max constants via `full_like`, which applied
+  `default_dtype()` and broke F32 clamps when the workspace default was BF16).
+- `.maximum(&Tensor) / .minimum(&Tensor)` — `tensor_ops_extended.rs:691,731`.
+  Element-wise max/min with broadcasting. Require matching dtypes (no implicit
+  cast).
 - `.sum / .mean / .max / .min / .var / .std`
 - `.sum_dim / .sum_dim_keepdim / .mean_dim / .max_dim`
 

@@ -381,6 +381,32 @@ cargo build --release ...
 
 If that doesn't work, `cargo clean -p flame-core` and rebuild.
 
+### `full_like` uses `default_dtype`, not source dtype
+
+`Tensor::full_like(value)` goes through `Tensor::full`, which casts the
+resulting tensor to `default_dtype()` (BF16 in production). It does **not**
+inherit `self.dtype()`. This is the historical contract; changing it would
+silently affect several regularization / dropout paths that rely on the
+default cast.
+
+If you're building a constant tensor that must match the source's dtype,
+**do not use `full_like`**. Build the constant yourself:
+
+```rust
+let c = Tensor::from_vec(vec![value], Shape::from_dims(&[1]), device)?
+    .to_dtype(source.dtype())?;
+```
+
+Then call `maximum` / `minimum` / whichever op needs it — those broadcast
+scalar-shaped tensors fine.
+
+**Gotcha fixed 2026-04-20**: `Tensor::clamp` used to call `full_like` for
+its min/max constants. With `default_dtype = BF16`, clamping an F32 tensor
+would build BF16 constants and `maximum`/`minimum` rejected the dtype
+mismatch. `clamp` now builds constants in the source's dtype. Any future
+op that needs a "constant like" tensor in the caller's dtype should follow
+the same pattern.
+
 ### Two paths for silu/gelu
 
 There are TWO BF16 silu/gelu implementations:

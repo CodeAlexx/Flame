@@ -673,7 +673,13 @@ impl Tensor {
         self.square()?.sqrt()
     }
 
-    /// Clamp values between min and max
+    /// Clamp values between min and max.
+    ///
+    /// The min/max constant tensors are built in the source tensor's dtype
+    /// (not the workspace default dtype). This matters when the workspace
+    /// default is BF16 and the caller is clamping an F32 tensor: without
+    /// this, `full_like` would return BF16 constants and `maximum` / `minimum`
+    /// would panic on the dtype mismatch.
     pub fn clamp(&self, min: f32, max: f32) -> Result<Tensor> {
         if min > max {
             return Err(Error::InvalidInput(
@@ -681,8 +687,20 @@ impl Tensor {
             ));
         }
 
-        let lower = self.full_like(min)?;
-        let upper = self.full_like(max)?;
+        let dtype = self.dtype();
+        let lower = Tensor::from_vec(
+            vec![min],
+            Shape::from_dims(&[1]),
+            self.device.clone(),
+        )?
+        .to_dtype(dtype)?;
+        let upper = Tensor::from_vec(
+            vec![max],
+            Shape::from_dims(&[1]),
+            self.device.clone(),
+        )?
+        .to_dtype(dtype)?;
+        // `maximum` / `minimum` broadcast scalar-shaped tensors internally.
         let clipped = self.maximum(&lower)?;
         clipped.minimum(&upper)
     }
