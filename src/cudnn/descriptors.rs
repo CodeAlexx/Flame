@@ -61,6 +61,13 @@ extern "C" {
         h: c_int,
         w: c_int,
     ) -> c_int;
+    fn cudnnSetFilterNdDescriptor(
+        desc: *mut c_void,
+        datatype: c_int,
+        format: c_int,
+        nb_dims: c_int,
+        filter_dim_a: *const c_int,
+    ) -> c_int;
 
     // Convolution descriptors
     fn cudnnCreateConvolutionDescriptor(desc: *mut *mut c_void) -> c_int;
@@ -73,6 +80,15 @@ extern "C" {
         stride_w: c_int,
         dilation_h: c_int,
         dilation_w: c_int,
+        mode: c_int,
+        compute_type: c_int,
+    ) -> c_int;
+    fn cudnnSetConvolutionNdDescriptor(
+        desc: *mut c_void,
+        array_length: c_int,
+        pad_a: *const c_int,
+        filter_stride_a: *const c_int,
+        dilation_a: *const c_int,
         mode: c_int,
         compute_type: c_int,
     ) -> c_int;
@@ -248,6 +264,26 @@ impl FilterDescriptor {
         Ok(())
     }
 
+    pub fn set_nd(&self, dtype: DType, dims: &[usize]) -> Result<()> {
+        let dims: Vec<c_int> = dims.iter().map(|&d| d as c_int).collect();
+        let status = unsafe {
+            cudnnSetFilterNdDescriptor(
+                self.desc,
+                dtype_to_cudnn(dtype),
+                CUDNN_TENSOR_NCHW,
+                dims.len() as c_int,
+                dims.as_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(Error::CudaError(format!(
+                "Failed to set Nd filter descriptor: {}",
+                status
+            )));
+        }
+        Ok(())
+    }
+
     pub fn as_ptr(&self) -> *mut c_void {
         self.desc
     }
@@ -334,6 +370,43 @@ impl ConvolutionDescriptor {
         if status != 0 {
             return Err(Error::CudaError(format!(
                 "Failed to set asymmetric convolution descriptor: {}",
+                status
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn set_nd(
+        &self,
+        padding: &[usize],
+        stride: &[usize],
+        dilation: &[usize],
+        compute_dtype: DType,
+    ) -> Result<()> {
+        if padding.len() != stride.len() || padding.len() != dilation.len() {
+            return Err(Error::InvalidInput(
+                "padding/stride/dilation must have the same rank".into(),
+            ));
+        }
+
+        let pad: Vec<c_int> = padding.iter().map(|&v| v as c_int).collect();
+        let stride: Vec<c_int> = stride.iter().map(|&v| v as c_int).collect();
+        let dilation: Vec<c_int> = dilation.iter().map(|&v| v as c_int).collect();
+
+        let status = unsafe {
+            cudnnSetConvolutionNdDescriptor(
+                self.desc,
+                pad.len() as c_int,
+                pad.as_ptr(),
+                stride.as_ptr(),
+                dilation.as_ptr(),
+                CUDNN_CROSS_CORRELATION,
+                dtype_to_cudnn(compute_dtype),
+            )
+        };
+        if status != 0 {
+            return Err(Error::CudaError(format!(
+                "Failed to set Nd convolution descriptor: {}",
                 status
             )));
         }

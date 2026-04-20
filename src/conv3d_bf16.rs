@@ -26,10 +26,11 @@ use crate::{cuda_ops_bf16, Error, Result, Shape, Tensor, TensorId};
 // params is a packed i64 array:
 //   [0]=C_in, [1]=D_in, [2]=H_in, [3]=W_in,
 //   [4]=kD,   [5]=kH,   [6]=kW,
-//   [7]=sD,   [8]=sH,   [9]=sW,
-//   [10]=pD,  [11]=pH,  [12]=pW,
-//   [13]=D_out, [14]=H_out, [15]=W_out,
-//   [16]=col_rows, [17]=col_cols
+//   [7]=dD,   [8]=dH,   [9]=dW,
+//   [10]=sD,  [11]=sH,  [12]=sW,
+//   [13]=pD,  [14]=pH,  [15]=pW,
+//   [16]=D_out, [17]=H_out, [18]=W_out,
+//   [19]=col_rows, [20]=col_cols
 const IM2VOL_BF16_KERNEL: &str = r#"
 extern "C" __global__
 void im2vol_bf16(
@@ -44,17 +45,20 @@ void im2vol_bf16(
     int kD    = (int)params[4];
     int kH    = (int)params[5];
     int kW    = (int)params[6];
-    int sD    = (int)params[7];
-    int sH    = (int)params[8];
-    int sW    = (int)params[9];
-    int pD    = (int)params[10];
-    int pH    = (int)params[11];
-    int pW    = (int)params[12];
-    int D_out = (int)params[13];
-    int H_out = (int)params[14];
-    int W_out = (int)params[15];
-    int col_rows = (int)params[16];
-    int col_cols = (int)params[17];
+    int dD    = (int)params[7];
+    int dH    = (int)params[8];
+    int dW    = (int)params[9];
+    int sD    = (int)params[10];
+    int sH    = (int)params[11];
+    int sW    = (int)params[12];
+    int pD    = (int)params[13];
+    int pH    = (int)params[14];
+    int pW    = (int)params[15];
+    int D_out = (int)params[16];
+    int H_out = (int)params[17];
+    int W_out = (int)params[18];
+    int col_rows = (int)params[19];
+    int col_cols = (int)params[20];
 
     long long total = (long long)col_rows * col_cols;
 
@@ -78,9 +82,9 @@ void im2vol_bf16(
         int od = tmp2 / H_out;
 
         // Input coordinates
-        int id = od * sD - pD + kd_idx;
-        int ih = oh * sH - pH + kh_idx;
-        int iw = ow * sW - pW + kw_idx;
+        int id = od * sD - pD + kd_idx * dD;
+        int ih = oh * sH - pH + kh_idx * dH;
+        int iw = ow * sW - pW + kw_idx * dW;
 
         unsigned short val = 0;
         if (id >= 0 && id < D_in &&
@@ -186,6 +190,8 @@ pub struct Conv3dBF16 {
     pub kernel_size: (usize, usize, usize),
     pub stride: (usize, usize, usize),
     pub padding: (usize, usize, usize),
+    pub dilation: (usize, usize, usize),
+    pub groups: usize,
     pub in_channels: usize,
     pub out_channels: usize,
 }
@@ -198,16 +204,30 @@ impl Conv3dBF16 {
         stride: (usize, usize, usize),
         padding: (usize, usize, usize),
     ) -> Self {
+        Self::from_weights_with_config(weight, bias, stride, padding, (1, 1, 1), 1)
+    }
+
+    pub fn from_weights_with_config(
+        weight: Tensor,
+        bias: Option<Tensor>,
+        stride: (usize, usize, usize),
+        padding: (usize, usize, usize),
+        dilation: (usize, usize, usize),
+        groups: usize,
+    ) -> Self {
         let w = weight.shape().dims();
-        assert!(w.len() == 5, "Conv3dBF16 weight must be 5D [C_out, C_in, kD, kH, kW]");
+        assert!(w.len() == 5, "Conv3dBF16 weight must be 5D [C_out, C_in/groups, kD, kH, kW]");
+        assert!(groups >= 1, "Conv3dBF16 groups must be >= 1");
         Conv3dBF16 {
             out_channels: w[0],
-            in_channels: w[1],
+            in_channels: w[1] * groups,
             kernel_size: (w[2], w[3], w[4]),
             weight,
             bias,
             stride,
             padding,
+            dilation,
+            groups,
         }
     }
 
@@ -238,16 +258,46 @@ impl Conv3dBF16 {
         let (kd, kh, kw) = self.kernel_size;
         let (sd, sh, sw) = self.stride;
         let (pd, ph, pw) = self.padding;
+        let (dd, dh, dw) = self.dilation;
 
-        let d_out = (d_in + 2 * pd - kd) / sd + 1;
-        let h_out = (h_in + 2 * ph - kh) / sh + 1;
-        let w_out = (w_in + 2 * pw - kw) / sw + 1;
+        let d_out = (d_in + 2 * pd - dd * (kd - 1) - 1) / sd + 1;
+        let h_out = (h_in + 2 * ph - dh * (kh - 1) - 1) / sh + 1;
+        let w_out = (w_in + 2 * pw - dw * (kw - 1) - 1) / sw + 1;
+
+        #[cfg(feature = "cudnn")]
+        {
+            match crate::cudnn::cudnn_conv3d_bf16(
+                input,
+                &self.weight,
+                self.bias.as_ref(),
+                self.stride,
+                self.padding,
+                self.dilation,
+                self.groups,
+            ) {
+                Ok(out) => return Ok(out),
+                Err(err) => {
+                    if std::env::var_os("FLAME_CUDNN_CONV3D_STRICT").is_some() {
+                        return Err(err);
+                    }
+                    if std::env::var_os("BF16_CONV_DEBUG").is_some() {
+                        eprintln!("[conv3d_bf16] cuDNN path failed, falling back to im2vol+gemm: {err}");
+                    }
+                }
+            }
+        }
 
         let col_rows = c_in * kd * kh * kw;
         let col_cols = d_out * h_out * w_out;
         let col_numel = col_rows * col_cols;
 
         let dev = input.device().clone();
+
+        if self.groups != 1 {
+            return Err(Error::Unsupported(
+                "Conv3dBF16 legacy fallback only supports groups=1; enable cuDNN for grouped Conv3d".into(),
+            ));
+        }
 
         // ---- weight reshaped to 2D [C_out, col_rows] (view, no copy) ----
         let weight_2d = self.weight.reshape(&[self.out_channels, col_rows])?;
@@ -295,6 +345,9 @@ impl Conv3dBF16 {
             kd as i64,
             kh as i64,
             kw as i64,
+            dd as i64,
+            dh as i64,
+            dw as i64,
             sd as i64,
             sh as i64,
             sw as i64,

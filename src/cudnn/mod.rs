@@ -6,6 +6,9 @@
 pub mod conv2d;
 
 #[cfg(feature = "cudnn")]
+pub mod conv3d;
+
+#[cfg(feature = "cudnn")]
 pub mod descriptors;
 
 #[cfg(feature = "cudnn")]
@@ -32,6 +35,9 @@ pub mod activation;
 // Core operations
 #[cfg(feature = "cudnn")]
 pub use conv2d::cudnn_conv2d_bf16;
+
+#[cfg(feature = "cudnn")]
+pub use conv3d::cudnn_conv3d_bf16;
 
 #[cfg(feature = "cudnn")]
 pub use matmul_simple::{cudnn_bmm, cudnn_matmul, is_cudnn_matmul_compatible};
