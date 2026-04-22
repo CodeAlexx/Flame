@@ -977,6 +977,118 @@ pub fn swiglu_fused_bf16(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 // most of the win on its own; a packed-args variant of the full joint
 // kernel is queued for a follow-up once the wins here are measured.
 
+// ---- Fused post-SDPA split: [B,H,N_txt+N_img,D] -> txt[B,N_txt,H*D] + img[B,N_img,H*D]
+
+const CUDA_ATTN_SPLIT_TXT_IMG: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void attn_split_txt_img_bf16_kernel(
+    const __nv_bfloat16* __restrict__ ATTN,  // [B, H, N_total, D], N_total = N_txt + N_img
+    __nv_bfloat16* __restrict__ TXT,          // [B, N_txt, H*D]
+    __nv_bfloat16* __restrict__ IMG,          // [B, N_img, H*D]
+    int B, int H, int N_txt, int N_img, int D)
+{
+    int N_total = N_txt + N_img;
+    long total = (long)B * H * N_total * D;
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int d = idx % D;
+    long t = idx / D;
+    int n_tot = t % N_total;
+    t = t / N_total;
+    int h = t % H;
+    int b = t / H;
+
+    __nv_bfloat16 val = ATTN[idx];
+
+    if (n_tot < N_txt) {
+        // TXT[b, n_txt, h*D + d]
+        int n_txt_i = n_tot;
+        long out_idx = (long)b * N_txt * H * D + (long)n_txt_i * H * D + (long)h * D + d;
+        TXT[out_idx] = val;
+    } else {
+        int n_img_i = n_tot - N_txt;
+        long out_idx = (long)b * N_img * H * D + (long)n_img_i * H * D + (long)h * D + d;
+        IMG[out_idx] = val;
+    }
+}
+"#;
+
+/// Fused post-SDPA split: reads a joint-attention output `[B, H, N_txt+N_img, D]`
+/// and writes two pre-permuted+flattened outputs `txt [B, N_txt, H*D]` and
+/// `img [B, N_img, H*D]` in a single pass.
+///
+/// Replaces:
+///   txt_attn = attn_out.narrow(2, 0, n_txt)?;                    // kernel
+///   img_attn = attn_out.narrow(2, n_txt, n_img)?;                // kernel
+///   txt_flat = txt_attn.permute([0,2,1,3]).reshape([B,N_txt,HD]); // kernel (view)
+///   img_flat = img_attn.permute([0,2,1,3]).reshape([B,N_img,HD]); // kernel (view)
+/// — 4 BF16 materializing ops → 1.
+///
+/// Layout convention: txt tokens occupy positions [0, N_txt) of the joint
+/// sequence, img tokens occupy [N_txt, N_txt+N_img). Matches FLUX / Chroma /
+/// Klein double-block concat order `cat([txt, img], seq_dim=2)`.
+pub fn attn_split_txt_img_bf16(
+    attn_out: &Tensor,
+    n_txt: usize,
+    n_img: usize,
+) -> Result<(Tensor, Tensor)> {
+    debug_assert_eq!(attn_out.dtype(), DType::BF16);
+    let dims = attn_out.shape().dims();
+    if dims.len() != 4 {
+        return Err(Error::InvalidOperation(format!(
+            "attn_split_txt_img_bf16: expected 4D [B,H,N_total,D], got {:?}", dims
+        )));
+    }
+    let (b, h, n_total, d) = (dims[0], dims[1], dims[2], dims[3]);
+    if n_total != n_txt + n_img {
+        return Err(Error::InvalidOperation(format!(
+            "attn_split_txt_img_bf16: N_total={} != N_txt({}) + N_img({})",
+            n_total, n_txt, n_img
+        )));
+    }
+
+    let txt_numel = b * n_txt * h * d;
+    let img_numel = b * n_img * h * d;
+    let txt_data = crate::cuda_alloc_pool::pool_alloc_u16(&attn_out.device, txt_numel)?;
+    let img_data = crate::cuda_alloc_pool::pool_alloc_u16(&attn_out.device, img_numel)?;
+    let mut txt = Tensor {
+        storage: TensorStorage::BF16 { data: txt_data.into(), numel: txt_numel },
+        shape: Shape::from_dims(&[b, n_txt, h * d]),
+        device: attn_out.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+    };
+    let mut img = Tensor {
+        storage: TensorStorage::BF16 { data: img_data.into(), numel: img_numel },
+        shape: Shape::from_dims(&[b, n_img, h * d]),
+        device: attn_out.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+    };
+
+    ensure(&attn_out.device, "attn_split_txt_img_bf16_kernel", CUDA_ATTN_SPLIT_TXT_IMG)?;
+    let f = attn_out.device
+        .get_func("attn_split_txt_img_bf16_kernel", "attn_split_txt_img_bf16_kernel")
+        .ok_or_else(|| Error::Cuda("attn_split_txt_img_bf16_kernel missing".into()))?;
+
+    let xs = match &attn_out.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("attn_out BF16".into())) };
+    let ts = match &mut txt.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let ts = ensure_unique_slice(ts)?;
+    let is_ = match &mut img.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let is_ = ensure_unique_slice(is_)?;
+
+    let total = b * h * n_total * d;
+    unsafe {
+        f.launch(
+            lc(total),
+            (slice_ref(xs), ts, is_, b as i32, h as i32, n_txt as i32, n_img as i32, d as i32),
+        )?;
+    }
+    Ok((txt, img))
+}
+
 /*
 const _CUDA_QKV_RMSNORM_ROPE_CAT_RESERVED: &str = r#"
 #include <cuda_bf16.h>
