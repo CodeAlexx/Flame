@@ -970,3 +970,400 @@ pub fn swiglu_fused_bf16(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     }
     Ok(out)
 }
+
+// NOTE: a larger "qkv_rmsnorm_rope_cat_bf16" single-shot joint-attention
+// kernel was prototyped here but exceeded cudarc 0.11.9's 12-tuple
+// LaunchAsync limit. The simpler `qkv_split_permute_bf16` below captures
+// most of the win on its own; a packed-args variant of the full joint
+// kernel is queued for a follow-up once the wins here are measured.
+
+/*
+const _CUDA_QKV_RMSNORM_ROPE_CAT_RESERVED: &str = r#"
+#include <cuda_bf16.h>
+#include <math_constants.h>
+
+extern "C" __global__
+void qkv_rmsnorm_rope_cat_bf16_kernel(
+    const __nv_bfloat16* __restrict__ IMG_QKV,    // [B, N_img, 3*H*D]
+    const __nv_bfloat16* __restrict__ TXT_QKV,    // [B, N_txt, 3*H*D]
+    const __nv_bfloat16* __restrict__ IMG_Q_W,    // [D] (per-head query rms scale)
+    const __nv_bfloat16* __restrict__ IMG_K_W,    // [D]
+    const __nv_bfloat16* __restrict__ TXT_Q_W,    // [D]
+    const __nv_bfloat16* __restrict__ TXT_K_W,    // [D]
+    const __nv_bfloat16* __restrict__ COS,        // [N_total, D/2]
+    const __nv_bfloat16* __restrict__ SIN,        // [N_total, D/2]
+    __nv_bfloat16* __restrict__ Q_OUT,            // [B, H, N_total, D]
+    __nv_bfloat16* __restrict__ K_OUT,            // [B, H, N_total, D]
+    __nv_bfloat16* __restrict__ V_OUT,            // [B, H, N_total, D]
+    int B, int H, int N_img, int N_txt, int D, float eps)
+{
+    // grid.y = (b, h) via blockIdx.y = b*H + h
+    // grid.x = position in N_total = N_txt + N_img
+    int bh = blockIdx.y;
+    int h  = bh % H;
+    int b  = bh / H;
+    int n_tot = blockIdx.x;
+    int N_total = N_txt + N_img;
+    if (n_tot >= N_total) return;
+
+    // Choose stream: txt first, then img
+    bool is_txt = n_tot < N_txt;
+    int n_local = is_txt ? n_tot : (n_tot - N_txt);
+    const __nv_bfloat16* QKV = is_txt ? TXT_QKV : IMG_QKV;
+    const __nv_bfloat16* QW  = is_txt ? TXT_Q_W : IMG_Q_W;
+    const __nv_bfloat16* KW  = is_txt ? TXT_K_W : IMG_K_W;
+    int N_local = is_txt ? N_txt : N_img;
+
+    long HD = (long)H * D;
+    long row_stride = 3L * HD;
+    long qkv_row = (long)b * N_local * row_stride + (long)n_local * row_stride + (long)h * D;
+
+    // Load Q, K, V head vectors (D each) into registers via shared memory staging.
+    // Each thread handles one d.
+    int tid = threadIdx.x;
+    if (tid >= D) return;
+
+    float q = __bfloat162float(QKV[qkv_row + 0 * HD + tid]);
+    float k = __bfloat162float(QKV[qkv_row + 1 * HD + tid]);
+    float v = __bfloat162float(QKV[qkv_row + 2 * HD + tid]);
+
+    // RMSNorm on Q and K (head-dim).
+    // sum(x^2) / D, reduce across threads in block (block = D).
+    extern __shared__ float ssum[];  // size 2*D: ssum[0..D-1]=q^2, ssum[D..2D-1]=k^2
+    ssum[tid]     = q * q;
+    ssum[D + tid] = k * k;
+    __syncthreads();
+
+    // Tree reduction (D is power of 2 in practice; generic otherwise)
+    for (int stride = D >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            ssum[tid]     += ssum[tid + stride];
+            ssum[D + tid] += ssum[D + tid + stride];
+        }
+        __syncthreads();
+    }
+    float q_inv = rsqrtf(ssum[0] / (float)D + eps);
+    float k_inv = rsqrtf(ssum[D] / (float)D + eps);
+    __syncthreads();
+
+    float q_w = __bfloat162float(QW[tid]);
+    float k_w = __bfloat162float(KW[tid]);
+    q = q * q_inv * q_w;
+    k = k * k_inv * k_w;
+
+    // RoPE: (x0, x1) where x0=elem at 2i, x1=elem at 2i+1 within paired halves.
+    // flame rope_fused_bf16 layout: D/2 = half; for each thread d in [0,half):
+    //   out[d]      = x[d]      * cos[d] - x[d+half] * sin[d]
+    //   out[d+half] = x[d+half] * cos[d] + x[d]      * sin[d]
+    int half = D >> 1;
+    // Exchange via shared so every thread can see both halves.
+    __shared__ float q_vec[512];  // enough for D<=512
+    __shared__ float k_vec[512];
+    q_vec[tid] = q;
+    k_vec[tid] = k;
+    __syncthreads();
+
+    float q_rot, k_rot;
+    if (tid < half) {
+        float c = __bfloat162float(COS[(long)n_tot * half + tid]);
+        float s = __bfloat162float(SIN[(long)n_tot * half + tid]);
+        q_rot = q_vec[tid] * c - q_vec[tid + half] * s;
+        k_rot = k_vec[tid] * c - k_vec[tid + half] * s;
+    } else {
+        int d_l = tid - half;
+        float c = __bfloat162float(COS[(long)n_tot * half + d_l]);
+        float s = __bfloat162float(SIN[(long)n_tot * half + d_l]);
+        q_rot = q_vec[tid] * c + q_vec[d_l] * s;
+        k_rot = k_vec[tid] * c + k_vec[d_l] * s;
+    }
+
+    long out_idx = (long)b * H * N_total * D + (long)h * N_total * D + (long)n_tot * D + tid;
+    Q_OUT[out_idx] = __float2bfloat16(q_rot);
+    K_OUT[out_idx] = __float2bfloat16(k_rot);
+    V_OUT[out_idx] = __float2bfloat16(v);
+}
+"#;
+
+/// Joint-attention fused pre-SDPA kernel.
+///
+/// Input:
+///   `img_qkv` [B, N_img, 3*H*D] BF16 — img QKV linear output (raw, unreshaped)
+///   `txt_qkv` [B, N_txt, 3*H*D] BF16 — txt QKV linear output
+///   `img_q_w, img_k_w` [D] BF16 — per-head RMSNorm scales for img stream
+///   `txt_q_w, txt_k_w` [D] BF16 — per-head RMSNorm scales for txt stream
+///   `cos, sin` [N_total, D/2] BF16 — RoPE tables indexed by concatenated position
+/// Output:
+///   `(q, k, v)` each [B, H, N_txt+N_img, D] BF16. Q and K have RMSNorm applied
+///    then RoPE. V is the raw values permuted to [B,H,N,D]. txt tokens occupy
+///    positions [0, N_txt), img tokens occupy [N_txt, N_total).
+///
+/// Replaces: 6 narrows + 6 permutes + 4 rms_norm + 3 cats + 2 rope calls
+///         = ~21 separate BF16 kernels → 1.
+#[allow(dead_code)]
+fn _qkv_rmsnorm_rope_cat_bf16_reserved(
+    img_qkv: &Tensor,
+    txt_qkv: &Tensor,
+    img_q_w: &Tensor,
+    img_k_w: &Tensor,
+    txt_q_w: &Tensor,
+    txt_k_w: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    debug_assert_eq!(img_qkv.dtype(), DType::BF16);
+    debug_assert_eq!(txt_qkv.dtype(), DType::BF16);
+    let img_dims = img_qkv.shape().dims();
+    let txt_dims = txt_qkv.shape().dims();
+    if img_dims.len() != 3 || txt_dims.len() != 3 {
+        return Err(Error::InvalidOperation(
+            "qkv_rmsnorm_rope_cat_bf16: img/txt qkv must be 3D".into(),
+        ));
+    }
+    let b = img_dims[0];
+    if txt_dims[0] != b {
+        return Err(Error::InvalidOperation(format!(
+            "qkv_rmsnorm_rope_cat_bf16: batch mismatch img={} txt={}",
+            b, txt_dims[0]
+        )));
+    }
+    let n_img = img_dims[1];
+    let n_txt = txt_dims[1];
+    let hd = heads * head_dim;
+    if img_dims[2] != 3 * hd || txt_dims[2] != 3 * hd {
+        return Err(Error::InvalidOperation(format!(
+            "qkv_rmsnorm_rope_cat_bf16: last-dim must be 3*H*D={} got img={} txt={}",
+            3 * hd,
+            img_dims[2],
+            txt_dims[2]
+        )));
+    }
+    if head_dim > 512 {
+        return Err(Error::InvalidOperation(format!(
+            "qkv_rmsnorm_rope_cat_bf16: head_dim {head_dim} exceeds shared-mem cap 512"
+        )));
+    }
+    let n_total = n_txt + n_img;
+    let out_numel = b * heads * n_total * head_dim;
+    let out_shape = Shape::from_dims(&[b, heads, n_total, head_dim]);
+
+    let q_data = crate::cuda_alloc_pool::pool_alloc_u16(&img_qkv.device, out_numel)?;
+    let k_data = crate::cuda_alloc_pool::pool_alloc_u16(&img_qkv.device, out_numel)?;
+    let v_data = crate::cuda_alloc_pool::pool_alloc_u16(&img_qkv.device, out_numel)?;
+    let mut q = Tensor {
+        storage: TensorStorage::BF16 { data: q_data.into(), numel: out_numel },
+        shape: out_shape.clone(),
+        device: img_qkv.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+    };
+    let mut k = Tensor {
+        storage: TensorStorage::BF16 { data: k_data.into(), numel: out_numel },
+        shape: out_shape.clone(),
+        device: img_qkv.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+    };
+    let mut v = Tensor {
+        storage: TensorStorage::BF16 { data: v_data.into(), numel: out_numel },
+        shape: out_shape,
+        device: img_qkv.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+    };
+
+    ensure(
+        &img_qkv.device,
+        "qkv_rmsnorm_rope_cat_bf16_kernel",
+        CUDA_QKV_RMSNORM_ROPE_CAT,
+    )?;
+    let f = img_qkv
+        .device
+        .get_func(
+            "qkv_rmsnorm_rope_cat_bf16_kernel",
+            "qkv_rmsnorm_rope_cat_bf16_kernel",
+        )
+        .ok_or_else(|| Error::Cuda("qkv_rmsnorm_rope_cat_bf16_kernel missing".into()))?;
+
+    // cos/sin: accept [1,1,N,D/2] or [N,D/2]. Reshape to [N,D/2] flat.
+    let half = head_dim / 2;
+    let cos_flat = cos.reshape(&[n_total, half])?;
+    let sin_flat = sin.reshape(&[n_total, half])?;
+
+    let ixs = match &img_qkv.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("img_qkv BF16".into())) };
+    let txs = match &txt_qkv.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("txt_qkv BF16".into())) };
+    let iqw = match &img_q_w.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("img_q_w BF16".into())) };
+    let ikw = match &img_k_w.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("img_k_w BF16".into())) };
+    let tqw = match &txt_q_w.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("txt_q_w BF16".into())) };
+    let tkw = match &txt_k_w.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("txt_k_w BF16".into())) };
+    let cs = match &cos_flat.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("cos BF16".into())) };
+    let ss = match &sin_flat.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("sin BF16".into())) };
+    let qs = match &mut q.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let qs = ensure_unique_slice(qs)?;
+    let ks = match &mut k.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let ks = ensure_unique_slice(ks)?;
+    let vs = match &mut v.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let vs = ensure_unique_slice(vs)?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (n_total as u32, (b * heads) as u32, 1),
+        block_dim: (head_dim as u32, 1, 1),
+        shared_mem_bytes: (2 * head_dim * 4) as u32, // 2*D floats for q^2/k^2 reduction
+    };
+    unsafe {
+        f.launch(
+            cfg,
+            (
+                slice_ref(ixs),
+                slice_ref(txs),
+                slice_ref(iqw),
+                slice_ref(ikw),
+                slice_ref(tqw),
+                slice_ref(tkw),
+                slice_ref(cs),
+                slice_ref(ss),
+                qs,
+                ks,
+                vs,
+                b as i32,
+                heads as i32,
+                n_img as i32,
+                n_txt as i32,
+                head_dim as i32,
+                eps,
+            ),
+        )?;
+    }
+    Ok((q, k, v))
+}
+*/
+
+// ---- Fused QKV split + permute: one kernel replaces 3 narrows + 3 permutes ----
+//
+// The attention layer pattern is:
+//   qkv  = Linear(x)                              // [B, N, 3*H*D]
+//   q,k,v = qkv.split(inner, dim=2)              // 3 × narrow  (materializes!)
+//   q = q.view([B,N,H,D]).permute([0,2,1,3])     // materializes
+//   k, v = same                                   // materializes
+//
+// That's 3 narrow kernels + 3 permute kernels per attention, each with its own
+// HBM round-trip, per block, per forward, per step. This replaces the six ops
+// with ONE kernel that reads the fused QKV tensor once and writes three
+// pre-permuted outputs at final [B,H,N,D] layout in a single pass.
+
+const CUDA_QKV_SPLIT_PERMUTE: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void qkv_split_permute_bf16_kernel(
+    const __nv_bfloat16* __restrict__ QKV,  // [B, N, 3*H*D]
+    __nv_bfloat16* __restrict__ Q,          // [B, H, N, D]
+    __nv_bfloat16* __restrict__ K,          // [B, H, N, D]
+    __nv_bfloat16* __restrict__ V,          // [B, H, N, D]
+    int B, int H, int N, int D)
+{
+    long total = (long)B * H * N * D;
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int d = idx % D;
+    long t = idx / D;
+    int n = t % N;
+    t = t / N;
+    int h = t % H;
+    int b = t / H;
+
+    long HD  = (long)H * D;
+    long row_stride = 3 * HD;               // per-token stride in QKV
+    long qkv_row = (long)b * N * row_stride + (long)n * row_stride;
+    long head_off = (long)h * D + d;
+
+    Q[idx] = QKV[qkv_row + 0 * HD + head_off];
+    K[idx] = QKV[qkv_row + 1 * HD + head_off];
+    V[idx] = QKV[qkv_row + 2 * HD + head_off];
+}
+"#;
+
+/// Fused QKV split + permute: one kernel replaces 3 narrows + 3 permutes.
+///
+/// Input `qkv` shape `[B, N, 3*H*D]` BF16 — the raw linear output where the
+/// last dim is `[q_head_0 .. q_head_{H-1}, k_head_0 .. k_head_{H-1}, v_head_0 ..]`.
+///
+/// Returns `(q, k, v)` each shape `[B, H, N, D]` BF16, ready for SDPA.
+///
+/// Semantics are bit-identical to the slow path:
+///   let q = qkv.narrow(2, 0,     h*d)?.reshape([b,n,h,d])?.permute([0,2,1,3])?;
+///   let k = qkv.narrow(2, h*d,   h*d)?.reshape([b,n,h,d])?.permute([0,2,1,3])?;
+///   let v = qkv.narrow(2, 2*h*d, h*d)?.reshape([b,n,h,d])?.permute([0,2,1,3])?;
+/// — but fused into a single kernel launch with one read of `qkv` and three
+/// writes of contiguous outputs.
+pub fn qkv_split_permute_bf16(
+    qkv: &Tensor,
+    heads: usize,
+    head_dim: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    debug_assert_eq!(qkv.dtype(), DType::BF16);
+    let dims = qkv.shape().dims();
+    if dims.len() != 3 {
+        return Err(Error::InvalidOperation(format!(
+            "qkv_split_permute_bf16: expected 3D [B,N,3*H*D], got {:?}", dims
+        )));
+    }
+    let (b, n, c) = (dims[0], dims[1], dims[2]);
+    let hd = heads * head_dim;
+    if c != 3 * hd {
+        return Err(Error::InvalidOperation(format!(
+            "qkv_split_permute_bf16: last dim {c} != 3 * H*D = 3*{heads}*{head_dim} = {}",
+            3 * hd
+        )));
+    }
+    let out_numel = b * heads * n * head_dim;
+    let out_shape = Shape::from_dims(&[b, heads, n, head_dim]);
+
+    let q_data = crate::cuda_alloc_pool::pool_alloc_u16(&qkv.device, out_numel)?;
+    let k_data = crate::cuda_alloc_pool::pool_alloc_u16(&qkv.device, out_numel)?;
+    let v_data = crate::cuda_alloc_pool::pool_alloc_u16(&qkv.device, out_numel)?;
+    let mut q = Tensor {
+        storage: TensorStorage::BF16 { data: q_data.into(), numel: out_numel },
+        shape: out_shape.clone(),
+        device: qkv.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+    };
+    let mut k = Tensor {
+        storage: TensorStorage::BF16 { data: k_data.into(), numel: out_numel },
+        shape: out_shape.clone(),
+        device: qkv.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+    };
+    let mut v = Tensor {
+        storage: TensorStorage::BF16 { data: v_data.into(), numel: out_numel },
+        shape: out_shape,
+        device: qkv.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+    };
+
+    ensure(&qkv.device, "qkv_split_permute_bf16_kernel", CUDA_QKV_SPLIT_PERMUTE)?;
+    let f = qkv.device
+        .get_func("qkv_split_permute_bf16_kernel", "qkv_split_permute_bf16_kernel")
+        .ok_or_else(|| Error::Cuda("qkv_split_permute_bf16_kernel missing".into()))?;
+
+    let xs = match &qkv.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("qkv_split_permute_bf16: input must be BF16".into())) };
+    let qs = match &mut q.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let qs = ensure_unique_slice(qs)?;
+    let ks = match &mut k.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let ks = ensure_unique_slice(ks)?;
+    let vs = match &mut v.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let vs = ensure_unique_slice(vs)?;
+
+    unsafe {
+        f.launch(
+            lc(out_numel),
+            (slice_ref(xs), qs, ks, vs, b as i32, heads as i32, n as i32, head_dim as i32),
+        )?;
+    }
+    Ok((q, k, v))
+}
