@@ -318,9 +318,13 @@ These modules are the BF16 inference primitives. They live in
 ### `ops/gelu_iter.rs` — stride-aware GELU dispatcher (2026-04-22, session 2)
 - ⭐ `gelu_bf16_iter(x)` — `:23` — short-circuits contig to `bf16_ops::gelu_bf16`, else drives the new strided kernel via `flame_gelu_bf16_strided`. `Tensor::gelu` routes here.
 
+### `ops/square_iter.rs` — stride-aware square dispatcher (2026-04-22, session 3)
+- ⭐ `square_bf16_iter(x)` — `:19` — short-circuits contig to `bf16_ops::square_bf16`, else drives `flame_square_bf16_strided`. BF16 `Tensor::square` routes here (replacing the prior `GpuOps::mul(self, self)` call; bit-equivalent on BF16).
+
 ### `bf16_ops.rs` — fused inference primitives
 - ⭐ `gelu_bf16(x)` — `:120` — contig fast path, NOT called directly from `Tensor::gelu` since the 2026-04-22 session 2 TensorIterator port (reached via `ops::gelu_iter::gelu_bf16_iter`'s short-circuit).
 - ⭐ `silu_bf16(x)` — `:303` — contig fast path, NOT called directly from `Tensor::silu` since the 2026-04-22 TensorIterator port (reached via `ops::silu_iter::silu_bf16_iter`'s short-circuit).
+- ⭐ `square_bf16(x)` — `:157` — contig fast path, reached from BF16 `Tensor::square` via `ops::square_iter::square_bf16_iter`'s short-circuit (2026-04-22 session 3).
 - `square_bf16(x)` — `:155`
 - ⭐ `rope_fused_bf16(x, cos, sin)` — `:417` — interleaved-pair RoPE
 - `rope_halfsplit_bf16(x, cos, sin)` — `:500` — halfsplit RoPE

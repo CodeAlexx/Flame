@@ -16,3 +16,4 @@ pub mod utils;
 pub mod fused_inference;
 pub mod silu_iter;
 pub mod gelu_iter;
+pub mod square_iter;

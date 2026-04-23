@@ -2163,8 +2163,24 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Square all elements
     pub fn square(&self) -> Result<Tensor> {
-        // Use GpuOps directly to avoid recording during backward
-        let mut output = GpuOps::mul(self, self)?;
+        // BF16 → TensorIterator dispatcher (short-circuits contig to
+        // `bf16_ops::square_bf16`, bit-equivalent to the pre-migration
+        // `GpuOps::mul(self, self)` path since both compute
+        // `bf16(fp32(x) * fp32(x))`). Other dtypes stay on the original
+        // mul-self-self path. Session 3 of the TensorIterator port
+        // (HANDOFF_2026-04-22_TENSORITERATOR_PORT).
+        let mut output = if self.dtype() == DType::BF16 {
+            #[cfg(feature = "cuda")]
+            {
+                crate::ops::square_iter::square_bf16_iter(self)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                GpuOps::mul(self, self)?
+            }
+        } else {
+            GpuOps::mul(self, self)?
+        };
 
         // Set requires_grad if input requires grad
         if self.requires_grad {
