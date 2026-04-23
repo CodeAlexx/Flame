@@ -249,6 +249,33 @@ pub fn register_all_bf16_kernels() {
         crate::ops::log_iter::LOG_STUB,
         crate::ops::log_iter::log_bf16_kernel
     );
+    // Phase 9: comparison ops. Output dtype is BF16 0.0/1.0 — see the
+    // doc-comment on `TensorIteratorBase::build_comparison_op` for the
+    // flame-core deviation from PyTorch's kBool output.
+    crate::register_stub!(
+        crate::ops::ge_iter::GE_STUB,
+        crate::ops::ge_iter::ge_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::gt_iter::GT_STUB,
+        crate::ops::gt_iter::gt_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::le_iter::LE_STUB,
+        crate::ops::le_iter::le_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::lt_iter::LT_STUB,
+        crate::ops::lt_iter::lt_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::eq_iter::EQ_STUB,
+        crate::ops::eq_iter::eq_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::ne_iter::NE_STUB,
+        crate::ops::ne_iter::ne_bf16_kernel
+    );
 }
 
 #[cfg(not(feature = "cuda"))]

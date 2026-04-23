@@ -120,42 +120,14 @@ void transpose2d_bf16_kernel(const __nv_bfloat16* __restrict__ input,
 }
 "#;
 
-const CUDA_CMP_BF16: &str = r#"
-#include <cuda_bf16.h>
-extern "C" __global__
-void cmp_bf16_kernel(const __nv_bfloat16* A, const __nv_bfloat16* B, unsigned char* O,
-                     long d0, long d1, long d2, long d3, long d4, long d5, long d6, long d7,
-                     long as0, long as1, long as2, long as3, long as4, long as5, long as6, long as7,
-                     long bs0, long bs1, long bs2, long bs3, long bs4, long bs5, long bs6, long bs7,
-                     int nd, long total, int op) {
-  // op: 0=ge,1=gt,2=le,3=lt,4=ne
-  long tid = blockIdx.x * blockDim.x + threadIdx.x;
-  while (tid < total) {
-    long rem = tid, a_off = 0, b_off = 0;
-    { long _d[8] = {d0,d1,d2,d3,d4,d5,d6,d7};
-      long _as[8] = {as0,as1,as2,as3,as4,as5,as6,as7};
-      long _bs[8] = {bs0,bs1,bs2,bs3,bs4,bs5,bs6,bs7};
-      for (int i=nd-1; i>=0; --i) {
-        long idx = rem % _d[i]; rem /= _d[i];
-        a_off += idx * _as[i];
-        b_off += idx * _bs[i];
-      }
-    }
-    float a = __bfloat162float(A[a_off]);
-    float b = __bfloat162float(B[b_off]);
-    unsigned char m = 0;
-    switch (op) {
-      case 0: m = (a >= b); break;
-      case 1: m = (a >  b); break;
-      case 2: m = (a <= b); break;
-      case 3: m = (a <  b); break;
-      default: m = (a != b); break;
-    }
-    O[tid] = m;
-    tid += gridDim.x * blockDim.x;
-  }
-}
-"#;
+// Phase 9: the CUDA_CMP_BF16 NVRTC kernel was deleted. Comparison ops
+// (ge/gt/le/lt/eq/ne) migrated to the TensorIterator pipeline under
+// src/cuda/cmp/*.cu + src/ops/{ge,gt,le,lt,eq,ne}_iter.rs. The old kernel
+// was never wired into `Tensor::ge/gt/le/lt/eq/ne` (those went through
+// `GpuOps::compare_binary` with an F32 round-trip), and had an undiagnosed
+// bug: it wrote 1 byte/element into an f32-backed `TensorStorage::Bool`,
+// leaving 3 out of 4 bytes uninitialized. Since no callsite used the
+// result, the bug was never observed.
 
 #[inline]
 fn lc(n: usize) -> LaunchConfig {
@@ -439,107 +411,14 @@ pub fn transpose2d_bf16(tensor: &Tensor) -> Result<Tensor> {
     Ok(out)
 }
 
-fn cmp_bf16(a: &Tensor, b: &Tensor, op: i32) -> Result<Tensor> {
-    debug_assert_eq!(a.dtype(), DType::BF16);
-    debug_assert_eq!(b.dtype(), DType::BF16);
-    let spec = make_broadcast_spec(a.shape().dims(), b.shape().dims());
-    let n = spec.total as usize;
-    if spec.out_dims.len() > 8 {
-        return Err(Error::InvalidInput(format!(
-            "cmp_bf16: ndim {} exceeds max 8", spec.out_dims.len()
-        )));
-    }
-
-    let data = unsafe { a.device.alloc::<f32>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc cmp bf16: {:?}", e)))?;
-    let out_dims_usize: Vec<usize> = spec.out_dims.iter().map(|&d| d as usize).collect();
-    let mut out = Tensor {
-        storage: TensorStorage::Bool {
-            data: data.into(),
-            numel: n,
-        },
-        shape: Shape::from_dims(&out_dims_usize),
-        device: a.device.clone(),
-        id: TensorId::new(),
-        requires_grad: false,
-        custom_strides: None,
-        view_offset: 0,
-
-    };
-
-    let f = ensure_and_get(&a.device, "cmp_bf16_kernel", CUDA_CMP_BF16)?;
-
-    let (d, ast, bst) = pad8(&spec);
-    let a_ptr = a.as_device_ptr_bf16("cmp_bf16:a")? as u64;
-    let b_ptr = b.as_device_ptr_bf16("cmp_bf16:b")? as u64;
-    let o_ptr = match &mut out.storage {
-        TensorStorage::Bool { data, .. } => *data.device_ptr() as u64,
-        _ => {
-            return Err(Error::InvalidOperation(
-                "expected Bool storage for out".into(),
-            ))
-        }
-    };
-    let nd = spec.out_dims.len() as i32;
-    let total = spec.total;
-
-    // Stack-allocated params array — avoids Vec heap allocation on every dispatch.
-    let mut params: [*mut std::ffi::c_void; 30] = [
-        &a_ptr as *const u64 as *mut std::ffi::c_void,
-        &b_ptr as *const u64 as *mut std::ffi::c_void,
-        &o_ptr as *const u64 as *mut std::ffi::c_void,
-        &d[0] as *const i64 as *mut std::ffi::c_void,
-        &d[1] as *const i64 as *mut std::ffi::c_void,
-        &d[2] as *const i64 as *mut std::ffi::c_void,
-        &d[3] as *const i64 as *mut std::ffi::c_void,
-        &d[4] as *const i64 as *mut std::ffi::c_void,
-        &d[5] as *const i64 as *mut std::ffi::c_void,
-        &d[6] as *const i64 as *mut std::ffi::c_void,
-        &d[7] as *const i64 as *mut std::ffi::c_void,
-        &ast[0] as *const i64 as *mut std::ffi::c_void,
-        &ast[1] as *const i64 as *mut std::ffi::c_void,
-        &ast[2] as *const i64 as *mut std::ffi::c_void,
-        &ast[3] as *const i64 as *mut std::ffi::c_void,
-        &ast[4] as *const i64 as *mut std::ffi::c_void,
-        &ast[5] as *const i64 as *mut std::ffi::c_void,
-        &ast[6] as *const i64 as *mut std::ffi::c_void,
-        &ast[7] as *const i64 as *mut std::ffi::c_void,
-        &bst[0] as *const i64 as *mut std::ffi::c_void,
-        &bst[1] as *const i64 as *mut std::ffi::c_void,
-        &bst[2] as *const i64 as *mut std::ffi::c_void,
-        &bst[3] as *const i64 as *mut std::ffi::c_void,
-        &bst[4] as *const i64 as *mut std::ffi::c_void,
-        &bst[5] as *const i64 as *mut std::ffi::c_void,
-        &bst[6] as *const i64 as *mut std::ffi::c_void,
-        &bst[7] as *const i64 as *mut std::ffi::c_void,
-        &nd as *const i32 as *mut std::ffi::c_void,
-        &total as *const i64 as *mut std::ffi::c_void,
-        &op as *const i32 as *mut std::ffi::c_void,
-    ];
-
-    unsafe {
-        f.launch(lc(n), &mut params[..])
-            .map_err(|e| Error::Training(format!("{e:?}")))?;
-    }
-    Ok(out)
-}
-
-// Public compare helpers
-pub fn ge_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    cmp_bf16(a, b, 0)
-}
-pub fn gt_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    cmp_bf16(a, b, 1)
-}
-pub fn le_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    cmp_bf16(a, b, 2)
-}
-pub fn lt_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    cmp_bf16(a, b, 3)
-}
-pub fn ne_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    cmp_bf16(a, b, 4)
-}
+// Phase 9: `cmp_bf16` + 5 op wrappers (ge_bf16/gt_bf16/le_bf16/lt_bf16/ne_bf16)
+// deleted. See the note above where `CUDA_CMP_BF16` used to live. The live
+// path is now `Tensor::ge/gt/le/lt/eq/ne` → `ops::{op}_iter::{op}_bf16_iter`
+// on BF16+BF16 inputs.
+//
+// Note: `eq_bf16` was never in this file — `eq` always routed through
+// `GpuOps::cmp_eq` with the same-shape precondition. That path is now
+// superseded by `eq_bf16_iter` for BF16+BF16.
 
 // ---------------------------------------------------------------------------
 // Fused patchify / unpatchify — BF16, no 6D permute, no F32 round-trip

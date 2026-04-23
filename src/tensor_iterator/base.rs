@@ -409,6 +409,66 @@ impl<'a> TensorIteratorBase<'a> {
             .build()
     }
 
+    /// Port of `TensorIteratorBase::build_comparison_op`
+    /// (TensorIterator.cpp:932 + set_up_comparison_op_config at :908).
+    ///
+    /// PyTorch's `set_up_comparison_op_config` flags (matched one-for-one
+    /// except output dtype — see below):
+    ///   * `set_check_mem_overlap(true)`
+    ///   * `allow_cpu_scalars(true)`
+    ///   * `promote_inputs_to_common_dtype(true)`
+    ///   * If `out` is undefined: `declare_static_dtype(kBool)`.
+    ///   * If `out` is defined and non-bool: `cast_common_dtype_to_outputs(true)`.
+    ///
+    /// Output-dtype divergence from PyTorch (Phase 9):
+    ///
+    /// PyTorch compare kernels write 1-byte `bool` values; flame-core has
+    /// no 1-byte `TensorStorage` variant (`DType::U8` is unimplemented in
+    /// `TensorStorage::empty`/`::zeros`, see tensor_storage.rs:174, 245),
+    /// and the existing `DType::Bool` backing is `StorageSlice<f32>` (4
+    /// bytes/elem) — allocating a Bool tensor here would require the
+    /// kernel to write 4 bytes/elem, but the output numel×elem-size must
+    /// still equal the f32 backing size or `to_f32(bool_tensor)` returns
+    /// garbage (see the pre-Phase-9 bug in `bf16_elementwise::cmp_bf16`
+    /// that wrote 1 byte/elem into an f32 buffer — broken and never
+    /// called from live code).
+    ///
+    /// The live callers of `Tensor::ge/gt/le/lt/eq/ne` (autograd_v4
+    /// ops/sdpa.rs:632; loss.rs; regularization.rs; autograd.rs) receive a
+    /// BF16 tensor of 0.0/1.0 from the current `GpuOps::compare_binary`
+    /// path (cuda_ops.rs:197–201). This builder preserves that contract:
+    /// output dtype = first input's BF16, sentinel value = 0.0 or 1.0.
+    /// The test `cmp_iter_output_dtype_is_bf16` pins this.
+    ///
+    /// A future phase that lands real U8 storage can flip this to
+    /// `declare_static_dtype(DType::U8)` and adjust the kernel functor's
+    /// return type — the infra in `gpu_kernel_impl_nocast` hardcodes
+    /// output type to `__nv_bfloat16` (tensor_iterator.cuh:600), which is
+    /// the other half of the dependency.
+    pub fn build_comparison_op(
+        out: Option<&'a Tensor>,
+        a: &'a Tensor,
+        b: &'a Tensor,
+    ) -> Result<TensorIteratorBase<'a>> {
+        super::config::TensorIteratorConfig::new()
+            .set_check_mem_overlap(true)
+            .allow_cpu_scalars(true)
+            .promote_inputs_to_common_dtype(true)
+            // NOTE: we intentionally do NOT .declare_static_dtype(U8) — see
+            // the doc-comment above. Output inherits BF16 from inputs.
+            // `cast_common_dtype_to_outputs(false)` matches PyTorch's
+            // "don't cast to bool" optimization at TensorIterator.cpp:927,
+            // reinterpreted for our BF16-output convention: the output
+            // dtype is already the common (BF16) dtype, so no cast is
+            // needed.
+            .cast_common_dtype_to_outputs(false)
+            .check_all_same_dtype(false)
+            .add_output(out)
+            .add_input(a)
+            .add_input(b)
+            .build()
+    }
+
     // ---------- allocate_or_resize_outputs (Phase 3) ----------
 
     /// Port of `TensorIteratorBase::allocate_or_resize_outputs`

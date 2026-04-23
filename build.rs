@@ -206,6 +206,15 @@ fn main() {
     cuda_sources.push("src/cuda/unary/rsqrt.cu");
     cuda_sources.push("src/cuda/unary/exp.cu");
     cuda_sources.push("src/cuda/unary/log.cu");
+    // Phase 9: comparison ops. Output dtype is BF16 0.0/1.0 sentinel —
+    // see the doc-comment on `TensorIteratorBase::build_comparison_op`
+    // for why flame-core diverges from PyTorch's kBool output here.
+    cuda_sources.push("src/cuda/cmp/ge.cu");
+    cuda_sources.push("src/cuda/cmp/gt.cu");
+    cuda_sources.push("src/cuda/cmp/le.cu");
+    cuda_sources.push("src/cuda/cmp/lt.cu");
+    cuda_sources.push("src/cuda/cmp/eq.cu");
+    cuda_sources.push("src/cuda/cmp/ne.cu");
 
     if !cuda_sources.iter().all(|p| Path::new(p).exists()) {
         panic!("CUDA sources missing; ensure submodules are synced");

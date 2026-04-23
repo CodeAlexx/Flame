@@ -113,23 +113,42 @@ impl Tensor {
         self.reshape(&new_dims)
     }
 
-    /// Greater than comparison (broadcast-safe)
+    /// Greater than comparison (broadcast-safe).
+    /// Phase 9: BF16+BF16 routes through the TensorIterator pipeline
+    /// (`ops::gt_iter::gt_bf16_iter`), which writes BF16 0.0/1.0 sentinels
+    /// bit-exactly matching PyTorch's `opmath_t=float` semantics. Other
+    /// dtype combinations stay on `GpuOps::cmp_gt` (F32 round-trip).
     pub fn gt(&self, other: &Tensor) -> Result<Tensor> {
+        if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
+            return crate::ops::gt_iter::gt_bf16_iter(self, other);
+        }
         GpuOps::cmp_gt(self, other)
     }
 
-    /// Greater than or equal comparison (broadcast-safe)
+    /// Greater than or equal comparison (broadcast-safe). See `gt` for
+    /// the Phase 9 BF16 dispatch note.
     pub fn ge(&self, other: &Tensor) -> Result<Tensor> {
+        if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
+            return crate::ops::ge_iter::ge_bf16_iter(self, other);
+        }
         GpuOps::cmp_ge(self, other)
     }
 
-    /// Less than comparison (broadcast-safe)
+    /// Less than comparison (broadcast-safe). See `gt` for the Phase 9
+    /// BF16 dispatch note.
     pub fn lt(&self, other: &Tensor) -> Result<Tensor> {
+        if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
+            return crate::ops::lt_iter::lt_bf16_iter(self, other);
+        }
         GpuOps::cmp_lt(self, other)
     }
 
-    /// Not equal comparison (broadcast-safe)
+    /// Not equal comparison (broadcast-safe). See `gt` for the Phase 9
+    /// BF16 dispatch note. IEEE: ne(NaN,NaN) = true.
     pub fn ne(&self, other: &Tensor) -> Result<Tensor> {
+        if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
+            return crate::ops::ne_iter::ne_bf16_iter(self, other);
+        }
         GpuOps::cmp_ne(self, other)
     }
 
@@ -947,12 +966,16 @@ impl Tensor {
         Ok(output)
     }
 
-    /// Element-wise equality comparison
+    /// Element-wise equality comparison. See `gt` for the Phase 9 BF16
+    /// dispatch note. IEEE: eq(NaN,NaN) = false.
     pub fn eq(&self, other: &Tensor) -> Result<Tensor> {
         if self.shape() != other.shape() {
             return Err(Error::InvalidOperation(
                 "Equality comparison requires tensors with identical shapes".into(),
             ));
+        }
+        if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
+            return crate::ops::eq_iter::eq_bf16_iter(self, other);
         }
         GpuOps::cmp_eq(self, other)
     }
@@ -1018,8 +1041,12 @@ impl Tensor {
         GpuOps::round(self)
     }
 
-    /// Element-wise less than or equal comparison
+    /// Element-wise less than or equal comparison. See `gt` for the
+    /// Phase 9 BF16 dispatch note.
     pub fn le(&self, other: &Tensor) -> Result<Tensor> {
+        if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
+            return crate::ops::le_iter::le_bf16_iter(self, other);
+        }
         GpuOps::cmp_le(self, other)
     }
 
