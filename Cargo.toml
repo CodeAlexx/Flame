@@ -111,6 +111,11 @@ harness = false
 name = "square_iter_alloc"
 harness = false
 
+# Add session 4 — first binary, same 5%-within gate.
+[[bench]]
+name = "add_iter_alloc"
+harness = false
+
 [build-dependencies]
 cbindgen = "0.26"
 cc = "1.0"

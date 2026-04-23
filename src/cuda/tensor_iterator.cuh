@@ -107,4 +107,51 @@ inline cudaError_t launch_elementwise_strided_to_contig(
     return cudaGetLastError();
 }
 
+// ---------------------------------------------------------------------------
+// Binary path (session 4, 2026-04-22): two strided inputs, contig output.
+//
+// Mirrors the non-contig branch of PyTorch's `gpu_kernel_impl_nocast` for
+// binary ops — two input OffsetCalculators, one linear output. Same-shape
+// only for now; broadcast (different-shape inputs with stride=0 on
+// broadcasted dims) is trivially representable in `StridedOffsetCalc` but
+// is scope-deferred to a later session.
+// ---------------------------------------------------------------------------
+
+template <typename InT, typename OutT, typename Op>
+__global__ void flame_elementwise_strided_binary_to_contig(
+    const InT* __restrict__ a_base,
+    const InT* __restrict__ b_base,
+    OutT*       __restrict__ y,
+    int64_t              n_elements,
+    StridedOffsetCalc    a_calc,
+    StridedOffsetCalc    b_calc,
+    Op                   op)
+{
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_elements) return;
+    int64_t a_off = a_calc.get(tid);
+    int64_t b_off = b_calc.get(tid);
+    y[tid] = op(a_base[a_off], b_base[b_off]);
+}
+
+template <typename InT, typename OutT, typename Op>
+inline cudaError_t launch_elementwise_strided_binary_to_contig(
+    const InT*        a_base,
+    const InT*        b_base,
+    OutT*             y,
+    int64_t           n_elements,
+    const StridedOffsetCalc& a_calc,
+    const StridedOffsetCalc& b_calc,
+    Op                op,
+    cudaStream_t      stream)
+{
+    if (n_elements <= 0) return cudaSuccess;
+    const int threads = 256;
+    int64_t blocks = (n_elements + threads - 1) / threads;
+    flame_elementwise_strided_binary_to_contig<InT, OutT, Op>
+        <<<(unsigned int)blocks, threads, 0, stream>>>(
+            a_base, b_base, y, n_elements, a_calc, b_calc, op);
+    return cudaGetLastError();
+}
+
 }}  // namespace flame::iter

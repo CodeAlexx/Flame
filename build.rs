@@ -181,6 +181,7 @@ fn main() {
     cuda_sources.push("src/cuda/activation_silu_iter.cu");
     cuda_sources.push("src/cuda/activation_gelu_iter.cu");
     cuda_sources.push("src/cuda/activation_square_iter.cu");
+    cuda_sources.push("src/cuda/add_bf16_iter.cu");
 
     if !cuda_sources.iter().all(|p| Path::new(p).exists()) {
         panic!("CUDA sources missing; ensure submodules are synced");

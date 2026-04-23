@@ -235,6 +235,25 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// TensorIterator strided-path BF16 elementwise add (same-shape only;
+    /// broadcast stays on `launch_bf16_elementwise`). Used by
+    /// `ops::add_iter::add_bf16_iter` when at least one input is strided.
+    /// Contig+contig same-shape callers short-circuit to the existing
+    /// `bf16_elementwise::add_bf16` fast path (`__hadd2` vectorized).
+    pub fn flame_add_bf16_strided(
+        a_ptr: *const core::ffi::c_void,
+        a_offset_elems: i64,
+        a_strides: *const i64,
+        b_ptr: *const core::ffi::c_void,
+        b_offset_elems: i64,
+        b_strides: *const i64,
+        y_ptr: *mut core::ffi::c_void,
+        rank: i32,
+        sizes: *const i64,
+        n_elements: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// TensorIterator strided-path BF16 square (y = x*x). Used only by
     /// `ops::square_iter::square_bf16_iter` when input is NOT contiguous —
     /// contig BF16 callers short-circuit to `bf16_ops::square_bf16`.

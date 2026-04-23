@@ -1843,8 +1843,23 @@ extern "C" __global__ void f32_to_bool_kernel(
     /// Element-wise addition
     pub fn add(&self, other: &Tensor) -> Result<Tensor> {
         // Use BF16 elementwise kernels when available to avoid F32 staging.
+        // BF16 + BF16 routes through the TensorIterator dispatcher, which
+        // short-circuits same-shape contig+contig to the existing fast path
+        // (bit-exact) and delegates different-shape (broadcast) to the
+        // same slow path as before. The only new behavior is same-shape
+        // strided inputs, which previously hit a latent
+        // storage-base-linear bug in `bf16_elementwise::add_bf16`'s fast
+        // branch (it ignored `view_offset`/custom strides). Session 4 of
+        // the TensorIterator port (HANDOFF_2026-04-22_TENSORITERATOR_PORT).
         let mut output = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            crate::bf16_elementwise::add_bf16(self, other)?
+            #[cfg(feature = "cuda")]
+            {
+                crate::ops::add_iter::add_bf16_iter(self, other)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                crate::bf16_elementwise::add_bf16(self, other)?
+            }
         } else {
             GpuOps::add(self, other)?
         };

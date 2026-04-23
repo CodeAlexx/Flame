@@ -699,12 +699,32 @@ pub fn sub_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     launch_bf16_elementwise(a, &neg_b, "add_bf16_kernel", "sub_bf16")
 }
 
+/// Gate for `launch_bf16_flat`: both inputs must be BF16, have the same
+/// logical shape, AND both be row-major contiguous in storage.
+///
+/// The contiguity check is REQUIRED (added 2026-04-22, session 4 of the
+/// TensorIterator port). Without it, `launch_bf16_flat` reads
+/// `as_device_ptr_bf16` (storage base) + linear `n` elements, ignoring
+/// `custom_strides` and `view_offset` — so two strided views with
+/// matching logical shape would produce semantically-wrong bytes.
+///
+/// PyTorch's equivalent (`gpu_kernel_impl_nocast` at
+/// `aten/src/ATen/native/cuda/CUDALoops.cuh:643`) branches on
+/// `iter.is_contiguous()`, never on shape equality alone. This function
+/// is the flame-core mirror of that PyTorch-side invariant.
+///
+/// Callers that hit this gate as `false` fall back to
+/// `launch_bf16_elementwise`, which respects per-arg strides via
+/// `make_broadcast_spec`. That path is correct for strided same-shape
+/// inputs as well as for broadcast.
 #[inline]
 fn shapes_equal_no_broadcast(a: &Tensor, b: &Tensor) -> bool {
     a.dtype() == DType::BF16
         && b.dtype() == DType::BF16
         && a.shape().dims() == b.shape().dims()
         && a.shape().elem_count() == b.shape().elem_count()
+        && a.is_contiguous()
+        && b.is_contiguous()
 }
 
 /// Fast path: both inputs are contiguous, same shape, no broadcast.
