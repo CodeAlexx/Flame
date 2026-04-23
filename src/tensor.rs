@@ -2024,7 +2024,13 @@ extern "C" __global__ void f32_to_bool_kernel(
         let mut output = if self.dtype() == DType::BF16 {
             #[cfg(feature = "cuda")]
             {
-                bf16_ops::silu_bf16(self)?
+                // Route through the TensorIterator dispatcher. It short-
+                // circuits `is_contiguous()` to the existing vectorized
+                // `bf16_ops::silu_bf16` unchanged, so contig callers
+                // (every current call site) pay zero iterator overhead.
+                // Strided inputs hit the new `flame_silu_bf16_strided`
+                // FFI path backed by `cuda/activation_silu_iter.cu`.
+                crate::ops::silu_iter::silu_bf16_iter(self)?
             }
             #[cfg(not(feature = "cuda"))]
             {

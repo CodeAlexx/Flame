@@ -14,3 +14,4 @@ pub mod reduce;
 pub mod tile;
 pub mod utils;
 pub mod fused_inference;
+pub mod silu_iter;

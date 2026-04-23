@@ -91,6 +91,14 @@ harness = false
 name = "strides_alloc"
 harness = false
 
+# TensorIterator silu dispatcher overhead (2026-04-22). Gate 6 of the
+# OffsetCalculator port: contig path through `silu_bf16_iter` must stay
+# within 5% of the direct `bf16_ops::silu_bf16` call on the primary
+# 4096×4096 shape. Strided (transpose-view) column is new capability.
+[[bench]]
+name = "silu_iter_alloc"
+harness = false
+
 [build-dependencies]
 cbindgen = "0.26"
 cc = "1.0"

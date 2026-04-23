@@ -312,9 +312,12 @@ These modules are the BF16 inference primitives. They live in
 - `BcSpec` — `:22` — broadcast spec struct
 - `patchify_bf16 / unpatchify_bf16` — `:866,922` — DiT patch ops
 
+### `ops/silu_iter.rs` — stride-aware SiLU dispatcher (2026-04-22)
+- ⭐ `silu_bf16_iter(x)` — `:39` — short-circuits contig to `bf16_ops::silu_bf16`, else drives the new strided kernel via `flame_silu_bf16_strided`. `Tensor::silu` routes here.
+
 ### `bf16_ops.rs` — fused inference primitives
 - ⭐ `gelu_bf16(x)` — `:120`
-- ⭐ `silu_bf16(x)` — `:303`
+- ⭐ `silu_bf16(x)` — `:303` — contig fast path, NOT called directly from `Tensor::silu` since the 2026-04-22 TensorIterator port (reached via `ops::silu_iter::silu_bf16_iter`'s short-circuit).
 - `square_bf16(x)` — `:155`
 - ⭐ `rope_fused_bf16(x, cos, sin)` — `:417` — interleaved-pair RoPE
 - `rope_halfsplit_bf16(x, cos, sin)` — `:500` — halfsplit RoPE
