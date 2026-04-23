@@ -1173,17 +1173,68 @@ void swiglu_fused_bf16_kernel(
 }
 "#;
 
+// Stride-aware variant for narrow-view inputs. Takes (out_strides,
+// gate_strides, up_strides) as device arrays plus per-input element offsets
+// applied on the base pointer. Decomposes the output index via the
+// contig-shape strides, then recomposes input addresses via per-input
+// strides. Equivalent to the contig kernel when inputs are already
+// contiguous; only used when at least one input is a strided view.
+const CUDA_SWIGLU_FUSED_STRIDED: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void swiglu_fused_strided_bf16_kernel(
+    const __nv_bfloat16* __restrict__ GATE,
+    long long gate_offset,
+    const __nv_bfloat16* __restrict__ UP,
+    long long up_offset,
+    __nv_bfloat16* __restrict__ Y,
+    int ndim,
+    const long long* __restrict__ out_strides,
+    const long long* __restrict__ gate_strides,
+    const long long* __restrict__ up_strides,
+    long long total)
+{
+    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    long long step = (long long)blockDim.x * (long long)gridDim.x;
+    while (idx < total) {
+        long long rem = idx;
+        long long g_addr = gate_offset;
+        long long u_addr = up_offset;
+        for (int d = 0; d < ndim; ++d) {
+            long long s = out_strides[d];
+            long long coord = (s > 0) ? rem / s : 0;
+            if (s > 0) { rem = rem % s; }
+            g_addr += coord * gate_strides[d];
+            u_addr += coord * up_strides[d];
+        }
+        float g = __bfloat162float(GATE[g_addr]);
+        float u = __bfloat162float(UP[u_addr]);
+        float silu_g = g / (1.0f + expf(-g));
+        Y[idx] = __float2bfloat16(silu_g * u);
+        idx += step;
+    }
+}
+"#;
+
 /// Fused SwiGLU: silu(gate) * up in one kernel (no intermediate silu tensor).
+///
+/// Stride-aware as of Phase 2b (2026-04-23). Contig fast path when both
+/// inputs are already contiguous; strided path indexes strided-view inputs
+/// directly, eliminating the Phase-2a materialize_view guard and the
+/// ~80 narrow-materialize DtoD memcpys per Klein denoise step that came
+/// with it.
 pub fn swiglu_fused_bf16(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     debug_assert_eq!(gate.dtype(), DType::BF16);
-    // Stride refactor Phase 2a: this kernel walks storage linearly. If a
-    // caller hands us a view (post-narrow/permute), materialize first.
-    // When both inputs are already contiguous (current Klein path today),
-    // `.contiguous()` is a cheap Arc clone.
-    let gate_owned = gate.contiguous()?;
-    let up_owned = up.contiguous()?;
-    let gate = &gate_owned;
-    let up = &up_owned;
+    debug_assert_eq!(up.dtype(), DType::BF16);
+    debug_assert_eq!(gate.shape(), up.shape());
+    if gate.is_contiguous() && up.is_contiguous() {
+        swiglu_fused_bf16_contig(gate, up)
+    } else {
+        swiglu_fused_bf16_strided(gate, up)
+    }
+}
+
+fn swiglu_fused_bf16_contig(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     let total = gate.shape().elem_count();
 
     let data = crate::cuda_alloc_pool::pool_alloc_u16(&gate.device, total)?;
@@ -1210,6 +1261,94 @@ pub fn swiglu_fused_bf16(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 
     unsafe {
         f.launch(lc(total), (slice_ref(gs), slice_ref(us), ys, total as i64))?;
+    }
+    Ok(out)
+}
+
+fn swiglu_fused_bf16_strided(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    use cudarc::driver::{CudaSlice, LaunchAsync};
+    let device = gate.device.clone();
+    let shape = gate.shape().clone();
+    let dims = shape.dims();
+    let ndim = dims.len();
+    let total = shape.elem_count();
+
+    // out_strides: row-major of output shape (contig).
+    let mut out_strides = vec![1i64; ndim];
+    for i in (0..ndim.saturating_sub(1)).rev() {
+        out_strides[i] = out_strides[i + 1] * dims[i + 1] as i64;
+    }
+    let gate_strides: Vec<i64> = gate.strides().iter().map(|&s| s as i64).collect();
+    let up_strides: Vec<i64> = up.strides().iter().map(|&s| s as i64).collect();
+    let gate_offset_i64 = gate.offset() as i64;
+    let up_offset_i64 = up.offset() as i64;
+
+    let mut d_out_strides: CudaSlice<i64> = unsafe { device.alloc::<i64>(ndim) }
+        .map_err(|e| Error::Cuda(format!("alloc out_strides: {:?}", e)))?;
+    device
+        .htod_copy_into(out_strides, &mut d_out_strides)
+        .map_err(|e| Error::Cuda(format!("htod out_strides: {:?}", e)))?;
+    let mut d_gate_strides: CudaSlice<i64> = unsafe { device.alloc::<i64>(ndim) }
+        .map_err(|e| Error::Cuda(format!("alloc gate_strides: {:?}", e)))?;
+    device
+        .htod_copy_into(gate_strides, &mut d_gate_strides)
+        .map_err(|e| Error::Cuda(format!("htod gate_strides: {:?}", e)))?;
+    let mut d_up_strides: CudaSlice<i64> = unsafe { device.alloc::<i64>(ndim) }
+        .map_err(|e| Error::Cuda(format!("alloc up_strides: {:?}", e)))?;
+    device
+        .htod_copy_into(up_strides, &mut d_up_strides)
+        .map_err(|e| Error::Cuda(format!("htod up_strides: {:?}", e)))?;
+
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&device, total)?;
+    let mut out = Tensor {
+        storage: TensorStorage::BF16 { data: data.into(), numel: total },
+        shape: shape.clone(),
+        device: device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+    };
+
+    ensure(&device, "swiglu_fused_strided_bf16_kernel", CUDA_SWIGLU_FUSED_STRIDED)?;
+    let f = device
+        .get_func(
+            "swiglu_fused_strided_bf16_kernel",
+            "swiglu_fused_strided_bf16_kernel",
+        )
+        .ok_or_else(|| Error::Cuda("swiglu_fused_strided_bf16_kernel missing".into()))?;
+
+    let gs = match &gate.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let us = match &up.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let ys = match &mut out.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
+    let ys = ensure_unique_slice(ys)?;
+
+    unsafe {
+        f.launch(
+            lc(total),
+            (
+                slice_ref(gs),
+                gate_offset_i64,
+                slice_ref(us),
+                up_offset_i64,
+                ys,
+                ndim as i32,
+                &d_out_strides,
+                &d_gate_strides,
+                &d_up_strides,
+                total as i64,
+            ),
+        )
+        .map_err(|e| Error::Cuda(format!("launch swiglu_fused_strided: {:?}", e)))?;
     }
     Ok(out)
 }
