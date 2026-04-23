@@ -1,6 +1,6 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::silu_iter::silu_bf16_iter` — the first kernel on
+//! Parity tests for `tensor_iterator::ops::unary::silu_bf16_iter` — the first kernel on
 //! flame-core's TensorIterator port
 //! (HANDOFF_2026-04-22_TENSORITERATOR_PORT).
 //!
@@ -23,7 +23,7 @@
 //!    return once it flips to view-return — many sessions away). Tests the
 //!    `base_offset` field of `StridedOffsetCalc`.
 
-use flame_core::{ops::silu_iter::silu_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::unary::silu_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

@@ -1,6 +1,6 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::neg_iter::neg_bf16_iter` (Phase 6).
+//! Parity tests for `tensor_iterator::ops::unary::neg_bf16_iter` (Phase 6).
 //!
 //! Neg is native BF16 via a sign-bit flip. The pre-Phase-6 reference path
 //! (`Tensor::neg` = `mul_scalar(-1.0)`) goes bf16→f32 → multiply by -1.0 →
@@ -15,7 +15,7 @@
 //!   3. narrow view cos_sim ≥ 0.9999.
 //!   4. edge values: ±0, ±∞, BF16::MAX/MIN.
 
-use flame_core::{ops::neg_iter::neg_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::unary::neg_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

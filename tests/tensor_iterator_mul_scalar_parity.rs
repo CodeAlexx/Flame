@@ -1,13 +1,13 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::mul_scalar_iter::mul_scalar_bf16_iter` (Phase 5b).
+//! Parity tests for `tensor_iterator::ops::binary::mul_scalar_bf16_iter` (Phase 5b).
 //!
 //! Reference: the legacy BF16 path through `ops::elt::mul_scalar_same_dtype`
 //! (which `GpuOps::mul_scalar` dispatches to for BF16 inputs). Same fp32
 //! multiply → round-to-nearest-even BF16 semantics, so bit-exact is
 //! expected on contig inputs.
 
-use flame_core::{ops::mul_scalar_iter::mul_scalar_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::binary::mul_scalar_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

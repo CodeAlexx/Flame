@@ -7,7 +7,7 @@
 // via stride=0 internally.
 use anyhow::Result;
 use flame_core::{
-    ops::{add_iter::add_bf16_iter, mul_iter::mul_bf16_iter},
+    tensor_iterator::ops::binary::{add_bf16_iter, mul_bf16_iter},
     DType, Device, Shape, Tensor,
 };
 

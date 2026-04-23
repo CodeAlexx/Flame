@@ -13,7 +13,7 @@
 
 #![cfg(feature = "cuda")]
 
-use flame_core::{bf16_ops, global_cuda_device, ops::silu_iter::silu_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{bf16_ops, global_cuda_device, tensor_iterator::ops::unary::silu_bf16_iter, DType, Result, Shape, Tensor};
 use std::hint::black_box;
 use std::time::Instant;
 

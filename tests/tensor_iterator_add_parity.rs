@@ -1,6 +1,6 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::add_iter::add_bf16_iter` (session 4, 2026-04-22).
+//! Parity tests for `tensor_iterator::ops::binary::add_bf16_iter` (session 4, 2026-04-22).
 //!
 //! Phase 5b rewrite (2026-04-23): the legacy reference path
 //! (`bf16_elementwise::add_bf16`) was deleted. Reference now comes from
@@ -17,7 +17,7 @@
 //!   3. both-permuted: same self-consistency check.
 //!   4. narrow+contig: ditto; exercises `base_offset`.
 
-use flame_core::{ops::add_iter::add_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::binary::add_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

@@ -26,7 +26,7 @@
 //! Rank 0 (scalar) is intentionally skipped — PyTorch handles degenerate
 //! elementwise specially too (`numel == 0` early-return at Loops.cuh:92).
 
-use flame_core::{ops::silu_iter::silu_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::unary::silu_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

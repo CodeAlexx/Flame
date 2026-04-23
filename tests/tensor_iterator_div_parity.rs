@@ -1,10 +1,10 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::div_iter::div_bf16_iter` (Phase 5b).
+//! Parity tests for `tensor_iterator::ops::binary::div_bf16_iter` (Phase 5b).
 //! Reference: CPU fp32 div + rne BF16 rounding. Divisor tensors use
 //! `make_bf16_tensor_positive` to avoid div-by-zero pathologies.
 
-use flame_core::{ops::div_iter::div_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::binary::div_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

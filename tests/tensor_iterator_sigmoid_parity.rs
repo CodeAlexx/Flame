@@ -1,6 +1,6 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::sigmoid_iter::sigmoid_bf16_iter` (Phase 6).
+//! Parity tests for `tensor_iterator::ops::unary::sigmoid_bf16_iter` (Phase 6).
 //!
 //! Sigmoid uses f32 opmath inside the functor (matching PyTorch's
 //! opmath_t=float for BF16). The reference is computed on the host in f32
@@ -9,7 +9,7 @@
 //! last-ULP drift between the host `exp` and `__expf` intrinsics is
 //! expected, so we gate on cos_sim ≥ 0.9999 (per plan §R7).
 
-use flame_core::{ops::sigmoid_iter::sigmoid_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::unary::sigmoid_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

@@ -18,7 +18,7 @@ use crate::perf_telemetry;
 use crate::strict::{self, GuardMode};
 use crate::{
     cuda_ops_ffi::{
-        fc_axpby_bf16, fc_bf16_broadcast, fc_bf16_index_select, fc_bf16_repeat_axis,
+        fc_bf16_broadcast, fc_bf16_index_select, fc_bf16_repeat_axis,
         fc_bf16_repeat_nd, fc_bf16_slice, fc_gelu_bf16, fc_gemm_bf16, fc_group_norm_backward_bf16,
         fc_group_norm_bf16, fc_layer_norm_backward_bf16, fc_layer_norm_bf16,
         fc_rms_norm_bf16, fc_rms_norm_bf16_to_f32, fc_silu_bf16, flame_conv2d_nhwc_bf16,
@@ -236,18 +236,6 @@ pub fn silu_bf16(x: &Tensor) -> Result<Tensor> {
     let status = unsafe { fc_silu_bf16(&vx, &mut vy, stream.as_raw()) };
     status_to_result(status, "fc_silu_bf16")?;
     Ok(out)
-}
-
-pub fn axpby_inplace_bf16(x: &Tensor, a: f32, y: &mut Tensor, b: f32) -> Result<()> {
-    ensure_bf16(x, "axpby_bf16:x")?;
-    ensure_bf16(y, "axpby_bf16:y")?;
-
-    let stream = default_stream(y);
-    let vx = tensor_as_view_bf16(x, "axpby_bf16:x")?;
-    let mut vy = tensor_as_view_bf16_mut(y, "axpby_bf16:y")?;
-
-    let status = unsafe { fc_axpby_bf16(&vx, a, &mut vy, b, stream.as_raw()) };
-    status_to_result(status, "fc_axpby_bf16")
 }
 
 pub fn rms_norm_bf16(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> Result<Tensor> {

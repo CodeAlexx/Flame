@@ -160,21 +160,22 @@ macro_rules! register_stub {
 /// the `cuda` feature, so the non-cuda build has nothing to register.
 #[cfg(feature = "cuda")]
 pub fn register_all_bf16_kernels() {
+    // Phase 4: pilot ops.
     crate::register_stub!(
-        crate::ops::silu_iter::SILU_STUB,
-        crate::ops::silu_iter::silu_bf16_kernel
+        crate::tensor_iterator::ops::unary::SILU_STUB,
+        crate::tensor_iterator::ops::unary::silu_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::gelu_iter::GELU_STUB,
-        crate::ops::gelu_iter::gelu_bf16_kernel
+        crate::tensor_iterator::ops::unary::GELU_STUB,
+        crate::tensor_iterator::ops::unary::gelu_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::square_iter::SQUARE_STUB,
-        crate::ops::square_iter::square_bf16_kernel
+        crate::tensor_iterator::ops::unary::SQUARE_STUB,
+        crate::tensor_iterator::ops::unary::square_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::add_iter::ADD_STUB,
-        crate::ops::add_iter::add_bf16_kernel
+        crate::tensor_iterator::ops::binary::ADD_STUB,
+        crate::tensor_iterator::ops::binary::add_bf16_kernel
     );
     // Phase 5b: 5 new binary ops. Scalar ops (mul_scalar, add_scalar) are
     // NOT registered here — their wrappers call the FFI directly because
@@ -183,98 +184,98 @@ pub fn register_all_bf16_kernels() {
     // captures the scalar inside the lambda at the call site, not via
     // REGISTER_DISPATCH.
     crate::register_stub!(
-        crate::ops::sub_iter::SUB_STUB,
-        crate::ops::sub_iter::sub_bf16_kernel
+        crate::tensor_iterator::ops::binary::SUB_STUB,
+        crate::tensor_iterator::ops::binary::sub_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::mul_iter::MUL_STUB,
-        crate::ops::mul_iter::mul_bf16_kernel
+        crate::tensor_iterator::ops::binary::MUL_STUB,
+        crate::tensor_iterator::ops::binary::mul_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::div_iter::DIV_STUB,
-        crate::ops::div_iter::div_bf16_kernel
+        crate::tensor_iterator::ops::binary::DIV_STUB,
+        crate::tensor_iterator::ops::binary::div_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::maximum_iter::MAXIMUM_STUB,
-        crate::ops::maximum_iter::maximum_bf16_kernel
+        crate::tensor_iterator::ops::binary::MAXIMUM_STUB,
+        crate::tensor_iterator::ops::binary::maximum_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::minimum_iter::MINIMUM_STUB,
-        crate::ops::minimum_iter::minimum_bf16_kernel
+        crate::tensor_iterator::ops::binary::MINIMUM_STUB,
+        crate::tensor_iterator::ops::binary::minimum_bf16_kernel
     );
     // Phase 6: unary activations. abs/relu/neg are native BF16 (sign-bit
     // manipulation or __hgt comparison), sigmoid/tanh use f32 opmath
     // inside the functor (matching PyTorch's opmath_t=float for BF16).
     crate::register_stub!(
-        crate::ops::abs_iter::ABS_STUB,
-        crate::ops::abs_iter::abs_bf16_kernel
+        crate::tensor_iterator::ops::unary::ABS_STUB,
+        crate::tensor_iterator::ops::unary::abs_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::relu_iter::RELU_STUB,
-        crate::ops::relu_iter::relu_bf16_kernel
+        crate::tensor_iterator::ops::unary::RELU_STUB,
+        crate::tensor_iterator::ops::unary::relu_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::neg_iter::NEG_STUB,
-        crate::ops::neg_iter::neg_bf16_kernel
+        crate::tensor_iterator::ops::unary::NEG_STUB,
+        crate::tensor_iterator::ops::unary::neg_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::sigmoid_iter::SIGMOID_STUB,
-        crate::ops::sigmoid_iter::sigmoid_bf16_kernel
+        crate::tensor_iterator::ops::unary::SIGMOID_STUB,
+        crate::tensor_iterator::ops::unary::sigmoid_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::tanh_iter::TANH_STUB,
-        crate::ops::tanh_iter::tanh_bf16_kernel
+        crate::tensor_iterator::ops::unary::TANH_STUB,
+        crate::tensor_iterator::ops::unary::tanh_bf16_kernel
     );
     // Phase 7: transcendentals. All use f32 opmath inside the functor
     // (bf16→f32 on load, f32 intrinsic, __float2bfloat16_rn on store).
     // Pre-Phase-7 these were all F32 roundtrips; exp/log/sqrt had a
     // `GpuOps::*` entry, rsqrt/recip were composed Rust-side.
     crate::register_stub!(
-        crate::ops::sqrt_iter::SQRT_STUB,
-        crate::ops::sqrt_iter::sqrt_bf16_kernel
+        crate::tensor_iterator::ops::transcendentals::SQRT_STUB,
+        crate::tensor_iterator::ops::transcendentals::sqrt_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::recip_iter::RECIP_STUB,
-        crate::ops::recip_iter::recip_bf16_kernel
+        crate::tensor_iterator::ops::transcendentals::RECIP_STUB,
+        crate::tensor_iterator::ops::transcendentals::recip_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::rsqrt_iter::RSQRT_STUB,
-        crate::ops::rsqrt_iter::rsqrt_bf16_kernel
+        crate::tensor_iterator::ops::transcendentals::RSQRT_STUB,
+        crate::tensor_iterator::ops::transcendentals::rsqrt_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::exp_iter::EXP_STUB,
-        crate::ops::exp_iter::exp_bf16_kernel
+        crate::tensor_iterator::ops::transcendentals::EXP_STUB,
+        crate::tensor_iterator::ops::transcendentals::exp_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::log_iter::LOG_STUB,
-        crate::ops::log_iter::log_bf16_kernel
+        crate::tensor_iterator::ops::transcendentals::LOG_STUB,
+        crate::tensor_iterator::ops::transcendentals::log_bf16_kernel
     );
     // Phase 9: comparison ops. Output dtype is BF16 0.0/1.0 — see the
     // doc-comment on `TensorIteratorBase::build_comparison_op` for the
     // flame-core deviation from PyTorch's kBool output.
     crate::register_stub!(
-        crate::ops::ge_iter::GE_STUB,
-        crate::ops::ge_iter::ge_bf16_kernel
+        crate::tensor_iterator::ops::comparison::GE_STUB,
+        crate::tensor_iterator::ops::comparison::ge_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::gt_iter::GT_STUB,
-        crate::ops::gt_iter::gt_bf16_kernel
+        crate::tensor_iterator::ops::comparison::GT_STUB,
+        crate::tensor_iterator::ops::comparison::gt_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::le_iter::LE_STUB,
-        crate::ops::le_iter::le_bf16_kernel
+        crate::tensor_iterator::ops::comparison::LE_STUB,
+        crate::tensor_iterator::ops::comparison::le_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::lt_iter::LT_STUB,
-        crate::ops::lt_iter::lt_bf16_kernel
+        crate::tensor_iterator::ops::comparison::LT_STUB,
+        crate::tensor_iterator::ops::comparison::lt_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::eq_iter::EQ_STUB,
-        crate::ops::eq_iter::eq_bf16_kernel
+        crate::tensor_iterator::ops::comparison::EQ_STUB,
+        crate::tensor_iterator::ops::comparison::eq_bf16_kernel
     );
     crate::register_stub!(
-        crate::ops::ne_iter::NE_STUB,
-        crate::ops::ne_iter::ne_bf16_kernel
+        crate::tensor_iterator::ops::comparison::NE_STUB,
+        crate::tensor_iterator::ops::comparison::ne_bf16_kernel
     );
 }
 

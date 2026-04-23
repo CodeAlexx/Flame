@@ -1,6 +1,6 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::square_iter::square_bf16_iter` — third kernel
+//! Parity tests for `tensor_iterator::ops::unary::square_bf16_iter` — third kernel
 //! on the TensorIterator port (session 3, 2026-04-22). Same 3 cases as
 //! silu/gelu sessions.
 //!
@@ -12,7 +12,7 @@
 //! dispatcher) to `x.mul(&x)` (the explicit binary-mul path) on a
 //! contig BF16 tensor to prove the dispatch flip is a no-op.
 
-use flame_core::{ops::square_iter::square_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::unary::square_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

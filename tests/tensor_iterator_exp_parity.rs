@@ -1,6 +1,6 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::exp_iter::exp_bf16_iter` (Phase 7).
+//! Parity tests for `tensor_iterator::ops::transcendentals::exp_bf16_iter` (Phase 7).
 //!
 //! Exp uses f32 opmath inside the functor (__expf). The reference is
 //! computed on the host in f32 (std `exp`) then rounded to BF16. The
@@ -8,7 +8,7 @@
 //! cos_sim ≥ 0.9999 holds on random BF16 ranges — matches silu/sigmoid
 //! threshold which also use `__expf`.
 
-use flame_core::{ops::exp_iter::exp_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::transcendentals::exp_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

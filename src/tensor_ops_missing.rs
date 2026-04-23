@@ -78,7 +78,7 @@ impl Tensor {
     /// Square root. Phase 10: BF16 → TensorIterator, else → GpuOps::sqrt.
     pub fn sqrt(&self) -> Result<Tensor> {
         let mut output = crate::tensor_iterator::dispatch_unary_bf16(
-            self, crate::ops::sqrt_iter::sqrt_bf16_iter, GpuOps::sqrt,
+            self, crate::tensor_iterator::ops::transcendentals::sqrt_bf16_iter, GpuOps::sqrt,
         )?;
         if self.requires_grad {
             output.requires_grad = true;

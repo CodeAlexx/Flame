@@ -1,11 +1,11 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::sub_iter::sub_bf16_iter` (Phase 5b).
+//! Parity tests for `tensor_iterator::ops::binary::sub_bf16_iter` (Phase 5b).
 //! Reference: CPU fp32 sub + rne BF16 rounding. See the header comment
 //! in `tensor_iterator_add_parity.rs` for the rationale — the legacy
 //! `bf16_elementwise::sub_bf16` was deleted in Phase 5b.
 
-use flame_core::{ops::sub_iter::sub_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::binary::sub_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

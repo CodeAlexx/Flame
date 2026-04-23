@@ -498,7 +498,7 @@ impl Tensor {
     pub fn reciprocal(&self) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_unary_bf16(
             self,
-            crate::ops::recip_iter::recip_bf16_iter,
+            crate::tensor_iterator::ops::transcendentals::recip_bf16_iter,
             |x| {
                 let ones = Tensor::ones_dtype(x.shape().clone(), x.dtype(), x.device.clone())?;
                 ones.div(x)

@@ -1,13 +1,13 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::tanh_iter::tanh_bf16_iter` (Phase 6).
+//! Parity tests for `tensor_iterator::ops::unary::tanh_bf16_iter` (Phase 6).
 //!
 //! Tanh uses f32 opmath inside the functor. Reference is computed on the
 //! host in f32 via `tanh(v)` then rounded to BF16; gate cos_sim ≥ 0.9999
 //! per plan §R7 (last-ULP drift between host libm tanh and `tanhf`
 //! intrinsic is expected).
 
-use flame_core::{ops::tanh_iter::tanh_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::unary::tanh_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

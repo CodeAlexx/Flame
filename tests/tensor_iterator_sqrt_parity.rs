@@ -1,11 +1,11 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::sqrt_iter::sqrt_bf16_iter` (Phase 7).
+//! Parity tests for `tensor_iterator::ops::transcendentals::sqrt_bf16_iter` (Phase 7).
 //!
 //! Sqrt uses f32 opmath inside the functor (__fsqrt_rn). The reference is
 //! computed on the host in f32 then rounded to BF16 (__float2bfloat16_rn).
 
-use flame_core::{ops::sqrt_iter::sqrt_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::transcendentals::sqrt_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

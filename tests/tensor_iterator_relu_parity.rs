@@ -1,6 +1,6 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::relu_iter::relu_bf16_iter` (Phase 6).
+//! Parity tests for `tensor_iterator::ops::unary::relu_bf16_iter` (Phase 6).
 //!
 //! Relu is native BF16 via `__hgt(x, 0) ? x : 0`. Reference is computed on
 //! the host: for each BF16 input value, if it is > 0 pass it through; else
@@ -12,7 +12,7 @@
 //!   3. narrow view bit-exact.
 //!   4. edge values (±0, ±∞, BF16::MAX/MIN).
 
-use flame_core::{ops::relu_iter::relu_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::unary::relu_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

@@ -1849,7 +1849,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         let mut output = crate::tensor_iterator::dispatch_binary_bf16(
             self,
             other,
-            crate::ops::add_iter::add_bf16_iter,
+            crate::tensor_iterator::ops::binary::add_bf16_iter,
             GpuOps::add,
         )?;
         if self.requires_grad || other.requires_grad {
@@ -1879,7 +1879,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         let mut output = crate::tensor_iterator::dispatch_binary_bf16(
             self,
             other,
-            crate::ops::sub_iter::sub_bf16_iter,
+            crate::tensor_iterator::ops::binary::sub_bf16_iter,
             |a, b| {
                 let neg_b = b.mul_scalar(-1.0)?;
                 a.add(&neg_b)
@@ -1907,7 +1907,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         let mut output = crate::tensor_iterator::dispatch_binary_bf16(
             self,
             other,
-            crate::ops::mul_iter::mul_bf16_iter,
+            crate::tensor_iterator::ops::binary::mul_bf16_iter,
             GpuOps::mul,
         )?;
         if self.requires_grad || other.requires_grad {
@@ -1934,7 +1934,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         let mut output = crate::tensor_iterator::dispatch_scalar_bf16(
             self,
             scalar,
-            crate::ops::mul_scalar_iter::mul_scalar_bf16_iter,
+            crate::tensor_iterator::ops::binary::mul_scalar_bf16_iter,
             GpuOps::mul_scalar,
         )?;
         if self.requires_grad {
@@ -1965,7 +1965,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         let mut output = crate::tensor_iterator::dispatch_scalar_bf16(
             self,
             scalar,
-            crate::ops::add_scalar_iter::add_scalar_bf16_iter,
+            crate::tensor_iterator::ops::binary::add_scalar_bf16_iter,
             GpuOps::add_scalar,
         )?;
         if self.requires_grad {
@@ -1989,7 +1989,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         // Phase 10: BF16 → TensorIterator, else → GpuOps::relu.
         let mut output = crate::tensor_iterator::dispatch_unary_bf16(
             self,
-            crate::ops::relu_iter::relu_bf16_iter,
+            crate::tensor_iterator::ops::unary::relu_bf16_iter,
             GpuOps::relu,
         )?;
         if self.requires_grad {
@@ -2010,7 +2010,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         // Phase 10: BF16 → TensorIterator, else → GpuOps::gelu.
         let mut output = crate::tensor_iterator::dispatch_unary_bf16(
             self,
-            crate::ops::gelu_iter::gelu_bf16_iter,
+            crate::tensor_iterator::ops::unary::gelu_bf16_iter,
             GpuOps::gelu,
         )?;
         if self.requires_grad {
@@ -2031,7 +2031,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         // Phase 10: BF16 → TensorIterator, else → GpuOps::silu.
         let mut output = crate::tensor_iterator::dispatch_unary_bf16(
             self,
-            crate::ops::silu_iter::silu_bf16_iter,
+            crate::tensor_iterator::ops::unary::silu_bf16_iter,
             GpuOps::silu,
         )?;
         if self.requires_grad {
@@ -2080,7 +2080,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         // Phase 10: BF16 → TensorIterator, else → GpuOps::tanh.
         let mut output = crate::tensor_iterator::dispatch_unary_bf16(
             self,
-            crate::ops::tanh_iter::tanh_bf16_iter,
+            crate::tensor_iterator::ops::unary::tanh_bf16_iter,
             GpuOps::tanh,
         )?;
         if self.requires_grad {
@@ -2101,7 +2101,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         // Phase 10: BF16 → TensorIterator, else → GpuOps::sigmoid.
         let mut output = crate::tensor_iterator::dispatch_unary_bf16(
             self,
-            crate::ops::sigmoid_iter::sigmoid_bf16_iter,
+            crate::tensor_iterator::ops::unary::sigmoid_bf16_iter,
             GpuOps::sigmoid,
         )?;
         if self.requires_grad {
@@ -2152,7 +2152,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         // need it (or via the composite Op::Exp in autograd_ops_complete).
         crate::tensor_iterator::dispatch_unary_bf16(
             self,
-            crate::ops::exp_iter::exp_bf16_iter,
+            crate::tensor_iterator::ops::transcendentals::exp_bf16_iter,
             GpuOps::exp,
         )
     }
@@ -2162,7 +2162,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         // Phase 10: BF16 → TensorIterator; other dtypes → mul-self-self.
         let mut output = crate::tensor_iterator::dispatch_unary_bf16(
             self,
-            crate::ops::square_iter::square_bf16_iter,
+            crate::tensor_iterator::ops::unary::square_bf16_iter,
             |x| GpuOps::mul(x, x),
         )?;
         if self.requires_grad {

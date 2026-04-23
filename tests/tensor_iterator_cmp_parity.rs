@@ -16,9 +16,9 @@
 //! IEEE semantics survive through `__float2bfloat16_rn(1.0 or 0.0)`.
 
 use flame_core::{
-    ops::{
-        eq_iter::eq_bf16_iter, ge_iter::ge_bf16_iter, gt_iter::gt_bf16_iter,
-        le_iter::le_bf16_iter, lt_iter::lt_bf16_iter, ne_iter::ne_bf16_iter,
+    tensor_iterator::ops::comparison::{
+        eq_bf16_iter, ge_bf16_iter, gt_bf16_iter,
+        le_bf16_iter, lt_bf16_iter, ne_bf16_iter,
     },
     DType, Result, Shape, Tensor,
 };

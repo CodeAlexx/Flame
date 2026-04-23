@@ -121,21 +121,21 @@ impl Tensor {
     /// tape — `.requires_grad` doesn't propagate through a boolean mask.
     pub fn gt(&self, other: &Tensor) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_comparison_bf16(
-            self, other, crate::ops::gt_iter::gt_bf16_iter, GpuOps::cmp_gt,
+            self, other, crate::tensor_iterator::ops::comparison::gt_bf16_iter, GpuOps::cmp_gt,
         )
     }
 
     /// Greater than or equal comparison. See `gt` for dispatch notes.
     pub fn ge(&self, other: &Tensor) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_comparison_bf16(
-            self, other, crate::ops::ge_iter::ge_bf16_iter, GpuOps::cmp_ge,
+            self, other, crate::tensor_iterator::ops::comparison::ge_bf16_iter, GpuOps::cmp_ge,
         )
     }
 
     /// Less than comparison. See `gt` for dispatch notes.
     pub fn lt(&self, other: &Tensor) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_comparison_bf16(
-            self, other, crate::ops::lt_iter::lt_bf16_iter, GpuOps::cmp_lt,
+            self, other, crate::tensor_iterator::ops::comparison::lt_bf16_iter, GpuOps::cmp_lt,
         )
     }
 
@@ -143,7 +143,7 @@ impl Tensor {
     /// ne(NaN, NaN) = true.
     pub fn ne(&self, other: &Tensor) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_comparison_bf16(
-            self, other, crate::ops::ne_iter::ne_bf16_iter, GpuOps::cmp_ne,
+            self, other, crate::tensor_iterator::ops::comparison::ne_bf16_iter, GpuOps::cmp_ne,
         )
     }
 
@@ -665,7 +665,7 @@ impl Tensor {
     /// else → GpuOps::log.
     pub fn log(&self) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_unary_bf16(
-            self, crate::ops::log_iter::log_bf16_iter, GpuOps::log,
+            self, crate::tensor_iterator::ops::transcendentals::log_bf16_iter, GpuOps::log,
         )
     }
 
@@ -675,7 +675,7 @@ impl Tensor {
     pub fn rsqrt(&self) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_unary_bf16(
             self,
-            crate::ops::rsqrt_iter::rsqrt_bf16_iter,
+            crate::tensor_iterator::ops::transcendentals::rsqrt_bf16_iter,
             |x| x.sqrt()?.reciprocal(),
         )
     }
@@ -686,7 +686,7 @@ impl Tensor {
     pub fn neg(&self) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_unary_bf16(
             self,
-            crate::ops::neg_iter::neg_bf16_iter,
+            crate::tensor_iterator::ops::unary::neg_bf16_iter,
             |x| x.mul_scalar(-1.0),
         )
     }
@@ -698,7 +698,7 @@ impl Tensor {
     /// tape record gated on BF16 preserves that split byte-for-byte.
     pub fn abs(&self) -> Result<Tensor> {
         if self.dtype() == DType::BF16 {
-            let mut output = crate::ops::abs_iter::abs_bf16_iter(self)?;
+            let mut output = crate::tensor_iterator::ops::unary::abs_bf16_iter(self)?;
             if self.requires_grad {
                 output.requires_grad = true;
                 if crate::AutogradContext::is_recording() {
@@ -753,7 +753,7 @@ impl Tensor {
         let mut out = crate::tensor_iterator::dispatch_binary_bf16(
             self,
             other,
-            crate::ops::maximum_iter::maximum_bf16_iter,
+            crate::tensor_iterator::ops::binary::maximum_bf16_iter,
             |a, b| {
                 let bshape = broadcast_shapes(a.shape().dims(), b.shape().dims())?;
                 let a_bc = if a.shape().dims() != bshape {
@@ -789,7 +789,7 @@ impl Tensor {
         let mut out = crate::tensor_iterator::dispatch_binary_bf16(
             self,
             other,
-            crate::ops::minimum_iter::minimum_bf16_iter,
+            crate::tensor_iterator::ops::binary::minimum_bf16_iter,
             |a, b| {
                 let bshape = broadcast_shapes(a.shape().dims(), b.shape().dims())?;
                 let a_bc = if a.shape().dims() != bshape {
@@ -860,7 +860,7 @@ impl Tensor {
         let mut output = crate::tensor_iterator::dispatch_binary_bf16(
             self,
             other,
-            crate::ops::div_iter::div_bf16_iter,
+            crate::tensor_iterator::ops::binary::div_bf16_iter,
             |a, b| {
                 let (lhs, rhs) = if a.shape == b.shape {
                     (a.clone_result()?, b.clone_result()?)
@@ -910,7 +910,7 @@ impl Tensor {
             ));
         }
         crate::tensor_iterator::dispatch_comparison_bf16(
-            self, other, crate::ops::eq_iter::eq_bf16_iter, GpuOps::cmp_eq,
+            self, other, crate::tensor_iterator::ops::comparison::eq_bf16_iter, GpuOps::cmp_eq,
         )
     }
 
@@ -979,7 +979,7 @@ impl Tensor {
     /// → iter, else → `GpuOps::cmp_le`.
     pub fn le(&self, other: &Tensor) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_comparison_bf16(
-            self, other, crate::ops::le_iter::le_bf16_iter, GpuOps::cmp_le,
+            self, other, crate::tensor_iterator::ops::comparison::le_bf16_iter, GpuOps::cmp_le,
         )
     }
 

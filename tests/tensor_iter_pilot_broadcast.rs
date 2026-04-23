@@ -1,6 +1,6 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Phase 4 broadcast coverage for `ops::add_iter::add_bf16_iter`.
+//! Phase 4 broadcast coverage for `tensor_iterator::ops::binary::add_bf16_iter`.
 //! Supplements `tensor_iterator_add_parity` which covers the
 //! same-shape contig/permuted/narrow cases. The four cases here exercise
 //! the BROADCAST path (operand shapes differ, compute_shape infers the
@@ -26,7 +26,7 @@
 //!      sibling of `add_iter_permuted_plus_contig_cos_sim` that already
 //!      passes, kept here for a per-phase smoke gate).
 
-use flame_core::{ops::add_iter::add_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::binary::add_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

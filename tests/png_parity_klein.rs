@@ -28,7 +28,7 @@
 //!
 //! The fixture was generated at flame-core HEAD 5bc9857 before the
 //! `Tensor::silu` dispatch was flipped to route through
-//! `ops::silu_iter::silu_bf16_iter`. Post-flip runs must match it —
+//! `tensor_iterator::ops::unary::silu_bf16_iter`. Post-flip runs must match it —
 //! `silu_bf16_iter` delegates contig inputs straight back to the pre-flip
 //! kernel, so every current Klein caller should be bit-exact.
 

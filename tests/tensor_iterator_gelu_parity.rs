@@ -1,6 +1,6 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::gelu_iter::gelu_bf16_iter` — second kernel on
+//! Parity tests for `tensor_iterator::ops::unary::gelu_bf16_iter` — second kernel on
 //! the TensorIterator port (session 2, 2026-04-22). Mirrors the three
 //! cases from `tensor_iterator_silu_parity.rs`:
 //!
@@ -9,7 +9,7 @@
 //! 3. Narrow view (non-zero `view_offset`) cos_sim ≥ 0.9999 vs
 //!    materialized reference.
 
-use flame_core::{ops::gelu_iter::gelu_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::unary::gelu_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

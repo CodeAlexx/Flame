@@ -1,6 +1,6 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::abs_iter::abs_bf16_iter` (Phase 6).
+//! Parity tests for `tensor_iterator::ops::unary::abs_bf16_iter` (Phase 6).
 //!
 //! Abs is native BF16 — the functor clears bit 15 via a reinterpret cast.
 //! Reference is computed on the host by loading the BF16 bytes, clearing
@@ -14,7 +14,7 @@
 //!   3. narrow view bit-exact.
 //!   4. edge-value test (±0, ±∞, BF16::MAX/MIN, NaN-free).
 
-use flame_core::{ops::abs_iter::abs_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::unary::abs_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

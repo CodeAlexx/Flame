@@ -1,13 +1,13 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::log_iter::log_bf16_iter` (Phase 7).
+//! Parity tests for `tensor_iterator::ops::transcendentals::log_bf16_iter` (Phase 7).
 //!
 //! Log uses f32 opmath inside the functor (__logf). The reference is
 //! computed on the host in f32 (std `ln`) then rounded to BF16. The
 //! fast-intrinsic `__logf` delta from libm `log` is within BF16 rounding
 //! on positive inputs (cos_sim ≥ 0.9999).
 
-use flame_core::{ops::log_iter::log_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::transcendentals::log_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

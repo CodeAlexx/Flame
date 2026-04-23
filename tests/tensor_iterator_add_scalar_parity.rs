@@ -1,11 +1,11 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::add_scalar_iter::add_scalar_bf16_iter` (Phase 5b).
+//! Parity tests for `tensor_iterator::ops::binary::add_scalar_bf16_iter` (Phase 5b).
 //!
 //! Reference: legacy `ops::elt::add_scalar_same_dtype` (GpuOps::add_scalar
 //! BF16 branch). Same fp32 add → rne BF16.
 
-use flame_core::{ops::add_scalar_iter::add_scalar_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::binary::add_scalar_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

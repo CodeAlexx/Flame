@@ -1,5 +1,18 @@
+//! BF16 fused-op and reduction kernels. Kept per
+//! `docs/TENSORITERATOR_PORT_REFERENCE.md` §7 do-not-touch list (RoPE
+//! variants, SwiGLU, modulate, gate-residual, fused-RMSNorm hooks,
+//! softmax-lastdim, attn split/permute, QKV split, patchify/unpatchify).
+//!
+//! `silu_bf16`, `gelu_bf16`, `square_bf16` are retained as the reference
+//! oracles used by `tests/tensor_iterator_{silu,gelu,square}_parity.rs`
+//! and `benches/{silu,gelu,square}_iter_alloc.rs`. They test that the new
+//! TensorIterator pipeline's contig path is bit-exact with the old
+//! vectorized NVRTC kernel. Removing them would require also removing
+//! those parity tests — which remain useful regression oracles for any
+//! future change to the `tensor_iterator::ops::unary::{silu,gelu,square}`
+//! functors.
+
 use std::sync::Arc;
-// Legacy bf16 ops retained for backwards compatibility.
 use crate::dtype::DType;
 use crate::tensor_storage::{ensure_unique_slice, slice_ref, TensorStorage};
 use crate::{Error, Result, Shape, Tensor, TensorId};

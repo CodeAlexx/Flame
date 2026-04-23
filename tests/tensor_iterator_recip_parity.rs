@@ -1,11 +1,11 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::recip_iter::recip_bf16_iter` (Phase 7).
+//! Parity tests for `tensor_iterator::ops::transcendentals::recip_bf16_iter` (Phase 7).
 //!
 //! Recip uses f32 opmath inside the functor (__frcp_rn). The reference is
 //! computed on the host in f32 (`1.0 / v`) then rounded to BF16.
 
-use flame_core::{ops::recip_iter::recip_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::transcendentals::recip_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;

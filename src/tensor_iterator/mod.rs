@@ -19,6 +19,7 @@ pub mod dispatch;
 pub mod dispatch_helpers;
 #[cfg(feature = "cuda")]
 pub mod iter_metadata;
+pub mod ops;
 pub mod promote;
 
 pub use base::{FastSetupType, OperandInfo, OperandSrc, TensorIteratorBase};

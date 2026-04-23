@@ -1,9 +1,9 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-//! Parity tests for `ops::mul_iter::mul_bf16_iter` (Phase 5b).
+//! Parity tests for `tensor_iterator::ops::binary::mul_bf16_iter` (Phase 5b).
 //! Reference: CPU fp32 mul + rne BF16 rounding.
 
-use flame_core::{ops::mul_iter::mul_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{tensor_iterator::ops::binary::mul_bf16_iter, DType, Result, Shape, Tensor};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
