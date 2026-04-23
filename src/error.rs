@@ -54,6 +54,14 @@ pub enum Error {
 
     #[error("CUDA error: {0}")]
     CudaError(String),
+
+    /// Used by staged ports that intentionally delay implementing a code path
+    /// (e.g. `TensorIteratorBase::build_unary_op` is stubbed in Phase 1 and
+    /// filled in at Phase 3 of the TensorIterator migration). Carrying the
+    /// phase name in `reason` lets the calling tests assert the stub without
+    /// string-matching a generic message.
+    #[error("Not implemented: {reason}")]
+    NotImplemented { reason: String },
 }
 
 // Now actually converts cudarc errors

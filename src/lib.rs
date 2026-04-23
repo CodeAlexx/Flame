@@ -111,6 +111,7 @@ pub mod shape;
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 pub mod staging;
 pub mod tensor;
+pub mod tensor_iterator;
 pub mod tensor_compute;
 pub mod tensor_ext;
 pub mod tensor_narrow;
