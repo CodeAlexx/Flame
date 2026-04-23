@@ -338,18 +338,15 @@ extern "C" __global__ void fused_attention_kernel(
 }
 "#;
 
-        // Use Flash Attention for fused implementation when available
-        #[cfg(feature = "flash_attn")]
-        {
-            let fa = crate::flash_attention::FlashAttention::new().with_causal(mask.is_some());
-            fa.forward(q, k, v, mask)
-        }
-        #[cfg(not(feature = "flash_attn"))]
-        {
-            Err(crate::Error::InvalidOperation(
-                "flash_attn feature disabled".into(),
-            ))
-        }
+        // Delegate to the canonical SDPA dispatcher. Phase 2c (2026-04-23):
+        // the previous `crate::flash_attention::FlashAttention::new()` path
+        // was gated behind a `flash_attn` feature that no crate enabled, so
+        // this always returned InvalidOperation. The sdpa dispatcher now
+        // routes unmasked head_dim ∈ {64, 96, 128} through cuDNN SDPA for
+        // both inference (12.1× WMMA) and training (30-50× decomposed
+        // recompute on backward). Mask support is handled by the fallback
+        // path inside sdpa::forward.
+        crate::sdpa::forward(q, k, v, mask).map_err(crate::Error::from)
     }
 
     /// Fused residual + LayerNorm

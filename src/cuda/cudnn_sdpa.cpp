@@ -38,11 +38,13 @@
 
 namespace fe = cudnn_frontend;
 
-// Fixed tensor UIDs — the graph has exactly four bound tensors.
-static constexpr int32_t Q_UID = 1;
-static constexpr int32_t K_UID = 2;
-static constexpr int32_t V_UID = 3;
-static constexpr int32_t O_UID = 4;
+// Fixed tensor UIDs — the graph has exactly four bound tensors for inference,
+// five for training (inference UIDs + Stats at UID 5).
+static constexpr int32_t Q_UID     = 1;
+static constexpr int32_t K_UID     = 2;
+static constexpr int32_t V_UID     = 3;
+static constexpr int32_t O_UID     = 4;
+static constexpr int32_t STATS_UID = 5;
 
 // Cache key. Stride refactor Phase 2b: strides are part of the graph
 // definition (cuDNN bakes them into the operation signature), so they must
@@ -114,6 +116,12 @@ std::once_flag            g_handle_once;
 cudnnHandle_t             g_handle        = nullptr;
 std::mutex                g_cache_mutex;
 std::unordered_map<SdpaKey, SdpaEntry, SdpaKeyHash> g_cache;
+
+// Separate cache for the training forward variant. Shares the same key
+// struct but the graph topology differs (emits Stats), so a given key
+// points to a different finalized graph than the inference cache.
+std::mutex                g_cache_train_mutex;
+std::unordered_map<SdpaKey, SdpaEntry, SdpaKeyHash> g_cache_train;
 
 int ensure_handle() {
     int ret = 0;
@@ -209,6 +217,98 @@ int build_graph(const SdpaKey& k, SdpaEntry& entry) {
     return 0;
 }
 
+// Build and finalize a training-forward graph (same as `build_graph` except
+// `set_generate_stats(true)` and the Stats output is kept and given a UID so
+// callers can bind a real FP32 buffer at execute time). Called under
+// g_cache_train_mutex.
+int build_graph_train(const SdpaKey& k, SdpaEntry& entry) {
+    auto g = std::make_shared<fe::graph::Graph>();
+    g->set_io_data_type(fe::DataType_t::BFLOAT16)
+     .set_intermediate_data_type(fe::DataType_t::FLOAT)
+     .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    const int64_t B   = k.B;
+    const int64_t H   = k.H;
+    const int64_t Nq  = k.N_q;
+    const int64_t Nkv = k.N_kv;
+    const int64_t D   = k.D;
+
+    auto to_vec4 = [](const int64_t s[4]) {
+        return std::vector<int64_t>{s[0], s[1], s[2], s[3]};
+    };
+
+    auto Q = g->tensor(fe::graph::Tensor_attributes()
+                           .set_name("Q")
+                           .set_uid(Q_UID)
+                           .set_dim({B, H, Nq, D})
+                           .set_stride(to_vec4(k.q_s)));
+
+    auto K = g->tensor(fe::graph::Tensor_attributes()
+                           .set_name("K")
+                           .set_uid(K_UID)
+                           .set_dim({B, H, Nkv, D})
+                           .set_stride(to_vec4(k.k_s)));
+
+    auto V = g->tensor(fe::graph::Tensor_attributes()
+                           .set_name("V")
+                           .set_uid(V_UID)
+                           .set_dim({B, H, Nkv, D})
+                           .set_stride(to_vec4(k.v_s)));
+
+    auto opts = fe::graph::SDPA_attributes()
+                    .set_name("flame_klein_sdpa_train")
+                    .set_generate_stats(true)
+                    .set_attn_scale(k.scale);
+    // No causal / padding mask. See inference build_graph for rationale.
+
+    auto [O, Stats] = g->sdpa(Q, K, V, opts);
+
+    O->set_output(true)
+     .set_dim({B, H, Nq, D})
+     .set_stride(to_vec4(k.o_s))
+     .set_uid(O_UID);
+
+    // Stats layout: [B, H, Nq, 1] FP32, with stride [H*Nq, Nq, 1, 1].
+    // This is layout-equivalent to a contiguous [B*H, Nq] 2D FP32 tensor,
+    // which is the shape Rust-side allocates and which matches the layout
+    // the autograd backward code looks up by dims.
+    Stats->set_output(true)
+          .set_data_type(fe::DataType_t::FLOAT)
+          .set_dim({B, H, Nq, 1})
+          .set_stride({H * Nq, Nq, 1, 1})
+          .set_uid(STATS_UID);
+
+    auto status = g->build(g_handle, {fe::HeurMode_t::A});
+    if (!status.is_good()) {
+        fprintf(stderr, "[flame_cudnn_sdpa_train] graph->build failed for (B=%d H=%d Nq=%d Nkv=%d D=%d): %s\n",
+                k.B, k.H, k.N_q, k.N_kv, k.D, status.get_message().c_str());
+        return -1;
+    }
+
+    int64_t ws = 0;
+    status = g->get_workspace_size(ws);
+    if (!status.is_good()) {
+        fprintf(stderr, "[flame_cudnn_sdpa_train] get_workspace_size failed: %s\n",
+                status.get_message().c_str());
+        return -1;
+    }
+
+    void* ws_buf = nullptr;
+    if (ws > 0) {
+        cudaError_t e = cudaMalloc(&ws_buf, ws);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[flame_cudnn_sdpa_train] workspace cudaMalloc(%ld) failed: %s\n",
+                    (long)ws, cudaGetErrorString(e));
+            return -1;
+        }
+    }
+
+    entry.graph          = g;
+    entry.workspace_size = ws;
+    entry.workspace_buf  = ws_buf;
+    return 0;
+}
+
 } // namespace
 
 extern "C" int flame_cudnn_sdpa_bf16(
@@ -288,6 +388,95 @@ extern "C" int flame_cudnn_sdpa_bf16(
     auto status = graph->execute(g_handle, vp, ws_buf);
     if (!status.is_good()) {
         fprintf(stderr, "[flame_cudnn_sdpa] execute failed: %s\n",
+                status.get_message().c_str());
+        return -1;
+    }
+    return 0;
+}
+
+// Training-forward variant: emits Stats (per-row log-sum-exp) alongside O
+// so the backward pass has the softmax normalization it needs to recompute
+// attention without re-running the forward. Called only under autograd.
+//
+// Stats layout (caller-visible): contiguous FP32, size B*H*N_q elements,
+// interpretable either as [B*H, N_q] 2D or [B, H, N_q, 1] 4D — the cuDNN
+// graph is built with the 4D stride [H*N_q, N_q, 1, 1] so the two views
+// alias the same memory.
+extern "C" int flame_cudnn_sdpa_bf16_train_fwd(
+    const void* Q, const void* K, const void* V, void* O, void* Stats,
+    int B, int H, int N_q, int N_kv, int D,
+    float scale,
+    const int64_t* q_strides,
+    const int64_t* k_strides,
+    const int64_t* v_strides,
+    const int64_t* o_strides,
+    int64_t q_offset_elems, int64_t k_offset_elems,
+    int64_t v_offset_elems, int64_t o_offset_elems,
+    int64_t stats_offset_elems,
+    void* stream
+) {
+    if (!Q || !K || !V || !O || !Stats) return -1;
+    if (B <= 0 || H <= 0 || N_q <= 0 || N_kv <= 0 || D <= 0) return -1;
+    if (!q_strides || !k_strides || !v_strides || !o_strides) return -1;
+
+    int rc = ensure_handle();
+    if (rc != 0) return rc;
+
+    SdpaKey key{};
+    key.B = B; key.H = H; key.N_q = N_q; key.N_kv = N_kv; key.D = D;
+    key.scale = scale;
+    for (int i = 0; i < 4; ++i) {
+        key.q_s[i] = q_strides[i];
+        key.k_s[i] = k_strides[i];
+        key.v_s[i] = v_strides[i];
+        key.o_s[i] = o_strides[i];
+    }
+
+    std::shared_ptr<fe::graph::Graph> graph;
+    void*   ws_buf = nullptr;
+    int64_t ws_sz  = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_cache_train_mutex);
+        auto it = g_cache_train.find(key);
+        if (it == g_cache_train.end()) {
+            SdpaEntry entry{};
+            rc = build_graph_train(key, entry);
+            if (rc != 0) return rc;
+            it = g_cache_train.emplace(key, std::move(entry)).first;
+        }
+        graph  = it->second.graph;
+        ws_buf = it->second.workspace_buf;
+        ws_sz  = it->second.workspace_size;
+        (void)ws_sz;
+    }
+
+    cudnnStatus_t s = cudnnSetStream(g_handle, (cudaStream_t)stream);
+    if (s != CUDNN_STATUS_SUCCESS) {
+        fprintf(stderr, "[flame_cudnn_sdpa_train] cudnnSetStream failed: %d\n", (int)s);
+        return (int)s;
+    }
+
+    // BF16 element size = 2 bytes. Stats is FP32 = 4 bytes.
+    auto advance_bf16 = [&](const void* p, int64_t off_elems) -> void* {
+        return const_cast<void*>(static_cast<const void*>(
+            static_cast<const char*>(p) + off_elems * (int64_t)2));
+    };
+    auto advance_f32 = [&](const void* p, int64_t off_elems) -> void* {
+        return const_cast<void*>(static_cast<const void*>(
+            static_cast<const char*>(p) + off_elems * (int64_t)4));
+    };
+
+    std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> vp = {
+        {Q_UID,     advance_bf16(Q, q_offset_elems)},
+        {K_UID,     advance_bf16(K, k_offset_elems)},
+        {V_UID,     advance_bf16(V, v_offset_elems)},
+        {O_UID,     advance_bf16(O, o_offset_elems)},
+        {STATS_UID, advance_f32(Stats, stats_offset_elems)},
+    };
+
+    auto status = graph->execute(g_handle, vp, ws_buf);
+    if (!status.is_good()) {
+        fprintf(stderr, "[flame_cudnn_sdpa_train] execute failed: %s\n",
                 status.get_message().c_str());
         return -1;
     }

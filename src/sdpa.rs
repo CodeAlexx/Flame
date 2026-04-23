@@ -34,12 +34,13 @@ fn parse_env_flag(name: &str) -> Option<bool> {
 // per denoise step. Each of these used to be a fresh syscall.
 
 // cuDNN v9 Flash SDPA is the default and only flash path for unmasked
-// head_dim ∈ {64, 96, 128} — see the dispatcher below. The in-tree WMMA
-// kernel (`flame_flash_attention_bf16` in ffi.rs + `flash_attention_fwd.cu`)
-// still exists because the training autograd paths (`flash_attention.rs`,
-// sdpa.rs:203 training branch) call it directly, but it is no longer part
-// of the inference dispatch. If cuDNN fails, the error surfaces; there is
-// no silent fall-through to WMMA.
+// head_dim ∈ {64, 96, 128} on both the inference and training paths.
+// Inference goes through `forward_cudnn_sdpa_bf16` (fwd only); training
+// goes through `forward_cudnn_sdpa_train_bf16` (fwd + Stats emit) and
+// `flame_cudnn_sdpa_bwd_bf16` on backward. The in-tree WMMA forward
+// (`flame_flash_attention_bf16` in `flash_attention_fwd.cu`) is currently
+// unreferenced and will be deleted in a follow-up cleanup. If cuDNN
+// fails, the error surfaces; there is no silent fall-through to WMMA.
 
 #[inline]
 fn force_stream_sdpa() -> bool {
@@ -130,57 +131,29 @@ pub fn forward_train(
             1.0
         };
 
-        // Run forward under no_grad using the wmma kernel, also capture LSE
-        // for the fused backward kernel.
-        let (output, lse_tensor) = {
+        // Run forward under no_grad. Primary path: cuDNN SDPA forward-train,
+        // which produces both O and Stats (per-row LSE) in one call. Backward
+        // (autograd.rs::Op::FlashAttention) picks up the Stats tensor and
+        // feeds it to `flame_cudnn_sdpa_bwd_bf16` — 30-50× faster than the
+        // decomposed-recompute path this was doing pre-Phase-2c. Unsupported
+        // shapes (head_dim ∉ {64,96,128}, masked, non-BF16) fall through to
+        // `forward_inner`; backward recomputes from scratch in that case.
+        let (output, stats_tensor) = {
             let _guard = crate::autograd::AutogradContext::no_grad();
             let (b, h, sq, hd) = (dims[0], dims[1], dims[2], head_dim);
-            let sk = k_dims[2];
-            let bh = (b * h) as i32;
 
-            // Try wmma kernel path (needs HD=64/96/128, BF16)
-            if (hd == 64 || hd == 96 || hd == 128)
+            if mask.is_none()
+                && (hd == 64 || hd == 96 || hd == 128)
                 && q.dtype() == DType::BF16
                 && k.dtype() == DType::BF16
                 && v.dtype() == DType::BF16
             {
-                use crate::cuda::device_lt;
-                use cudarc::driver::DevicePtr;
-
-                let out_tensor = Tensor::empty_dtype(q.shape().clone(), DType::BF16, q.device().clone())?;
-                let lse = Tensor::zeros_dtype(
-                    crate::Shape::from_dims(&[b * h, sq]),
-                    DType::F32,
-                    q.device().clone(),
-                )?;
-
-                // Reshape to [BH, N, HD]
-                let q_3d = q.reshape(&[bh as usize, sq, hd])?;
-                let k_3d = k.reshape(&[bh as usize, sk, hd])?;
-                let v_3d = v.reshape(&[bh as usize, sk, hd])?;
-
-                let q_ptr = q_3d.as_device_ptr_bf16("sdpa_train:q")? as *const core::ffi::c_void;
-                let k_ptr = k_3d.as_device_ptr_bf16("sdpa_train:k")? as *const core::ffi::c_void;
-                let v_ptr = v_3d.as_device_ptr_bf16("sdpa_train:v")? as *const core::ffi::c_void;
-                let o_ptr = out_tensor.as_device_ptr_bf16("sdpa_train:o")? as *mut core::ffi::c_void;
-                let lse_ptr = match &lse.storage {
-                    crate::tensor_storage::TensorStorage::F32 { data, .. } =>
-                        *crate::tensor_storage::slice_ref(data).device_ptr() as *mut f32,
-                    _ => core::ptr::null_mut(),
-                };
-
-                let stream = device_lt::stream_ptr(q.device())?;
-                let ret = unsafe {
-                    crate::cuda::ffi::flame_flash_attention_bf16(
-                        q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr,
-                        bh, sq as i32, sk as i32, hd as i32, stream,
-                    )
-                };
-                if ret == 0 {
-                    (out_tensor, Some(lse))
-                } else {
-                    // Fallback to decomposed forward
-                    (forward_inner(q, k, v, mask)?, None)
+                match forward_cudnn_sdpa_train_bf16(q, k, v, b, h, sq, k_dims[2], hd) {
+                    Ok((o, stats)) => (o, Some(stats)),
+                    Err(e) => {
+                        log::error!("cudnn SDPA train-fwd failed: {:?}", e);
+                        return Err(e);
+                    }
                 }
             } else {
                 (forward_inner(q, k, v, mask)?, None)
@@ -198,9 +171,11 @@ pub fn forward_train(
                 // Save output for fused backward
                 (out.id(), out.clone()),
             ];
-            // Save LSE for fused backward kernel
-            if let Some(ref lse) = lse_tensor {
-                saved.push((lse.id(), lse.clone()));
+            // Save Stats for cuDNN backward. Shape [B*H, Nq] FP32 —
+            // autograd.rs::try_cudnn_sdpa_backward looks for this exact
+            // shape+dtype to decide whether to route to cuDNN.
+            if let Some(ref stats) = stats_tensor {
+                saved.push((stats.id(), stats.clone()));
             }
             let mask_id = if let Some(mask_tensor) = mask {
                 saved.push((mask_tensor.id(), mask_tensor.clone()));
@@ -703,6 +678,92 @@ fn forward_cudnn_sdpa_bf16(
         return Err(Error::Cuda(format!("cudnn_sdpa CUDA error: {ret}")));
     }
     Ok(output)
+}
+
+/// cuDNN v9 Flash SDPA training-forward. Identical output to
+/// `forward_cudnn_sdpa_bf16` but also emits Stats (per-row log-sum-exp,
+/// contiguous FP32 `[B*H, Nq]`) which the autograd backward reads to skip
+/// recomputing the forward in `flame_cudnn_sdpa_bwd_bf16`.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn forward_cudnn_sdpa_train_bf16(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    b: usize,
+    h: usize,
+    q_len: usize,
+    k_len: usize,
+    d_q: usize,
+) -> SdpaResult<(Tensor, Tensor)> {
+    use crate::cuda::device_lt;
+    use cudarc::driver::DevicePtr;
+
+    let q_strides_4d = tensor_strides_as_4d_bhnd(q)?;
+    let k_strides_4d = tensor_strides_as_4d_bhnd(k)?;
+    let v_strides_4d = tensor_strides_as_4d_bhnd(v)?;
+
+    let device = q.device();
+    let stream = device_lt::stream_ptr(device)?;
+    let scale = 1.0f32 / (d_q as f32).sqrt();
+
+    let output = Tensor::empty_dtype(q.shape().clone(), DType::BF16, device.clone())?;
+    let o_strides_4d = tensor_strides_as_4d_bhnd(&output)?;
+
+    // Stats: contiguous FP32 [B*H, N_q]. The cuDNN shim writes this with a
+    // 4D view [B, H, N_q, 1] stride [H*N_q, N_q, 1, 1], which is
+    // bytewise-identical to a row-major 2D [B*H, N_q].
+    let stats = Tensor::zeros_dtype(
+        crate::Shape::from_dims(&[b * h, q_len]),
+        DType::F32,
+        device.clone(),
+    )?;
+
+    let q_ptr = q.as_device_ptr_bf16("cudnn_sdpa_train:q")? as *const core::ffi::c_void;
+    let k_ptr = k.as_device_ptr_bf16("cudnn_sdpa_train:k")? as *const core::ffi::c_void;
+    let v_ptr = v.as_device_ptr_bf16("cudnn_sdpa_train:v")? as *const core::ffi::c_void;
+    let o_ptr = output.as_device_ptr_bf16("cudnn_sdpa_train:o")? as *mut core::ffi::c_void;
+    let stats_ptr = match &stats.storage {
+        crate::tensor_storage::TensorStorage::F32 { data, .. } =>
+            *crate::tensor_storage::slice_ref(data).device_ptr() as *mut core::ffi::c_void,
+        _ => return Err(Error::InvalidOperation(
+            "cudnn_sdpa_train: expected F32 storage for stats".into()
+        )),
+    };
+
+    let q_off = q.offset() as i64;
+    let k_off = k.offset() as i64;
+    let v_off = v.offset() as i64;
+    let o_off = output.offset() as i64;
+    let stats_off = stats.offset() as i64;
+
+    let q_strides: [i64; 4] = q_strides_4d;
+    let k_strides: [i64; 4] = k_strides_4d;
+    let v_strides: [i64; 4] = v_strides_4d;
+    let o_strides: [i64; 4] = o_strides_4d;
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_cudnn_sdpa_bf16_train_fwd(
+            q_ptr, k_ptr, v_ptr, o_ptr, stats_ptr,
+            b as i32,
+            h as i32,
+            q_len as i32,
+            k_len as i32,
+            d_q as i32,
+            scale,
+            q_strides.as_ptr(),
+            k_strides.as_ptr(),
+            v_strides.as_ptr(),
+            o_strides.as_ptr(),
+            q_off, k_off, v_off, o_off,
+            stats_off,
+            stream,
+        )
+    };
+
+    if ret != 0 {
+        return Err(Error::Cuda(format!("cudnn_sdpa_train CUDA error: {ret}")));
+    }
+    Ok((output, stats))
 }
 
 /// Convert a tensor's strides to a fixed-length `[i64; 4]` in [B,H,N,D] order.

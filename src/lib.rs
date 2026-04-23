@@ -141,9 +141,6 @@ pub use pinned_pool::PinnedPool;
 pub mod kernels {
     pub mod adaln;
 }
-#[cfg(feature = "flash_attn")]
-#[path = "flash_attention.rs"]
-pub mod flash_attention;
 pub mod group_norm;
 pub mod layer_norm;
 pub mod logging;
@@ -223,8 +220,6 @@ pub use device::{global_cuda_device, trim_cuda_mempool, Device};
 pub use dtype::DType;
 pub use error::{Error, Result};
 pub type FlameError = Error;
-#[cfg(feature = "flash_attn")]
-pub use flash_attention::{flash_attention_forward, FlashAttention};
 pub use gradient::{GradientMap, TensorGradExt};
 pub use group_norm::{group_norm, GroupNorm};
 pub use parameter::Parameter as Var;

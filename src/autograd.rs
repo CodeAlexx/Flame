@@ -648,6 +648,132 @@ pub fn backward(loss: &Tensor, _retain_graph: bool) -> Result<crate::GradientMap
     }
     AutogradContext::backward(loss)
 }
+/// cuDNN SDPA backward. Returns `Some((dQ, dK, dV))` when cuDNN handled the
+/// shape, `None` when the caller should fall back to decomposed recompute.
+///
+/// Requirements for the cuDNN path:
+///   - 4D BF16 Q/K/V/O/dO, head_dim ∈ {64, 96, 128}
+///   - unmasked (no causal, no padding)
+///   - Stats tensor saved from forward — contiguous FP32 `[B*H, N_q]`
+///
+/// Uses the tensors' native strides so permute-views work without
+/// materialization. The output dQ/dK/dV are freshly-allocated contiguous.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn try_cudnn_sdpa_backward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    o: Option<&Tensor>,
+    d_o: &Tensor,
+    stats: Option<&Tensor>,
+    mask: Option<&Tensor>,
+    scale: f32,
+    device: &Arc<cudarc::driver::CudaDevice>,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    // All the reasons to bail out.
+    if mask.is_some() { return Ok(None); }
+    let (Some(o), Some(stats)) = (o, stats) else { return Ok(None); };
+    let q_dims = q.shape().dims();
+    let k_dims = k.shape().dims();
+    if q_dims.len() != 4 || k_dims.len() != 4 { return Ok(None); }
+    let (b, h, n_q, d) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
+    let n_kv = k_dims[2];
+    if !(d == 64 || d == 96 || d == 128) { return Ok(None); }
+    if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16
+        || o.dtype() != DType::BF16 || d_o.dtype() != DType::BF16 {
+        return Ok(None);
+    }
+    if stats.shape().dims() != [b * h, n_q] { return Ok(None); }
+
+    // Read each tensor's native 4D strides.
+    let q_strides  = strides_4d(q)?;
+    let k_strides  = strides_4d(k)?;
+    let v_strides  = strides_4d(v)?;
+    let o_strides  = strides_4d(o)?;
+    let do_strides = strides_4d(d_o)?;
+
+    // Allocate contiguous dQ/dK/dV. Strides computed from shape
+    // (row-major [B, H, N, D] layout).
+    let dq = Tensor::empty_dtype(q.shape().clone(), DType::BF16, device.clone())?;
+    let dk = Tensor::empty_dtype(k.shape().clone(), DType::BF16, device.clone())?;
+    let dv = Tensor::empty_dtype(v.shape().clone(), DType::BF16, device.clone())?;
+    let dq_strides = strides_4d(&dq)?;
+    let dk_strides = strides_4d(&dk)?;
+    let dv_strides = strides_4d(&dv)?;
+
+    use cudarc::driver::DevicePtr;
+    let stream = crate::cuda::device_lt::stream_ptr(device)?;
+
+    let q_ptr  = q.as_device_ptr_bf16("cudnn_sdpa_bwd:q")?  as *const core::ffi::c_void;
+    let k_ptr  = k.as_device_ptr_bf16("cudnn_sdpa_bwd:k")?  as *const core::ffi::c_void;
+    let v_ptr  = v.as_device_ptr_bf16("cudnn_sdpa_bwd:v")?  as *const core::ffi::c_void;
+    let o_ptr  = o.as_device_ptr_bf16("cudnn_sdpa_bwd:o")?  as *const core::ffi::c_void;
+    let do_ptr = d_o.as_device_ptr_bf16("cudnn_sdpa_bwd:do")? as *const core::ffi::c_void;
+    let dq_ptr = dq.as_device_ptr_bf16("cudnn_sdpa_bwd:dq")? as *mut core::ffi::c_void;
+    let dk_ptr = dk.as_device_ptr_bf16("cudnn_sdpa_bwd:dk")? as *mut core::ffi::c_void;
+    let dv_ptr = dv.as_device_ptr_bf16("cudnn_sdpa_bwd:dv")? as *mut core::ffi::c_void;
+
+    let stats_ptr = match &stats.storage {
+        crate::tensor_storage::TensorStorage::F32 { data, .. } =>
+            *crate::tensor_storage::slice_ref(data).device_ptr() as *const core::ffi::c_void,
+        _ => return Ok(None),
+    };
+
+    let q_off  = q.offset()   as i64;
+    let k_off  = k.offset()   as i64;
+    let v_off  = v.offset()   as i64;
+    let o_off  = o.offset()   as i64;
+    let do_off = d_o.offset() as i64;
+    let dq_off = dq.offset()  as i64;
+    let dk_off = dk.offset()  as i64;
+    let dv_off = dv.offset()  as i64;
+    let stats_off = stats.offset() as i64;
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_cudnn_sdpa_bwd_bf16(
+            q_ptr, k_ptr, v_ptr, o_ptr, do_ptr, stats_ptr,
+            dq_ptr, dk_ptr, dv_ptr,
+            b as i32, h as i32, n_q as i32, n_kv as i32, d as i32,
+            scale,
+            q_strides.as_ptr(), k_strides.as_ptr(),
+            v_strides.as_ptr(), o_strides.as_ptr(),
+            do_strides.as_ptr(),
+            dq_strides.as_ptr(), dk_strides.as_ptr(),
+            dv_strides.as_ptr(),
+            q_off, k_off, v_off, o_off, do_off, stats_off,
+            dq_off, dk_off, dv_off,
+            stream,
+        )
+    };
+    if ret != 0 {
+        return Err(Error::Cuda(format!("cudnn_sdpa_bwd CUDA error: {ret}")));
+    }
+    Ok(Some((dq, dk, dv)))
+}
+
+#[cfg(not(all(feature = "cuda", feature = "bf16_u16")))]
+fn try_cudnn_sdpa_backward(
+    _q: &Tensor, _k: &Tensor, _v: &Tensor,
+    _o: Option<&Tensor>, _d_o: &Tensor,
+    _stats: Option<&Tensor>, _mask: Option<&Tensor>,
+    _scale: f32, _device: &Arc<cudarc::driver::CudaDevice>,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    Ok(None)
+}
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn strides_4d(t: &Tensor) -> Result<[i64; 4]> {
+    let mut s = [0usize; 8];
+    let rank = t.fill_strides_into(&mut s);
+    if rank != 4 {
+        return Err(Error::InvalidInput(format!(
+            "cudnn_sdpa_bwd: expected 4D tensor, got rank {}",
+            rank
+        )));
+    }
+    Ok([s[0] as i64, s[1] as i64, s[2] as i64, s[3] as i64])
+}
+
 // Local, dependency-free SDPA backward (recompute path)
 // SDPA backward (recompute path)
 /// SDPA backward via recompute. If `cached_attn` is Some, uses it directly
@@ -3544,7 +3670,6 @@ fn compute_gradients(
             Ok(grads)
         }
 
-        #[cfg(feature = "flash_attn")]
         Op::FlashAttention {
             query,
             key,
@@ -3553,140 +3678,11 @@ fn compute_gradients(
             scale,
             causal: _,
         } => {
-            let query_tensor = entry
-                .get_saved(query)
-                .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for query".into()))?;
-            let key_tensor = entry
-                .get_saved(key)
-                .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for key".into()))?;
-            let value_tensor = entry
-                .get_saved(value)
-                .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for value".into()))?;
-
-            // Find saved output and LSE tensors for fused backward
-            let output_tensor = entry
-                .saved_tensors
-                .iter()
-                .map(|(_, t)| t)
-                .find(|t| {
-                    t.shape().dims() == output_grad.shape().dims()
-                        && t.id != query_tensor.id
-                        && t.id != key_tensor.id
-                        && t.id != value_tensor.id
-                });
-
-            // Find LSE tensor: shape [batch_heads, seq_len_q], dtype F32
-            let q_dims = query_tensor.shape().dims();
-            let lse_tensor = if q_dims.len() == 4 {
-                let bh = q_dims[0] * q_dims[1];
-                let sq = q_dims[2];
-                entry.saved_tensors.iter().map(|(_, t)| t).find(|t| {
-                    t.dtype() == DType::F32 && t.shape().dims() == [bh, sq]
-                })
-            } else {
-                None
-            };
-
-            // Try fused wmma backward kernel (requires output + LSE saved from forward)
-            let fused_result = if let (Some(out_t), Some(lse_t)) = (output_tensor, lse_tensor) {
-                if q_dims.len() == 4
-                    && query_tensor.dtype() == DType::BF16
-                    && output_grad.dtype() == DType::BF16
-                {
-                    let (b, h, sq, hd) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
-                    let sk = key_tensor.shape().dims()[2];
-                    let bh = (b * h) as i32;
-
-                    // Reshape to [BH, N, HD] for kernel
-                    let q_3d = query_tensor.reshape(&[bh as usize, sq, hd])?;
-                    let k_3d = key_tensor.reshape(&[bh as usize, sk, hd])?;
-                    let v_3d = value_tensor.reshape(&[bh as usize, sk, hd])?;
-                    let o_3d = out_t.reshape(&[bh as usize, sq, hd])?;
-                    let do_3d = output_grad.reshape(&[bh as usize, sq, hd])?;
-
-                    // Allocate BF16 output grad tensors
-                    let dq = Tensor::empty_dtype(q_3d.shape().clone(), DType::BF16, device.clone())?;
-                    let dk = Tensor::empty_dtype(k_3d.shape().clone(), DType::BF16, device.clone())?;
-                    let dv = Tensor::empty_dtype(v_3d.shape().clone(), DType::BF16, device.clone())?;
-
-                    // Only dQ needs FP32 staging (atomicAdd across KV-tile blocks).
-                    // dK, dV are written directly as BF16 by the kernel (register accum).
-                    let dq_f32_n = bh as usize * sq * hd;
-                    let mut dq_f32 = crate::cuda_memory_alignment::alloc_aligned_f32(device, dq_f32_n)?;
-                    device.memset_zeros(&mut dq_f32).map_err(|e| Error::Cuda(format!("{e:?}")))?;
-
-                    use cudarc::driver::DevicePtr;
-                    let stream = crate::cuda::device_lt::stream_ptr(device)?;
-                    let ret = unsafe {
-                        crate::cuda::ffi::flame_flash_attention_backward_bf16(
-                            q_3d.as_device_ptr_bf16("fa_bwd:q")? as *const core::ffi::c_void,
-                            k_3d.as_device_ptr_bf16("fa_bwd:k")? as *const core::ffi::c_void,
-                            v_3d.as_device_ptr_bf16("fa_bwd:v")? as *const core::ffi::c_void,
-                            o_3d.as_device_ptr_bf16("fa_bwd:o")? as *const core::ffi::c_void,
-                            do_3d.as_device_ptr_bf16("fa_bwd:do")? as *const core::ffi::c_void,
-                            {
-                                match &lse_t.storage {
-                                    crate::tensor_storage::TensorStorage::F32 { data, .. } =>
-                                        *crate::tensor_storage::slice_ref(data).device_ptr()
-                                            as *const core::ffi::c_void,
-                                    _ => core::ptr::null(),
-                                }
-                            },
-                            dq.as_device_ptr_bf16("fa_bwd:dq")? as *mut core::ffi::c_void,
-                            dk.as_device_ptr_bf16("fa_bwd:dk")? as *mut core::ffi::c_void,
-                            dv.as_device_ptr_bf16("fa_bwd:dv")? as *mut core::ffi::c_void,
-                            bh,
-                            sq as i32,
-                            sk as i32,
-                            hd as i32,
-                            stream,
-                            *dq_f32.device_ptr() as *mut f32,
-                        )
-                    };
-                    if ret == 0 {
-                        // Reshape back to [B, H, N, D]
-                        let dq = dq.reshape(&[b, h, sq, hd])?;
-                        let dk = dk.reshape(&[b, h, sk, hd])?;
-                        let dv = dv.reshape(&[b, h, sk, hd])?;
-                        Some((dq, dk, dv))
-                    } else {
-                        eprintln!("[flash_attn_bwd] fused kernel failed (ret={ret}), falling back");
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let (grad_q, grad_k, grad_v) = if let Some(triple) = fused_result {
-                triple
-            } else {
-                // Fallback to decomposed recompute path
-                let mask_tensor = if let Some(m_id) = mask {
-                    entry.get_saved(m_id)
-                } else {
-                    None
-                };
-                attention_backward_recompute(
-                    query_tensor, key_tensor, value_tensor,
-                    output_grad, mask_tensor, *scale, None,
-                )?
-            };
-
-            Ok(smallvec![(*query, grad_q), (*key, grad_k), (*value, grad_v)])
-        }
-        #[cfg(not(feature = "flash_attn"))]
-        Op::FlashAttention {
-            query,
-            key,
-            value,
-            mask,
-            scale,
-            causal: _,
-        } => {
-            // Recompute SDPA backward path
+            // Phase 2c (2026-04-23): cuDNN SDPA backward is the primary path
+            // for shapes the frontend supports (head_dim ∈ {64, 96, 128},
+            // unmasked, 4D BF16). Decomposed recompute is the fallback for
+            // everything else — masks, odd head_dims, non-BF16 dtypes,
+            // non-4D tensors. See HANDOFF_2026-04-23.md §4.
             let query_tensor = entry
                 .get_saved(query)
                 .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for query".into()))?;
@@ -3702,36 +3698,62 @@ fn compute_gradients(
                 None
             };
 
-            // Look for a cached attn tensor in saved_tensors (shape
-            // [batch, heads, q_len, k_len]). Callers that pre-compute
-            // softmax in forward append it to saved_tensors; the rest
-            // fall back to recomputing logits+softmax in backward.
-            let expected_attn_shape = {
-                let q_dims = query_tensor.shape().dims();
-                let k_dims = key_tensor.shape().dims();
-                if q_dims.len() == 4 && k_dims.len() == 4 {
+            let q_dims = query_tensor.shape().dims().to_vec();
+            let k_dims = key_tensor.shape().dims().to_vec();
+
+            // Find saved O (same shape as output_grad, distinct from Q/K/V).
+            let output_tensor = entry
+                .saved_tensors
+                .iter()
+                .map(|(_, t)| t)
+                .find(|t| {
+                    t.shape().dims() == output_grad.shape().dims()
+                        && t.id != query_tensor.id
+                        && t.id != key_tensor.id
+                        && t.id != value_tensor.id
+                });
+
+            // Find saved Stats: contiguous FP32 [B*H, Nq] — what
+            // `flame_cudnn_sdpa_bf16_train_fwd` writes. (Also still
+            // matches the legacy WMMA LSE layout pre-Phase-2c.)
+            let stats_tensor = if q_dims.len() == 4 {
+                let bh = q_dims[0] * q_dims[1];
+                let sq = q_dims[2];
+                entry.saved_tensors.iter().map(|(_, t)| t).find(|t| {
+                    t.dtype() == DType::F32 && t.shape().dims() == [bh, sq]
+                })
+            } else {
+                None
+            };
+
+            // Try cuDNN backward for supported shapes.
+            let cudnn_result = try_cudnn_sdpa_backward(
+                query_tensor, key_tensor, value_tensor,
+                output_tensor, output_grad, stats_tensor, mask_tensor,
+                *scale, device,
+            )?;
+
+            let (grad_q, grad_k, grad_v) = if let Some(triple) = cudnn_result {
+                triple
+            } else {
+                // Decomposed recompute fallback.
+                let expected_attn_shape = if q_dims.len() == 4 && k_dims.len() == 4 {
                     Some([q_dims[0], q_dims[1], q_dims[2], k_dims[2]])
                 } else {
                     None
-                }
+                };
+                let cached_attn: Option<&Tensor> = expected_attn_shape.and_then(|s| {
+                    entry
+                        .saved_tensors
+                        .iter()
+                        .map(|(_, t)| t)
+                        .find(|t| t.shape().dims() == s)
+                });
+                attention_backward_recompute(
+                    query_tensor, key_tensor, value_tensor,
+                    output_grad, mask_tensor, *scale, cached_attn,
+                )?
             };
-            let cached_attn: Option<&Tensor> = expected_attn_shape.and_then(|s| {
-                entry
-                    .saved_tensors
-                    .iter()
-                    .map(|(_, t)| t)
-                    .find(|t| t.shape().dims() == s)
-            });
-
-            let (grad_q, grad_k, grad_v) = attention_backward_recompute(
-                query_tensor,
-                key_tensor,
-                value_tensor,
-                output_grad,
-                mask_tensor,
-                *scale,
-                cached_attn,
-            )?;
             Ok(smallvec![(*query, grad_q), (*key, grad_k), (*value, grad_v)])
         }
 

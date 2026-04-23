@@ -160,10 +160,17 @@ This is a critical area with several implementations. **Use these for inference*
 ### ⚠️ Legacy / training-only
 - `attention/sdpa_legacy.rs` — old impl, keep for reference, do NOT call
 - `sdpa_legacy.rs` (top-level) — same
-- `flash_attention.rs` — feature-gated old "flash_attn" path
 - `sage_attention.rs` — experimental sage attention
-- `attention/flash_ffi.rs` / `flash_impl.rs` — feature-gated FFI shim
 - `sdpa::forward_v4(...)` — `sdpa.rs:291` — gated on `autograd_v4` feature
+
+### 🧠 Training path (autograd-recorded SDPA)
+- `sdpa::forward_train(q, k, v, mask)` — `sdpa.rs:105`
+  Called from `sdpa::forward` when `AutogradContext::is_recording()` and
+  any input requires grad. Routes unmasked BF16 head_dim ∈ {64, 96, 128}
+  through `flame_cudnn_sdpa_bf16_train_fwd` (emits O + Stats in one graph
+  execute), records `Op::FlashAttention`. Backward then calls
+  `flame_cudnn_sdpa_bwd_bf16` via `autograd::try_cudnn_sdpa_backward`.
+  Unsupported shapes fall through to the decomposed recompute.
 
 ### Helper structs (in `attention/sdpa.rs`, used by training paths)
 - `AttentionConfig` — `:83`
@@ -403,7 +410,10 @@ to see what kernels are linked in. Notable groups:
 - `fc_upsample2d_bilinear_bf16 / fc_upsample2d_bilinear_f32` (`:509,522`) — bilinear 2D upsample (BF16 + F32), PyTorch-matching index math with `align_corners`. Added 2026-04-19 to unblock Cascade.
 - `flame_fp8_to_bf16` (`:409`) — FP8 dequant
 - `flame_fp16_to_bf16` (`:416`) — FP16 → BF16 conversion (in-place safe). Used by BlockOffloader for FP16 checkpoints.
-- `flame_flash_attention_bf16` (`:424`) — wmma flash attention
+- `flame_flash_attention_bf16` (`:424`) — wmma flash attention forward (LIVE, inference dead-code fallback only; training uses cuDNN)
+- `flame_cudnn_sdpa_bf16` — cuDNN v9 SDPA inference forward (primary inference attention path; see `src/cuda/cudnn_sdpa.cpp`)
+- `flame_cudnn_sdpa_bf16_train_fwd` — cuDNN v9 SDPA training forward. Emits O + Stats (per-row LSE) so backward can skip recompute. Added Phase 2c (2026-04-23).
+- `flame_cudnn_sdpa_bwd_bf16` — cuDNN v9 SDPA backward (`src/cuda/cudnn_sdpa_bwd.cpp`). Reads Stats from train-fwd. Replaces the removed `flame_flash_attention_backward_bf16` WMMA kernel and the decomposed-recompute backward. Added Phase 2c.
 - `flame_fused_rms_norm_modulate_bf16` (`:434`)
 - `flame_fused_residual_gate_bf16` (`:448`)
 - `flame_fused_rms_norm_bf16` (`:459`)
@@ -622,7 +632,6 @@ backward. Foundation of the "offload instead of recompute" checkpoint path.
 - `borrowed/mod.rs` — feature-gated borrowed-weight tensor variant
 - `python/*` — feature-gated PyO3 bindings
 - `capi.rs` — feature-gated C API surface
-- `flash_attention.rs` — feature-gated flash-attn-2 FFI shim
 - `debug_device.rs` — `assert_cuda(tag, t) / log_device(tag, t)`
 - `logging.rs` — logging setup
 - `env_flags.rs` — env var caching
@@ -658,7 +667,8 @@ by `.cu` file with launch configs and perf notes.
 - **"Where is the SDPA dispatcher I should call from a model?"** → `attention::sdpa`
 - **"Where do I add a new BF16 elementwise op?"** → `tensor_iterator/ops/{unary,binary,transcendentals,comparison}.rs` +
   a `.cu` functor under `src/cuda/{unary,binary,cmp}/` — see CONVENTIONS for the template
-- **"Where is the wmma flash attention kernel?"** → `src/cuda/flash_attention_fwd.cu`
+- **"Where is the cuDNN SDPA shim?"** → `src/cuda/cudnn_sdpa.cpp` (inference + training fwd), `src/cuda/cudnn_sdpa_bwd.cpp` (backward)
+- **"Where is the wmma flash attention kernel?"** → `src/cuda/flash_attention_fwd.cu` (forward only; bwd was deleted in Phase 2c)
 - **"Where do I add a new fused C kernel?"** → `src/cuda/fused_*.cu` + `src/cuda/ffi.rs` declaration +
   `ops/fused_inference.rs` Rust wrapper
 - **"Where is the load_file used by every inference binary?"** → `serialization::load_file_filtered`

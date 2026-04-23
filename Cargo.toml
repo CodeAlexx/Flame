@@ -37,7 +37,6 @@ numpy = { version = "0.22", optional = true }
 default = ["cuda", "bf16_u16", "cudnn", "shared_storage"]
 legacy_examples = []
 nvrtc = []
-flash_attn = []   # Opt-in only (not enabled by default)
 cudnn = []        # Opt-in only
 dtype_trace = []
 # Phase 3 attention oracle gate

@@ -244,14 +244,57 @@ corresponding softmax scores are also tail-masked) and for V (zero V
 rows contribute zero through PV).
 
 **LSE output**: unused by this kernel. The `LSE` argument is kept in
-the C entry for signature compatibility with the backward kernel in
-`src/cuda/flash_attention_bwd.cu`, which stores its own LSE from
-scratch.
+the C entry for signature compatibility with the prior backward
+kernel. The backward was removed in Phase 2c (2026-04-23) — training
+now uses `flame_cudnn_sdpa_bwd_bf16` instead, which reads its Stats
+(LSE) from the cuDNN training-forward (`flame_cudnn_sdpa_bf16_train_fwd`)
+rather than this kernel.
 
 **Parity**: `tests/fa2_parity_naive.rs` validates the kernel against a
 pure-Rust FP32-materialized reference. `tests/sdpa_ragged_sk.rs`
 covers the Sk > BKV regression at Sk ∈ {64, 71, 72, 128, 200} —
 the bug fixed on 2026-04-19.
+
+### `src/cuda/cudnn_sdpa.cpp` — cuDNN v9 Flash SDPA forward shim (LIVE)
+
+Host-only C++17 shim over NVIDIA's vendored `cudnn_frontend`. Two
+entry points, both using the same graph-cache machinery keyed on
+(shape, per-tensor strides, scale). Offsets are pointer-arithmetic
+at execute-time so one graph handles any sliced/narrow view.
+
+| Symbol | Notes |
+|---|---|
+| `flame_cudnn_sdpa_bf16` | Inference forward. `set_generate_stats(false)`. 12.1× faster than WMMA at Klein's shape (3.24 ms vs 39.26 ms per call). |
+| `flame_cudnn_sdpa_bf16_train_fwd` | Training forward. `set_generate_stats(true)` — also writes Stats (per-row log-sum-exp). Added Phase 2c (2026-04-23). Output Stats layout: contig FP32 `[B*H, N_q]`, equivalent to 4D `[B, H, N_q, 1]` stride `[H*N_q, N_q, 1, 1]` — that's what the backward shim expects. |
+
+BF16 in/out, FP32 intermediate + compute. Per-shape graph build is a
+one-shot cost (~50–200 ms); steady-state dispatch is pure `execute`.
+Separate graph caches for the two entry points (different topology
+because of the Stats output).
+
+**Parity**: `tests/cudnn_sdpa_parity.rs` (inference vs WMMA, Klein +
+Chroma, cos_sim 1.000000), `tests/cudnn_sdpa_bwd_parity.rs::cudnn_sdpa_train_fwd_matches_inference_fwd`
+(train-fwd O is bit-exact to inference-fwd O).
+
+### `src/cuda/cudnn_sdpa_bwd.cpp` — cuDNN v9 SDPA backward shim (LIVE)
+
+Companion to `cudnn_sdpa.cpp`. Added Phase 2c (2026-04-23) to replace
+the decomposed-recompute backward that every trainer was actually
+hitting (the old WMMA backward at `flash_attention_bwd.cu` was gated
+behind an unused `flash_attn` feature). Measured: 30–50× faster than
+decomposed recompute on typical DiT training shapes.
+
+| Symbol | Notes |
+|---|---|
+| `flame_cudnn_sdpa_bwd_bf16` | `g.sdpa_backward(Q, K, V, O, dO, Stats) → [dQ, dK, dV]`. 9 BF16 tensors in/out plus the FP32 Stats input. Graph cached per (shape, all 8 BF16 stride vectors, scale). Stats stride is fixed by convention (`[H*N_q, N_q, 1, 1]`) so it's not part of the key. |
+
+Shape support mirrors the forward: unmasked, head_dim ∈ {64, 96, 128},
+4D `[B, H, N, D]` BF16. Shapes outside that fall through to the
+decomposed recompute path in `autograd.rs::attention_backward_recompute`.
+
+**Parity**: `tests/cudnn_sdpa_bwd_parity.rs` (HD=64 and HD=128 vs
+decomposed FP32 recompute; cos_sim ≥ 0.999996, mean_rel ≤ 1.7e-3
+on each of dQ, dK, dV).
 
 ### `src/cuda/fused_linear3d.cu` — cuBLASLt 3D linear (LIVE)
 

@@ -628,30 +628,91 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
-    /// Flash attention backward — wmma tensor core version.
-    /// Computes dQ, dK, dV from Q, K, V, O, dO, and LSE.
-    /// Q,K,V,O,dO: [B*H, N, HD] BF16. LSE: [B*H, N_q] FP32.
-    /// dQ,dK,dV: [B*H, N, HD] BF16 output.
-    /// head_dim must be 64, 96, or 128. Returns 0 on success.
-    /// Flash attention backward — wmma tensor core version.
-    /// dK, dV written directly as BF16 (register accumulation, no staging).
-    /// dQ uses FP32 staging buffer (atomicAdd across KV-tile blocks).
-    pub fn flame_flash_attention_backward_bf16(
+    /// cuDNN v9 Flash SDPA training-forward (host shim in
+    /// `src/cuda/cudnn_sdpa.cpp`). Identical to `flame_cudnn_sdpa_bf16`
+    /// except that it also writes `Stats` (per-row log-sum-exp) so the
+    /// backward can recompute softmax without re-running the forward.
+    ///
+    /// Stats layout (written by this call, consumed by the backward):
+    /// contiguous FP32, size B*H*N_q elements. Interpretable as 4D
+    /// `[B, H, N_q, 1]` with stride `[H*N_q, N_q, 1, 1]`, which is
+    /// layout-equivalent to contiguous 2D `[B*H, N_q]` — callers
+    /// typically allocate the 2D form on the Rust side.
+    ///
+    /// Graph cached per (shape, Q/K/V/O strides, scale). `stats_offset_elems`
+    /// is applied at execute-time as pointer arithmetic (4 bytes per elem).
+    pub fn flame_cudnn_sdpa_bf16_train_fwd(
+        Q: *const core::ffi::c_void,
+        K: *const core::ffi::c_void,
+        V: *const core::ffi::c_void,
+        O: *mut core::ffi::c_void,
+        Stats: *mut core::ffi::c_void,
+        B: i32,
+        H: i32,
+        N_q: i32,
+        N_kv: i32,
+        D: i32,
+        scale: f32,
+        q_strides: *const i64,
+        k_strides: *const i64,
+        v_strides: *const i64,
+        o_strides: *const i64,
+        q_offset_elems: i64,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        o_offset_elems: i64,
+        stats_offset_elems: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// cuDNN v9 Flash SDPA backward (host shim in
+    /// `src/cuda/cudnn_sdpa_bwd.cpp`). Computes dQ, dK, dV given Q, K, V,
+    /// O (from train-forward), dO (upstream grad), and Stats (LSE from
+    /// train-forward). BF16 in/out; FP32 intermediate + compute.
+    ///
+    /// Q, K, V, O, dO, dQ, dK, dV: 4D BF16 `[B, H, N, D]` with per-tensor
+    /// 4-element stride vectors (element strides, not byte strides).
+    /// Stats: FP32, layout fixed at `[B, H, N_q, 1]` stride
+    /// `[H*N_q, N_q, 1, 1]` — contiguous when viewed as `[B*H, N_q]` 2D.
+    ///
+    /// Graph cached per (shape, all 8 BF16 stride vectors, scale).
+    /// Offsets are element offsets applied as pointer arithmetic at
+    /// execute-time, not baked into the graph (BF16 = 2 bytes,
+    /// Stats = 4 bytes). Returns 0 on success.
+    pub fn flame_cudnn_sdpa_bwd_bf16(
         Q: *const core::ffi::c_void,
         K: *const core::ffi::c_void,
         V: *const core::ffi::c_void,
         O: *const core::ffi::c_void,
         dO: *const core::ffi::c_void,
-        LSE: *const core::ffi::c_void,
+        Stats: *const core::ffi::c_void,
         dQ: *mut core::ffi::c_void,
         dK: *mut core::ffi::c_void,
         dV: *mut core::ffi::c_void,
-        batch_heads: i32,
-        seq_len_q: i32,
-        seq_len_kv: i32,
-        head_dim: i32,
+        B: i32,
+        H: i32,
+        N_q: i32,
+        N_kv: i32,
+        D: i32,
+        scale: f32,
+        q_strides: *const i64,
+        k_strides: *const i64,
+        v_strides: *const i64,
+        o_strides: *const i64,
+        do_strides: *const i64,
+        dq_strides: *const i64,
+        dk_strides: *const i64,
+        dv_strides: *const i64,
+        q_offset_elems: i64,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        o_offset_elems: i64,
+        do_offset_elems: i64,
+        stats_offset_elems: i64,
+        dq_offset_elems: i64,
+        dk_offset_elems: i64,
+        dv_offset_elems: i64,
         stream: *mut core::ffi::c_void,
-        dQ_f32: *mut f32,  // Pre-allocated FP32 staging [BH, N_q, HD], zeroed
     ) -> i32;
 
     /// Fused RMS norm + modulation: out = rms_norm(x, w) * (1+scale) + shift.

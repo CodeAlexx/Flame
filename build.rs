@@ -169,7 +169,11 @@ fn main() {
     cuda_sources.push("src/cuda/fused_modulate.cu");
     cuda_sources.push("src/cuda/fused_linear3d.cu");
     cuda_sources.push("src/cuda/flash_attention_fwd.cu");
-    cuda_sources.push("src/cuda/flash_attention_bwd.cu");
+    // flash_attention_bwd.cu removed in Phase 2c (2026-04-23): training
+    // backward now goes through cuDNN SDPA backward via cudnn_sdpa_bwd.cpp
+    // below, which is 30-50× faster than the decomposed-recompute path the
+    // trainers were actually hitting (the WMMA backward was gated behind the
+    // unused `flash_attn` feature). See HANDOFF_2026-04-23.md §4.
     cuda_sources.push("src/cuda/fp8_dequant.cu");
     cuda_sources.push("src/cuda/fp8_quant.cu");
     cuda_sources.push("src/cuda/fp16_to_bf16.cu");
@@ -345,12 +349,18 @@ fn main() {
     // ---- cuDNN v9 Flash SDPA host shim ----
     // Host-only C++17. Does not participate in `-rdc=true` device link above:
     // pure cuDNN graph API calls from the host, no CUDA __global__ code here.
+    //
+    // `cudnn_sdpa.cpp` holds the inference forward + training-forward entry
+    // points. `cudnn_sdpa_bwd.cpp` holds the backward entry point. They
+    // compile into the same archive.
     println!("cargo:rerun-if-changed=src/cuda/cudnn_sdpa.cpp");
+    println!("cargo:rerun-if-changed=src/cuda/cudnn_sdpa_bwd.cpp");
     println!("cargo:rerun-if-changed=third_party/cudnn_frontend/include");
     let mut sdpa_build = cc::Build::new();
     sdpa_build
         .cpp(true)
         .file("src/cuda/cudnn_sdpa.cpp")
+        .file("src/cuda/cudnn_sdpa_bwd.cpp")
         .include("third_party/cudnn_frontend/include")
         .include(format!("{cuda_home}/include"))
         .flag("-std=c++17")
