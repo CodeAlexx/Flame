@@ -6,7 +6,7 @@
 //! the BROADCAST path (operand shapes differ, compute_shape infers the
 //! union, stride=0 on the broadcasted dim) on the Phase-4 pipeline.
 //!
-//! Reference: TENSORITERATOR_PORT_REFERENCE.md §5.2 (binary shape),
+//! Reference: PyTorch TensorIterator port plan §5.2 (binary shape),
 //!            plan-this-and-fix-encapsulated-hennessy.md §Phase 4 exit,
 //!            Phase 4 Builder brief "tests/tensor_iter_pilot_broadcast.rs".
 //!

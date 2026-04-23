@@ -24,10 +24,13 @@ The 114 `pub fn` methods cover construction (zeros, randn, from_vec,
 from_f32_to_bf16), shape ops (reshape, view, narrow, permute, chunk, cat,
 unsqueeze, squeeze), math (add, mul, matmul, bmm, silu, gelu, softmax,
 sum_dim_keepdim), cast (to_dtype), and read-back (to_vec, item). Math ops
-auto-route to the BF16 fast path (`bf16_elementwise::*_bf16` for shape-equal
-elementwise, `bf16_elementwise::softmax_lastdim_bf16` for last-dim softmax,
-`bf16_ops::silu_bf16` for unary). The struct is large but its discoverability
-is good — start in [`FLAME_INDEX.md`](./FLAME_INDEX.md) "tensor.rs" section.
+auto-route to the BF16 fast path: pointwise ops go through
+`tensor_iterator::ops::{unary,binary,transcendentals,comparison}` (PyTorch
+TensorIterator port, Phases 1–11), softmax last-dim goes through
+`bf16_elementwise::softmax_lastdim_bf16`, and fused ops (RoPE, swiglu,
+gate_residual, modulate) go through `bf16_ops::*`. The struct is large but
+its discoverability is good — start in [`FLAME_INDEX.md`](./FLAME_INDEX.md)
+"tensor.rs" section.
 
 **Training-critical fixes (2026-04-09):**
 - `narrow()` BF16 path now records `Op::Slice` for autograd and preserves
@@ -99,23 +102,37 @@ checks during debugging.
 
 ## BF16 family — the inference hot path
 
+### ⭐ `tensor_iterator/`
+The PyTorch-style TensorIterator port (Phases 1–11). Shape/stride
+coalescing, broadcast, dtype promotion, `OffsetCalculator<NARGS>` with
+`IntDivider<uint32_t>` fast divmod, `gpu_kernel` CUDA templates, and a
+`DispatchStub` registry keyed on dtype. All BF16 pointwise ops live under
+`tensor_iterator/ops/{unary,binary,transcendentals,comparison}.rs`. CUDA
+functors live under `src/cuda/{unary,binary,cmp}/*.cu`. `Tensor::add / mul /
+silu / gelu / ge / ...` all route here when dtype is BF16. F32 paths still
+use `GpuOps`. See [`FLAME_INDEX.md`](./FLAME_INDEX.md) "tensor_iterator/ops/"
+for the full op list.
+
 ### ⭐ `bf16_elementwise.rs`
-Broadcast and flat-path BF16 elementwise ops. Has TWO paths: the slow
-generic broadcast kernel (per-element 8-D offset computation) and the fast
-flat path with `__hadd2`/`__hmul2`/`__hsub2`/`__h2div` vectorized over 2
-elements per thread. `add_bf16` / `mul_bf16` / etc. dispatch to the flat
-path when shapes match exactly. Also home of `transpose2d_bf16` (2D BF16
-transpose), the comparison ops returning u8, the patchify/unpatchify
-helpers, and `softmax_lastdim_bf16` (the fused last-dim softmax that
-`Tensor::softmax` dispatches to for BF16).
+Post-TensorIterator this file only hosts fused/structured BF16 kernels that
+aren't pointwise: `softmax_lastdim_bf16` (fused last-dim softmax — one
+block per row, exp+reduce+div in a single pass), `transpose2d_bf16` (2D
+BF16 transpose for Klein/Mistral pre-transpose), `patchify_bf16` /
+`unpatchify_bf16` (DiT patch ops). All NVRTC. The flat-path elementwise
+kernels that used to live here were moved to `tensor_iterator/` in
+Phase 5b–11.
 
 ### ⭐ `bf16_ops.rs`
-Single-arg BF16 ops + the fused inference primitives that don't fit in
-`fused_inference.rs`. `silu_bf16`, `gelu_bf16`, `square_bf16` (2-elem/thread
-vectorized), `rope_fused_bf16` (interleaved-pair RoPE for FLUX/Klein/LTX/
-Qwen/Chroma), `rope_halfsplit_bf16` (Z-Image variant), `gate_residual_fused_bf16`
-(`x + gate*attn`), `swiglu_fused_bf16` (`silu(gate)*up`), `modulate_pre_fused_bf16`
-(DiT modulate). All NVRTC, runtime-compiled.
+Fused BF16 inference primitives that don't fit in `fused_inference.rs`:
+`rope_fused_bf16` (interleaved-pair RoPE for FLUX/Klein/LTX/Qwen/Chroma),
+`rope_fused_bf16_f32pe` (F32 pos-emb variant), `rope_halfsplit_bf16`
+(Z-Image variant), `gate_residual_fused_bf16` (`x + gate*attn`),
+`swiglu_fused_bf16` (`silu(gate)*up`), `modulate_pre_fused_bf16` /
+`modulate_pre_split_apply_bf16` (DiT modulate), `attn_split_txt_img_bf16`,
+`qkv_split_permute_bf16`. Also retains `silu_bf16` / `gelu_bf16` /
+`square_bf16` / `softmax_last_dim_bf16` as parity oracles for the
+TensorIterator port (not on the live inference path — `Tensor::silu` etc.
+route through `tensor_iterator::ops::unary::silu_bf16_iter` now). All NVRTC.
 
 ### ⭐ `bf16_convert.rs`
 BF16↔F32 cast kernels. `bf16_u16_to_f32` and `f32_to_bf16_u16` are the
@@ -803,8 +820,9 @@ in earlier versions of this doc are no longer present.
    - `tensor.rs` — Tensor type
    - `attention::sdpa` — SDPA dispatcher
    - `ops::fused_inference::*` — fused primitives (linear, RMSNorm, modulate, gate)
-   - `bf16_ops::*` — RoPE, silu, gelu, swiglu, gate_residual
-   - `bf16_elementwise::*` — flat elementwise + softmax
+   - `tensor_iterator::ops::*` — BF16 pointwise (add/mul/silu/gelu/exp/ge/…)
+   - `bf16_ops::*` — RoPE, swiglu, gate_residual, modulate, qkv_split
+   - `bf16_elementwise::*` — softmax_lastdim, transpose2d, patchify/unpatchify
    - `cuda_ops_bf16::*` — BF16 op surface (norms, conv, sdpa_stream)
    - `serialization::*` — safetensors load/save
    - `cuda::ffi` — FFI declarations for the C kernels

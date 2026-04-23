@@ -173,20 +173,24 @@ force a recompile.
 
 | Situation | Use |
 |---|---|
-| Inference, BF16 in/out, elementwise op on shape-equal tensors | `bf16_elementwise::*_bf16` (auto-routed by `Tensor::*` for matching shapes) |
-| Inference, BF16 unary op (silu/gelu/sqrt/etc) | `bf16_ops::*_bf16` |
+| Inference, BF16 pointwise binary (add/sub/mul/div/max/min, broadcast or strided) | `tensor_iterator::ops::binary::*_bf16_iter` (auto-routed by `Tensor::*`) |
+| Inference, BF16 pointwise unary (silu/gelu/sqrt/exp/abs/neg/square/…) | `tensor_iterator::ops::{unary,transcendentals}::*_bf16_iter` (auto-routed by `Tensor::*`) |
+| Inference, BF16 comparison (ge/gt/le/lt/eq/ne) | `tensor_iterator::ops::comparison::*_bf16_iter` (output is BF16 0.0/1.0) |
 | Inference, BF16 matmul | `Tensor::matmul` (auto-routes) or `ops::fused_inference::fused_linear3d_native` for the cuBLASLt+bias path |
-| Inference, RMSNorm/LayerNorm | `cuda_ops_bf16::rms_norm_bf16 / layer_norm_bf16` (the `Tensor::softmax` BF16 fast path is automatic) |
+| Inference, last-dim softmax | `Tensor::softmax` BF16 fast path → `bf16_elementwise::softmax_lastdim_bf16` |
+| Inference, 2D transpose | `bf16_elementwise::transpose2d_bf16` |
+| Inference, DiT patchify/unpatchify | `bf16_elementwise::patchify_bf16 / unpatchify_bf16` |
+| Inference, RMSNorm/LayerNorm | `cuda_ops_bf16::rms_norm_bf16 / layer_norm_bf16` |
 | Inference, attention | `attention::sdpa` |
 | Inference, RoPE | `bf16_ops::rope_fused_bf16` (interleaved-pair) or `bf16_ops::rope_halfsplit_bf16` (Z-Image format) |
 | Inference, FFN gate-residual | `bf16_ops::gate_residual_fused_bf16` and `bf16_ops::swiglu_fused_bf16` |
 | Training F32 tensor add | falls through to `cuda_ops::GpuOps::add` |
-| Need autograd | use the `Tensor::*` methods (they record on the tape); the bare BF16 functions DO NOT record |
+| Need autograd | use the `Tensor::*` methods (they record on the tape); the bare `*_iter` functions DO NOT record |
 
 ### The autograd recording trap
 
-`bf16_elementwise::add_bf16(a, b)` does NOT record on the autograd tape.
-`Tensor::add(&b)` DOES (when `requires_grad` is true).
+`tensor_iterator::ops::binary::add_bf16_iter(a, b)` does NOT record on the
+autograd tape. `Tensor::add(&b)` DOES (when `requires_grad` is true).
 
 So:
 - Inference code can call the bare functions directly — slightly faster, no
@@ -245,85 +249,80 @@ pre-transpose all linear weights at load time. New code should use
 
 ## Adding a new BF16 op — template
 
-### Single-arg unary (like silu, gelu)
+Pointwise (elementwise) BF16 ops go through the TensorIterator pipeline.
+Fused / structured / reduction kernels stay under `bf16_ops.rs` with the
+old NVRTC pattern. Pick the right lane.
 
-In `src/bf16_ops.rs`:
+### Pointwise unary, binary, transcendental, comparison
+
+Three pieces: a `.cu` functor, a `declare_stub!`, and a Rust `_bf16_iter`
+wrapper. All three are small — each existing op under
+`src/tensor_iterator/ops/` is the working template. Copy the nearest
+sibling (`silu` for unary, `add` for binary, `exp` for transcendental,
+`ge` for comparison) and rename.
+
+1. **`.cu` functor** — drop a new file under `src/cuda/{unary,binary,cmp}/`
+   with a `__device__` functor struct and an `extern "C"` entry that calls
+   `flame::iter::gpu_kernel<NARGS>(...)` with that functor. For
+   transcendentals use the f32-opmath shim: convert BF16→f32, compute,
+   `__float2bfloat16_rn` back. Add the file to the `cuda_sources` list in
+   `build.rs`.
+
+2. **`declare_stub!`** at the top of the matching `tensor_iterator/ops/*.rs`:
+   register the FFI entry in the `DispatchStub` registry. See the 27
+   existing invocations for the exact shape.
+
+3. **Rust wrapper** in the same file:
+   ```rust
+   pub fn my_op_bf16_iter(x: &Tensor) -> Result<Tensor> {
+       let mut iter = build_unary_op(x, /*promote=*/false)?;
+       dispatch_my_op(&mut iter)?;   // from declare_stub!
+       Ok(iter.take_output())
+   }
+   ```
+   `build_unary_op` / `build_binary_op` / `build_comparison_op` (in
+   `tensor_iterator/base.rs`) handle broadcast, coalescing, and output
+   allocation. You do not write offset math.
+
+4. **Autograd** — add an `Op::` variant and a backward arm in
+   `autograd_ops_complete.rs` if the op ever runs under `requires_grad`.
+   Inference-only ops skip this and call `_bf16_iter` directly.
+
+5. **Wire into `Tensor::*`** — add a `pub fn my_op(&self)` method to
+   `tensor.rs` (or the appropriate `tensor_ops_*.rs`) that routes BF16 to
+   `my_op_bf16_iter` via `dispatch_unary_bf16` /
+   `dispatch_binary_bf16` in `tensor_iterator/dispatch_helpers.rs`, and
+   F32 through `GpuOps`.
+
+6. **Parity test** — add `tests/tensor_iterator_my_op_parity.rs`. Compare
+   contig output bit-exact to a BF16 oracle (write one inline if none
+   exists; the three retained oracles `silu_bf16`/`gelu_bf16`/`square_bf16`
+   in `bf16_ops.rs` are the pattern).
+
+### Fused / structured / reduction (RoPE, swiglu, softmax, …)
+
+These stay NVRTC with the old pattern. In `src/bf16_ops.rs`:
 
 ```rust
-const CUDA_MY_OP: &str = r#"
+const CUDA_MY_FUSED: &str = r#"
 #include <cuda_bf16.h>
 extern "C" __global__
-void my_op_bf16_kernel(const __nv_bfloat16* __restrict__ X,
-                        __nv_bfloat16* __restrict__ Y,
-                        long n) {
-    long i2 = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    long n2 = n >> 1;
-    if (i2 < n2) {
-        const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(X);
-        __nv_bfloat162* y2 = reinterpret_cast<__nv_bfloat162*>(Y);
-        float2 v = __bfloat1622float2(x2[i2]);
-        // ... your math on v.x and v.y ...
-        y2[i2] = __floats2bfloat162_rn(result.x, result.y);
-    }
-    if (i2 == n2 && (n & 1)) {
-        long last = n - 1;
-        // ... scalar path for the tail ...
-    }
+void my_fused_bf16_kernel(const __nv_bfloat16* __restrict__ X,
+                           __nv_bfloat16* __restrict__ Y,
+                           long n) {
+    // ... your fused math ...
 }
 "#;
 
-pub fn my_op_bf16(x: &Tensor) -> Result<Tensor> {
-    debug_assert_eq!(x.dtype(), DType::BF16);
-    let n = x.shape().elem_count();
-    let data = unsafe { x.device.alloc::<u16>(n) }
-        .map_err(|e| Error::Cuda(format!("alloc my_op: {:?}", e)))?;
-    let mut out = Tensor {
-        storage: TensorStorage::BF16 { data: data.into(), numel: n },
-        shape: x.shape().clone(),
-        device: x.device.clone(),
-        id: TensorId::new(),
-        requires_grad: false,
-    };
-    ensure(&x.device, "my_op_bf16_kernel", CUDA_MY_OP)?;
-    let f = x.device
-        .get_func("my_op_bf16_kernel", "my_op_bf16_kernel")
-        .ok_or_else(|| Error::Cuda("my_op_bf16_kernel missing".into()))?;
-    let xs = match &x.storage {
-        TensorStorage::BF16 { data, .. } => data,
-        _ => return Err(Error::InvalidOperation("my_op_bf16 expects BF16".into())),
-    };
-    let ys = match &mut out.storage {
-        TensorStorage::BF16 { data, .. } => data,
-        _ => unreachable!(),
-    };
-    let ys = ensure_unique_slice(ys)?;
-    unsafe {
-        f.launch(lc_pairs(n), (slice_ref(xs), ys, n as i64))?;
-    }
-    Ok(out)
+pub fn my_fused_bf16(x: &Tensor) -> Result<Tensor> {
+    // ensure kernel compiled, alloc output, launch with lc(n) or lc_pairs(n).
+    // See `rope_fused_bf16` or `swiglu_fused_bf16` for the full pattern.
 }
 ```
 
-Use `lc_pairs(n)` for the vectorized kernel. Use `lc(n)` if you went with a
-scalar 1-element-per-thread kernel.
-
-### Two-input elementwise (like add, mul)
-
-In `src/bf16_elementwise.rs`. Add a new flat-path kernel to `CUDA_ADD_MUL_BF16_FLAT`,
-add a `pub fn` that uses `shapes_equal_no_broadcast` to dispatch:
-
-```rust
-pub fn my_binary_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    if shapes_equal_no_broadcast(a, b) {
-        return launch_bf16_flat(a, b, "my_binary_bf16_flat_kernel", "my_binary_bf16");
-    }
-    // fall back to the broadcast path
-    launch_bf16_elementwise(a, b, "my_binary_bf16_kernel", "my_binary_bf16")
-}
-```
-
-Add the broadcast-path kernel to `CUDA_ADD_MUL_BF16` (the slow generic 8-D
-broadcast path).
+Use `lc_pairs(n)` for a 2-element-per-thread vectorized kernel; `lc(n)`
+for scalar. Same `ensure` + `get_func` + `f.launch` dance as the existing
+fused kernels.
 
 ### Build-time `.cu` kernel (cuBLASLt wrapper, big kernel)
 
@@ -407,17 +406,23 @@ mismatch. `clamp` now builds constants in the source's dtype. Any future
 op that needs a "constant like" tensor in the caller's dtype should follow
 the same pattern.
 
-### Two paths for silu/gelu
+### Three paths for silu/gelu (only one is live)
 
-There are TWO BF16 silu/gelu implementations:
-1. `bf16_ops::silu_bf16 / gelu_bf16` (NVRTC, in `src/bf16_ops.rs`)
-2. `cuda_ops_bf16::silu_bf16 / gelu_bf16` → `fc_silu_bf16 / fc_gelu_bf16`
-   (build-time, in `cuda/cuda_ops.cu`)
+Historical debris — there are THREE BF16 silu/gelu implementations:
+1. `tensor_iterator::ops::unary::silu_bf16_iter / gelu_bf16_iter` (LIVE — the
+   TensorIterator path, `.cu` functor in `src/cuda/unary/`). `Tensor::silu` and
+   `Tensor::gelu` route here for BF16.
+2. `bf16_ops::silu_bf16 / gelu_bf16 / square_bf16` (NVRTC, retained as parity
+   oracles for the `_iter` functions — tests under
+   `tests/tensor_iterator_{silu,gelu,square}_parity.rs` call these).
+3. `cuda_ops_bf16::silu_bf16 / gelu_bf16` → `fc_silu_bf16 / fc_gelu_bf16`
+   (build-time, in `cuda/cuda_ops.cu`). Reached only via `cuda_ops.rs`
+   dispatch and `attention::sdpa`'s MLP call (`gelu_bf16_into`).
 
-`Tensor::silu()` and `Tensor::gelu()` route to **#1** (the `bf16_ops` NVRTC
-path). If you edit `cuda/cuda_ops.cu`'s silu/gelu kernels, NOTHING in
-`Tensor::silu` will change. If you want to fix the live silu/gelu, edit
-`bf16_ops.rs`.
+If you edit `cuda/cuda_ops.cu` kernels, `Tensor::silu / Tensor::gelu` will
+NOT change. If you edit the NVRTC strings in `bf16_ops.rs`, parity tests
+will shift but the live path will NOT change. To edit the live path, touch
+the `.cu` functor under `src/cuda/unary/`.
 
 This bit me during the elementwise perf work.
 

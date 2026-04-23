@@ -1,6 +1,6 @@
 //! Phase 1 exit tests for `flame_core::tensor_iterator`.
 //!
-//! Covers, per the port reference doc (`flame-core/docs/TENSORITERATOR_PORT_REFERENCE.md`
+//! Covers, per the port reference doc (`PyTorch TensorIterator port plan`
 //! §10/§11) and plan-this-and-fix-encapsulated-hennessy.md Phase 1:
 //!   1. broadcast shape inference (right-aligned, singleton-on-either-side);
 //!   2. stride-0 emitted on broadcast dims;

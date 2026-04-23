@@ -2,7 +2,7 @@
 // Reference:
 //   pytorch/aten/src/ATen/native/DispatchStub.h L87–L330 (DispatchStub template),
 //   L389 (DECLARE_DISPATCH), L400 (DEFINE_DISPATCH), L471 (REGISTER_DISPATCH).
-//   flame-core docs/TENSORITERATOR_PORT_REFERENCE.md §4.
+//   flame-core PyTorch TensorIterator port plan §4.
 //
 // Why this file exists
 // --------------------
@@ -65,7 +65,7 @@ pub type BF16ElementwiseKernel = fn(&mut TensorIteratorBase<'_>) -> Result<()>;
 /// `DispatchStub::cuda_dispatch_ptr` (`DispatchStub.h:201`). More slots
 /// (F16, F32 CUDA; later CPU capability flavours) can be added as
 /// additional `OnceLock` fields when those phases land. Phase 3 is
-/// BF16-only — see `docs/TENSORITERATOR_PORT_REFERENCE.md` §12.
+/// BF16-only — see `PyTorch TensorIterator port plan` §12.
 pub struct StubEntry {
     /// CUDA BF16 kernel entry. `None` until `register_cuda_bf16` has been
     /// called.

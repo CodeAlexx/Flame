@@ -1,7 +1,7 @@
 //! Phase 3 exit tests for `TensorIteratorBase::build_unary_op` /
 //! `build_binary_op` and the `dispatch::StubEntry` registry.
 //!
-//! Reference: `flame-core/docs/TENSORITERATOR_PORT_REFERENCE.md` §4, §10,
+//! Reference: `PyTorch TensorIterator port plan` §4, §10,
 //! §11 and the Phase 3 section of
 //! `plan-this-and-fix-encapsulated-hennessy.md`.
 //!
@@ -35,7 +35,7 @@ use flame_core::{declare_stub, DType, Error, Shape, Tensor};
 
 #[test]
 fn build_unary_op_allocates_contig_output_for_rank2_contig_input() {
-    // Reference contract (TENSORITERATOR_PORT_REFERENCE.md §4 "Phase 3
+    // Reference contract (PyTorch TensorIterator port plan §4 "Phase 3
     // deliverable files", row "tests/tensor_iter_builders.rs"):
     // build_unary_op produces correct shape/strides/allocations on
     // matching inputs.

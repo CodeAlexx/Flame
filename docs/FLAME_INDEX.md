@@ -90,11 +90,13 @@
 - `.flatten / .flatten_to_2d`
 
 ### Math (most go through GpuOps or BF16 paths)
-- `.add(&Tensor) / .sub / .mul / .div` — auto-route to BF16 flat path when shapes match (`bf16_elementwise::*_bf16`)
-- `.add_scalar(f32) / .mul_scalar / .sub_scalar / .div_scalar / .mul_scalar_inplace`
+- `.add(&Tensor) / .sub / .mul / .div / .maximum / .minimum` — BF16 routes through the TensorIterator pipeline (`tensor_iterator::ops::binary::*_bf16_iter`); F32 routes through `GpuOps`
+- `.add_scalar(f32) / .mul_scalar / .sub_scalar / .div_scalar / .mul_scalar_inplace` — BF16 through `tensor_iterator::ops::binary::{add,mul}_scalar_bf16_iter`
 - `.matmul(&Tensor)` — 2D matmul (cuBLASLt for BF16)
 - `.bmm(&Tensor)` — 3D batched matmul
-- `.silu / .gelu / .relu / .exp / .log / .sin / .cos / .sqrt / .pow / .tanh / .neg / .abs`
+- `.silu / .gelu / .relu / .sigmoid / .tanh / .neg / .abs / .square` — BF16 through `tensor_iterator::ops::unary::*_bf16_iter`
+- `.exp / .log / .sqrt / .rsqrt / .recip` — BF16 through `tensor_iterator::ops::transcendentals::*_bf16_iter` (f32-opmath inside)
+- `.ge / .gt / .le / .lt / .eq / .ne` — BF16 through `tensor_iterator::ops::comparison::*_bf16_iter` (output is BF16 0.0/1.0)
 - `.softmax(dim)` — fast-path dispatches to `bf16_elementwise::softmax_lastdim_bf16` for BF16 last-dim
 - `.clamp(min, max)` — `tensor_ops_extended.rs:677`. Element-wise clamp via
   `maximum`/`minimum`. Output dtype always equals source dtype (fix 2026-04:
@@ -175,9 +177,9 @@ This is a critical area with several implementations. **Use these for inference*
 
 ### RoPE
 - `attention/rope.rs` — RoPE precompute + apply helpers
-- ⭐ `bf16_ops::rope_fused_bf16(x, cos, sin)` — `bf16_ops.rs:417`
+- ⭐ `bf16_ops::rope_fused_bf16(x, cos, sin)` — `bf16_ops.rs:476`
   The interleaved-pair (FLUX/Klein/LTX/HunyuanVideo/QwenImage/Chroma) format.
-- `bf16_ops::rope_halfsplit_bf16(x, cos, sin)` — `bf16_ops.rs:500`
+- `bf16_ops::rope_halfsplit_bf16(x, cos, sin)` — `bf16_ops.rs:656`
   The halfsplit (Z-Image/some Klein variants) format.
 
 ---
@@ -299,41 +301,52 @@ These modules are the BF16 inference primitives. They live in
 `src/bf16_*.rs` (NVRTC kernels in inline string consts) and
 `src/cuda/fused_*.cu` (build-time compiled kernels).
 
-### `bf16_elementwise.rs` — broadcast + flat-path elementwise
-- ⭐ `add_bf16(a, b)` — `:532` — flat fast-path when shapes match (uses `__hadd2`)
-- ⭐ `sub_bf16(a, b)` — `:539`
-- ⭐ `mul_bf16(a, b)` — `:680`
-- `div_bf16 / max_bf16 / min_bf16` — `:687,694,698`
-- `ge_bf16 / gt_bf16 / le_bf16 / lt_bf16 / ne_bf16` — `:766+` — comparison ops returning u8
-- ⭐ `transpose2d_bf16(t)` — `:616` — 2D BF16 transpose (used by Klein/Mistral pre-transpose)
-- ⭐ `softmax_lastdim_bf16(x)` — `:469` — fused last-dim softmax (no scratch alloc).
-  Wired into `Tensor::softmax` BF16 fast path as of 2026-04.
-- `make_broadcast_spec(a_dims, b_dims)` — `:30` — internal broadcast helper
-- `BcSpec` — `:22` — broadcast spec struct
-- `patchify_bf16 / unpatchify_bf16` — `:866,922` — DiT patch ops
+### `bf16_elementwise.rs` — fused/structured survivors (post-TensorIterator)
+Historically the flat-path elementwise home; after the Phase 1–11 TensorIterator
+port, this file only hosts fused and memory-layout kernels. Pointwise
+`add / sub / mul / div / max / min / ge / gt / le / lt / eq / ne` live under
+`tensor_iterator::ops` now.
+- ⭐ `softmax_lastdim_bf16(x)` — `:152` — fused last-dim softmax (no scratch
+  alloc). Wired into `Tensor::softmax` BF16 fast path.
+- ⭐ `transpose2d_bf16(t)` — `:232` — 2D BF16 transpose (used by Klein/Mistral
+  pre-transpose).
+- `patchify_bf16 / unpatchify_bf16` — `:374,426` — DiT patch ops.
 
-### `ops/silu_iter.rs` — stride-aware SiLU dispatcher (2026-04-22)
-- ⭐ `silu_bf16_iter(x)` — `:39` — short-circuits contig to `bf16_ops::silu_bf16`, else drives the new strided kernel via `flame_silu_bf16_strided`. `Tensor::silu` routes here.
+### `tensor_iterator/ops/` — BF16 elementwise via PyTorch-style TensorIterator (Phases 4–11)
+All entries are `pub fn <op>_bf16_iter(...)` and route through the shared
+dispatch registry in `tensor_iterator/dispatch.rs`.
+- `unary.rs` — ⭐ `silu_bf16_iter` `:58`, ⭐ `gelu_bf16_iter` `:102`,
+  ⭐ `square_bf16_iter` `:144`, `abs_bf16_iter` `:186`,
+  `relu_bf16_iter` `:228`, `sigmoid_bf16_iter` `:270`,
+  `tanh_bf16_iter` `:312`, `neg_bf16_iter` `:354`.
+- `transcendentals.rs` — `exp_bf16_iter` `:46`, `log_bf16_iter` `:88`,
+  `sqrt_bf16_iter` `:130`, `rsqrt_bf16_iter` `:172`,
+  `recip_bf16_iter` `:214`. (f32-opmath inside: bf16→f32→op→`__float2bfloat16_rn`.)
+- `binary.rs` — ⭐ `add_bf16_iter` `:54`, ⭐ `sub_bf16_iter` `:97`,
+  ⭐ `mul_bf16_iter` `:140`, `div_bf16_iter` `:183`,
+  `maximum_bf16_iter` `:226`, `minimum_bf16_iter` `:269`,
+  `mul_scalar_bf16_iter` `:289`, `add_scalar_bf16_iter` `:331`.
+- `comparison.rs` — `ge_bf16_iter` `:48`, `gt_bf16_iter` `:91`,
+  `le_bf16_iter` `:134`, `lt_bf16_iter` `:177`, `eq_bf16_iter` `:220`,
+  `ne_bf16_iter` `:263`. Output dtype is BF16 0.0/1.0 (not u8), matching
+  the pre-port `GpuOps::compare_binary` contract.
 
-### `ops/gelu_iter.rs` — stride-aware GELU dispatcher (2026-04-22, session 2)
-- ⭐ `gelu_bf16_iter(x)` — `:23` — short-circuits contig to `bf16_ops::gelu_bf16`, else drives the new strided kernel via `flame_gelu_bf16_strided`. `Tensor::gelu` routes here.
-
-### `ops/square_iter.rs` — stride-aware square dispatcher (2026-04-22, session 3)
-- ⭐ `square_bf16_iter(x)` — `:19` — short-circuits contig to `bf16_ops::square_bf16`, else drives `flame_square_bf16_strided`. BF16 `Tensor::square` routes here (replacing the prior `GpuOps::mul(self, self)` call; bit-equivalent on BF16).
-
-### `ops/add_iter.rs` — stride-aware add dispatcher (2026-04-22, session 4)
-- ⭐ `add_bf16_iter(a, b)` — `:30` — routes: different-shape → `bf16_elementwise::add_bf16` (broadcast); same-shape + both contig → same (fast `__hadd2`); same-shape + ≥1 strided → `flame_add_bf16_strided`. BF16 `Tensor::add` routes here.
-
-### `bf16_ops.rs` — fused inference primitives
-- ⭐ `gelu_bf16(x)` — `:120` — contig fast path, NOT called directly from `Tensor::gelu` since the 2026-04-22 session 2 TensorIterator port (reached via `ops::gelu_iter::gelu_bf16_iter`'s short-circuit).
-- ⭐ `silu_bf16(x)` — `:303` — contig fast path, NOT called directly from `Tensor::silu` since the 2026-04-22 TensorIterator port (reached via `ops::silu_iter::silu_bf16_iter`'s short-circuit).
-- ⭐ `square_bf16(x)` — `:157` — contig fast path, reached from BF16 `Tensor::square` via `ops::square_iter::square_bf16_iter`'s short-circuit (2026-04-22 session 3).
-- ⭐ `rope_fused_bf16(x, cos, sin)` — `:417` — interleaved-pair RoPE
-- `rope_halfsplit_bf16(x, cos, sin)` — `:500` — halfsplit RoPE
-- ⭐ `gate_residual_fused_bf16(x, gate, attn_out)` — `:729` — `x + gate * attn_out`
-- ⭐ `swiglu_fused_bf16(gate, up)` — `:794` — `silu(gate) * up`
-- `modulate_pre_fused_bf16(...)` — `:643`
-- `softmax_last_dim_bf16(x)` — `:247` — older fused softmax (one block per row)
+### `bf16_ops.rs` — fused inference primitives (+ oracle references)
+- `gelu_bf16(x)` — `:133` — NVRTC contig fast path. Retained as the parity
+  oracle for `tensor_iterator/ops/unary.rs::gelu_bf16_iter`; not on the live
+  inference path.
+- `square_bf16(x)` — `:170` — same role for `square_bf16_iter`.
+- `silu_bf16(x)` — `:322` — same role for `silu_bf16_iter`.
+- `softmax_last_dim_bf16(x)` — `:264` — older fused softmax (one block per row).
+- ⭐ `rope_fused_bf16(x, cos, sin)` — `:476` — interleaved-pair RoPE.
+- ⭐ `rope_fused_bf16_f32pe(x, cos, sin)` — `:567` — RoPE with F32 positional embeddings.
+- `rope_halfsplit_bf16(x, cos, sin)` — `:656` — halfsplit RoPE.
+- `modulate_pre_fused_bf16(...)` — `:895` — DiT shift+scale modulation.
+- `modulate_pre_split_apply_bf16(...)` — `:961` — B.3 split+apply variant.
+- ⭐ `gate_residual_fused_bf16(x, gate, attn_out)` — `:1089` — `x + gate * attn_out`.
+- ⭐ `swiglu_fused_bf16(gate, up)` — `:1156` — `silu(gate) * up`.
+- `attn_split_txt_img_bf16(...)` — `:1246` — attention output text/image split.
+- `qkv_split_permute_bf16(...)` — `:1642` — QKV split + permute.
 
 ### `bf16_convert.rs` — BF16↔F32 cast
 - `bf16_u16_to_f32(...)` — `:54` — vectorized via `__nv_bfloat162` (2-element/thread)
@@ -643,8 +656,8 @@ by `.cu` file with launch configs and perf notes.
 
 - **"Where is the BF16 fast-path matmul?"** → `ops::fused_inference::fused_linear3d_native`
 - **"Where is the SDPA dispatcher I should call from a model?"** → `attention::sdpa`
-- **"Where do I add a new BF16 elementwise op?"** → `bf16_elementwise.rs` (flat path) +
-  `bf16_ops.rs` (single-arg) — see CONVENTIONS for the template
+- **"Where do I add a new BF16 elementwise op?"** → `tensor_iterator/ops/{unary,binary,transcendentals,comparison}.rs` +
+  a `.cu` functor under `src/cuda/{unary,binary,cmp}/` — see CONVENTIONS for the template
 - **"Where is the wmma flash attention kernel?"** → `src/cuda/flash_attention_fwd.cu`
 - **"Where do I add a new fused C kernel?"** → `src/cuda/fused_*.cu` + `src/cuda/ffi.rs` declaration +
   `ops/fused_inference.rs` Rust wrapper

@@ -1,7 +1,7 @@
 // TensorIterator port — Phases 1–3 wired (config + base + broadcast + dim_vec
 // + dispatch).
 //
-// Reference: `flame-core/docs/TENSORITERATOR_PORT_REFERENCE.md` §2 (port
+// Reference: `PyTorch TensorIterator port plan` §2 (port
 // mapping) and §10 (file layout). Migration plan:
 // `/home/alex/.claude/plans/plan-this-and-fix-encapsulated-hennessy.md`.
 //

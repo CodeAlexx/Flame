@@ -13,7 +13,7 @@
 //! been removed. Those ops now route through
 //! `tensor_iterator::ops::{unary,binary,transcendentals,comparison}`.
 //!
-//! Per `docs/TENSORITERATOR_PORT_REFERENCE.md` §7 do-not-touch list.
+//! Per `PyTorch TensorIterator port plan` §7 do-not-touch list.
 
 use std::sync::Arc;
 use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};

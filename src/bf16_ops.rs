@@ -1,5 +1,5 @@
 //! BF16 fused-op and reduction kernels. Kept per
-//! `docs/TENSORITERATOR_PORT_REFERENCE.md` §7 do-not-touch list (RoPE
+//! `PyTorch TensorIterator port plan` §7 do-not-touch list (RoPE
 //! variants, SwiGLU, modulate, gate-residual, fused-RMSNorm hooks,
 //! softmax-lastdim, attn split/permute, QKV split, patchify/unpatchify).
 //!
