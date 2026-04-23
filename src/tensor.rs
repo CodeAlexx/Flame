@@ -1842,26 +1842,16 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Element-wise addition
     pub fn add(&self, other: &Tensor) -> Result<Tensor> {
-        // BF16+BF16 routes through the TensorIterator pipeline
-        // (build_binary_op → launch_gpu_kernel<2, AddBF16Op>). Other dtypes
-        // go through GpuOps::add (F32 path). Phase 5b: non-cuda builds
-        // return an error — the legacy BF16 NVRTC kernels were deleted.
-        let mut output = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                crate::ops::add_iter::add_bf16_iter(self, other)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                return Err(Error::InvalidOperation(
-                    "Tensor::add on BF16 requires the `cuda` feature".into(),
-                ));
-            }
-        } else {
-            GpuOps::add(self, other)?
-        };
-
-        // AUTOGRAD: Record operation if needed
+        // Phase 10: BF16+BF16 → TensorIterator, else → GpuOps::add. The
+        // `*_bf16_iter` functions handle their own cuda-feature gating
+        // (return InvalidOperation on non-cuda builds), so no extra cfg
+        // scaffolding is needed here. Autograd tape block is unchanged.
+        let mut output = crate::tensor_iterator::dispatch_binary_bf16(
+            self,
+            other,
+            crate::ops::add_iter::add_bf16_iter,
+            GpuOps::add,
+        )?;
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
@@ -1877,34 +1867,24 @@ extern "C" __global__ void f32_to_bool_kernel(
                 );
             }
         }
-
         Ok(output)
     }
 
     /// Subtract another tensor
     pub fn sub(&self, other: &Tensor) -> Result<Tensor> {
-        // BF16: route to the TensorIterator pipeline
-        // (build_binary_op → launch_gpu_kernel<2, SubBF16Op>). Other dtypes
-        // fall through to the add+neg composition used pre-Phase-5b, which
-        // still works (autograd records Sub afterwards either way).
-        let mut output = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                crate::ops::sub_iter::sub_bf16_iter(self, other)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                return Err(Error::InvalidOperation(
-                    "Tensor::sub on BF16 requires the `cuda` feature".into(),
-                ));
-            }
-        } else {
-            // Non-BF16 path: a - b = a + (-1 * b), composed via add.
-            let neg_other = other.mul_scalar(-1.0)?;
-            self.add(&neg_other)?
-        };
-
-        // Record subtraction operation if needed.
+        // Phase 10: BF16+BF16 → TensorIterator sub kernel; non-BF16 stays
+        // on the add+neg composition (GpuOps has no `sub`; the compose
+        // path is the canonical F32 fallback). Autograd records Sub
+        // afterwards either way.
+        let mut output = crate::tensor_iterator::dispatch_binary_bf16(
+            self,
+            other,
+            crate::ops::sub_iter::sub_bf16_iter,
+            |a, b| {
+                let neg_b = b.mul_scalar(-1.0)?;
+                a.add(&neg_b)
+            },
+        )?;
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
@@ -1918,30 +1898,18 @@ extern "C" __global__ void f32_to_bool_kernel(
                 );
             }
         }
-
         Ok(output)
     }
 
     /// Element-wise multiplication (Hadamard product)
     pub fn mul(&self, other: &Tensor) -> Result<Tensor> {
-        // BF16 path: TensorIterator pipeline
-        // (build_binary_op → launch_gpu_kernel<2, MulBF16Op>).
-        let mut output = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                crate::ops::mul_iter::mul_bf16_iter(self, other)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                return Err(Error::InvalidOperation(
-                    "Tensor::mul on BF16 requires the `cuda` feature".into(),
-                ));
-            }
-        } else {
-            GpuOps::mul(self, other)?
-        };
-
-        // AUTOGRAD: Record operation if needed
+        // Phase 10: BF16+BF16 → TensorIterator, else → GpuOps::mul.
+        let mut output = crate::tensor_iterator::dispatch_binary_bf16(
+            self,
+            other,
+            crate::ops::mul_iter::mul_bf16_iter,
+            GpuOps::mul,
+        )?;
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
@@ -1955,31 +1923,20 @@ extern "C" __global__ void f32_to_bool_kernel(
                 );
             }
         }
-
         Ok(output)
     }
 
     /// Scalar multiplication
     pub fn mul_scalar(&self, scalar: f32) -> Result<Tensor> {
-        // BF16 path: TensorIterator pipeline with the scalar captured in a
-        // stateful functor (mirrors PyTorch's opmath_gpu_kernel_with_scalars).
-        // Other dtypes go through GpuOps::mul_scalar (F32 path).
-        let mut output = if self.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                crate::ops::mul_scalar_iter::mul_scalar_bf16_iter(self, scalar)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                return Err(Error::InvalidOperation(
-                    "Tensor::mul_scalar on BF16 requires the `cuda` feature".into(),
-                ));
-            }
-        } else {
-            GpuOps::mul_scalar(self, scalar)?
-        };
-
-        // AUTOGRAD: Record operation if needed
+        // Phase 10: BF16 → TensorIterator (scalar captured in stateful
+        // functor, mirrors PyTorch's opmath_gpu_kernel_with_scalars).
+        // Other dtypes → GpuOps::mul_scalar (F32 path).
+        let mut output = crate::tensor_iterator::dispatch_scalar_bf16(
+            self,
+            scalar,
+            crate::ops::mul_scalar_iter::mul_scalar_bf16_iter,
+            GpuOps::mul_scalar,
+        )?;
         if self.requires_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
@@ -1993,7 +1950,6 @@ extern "C" __global__ void f32_to_bool_kernel(
                 );
             }
         }
-
         Ok(output)
     }
 
@@ -2004,25 +1960,14 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Add scalar to all elements
     pub fn add_scalar(&self, scalar: f32) -> Result<Tensor> {
-        // BF16 path: TensorIterator pipeline with captured scalar
-        // (see mul_scalar for the stateful-functor design). Other dtypes
-        // go through GpuOps::add_scalar (F32 path).
-        let mut output = if self.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                crate::ops::add_scalar_iter::add_scalar_bf16_iter(self, scalar)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                return Err(Error::InvalidOperation(
-                    "Tensor::add_scalar on BF16 requires the `cuda` feature".into(),
-                ));
-            }
-        } else {
-            GpuOps::add_scalar(self, scalar)?
-        };
-
-        // AUTOGRAD: Record operation if needed
+        // Phase 10: BF16 → TensorIterator (scalar captured in functor);
+        // other dtypes → GpuOps::add_scalar (F32 path).
+        let mut output = crate::tensor_iterator::dispatch_scalar_bf16(
+            self,
+            scalar,
+            crate::ops::add_scalar_iter::add_scalar_bf16_iter,
+            GpuOps::add_scalar,
+        )?;
         if self.requires_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
@@ -2036,28 +1981,17 @@ extern "C" __global__ void f32_to_bool_kernel(
                 );
             }
         }
-
         Ok(output)
     }
 
     /// ReLU activation
     pub fn relu(&self) -> Result<Tensor> {
-        let mut output = if self.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                // Phase 6: BF16 routes through the TensorIterator pipeline
-                // (build_unary_op → launch_gpu_kernel<1, ReluBF16Op>).
-                crate::ops::relu_iter::relu_bf16_iter(self)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                GpuOps::relu(self)?
-            }
-        } else {
-            GpuOps::relu(self)?
-        };
-
-        // AUTOGRAD: Record operation if needed
+        // Phase 10: BF16 → TensorIterator, else → GpuOps::relu.
+        let mut output = crate::tensor_iterator::dispatch_unary_bf16(
+            self,
+            crate::ops::relu_iter::relu_bf16_iter,
+            GpuOps::relu,
+        )?;
         if self.requires_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
@@ -2068,27 +2002,17 @@ extern "C" __global__ void f32_to_bool_kernel(
                 );
             }
         }
-
         Ok(output)
     }
 
     /// GELU activation
     pub fn gelu(&self) -> Result<Tensor> {
-        let mut output = if self.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                // BF16 routes through the TensorIterator pipeline
-                // (build_unary_op → launch_gpu_kernel<1, GeluBF16Op>).
-                crate::ops::gelu_iter::gelu_bf16_iter(self)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                GpuOps::gelu(self)?.to_dtype(DType::BF16)?
-            }
-        } else {
-            GpuOps::gelu(self)?
-        };
-
+        // Phase 10: BF16 → TensorIterator, else → GpuOps::gelu.
+        let mut output = crate::tensor_iterator::dispatch_unary_bf16(
+            self,
+            crate::ops::gelu_iter::gelu_bf16_iter,
+            GpuOps::gelu,
+        )?;
         if self.requires_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
@@ -2099,27 +2023,17 @@ extern "C" __global__ void f32_to_bool_kernel(
                 );
             }
         }
-
         Ok(output)
     }
 
     /// SiLU (Swish) activation
     pub fn silu(&self) -> Result<Tensor> {
-        let mut output = if self.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                // BF16 routes through the TensorIterator pipeline
-                // (build_unary_op → launch_gpu_kernel<1, SiluBF16Op>).
-                crate::ops::silu_iter::silu_bf16_iter(self)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                GpuOps::silu(self)?.to_dtype(DType::BF16)?
-            }
-        } else {
-            GpuOps::silu(self)?
-        };
-
+        // Phase 10: BF16 → TensorIterator, else → GpuOps::silu.
+        let mut output = crate::tensor_iterator::dispatch_unary_bf16(
+            self,
+            crate::ops::silu_iter::silu_bf16_iter,
+            GpuOps::silu,
+        )?;
         if self.requires_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
@@ -2130,7 +2044,6 @@ extern "C" __global__ void f32_to_bool_kernel(
                 );
             }
         }
-
         Ok(output)
     }
 
@@ -2164,22 +2077,12 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Tanh activation
     pub fn tanh(&self) -> Result<Tensor> {
-        let mut output = if self.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                // Phase 6: BF16 routes through the TensorIterator pipeline
-                // (build_unary_op → launch_gpu_kernel<1, TanhBF16Op>).
-                crate::ops::tanh_iter::tanh_bf16_iter(self)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                GpuOps::tanh(self)?
-            }
-        } else {
-            GpuOps::tanh(self)?
-        };
-
-        // AUTOGRAD: Record operation if needed
+        // Phase 10: BF16 → TensorIterator, else → GpuOps::tanh.
+        let mut output = crate::tensor_iterator::dispatch_unary_bf16(
+            self,
+            crate::ops::tanh_iter::tanh_bf16_iter,
+            GpuOps::tanh,
+        )?;
         if self.requires_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
@@ -2190,28 +2093,17 @@ extern "C" __global__ void f32_to_bool_kernel(
                 );
             }
         }
-
         Ok(output)
     }
 
     /// Sigmoid activation
     pub fn sigmoid(&self) -> Result<Tensor> {
-        let mut output = if self.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                // Phase 6: BF16 routes through the TensorIterator pipeline
-                // (build_unary_op → launch_gpu_kernel<1, SigmoidBF16Op>).
-                crate::ops::sigmoid_iter::sigmoid_bf16_iter(self)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                GpuOps::sigmoid(self)?
-            }
-        } else {
-            GpuOps::sigmoid(self)?
-        };
-
-        // AUTOGRAD: Record operation if needed
+        // Phase 10: BF16 → TensorIterator, else → GpuOps::sigmoid.
+        let mut output = crate::tensor_iterator::dispatch_unary_bf16(
+            self,
+            crate::ops::sigmoid_iter::sigmoid_bf16_iter,
+            GpuOps::sigmoid,
+        )?;
         if self.requires_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
@@ -2222,7 +2114,6 @@ extern "C" __global__ void f32_to_bool_kernel(
                 );
             }
         }
-
         Ok(output)
     }
 
@@ -2256,39 +2147,27 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Exponential function (GPU)
     pub fn exp(&self) -> Result<Tensor> {
-        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-        if self.dtype() == DType::BF16 {
-            // Phase 7: BF16 routes through the TensorIterator pipeline
-            // (build_unary_op → launch_gpu_kernel<1, ExpBF16Op>). No F32
-            // round-trip; f32 opmath is inside the functor.
-            return crate::ops::exp_iter::exp_bf16_iter(self);
-        }
-        GpuOps::exp(self)
+        // Phase 10: BF16 → TensorIterator, else → GpuOps::exp. No autograd
+        // record here — exp's autograd tape is recorded by callers that
+        // need it (or via the composite Op::Exp in autograd_ops_complete).
+        crate::tensor_iterator::dispatch_unary_bf16(
+            self,
+            crate::ops::exp_iter::exp_bf16_iter,
+            GpuOps::exp,
+        )
     }
 
     /// Square all elements
     pub fn square(&self) -> Result<Tensor> {
-        // BF16 routes through the TensorIterator pipeline (build_unary_op
-        // → launch_gpu_kernel<1, SquareBF16Op>). Other dtypes go through
-        // the mul-self-self F32 path.
-        let mut output = if self.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                crate::ops::square_iter::square_bf16_iter(self)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                GpuOps::mul(self, self)?
-            }
-        } else {
-            GpuOps::mul(self, self)?
-        };
-
-        // Set requires_grad if input requires grad
+        // Phase 10: BF16 → TensorIterator; other dtypes → mul-self-self.
+        let mut output = crate::tensor_iterator::dispatch_unary_bf16(
+            self,
+            crate::ops::square_iter::square_bf16_iter,
+            |x| GpuOps::mul(x, x),
+        )?;
         if self.requires_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
-                // Record as square operation
                 AutogradContext::record_op(
                     output.id,
                     Op::Square { input: self.id },
@@ -2296,7 +2175,6 @@ extern "C" __global__ void f32_to_bool_kernel(
                 );
             }
         }
-
         Ok(output)
     }
 

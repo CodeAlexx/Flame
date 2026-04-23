@@ -490,23 +490,20 @@ impl Tensor {
         }
     }
 
-    /// Compute reciprocal (1/x)
+    /// Compute reciprocal (1/x). Phase 10: BF16 → TensorIterator (single
+    /// native `__frcp_rn`); other dtypes → composite `ones.div(self)`
+    /// fallback. The pre-Phase-10 `ensure_bf16` tail on the composite
+    /// path is dropped — it only fired when `self.dtype() == BF16`, which
+    /// is now unreachable on the fallback.
     pub fn reciprocal(&self) -> Result<Tensor> {
-        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-        if self.dtype() == DType::BF16 {
-            // Phase 7: BF16 routes through the TensorIterator pipeline
-            // (build_unary_op → launch_gpu_kernel<1, RecipBF16Op>). Pre-Phase-7
-            // composed as `ones.div(self)` which allocated a BF16 ones tensor
-            // and ran elementwise div; this is a single native __frcp_rn path.
-            return crate::ops::recip_iter::recip_bf16_iter(self);
-        }
-        let ones = Tensor::ones_dtype(self.shape().clone(), self.dtype(), self.device.clone())?;
-        let result = ones.div(self)?;
-        if self.dtype() == DType::BF16 {
-            ensure_bf16(result)
-        } else {
-            Ok(result)
-        }
+        crate::tensor_iterator::dispatch_unary_bf16(
+            self,
+            crate::ops::recip_iter::recip_bf16_iter,
+            |x| {
+                let ones = Tensor::ones_dtype(x.shape().clone(), x.dtype(), x.device.clone())?;
+                ones.div(x)
+            },
+        )
     }
 
     /// Clamp tensor values with gradient preservation (internal implementation)

@@ -75,20 +75,11 @@ impl Tensor {
         var.sqrt()
     }
 
-    /// Square root
+    /// Square root. Phase 10: BF16 → TensorIterator, else → GpuOps::sqrt.
     pub fn sqrt(&self) -> Result<Tensor> {
-        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-        let mut output = if self.dtype() == DType::BF16 {
-            // Phase 7: BF16 routes through the TensorIterator pipeline
-            // (build_unary_op → launch_gpu_kernel<1, SqrtBF16Op>). No F32
-            // round-trip; f32 opmath is inside the functor.
-            crate::ops::sqrt_iter::sqrt_bf16_iter(self)?
-        } else {
-            GpuOps::sqrt(self)?
-        };
-        #[cfg(not(all(feature = "cuda", feature = "bf16_u16")))]
-        let mut output = GpuOps::sqrt(self)?;
-
+        let mut output = crate::tensor_iterator::dispatch_unary_bf16(
+            self, crate::ops::sqrt_iter::sqrt_bf16_iter, GpuOps::sqrt,
+        )?;
         if self.requires_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
@@ -100,7 +91,6 @@ impl Tensor {
                 );
             }
         }
-
         Ok(output)
     }
 

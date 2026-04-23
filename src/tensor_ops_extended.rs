@@ -114,42 +114,37 @@ impl Tensor {
     }
 
     /// Greater than comparison (broadcast-safe).
-    /// Phase 9: BF16+BF16 routes through the TensorIterator pipeline
-    /// (`ops::gt_iter::gt_bf16_iter`), which writes BF16 0.0/1.0 sentinels
-    /// bit-exactly matching PyTorch's `opmath_t=float` semantics. Other
-    /// dtype combinations stay on `GpuOps::cmp_gt` (F32 round-trip).
+    /// Phase 9/10: BF16+BF16 → TensorIterator (`ops::gt_iter::gt_bf16_iter`),
+    /// which writes BF16 0.0/1.0 sentinels bit-exactly matching PyTorch's
+    /// `opmath_t=float` semantics. Other dtype combinations stay on
+    /// `GpuOps::cmp_gt` (F32 round-trip). Comparisons have no autograd
+    /// tape — `.requires_grad` doesn't propagate through a boolean mask.
     pub fn gt(&self, other: &Tensor) -> Result<Tensor> {
-        if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            return crate::ops::gt_iter::gt_bf16_iter(self, other);
-        }
-        GpuOps::cmp_gt(self, other)
+        crate::tensor_iterator::dispatch_comparison_bf16(
+            self, other, crate::ops::gt_iter::gt_bf16_iter, GpuOps::cmp_gt,
+        )
     }
 
-    /// Greater than or equal comparison (broadcast-safe). See `gt` for
-    /// the Phase 9 BF16 dispatch note.
+    /// Greater than or equal comparison. See `gt` for dispatch notes.
     pub fn ge(&self, other: &Tensor) -> Result<Tensor> {
-        if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            return crate::ops::ge_iter::ge_bf16_iter(self, other);
-        }
-        GpuOps::cmp_ge(self, other)
+        crate::tensor_iterator::dispatch_comparison_bf16(
+            self, other, crate::ops::ge_iter::ge_bf16_iter, GpuOps::cmp_ge,
+        )
     }
 
-    /// Less than comparison (broadcast-safe). See `gt` for the Phase 9
-    /// BF16 dispatch note.
+    /// Less than comparison. See `gt` for dispatch notes.
     pub fn lt(&self, other: &Tensor) -> Result<Tensor> {
-        if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            return crate::ops::lt_iter::lt_bf16_iter(self, other);
-        }
-        GpuOps::cmp_lt(self, other)
+        crate::tensor_iterator::dispatch_comparison_bf16(
+            self, other, crate::ops::lt_iter::lt_bf16_iter, GpuOps::cmp_lt,
+        )
     }
 
-    /// Not equal comparison (broadcast-safe). See `gt` for the Phase 9
-    /// BF16 dispatch note. IEEE: ne(NaN,NaN) = true.
+    /// Not equal comparison. See `gt` for dispatch notes. IEEE:
+    /// ne(NaN, NaN) = true.
     pub fn ne(&self, other: &Tensor) -> Result<Tensor> {
-        if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            return crate::ops::ne_iter::ne_bf16_iter(self, other);
-        }
-        GpuOps::cmp_ne(self, other)
+        crate::tensor_iterator::dispatch_comparison_bf16(
+            self, other, crate::ops::ne_iter::ne_bf16_iter, GpuOps::cmp_ne,
+        )
     }
 
     /// Conditional where operation
@@ -666,50 +661,43 @@ impl Tensor {
         self.broadcast_to(&Shape::from_dims(new_shape))
     }
 
-    /// Compute natural logarithm (GPU)
+    /// Compute natural logarithm (GPU). Phase 10: BF16 → TensorIterator,
+    /// else → GpuOps::log.
     pub fn log(&self) -> Result<Tensor> {
-        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-        if self.dtype() == DType::BF16 {
-            // Phase 7: BF16 routes through the TensorIterator pipeline
-            // (build_unary_op → launch_gpu_kernel<1, LogBF16Op>). No F32
-            // round-trip; f32 opmath is inside the functor.
-            return crate::ops::log_iter::log_bf16_iter(self);
-        }
-        GpuOps::log(self)
+        crate::tensor_iterator::dispatch_unary_bf16(
+            self, crate::ops::log_iter::log_bf16_iter, GpuOps::log,
+        )
     }
 
-    /// Compute reciprocal square root
+    /// Compute reciprocal square root. Phase 10: BF16 → native
+    /// TensorIterator rsqrt (single `__frsqrt_rn`); else the composite
+    /// `sqrt().reciprocal()` fallback (two F32 round-trips).
     pub fn rsqrt(&self) -> Result<Tensor> {
-        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-        if self.dtype() == DType::BF16 {
-            // Phase 7: BF16 routes through the TensorIterator pipeline
-            // (build_unary_op → launch_gpu_kernel<1, RsqrtBF16Op>). Pre-Phase-7
-            // composed as sqrt().reciprocal() which did two F32 roundtrips;
-            // this is a single native path using __frsqrt_rn.
-            return crate::ops::rsqrt_iter::rsqrt_bf16_iter(self);
-        }
-        self.sqrt()?.reciprocal()
+        crate::tensor_iterator::dispatch_unary_bf16(
+            self,
+            crate::ops::rsqrt_iter::rsqrt_bf16_iter,
+            |x| x.sqrt()?.reciprocal(),
+        )
     }
 
-    /// Negate tensor
+    /// Negate tensor. Phase 10: BF16 → TensorIterator (native sign-bit
+    /// flip); else the `mul_scalar(-1.0)` composition (bit-exact to the
+    /// iter path on finite values).
     pub fn neg(&self) -> Result<Tensor> {
-        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-        if self.dtype() == DType::BF16 {
-            // Phase 6: BF16 routes through the TensorIterator pipeline
-            // (build_unary_op → launch_gpu_kernel<1, NegBF16Op>). Native
-            // sign-bit flip; bit-exact with the prior mul_scalar(-1.0)
-            // path for finite BF16 values.
-            return crate::ops::neg_iter::neg_bf16_iter(self);
-        }
-        self.mul_scalar(-1.0)
+        crate::tensor_iterator::dispatch_unary_bf16(
+            self,
+            crate::ops::neg_iter::neg_bf16_iter,
+            |x| x.mul_scalar(-1.0),
+        )
     }
 
-    /// Compute absolute value
+    /// Compute absolute value. Phase 10: BF16 → TensorIterator + explicit
+    /// `Op::Abs` autograd record; non-BF16 falls back to the composite
+    /// `square().sqrt()`, whose own autograd tape (Square then Sqrt) is
+    /// the pre-Phase-10 behavior for non-BF16 inputs. Keeping the Abs
+    /// tape record gated on BF16 preserves that split byte-for-byte.
     pub fn abs(&self) -> Result<Tensor> {
-        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
         if self.dtype() == DType::BF16 {
-            // Phase 6: BF16 routes through the TensorIterator pipeline
-            // (build_unary_op → launch_gpu_kernel<1, AbsBF16Op>).
             let mut output = crate::ops::abs_iter::abs_bf16_iter(self)?;
             if self.requires_grad {
                 output.requires_grad = true;
@@ -723,7 +711,6 @@ impl Tensor {
             }
             return Ok(output);
         }
-        // Fallback for non-BF16
         self.square()?.sqrt()
     }
 
@@ -759,112 +746,78 @@ impl Tensor {
         clipped.minimum(&upper)
     }
 
-    /// Compute element-wise maximum with another tensor (GPU)
+    /// Compute element-wise maximum with another tensor (GPU). Phase 10:
+    /// BF16+BF16 → TensorIterator (handles broadcast via stride=0); other
+    /// dtypes → broadcast-then-`GpuOps::max_elemwise` (F32 path).
     pub fn maximum(&self, other: &Tensor) -> Result<Tensor> {
-        // BF16: route to TensorIterator pipeline, which handles broadcast
-        // internally via stride=0. Other dtypes: broadcast explicitly and
-        // fall through to GpuOps::max_elemwise (F32 path).
-        let mut out = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                crate::ops::maximum_iter::maximum_bf16_iter(self, other)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                return Err(Error::InvalidOperation(
-                    "Tensor::maximum on BF16 requires the `cuda` feature".into(),
-                ));
-            }
-        } else {
-            let broadcast_shape =
-                broadcast_shapes(self.shape().dims(), other.shape().dims())?;
-            let a = if self.shape().dims() != broadcast_shape {
-                self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-            } else {
-                self.clone_result()?
-            };
-            let b = if other.shape().dims() != broadcast_shape {
-                other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-            } else {
-                other.clone_result()?
-            };
-            crate::cuda_ops::GpuOps::max_elemwise(&a, &b)?
-        };
-
-        // Autograd record
+        let mut out = crate::tensor_iterator::dispatch_binary_bf16(
+            self,
+            other,
+            crate::ops::maximum_iter::maximum_bf16_iter,
+            |a, b| {
+                let bshape = broadcast_shapes(a.shape().dims(), b.shape().dims())?;
+                let a_bc = if a.shape().dims() != bshape {
+                    a.broadcast_to(&Shape::from_dims(&bshape))?
+                } else {
+                    a.clone_result()?
+                };
+                let b_bc = if b.shape().dims() != bshape {
+                    b.broadcast_to(&Shape::from_dims(&bshape))?
+                } else {
+                    b.clone_result()?
+                };
+                crate::cuda_ops::GpuOps::max_elemwise(&a_bc, &b_bc)
+            },
+        )?;
         if self.requires_grad || other.requires_grad {
             out.requires_grad = true;
             if AutogradContext::is_recording() {
                 AutogradContext::record_op(
                     out.id,
-                    Op::Maximum {
-                        a: self.id,
-                        b: other.id,
-                    },
-                    vec![
-                        (self.id, self.alias()),
-                        (other.id, other.alias()),
-                    ],
+                    Op::Maximum { a: self.id, b: other.id },
+                    vec![(self.id, self.alias()), (other.id, other.alias())],
                 );
             }
         }
         Ok(out)
     }
 
-    /// Compute element-wise minimum with another tensor
+    /// Compute element-wise minimum with another tensor. Phase 10:
+    /// BF16+BF16 → TensorIterator (native min); other dtypes preserve the
+    /// composite `-max(-a, -b)` fallback (unchanged from Phase 5b).
     pub fn minimum(&self, other: &Tensor) -> Result<Tensor> {
-        // BF16: direct native minimum via TensorIterator pipeline. Other
-        // dtypes: preserve the composite `-max(-a, -b)` path — that path
-        // goes through GpuOps::max_elemwise (F32) and neg (F32 via
-        // mul_scalar(-1)), which is unchanged.
-        let mut out = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                crate::ops::minimum_iter::minimum_bf16_iter(self, other)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                return Err(Error::InvalidOperation(
-                    "Tensor::minimum on BF16 requires the `cuda` feature".into(),
-                ));
-            }
-        } else {
-            let broadcast_shape =
-                broadcast_shapes(self.shape().dims(), other.shape().dims())?;
-            let a = if self.shape().dims() != broadcast_shape {
-                self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-            } else {
-                self.clone_result()?
-            };
-            let b = if other.shape().dims() != broadcast_shape {
-                other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-            } else {
-                other.clone_result()?
-            };
-            // -max(-a, -b) path (unchanged for non-BF16).
-            let neg_a = a.neg()?;
-            let neg_b = b.neg()?;
-            let neg_max = neg_a.maximum(&neg_b)?;
-            neg_max.neg()?
-        };
-
+        let mut out = crate::tensor_iterator::dispatch_binary_bf16(
+            self,
+            other,
+            crate::ops::minimum_iter::minimum_bf16_iter,
+            |a, b| {
+                let bshape = broadcast_shapes(a.shape().dims(), b.shape().dims())?;
+                let a_bc = if a.shape().dims() != bshape {
+                    a.broadcast_to(&Shape::from_dims(&bshape))?
+                } else {
+                    a.clone_result()?
+                };
+                let b_bc = if b.shape().dims() != bshape {
+                    b.broadcast_to(&Shape::from_dims(&bshape))?
+                } else {
+                    b.clone_result()?
+                };
+                let neg_a = a_bc.neg()?;
+                let neg_b = b_bc.neg()?;
+                let neg_max = neg_a.maximum(&neg_b)?;
+                neg_max.neg()
+            },
+        )?;
         if self.requires_grad || other.requires_grad {
             out.requires_grad = true;
             if AutogradContext::is_recording() {
                 AutogradContext::record_op(
                     out.id,
-                    Op::Minimum {
-                        a: self.id,
-                        b: other.id,
-                    },
-                    vec![
-                        (self.id, self.alias()),
-                        (other.id, other.alias()),
-                    ],
+                    Op::Minimum { a: self.id, b: other.id },
+                    vec![(self.id, self.alias()), (other.id, other.alias())],
                 );
             }
         }
-
         Ok(out)
     }
 
@@ -899,51 +852,35 @@ impl Tensor {
         Ok(output)
     }
 
-    /// Divide by another tensor
+    /// Divide by another tensor. Phase 10: BF16+BF16 → TensorIterator
+    /// (handles broadcast internally); other dtypes → explicit broadcast
+    /// + `GpuOps::div` F32 path. Autograd records with ORIGINAL tensor
+    /// IDs so gradients flow to the real inputs, not broadcast views.
     pub fn div(&self, other: &Tensor) -> Result<Tensor> {
-        // BF16: TensorIterator pipeline handles broadcasting internally.
-        // Other dtypes: fall through to the prior explicit-broadcast +
-        // GpuOps::div F32 path (autograd record is the same either way).
-        let mut output = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            #[cfg(feature = "cuda")]
-            {
-                crate::ops::div_iter::div_bf16_iter(self, other)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                return Err(Error::InvalidOperation(
-                    "Tensor::div on BF16 requires the `cuda` feature".into(),
-                ));
-            }
-        } else {
-            // Non-BF16: explicit broadcast then GpuOps::div.
-            let lhs = if self.shape == other.shape {
-                self.clone_result()?
-            } else {
-                let broadcast_shape =
-                    broadcast_shapes(self.shape().dims(), other.shape().dims())?;
-                if self.shape().dims() == broadcast_shape {
-                    self.clone_result()?
+        let mut output = crate::tensor_iterator::dispatch_binary_bf16(
+            self,
+            other,
+            crate::ops::div_iter::div_bf16_iter,
+            |a, b| {
+                let (lhs, rhs) = if a.shape == b.shape {
+                    (a.clone_result()?, b.clone_result()?)
                 } else {
-                    self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-                }
-            };
-            let rhs = if self.shape == other.shape {
-                other.clone_result()?
-            } else {
-                let broadcast_shape =
-                    broadcast_shapes(self.shape().dims(), other.shape().dims())?;
-                if other.shape().dims() == broadcast_shape {
-                    other.clone_result()?
-                } else {
-                    other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-                }
-            };
-            GpuOps::div(&lhs, &rhs)?
-        };
-
-        // AUTOGRAD: Record with ORIGINAL tensor IDs so gradients flow
-        // back to the actual inputs, not broadcast intermediates.
+                    let bshape = broadcast_shapes(a.shape().dims(), b.shape().dims())?;
+                    let lhs = if a.shape().dims() == bshape {
+                        a.clone_result()?
+                    } else {
+                        a.broadcast_to(&Shape::from_dims(&bshape))?
+                    };
+                    let rhs = if b.shape().dims() == bshape {
+                        b.clone_result()?
+                    } else {
+                        b.broadcast_to(&Shape::from_dims(&bshape))?
+                    };
+                    (lhs, rhs)
+                };
+                GpuOps::div(&lhs, &rhs)
+            },
+        )?;
         if self.requires_grad || other.requires_grad {
             output.requires_grad = true;
             if AutogradContext::is_recording() {
@@ -955,29 +892,26 @@ impl Tensor {
                         lhs_shape: self.shape.clone(),
                         rhs_shape: other.shape.clone(),
                     },
-                    vec![
-                        (self.id, self.clone()),
-                        (other.id, other.clone()),
-                    ],
+                    vec![(self.id, self.clone()), (other.id, other.clone())],
                 );
             }
         }
-
         Ok(output)
     }
 
-    /// Element-wise equality comparison. See `gt` for the Phase 9 BF16
-    /// dispatch note. IEEE: eq(NaN,NaN) = false.
+    /// Element-wise equality comparison. Phase 10: BF16+BF16 → iter,
+    /// else → `GpuOps::cmp_eq`. IEEE: eq(NaN, NaN) = false. The explicit
+    /// shape-equality check stays — `eq` is the only comparison that
+    /// requires matching shapes (pre-broadcast) on the GpuOps path.
     pub fn eq(&self, other: &Tensor) -> Result<Tensor> {
         if self.shape() != other.shape() {
             return Err(Error::InvalidOperation(
                 "Equality comparison requires tensors with identical shapes".into(),
             ));
         }
-        if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            return crate::ops::eq_iter::eq_bf16_iter(self, other);
-        }
-        GpuOps::cmp_eq(self, other)
+        crate::tensor_iterator::dispatch_comparison_bf16(
+            self, other, crate::ops::eq_iter::eq_bf16_iter, GpuOps::cmp_eq,
+        )
     }
 
     /// Create tensor filled with single value
@@ -1041,13 +975,12 @@ impl Tensor {
         GpuOps::round(self)
     }
 
-    /// Element-wise less than or equal comparison. See `gt` for the
-    /// Phase 9 BF16 dispatch note.
+    /// Element-wise less than or equal comparison. Phase 10: BF16+BF16
+    /// → iter, else → `GpuOps::cmp_le`.
     pub fn le(&self, other: &Tensor) -> Result<Tensor> {
-        if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            return crate::ops::le_iter::le_bf16_iter(self, other);
-        }
-        GpuOps::cmp_le(self, other)
+        crate::tensor_iterator::dispatch_comparison_bf16(
+            self, other, crate::ops::le_iter::le_bf16_iter, GpuOps::cmp_le,
+        )
     }
 
     /// Subtract a scalar from all elements

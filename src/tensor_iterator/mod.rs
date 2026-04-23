@@ -16,6 +16,7 @@ pub mod broadcast;
 pub mod config;
 pub mod dim_vec;
 pub mod dispatch;
+pub mod dispatch_helpers;
 #[cfg(feature = "cuda")]
 pub mod iter_metadata;
 pub mod promote;
@@ -28,6 +29,9 @@ pub use broadcast::{
 pub use config::TensorIteratorConfig;
 pub use dim_vec::{contiguous_element_strides, element_strides_to_bytes, DimVec, I64StrideVec, StrideVec};
 pub use dispatch::{BF16ElementwiseKernel, StubEntry};
+pub use dispatch_helpers::{
+    dispatch_binary_bf16, dispatch_comparison_bf16, dispatch_scalar_bf16, dispatch_unary_bf16,
+};
 #[cfg(feature = "cuda")]
 pub use iter_metadata::{IterMetadata, FLAME_MAX_DIMS as ITER_FLAME_MAX_DIMS, MAX_NARGS};
 pub use promote::{promote_dtypes, promote_many};
