@@ -22,6 +22,7 @@
 | ⭐ `Tensor` | `tensor.rs:135` | The central type. 114+ methods across 3 impl blocks. |
 | ⭐ `TensorId` | `tensor.rs` | Newtype for autograd tape keying. |
 | ⭐ `Shape, D` | `shape.rs:9+` | Shape vec wrapper, dim helper enum. |
+| ⭐ `Strides, ShapeDims` | `shape.rs` | `SmallVec<[usize;6]>` — inline storage for dims/strides. `Shape::strides()` and `Tensor::strides()` return `Strides`, not `Vec<usize>`, so kernel launchers never heap-allocate to read a tensor's strides. |
 | ⭐ `DType` | `dtype.rs:4+` | `BF16 / F16 / F32 / I32 / I64 / Bool / U8`. |
 | ⭐ `Error, Result, FlameError` | `error.rs:7` | Single error enum, `Result<T, Error>`. |
 | ⭐ `CudaDevice` | re-export of `cudarc::driver::CudaDevice` | |

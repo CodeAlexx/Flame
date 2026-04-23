@@ -85,6 +85,12 @@ harness = false
 name = "activation_bwd"
 harness = false
 
+# `.strides()` allocation microbench (2026-04-22). Baselines the heap cost
+# of returning Vec<usize>; post-SmallVec numbers go into the commit message.
+[[bench]]
+name = "strides_alloc"
+harness = false
+
 [build-dependencies]
 cbindgen = "0.26"
 cc = "1.0"

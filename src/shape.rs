@@ -10,6 +10,14 @@ use smallvec::{smallvec, SmallVec};
 /// training step via `Op::Add { lhs_shape, rhs_shape, .. }` and friends).
 pub type ShapeDims = SmallVec<[usize; 6]>;
 
+/// Strides use the same inline-6 SmallVec storage as dims. Returned by
+/// `Shape::strides` / `Tensor::strides` / `Tensor::stride` so that every
+/// kernel launcher that reads a tensor's strides avoids a heap allocation
+/// on every call. Prior to 2026-04-22 these methods returned `Vec<usize>`,
+/// costing ~16 ns per call in the default allocator (measured via
+/// `benches/strides_alloc.rs`).
+pub type Strides = SmallVec<[usize; 6]>;
+
 /// Dimension helper for tensor indexing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum D {
@@ -67,8 +75,9 @@ impl Shape {
         self.dims.iter().product()
     }
 
-    pub fn stride_contiguous(&self) -> Vec<usize> {
-        let mut stride = vec![1; self.rank()];
+    pub fn stride_contiguous(&self) -> Strides {
+        let rank = self.rank();
+        let mut stride: Strides = smallvec![1; rank];
         let mut cum_prod = 1;
         for (i, &dim) in self.dims.iter().enumerate().rev() {
             stride[i] = cum_prod;
@@ -78,7 +87,7 @@ impl Shape {
     }
 
     /// Get strides for this shape (alias for stride_contiguous)
-    pub fn strides(&self) -> Vec<usize> {
+    pub fn strides(&self) -> Strides {
         self.stride_contiguous()
     }
 

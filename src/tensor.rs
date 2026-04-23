@@ -155,26 +155,14 @@ pub struct Tensor {
     /// initializes to `None`; behavior unchanged. Phase 2 wires view
     /// ops (permute/transpose/narrow/chunk/view) to populate it
     /// without materializing storage.
-    pub(crate) custom_strides: Option<Vec<usize>>,
+    ///
+    /// Uses `Strides` (SmallVec<[usize;6]>) so views never heap-allocate
+    /// to carry their stride metadata. See shape::Strides.
+    pub(crate) custom_strides: Option<crate::shape::Strides>,
 
     /// Element offset into the underlying storage. Non-zero only for
     /// narrow/chunk views. Default 0.
     pub(crate) view_offset: usize,
-}
-
-/// Compute row-major (C-contiguous) strides for a shape.
-#[inline]
-pub(crate) fn row_major_strides(shape: &Shape) -> Vec<usize> {
-    let dims = shape.dims();
-    let n = dims.len();
-    if n == 0 {
-        return vec![];
-    }
-    let mut s = vec![1usize; n];
-    for i in (0..n.saturating_sub(1)).rev() {
-        s[i] = s[i + 1] * dims[i + 1];
-    }
-    s
 }
 
 impl AsRef<Tensor> for Tensor {
@@ -2535,7 +2523,8 @@ extern "C" __global__ void f32_to_bool_kernel(
         }
         let self_strides = self.strides();
         let new_shape = vec![dims[1], dims[0]];
-        let new_strides = vec![self_strides[1], self_strides[0]];
+        let new_strides: crate::shape::Strides =
+            smallvec::smallvec![self_strides[1], self_strides[0]];
 
         let mut output = Tensor {
             storage: self.storage.clone(),
@@ -2609,11 +2598,16 @@ extern "C" __global__ void f32_to_bool_kernel(
     /// populate `custom_strides` with a reordered-strides vector; everything
     /// else produces contiguous tensors whose strides are row-major (computed
     /// on demand, same as before the refactor).
-    pub fn strides(&self) -> Vec<usize> {
+    ///
+    /// Returns a `Strides` (SmallVec<[usize;6]>), not `Vec<usize>` — rank ≤ 6
+    /// in every real DL tensor, so no heap allocation. Prior `Vec` return
+    /// cost ~16 ns/call in the default allocator; kernel launchers hit this
+    /// on every launch. See `benches/strides_alloc.rs` for the baseline.
+    pub fn strides(&self) -> crate::shape::Strides {
         if let Some(s) = &self.custom_strides {
             return s.clone();
         }
-        row_major_strides(&self.shape)
+        self.shape.stride_contiguous()
     }
 
     /// Fill a caller-provided buffer with this tensor's real strides, returning
@@ -2750,22 +2744,10 @@ extern "C" __global__ void f32_to_bool_kernel(
     }
 
     /// Get the strides of this tensor (compatibility shim — prefer `strides()`).
-    /// Row-major unless the tensor is a view.
-    pub fn stride(&self) -> Vec<usize> {
-        if let Some(s) = &self.custom_strides {
-            return s.clone();
-        }
-        let dims = self.shape.dims();
-        let ndim = dims.len();
-        if ndim == 0 {
-            return vec![];
-        }
-
-        let mut strides = vec![1; ndim];
-        for i in (0..ndim - 1).rev() {
-            strides[i] = strides[i + 1] * dims[i + 1];
-        }
-        strides
+    /// Row-major unless the tensor is a view. Returns `Strides` (inline-6
+    /// SmallVec), not `Vec<usize>` — see `Tensor::strides` for rationale.
+    pub fn stride(&self) -> crate::shape::Strides {
+        self.strides()
     }
 
     /// Debug helper: inspect underlying storage dtype (no guarantee about views).
@@ -3104,7 +3086,7 @@ extern "C" __global__ void f32_to_bool_kernel(
             device: self.device.clone(),
             id: TensorId::new(),
             requires_grad: false,
-            custom_strides: Some(strides.to_vec()),
+            custom_strides: Some(smallvec::SmallVec::from_slice(strides)),
             view_offset: offset,
         })
     }
@@ -3141,7 +3123,8 @@ extern "C" __global__ void f32_to_bool_kernel(
 
         let self_strides = self.strides();
         let new_shape: Vec<usize> = dims.iter().map(|&d| shape[d]).collect();
-        let new_strides: Vec<usize> = dims.iter().map(|&d| self_strides[d]).collect();
+        let new_strides: crate::shape::Strides =
+            dims.iter().map(|&d| self_strides[d]).collect();
 
         let mut output = if is_identity {
             self.clone()
