@@ -761,6 +761,176 @@ pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Ten
 
 // ---- Fused modulate_pre: LayerNorm + (1+scale)*x + shift, single kernel ----
 
+// Strided variant for narrow/permute-view inputs. Same math as the contig
+// kernel but indexes each input with caller-supplied strides + offsets.
+// Output is always freshly allocated row-major contig so no output strides
+// needed.
+//
+// `strides_packed` layout (7 i64 entries):
+//     [0]   x_s_b         — x[b, n, d] batch stride
+//     [1]   x_s_n         — x[b, n, d] seq  stride
+//     [2]   x_s_d         — x[b, n, d] dim  stride
+//     [3]   shift_s_b     — shift[b, d]     batch stride
+//     [4]   shift_s_d     — shift[b, d]     dim   stride
+//     [5]   scale_s_b     — scale[b, d]     batch stride
+//     [6]   scale_s_d     — scale[b, d]     dim   stride
+//
+// Offsets are separate scalar args because kernel-scalar reads are ~free
+// and it avoids a device-to-device arithmetic in a 7-slot packed read.
+const CUDA_MODULATE_PRE_STRIDED: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void modulate_pre_strided_bf16_kernel(
+    const __nv_bfloat16* __restrict__ X,
+    long long x_offset,
+    const __nv_bfloat16* __restrict__ SCALE,
+    long long scale_offset,
+    const __nv_bfloat16* __restrict__ SHIFT,
+    long long shift_offset,
+    __nv_bfloat16* __restrict__ Y,
+    int rows, int dim, int seq_len, float eps,
+    const long long* __restrict__ strides_packed)
+{
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int batch_idx = row / seq_len;
+    int n_idx     = row - batch_idx * seq_len;
+
+    long long x_s_b     = strides_packed[0];
+    long long x_s_n     = strides_packed[1];
+    long long x_s_d     = strides_packed[2];
+    long long shift_s_b = strides_packed[3];
+    long long shift_s_d = strides_packed[4];
+    long long scale_s_b = strides_packed[5];
+    long long scale_s_d = strides_packed[6];
+
+    long long x_row_off     = x_offset     + (long long)batch_idx * x_s_b
+                                           + (long long)n_idx     * x_s_n;
+    long long shift_row_off = shift_offset + (long long)batch_idx * shift_s_b;
+    long long scale_row_off = scale_offset + (long long)batch_idx * scale_s_b;
+    __nv_bfloat16* y_row = Y + (long long)row * dim;
+
+    // 1) mean
+    float local_sum = 0.0f;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x)
+        local_sum += __bfloat162float(X[x_row_off + (long long)d * x_s_d]);
+    smem[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = smem[0] / dim;
+    __syncthreads();
+
+    // 2) variance
+    float local_var = 0.0f;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float v = __bfloat162float(X[x_row_off + (long long)d * x_s_d]) - mean;
+        local_var += v * v;
+    }
+    smem[threadIdx.x] = local_var;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(smem[0] / dim + eps);
+    __syncthreads();
+
+    // 3) normalize + modulate
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float normed = (__bfloat162float(X[x_row_off + (long long)d * x_s_d]) - mean) * inv_std;
+        float sc = __bfloat162float(SCALE[scale_row_off + (long long)d * scale_s_d]);
+        float sh = __bfloat162float(SHIFT[shift_row_off + (long long)d * shift_s_d]);
+        y_row[d] = __float2bfloat16((1.0f + sc) * normed + sh);
+    }
+}
+"#;
+
+// Strided variant of modulate_pre_split_apply. Same math — LN(x) then
+// (1+scale)*normed + shift, reading shift/scale from a single MOD tensor
+// at rows (shift_idx, shift_idx+1). Indexes each input with caller strides.
+//
+// `strides_packed` layout (6 i64 entries):
+//     [0]   x_s_b         — x[b, n, d] batch stride
+//     [1]   x_s_n         — x[b, n, d] seq  stride
+//     [2]   x_s_d         — x[b, n, d] dim  stride
+//     [3]   mod_s_b       — mod[b, k, d] batch stride
+//     [4]   mod_s_k       — mod[b, k, d] chunk stride
+//     [5]   mod_s_d       — mod[b, k, d] dim  stride
+const CUDA_MODULATE_PRE_SPLIT_APPLY_STRIDED: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void modulate_pre_split_apply_strided_bf16_kernel(
+    const __nv_bfloat16* __restrict__ X,
+    long long x_offset,
+    const __nv_bfloat16* __restrict__ MOD,
+    long long mod_offset,
+    __nv_bfloat16* __restrict__ Y,
+    int rows, int dim, int seq_len, int shift_idx, float eps,
+    const long long* __restrict__ strides_packed)
+{
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int batch_idx = row / seq_len;
+    int n_idx     = row - batch_idx * seq_len;
+
+    long long x_s_b   = strides_packed[0];
+    long long x_s_n   = strides_packed[1];
+    long long x_s_d   = strides_packed[2];
+    long long mod_s_b = strides_packed[3];
+    long long mod_s_k = strides_packed[4];
+    long long mod_s_d = strides_packed[5];
+
+    long long x_row_off = x_offset + (long long)batch_idx * x_s_b
+                                   + (long long)n_idx     * x_s_n;
+    long long shift_row_off = mod_offset
+                              + (long long)batch_idx * mod_s_b
+                              + (long long)shift_idx * mod_s_k;
+    long long scale_row_off = shift_row_off + mod_s_k;  // next chunk
+    __nv_bfloat16* y_row = Y + (long long)row * dim;
+
+    // 1) mean
+    float local_sum = 0.0f;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x)
+        local_sum += __bfloat162float(X[x_row_off + (long long)d * x_s_d]);
+    smem[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = smem[0] / dim;
+    __syncthreads();
+
+    // 2) variance
+    float local_var = 0.0f;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float v = __bfloat162float(X[x_row_off + (long long)d * x_s_d]) - mean;
+        local_var += v * v;
+    }
+    smem[threadIdx.x] = local_var;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(smem[0] / dim + eps);
+    __syncthreads();
+
+    // 3) normalize + modulate
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float normed = (__bfloat162float(X[x_row_off + (long long)d * x_s_d]) - mean) * inv_std;
+        float sh = __bfloat162float(MOD[shift_row_off + (long long)d * mod_s_d]);
+        float sc = __bfloat162float(MOD[scale_row_off + (long long)d * mod_s_d]);
+        y_row[d] = __float2bfloat16((1.0f + sc) * normed + sh);
+    }
+}
+"#;
+
 const CUDA_MODULATE_PRE: &str = r#"
 #include <cuda_bf16.h>
 extern "C" __global__
@@ -819,12 +989,14 @@ void modulate_pre_bf16_kernel(
     }
 }
 
-// B.3 — same LN + modulate as above, but reads shift/scale from a
-// COMBINED modulation tensor [B, mod_dim, dim] via shift_idx. Replaces
-// two narrow(mod, idx) calls in the caller with a single kernel that
-// indexes directly. Every DiT block's modulate_pre fires this pattern
-// (shift_msa/scale_msa pair, shift_mlp/scale_mlp pair, etc.) — so every
-// block now has 2 fewer slice_copy kernel launches.
+"#;
+
+// B.3 — same LN + modulate as CUDA_MODULATE_PRE, but reads shift/scale
+// from a COMBINED modulation tensor [B, mod_dim, dim] via shift_idx.
+// Lives in its own NVRTC source so `ensure()` / `dev.load_ptx` can
+// register it — cudarc's load_ptx only exports one function per module.
+const CUDA_MODULATE_PRE_SPLIT_APPLY: &str = r#"
+#include <cuda_bf16.h>
 extern "C" __global__
 void modulate_pre_split_apply_bf16_kernel(
     const __nv_bfloat16* __restrict__ X,     // [rows, dim]
@@ -892,6 +1064,12 @@ void modulate_pre_split_apply_bf16_kernel(
 /// `scale`: [B, dim] BF16.
 ///
 /// Returns [B, N, dim] BF16.
+///
+/// Stride-aware as of Phase 2b-2 (2026-04-23). Contig fast path when all
+/// three inputs are contiguous; strided path indexes each with caller-side
+/// strides, eliminating the Phase-2a `.contiguous()` entry guards and the
+/// ~114 narrow-materialize DtoDs per Klein denoise step that came with
+/// them.
 pub fn modulate_pre_fused_bf16(
     x: &Tensor,
     shift: &Tensor,
@@ -899,20 +1077,26 @@ pub fn modulate_pre_fused_bf16(
     eps: f32,
 ) -> Result<Tensor> {
     debug_assert_eq!(x.dtype(), DType::BF16);
-    // Stride refactor Phase 2a: kernel assumes row-major contig storage.
-    // shift/scale come from shared_modulation's narrow chain.
-    let x_owned = x.contiguous()?;
-    let shift_owned = shift.contiguous()?;
-    let scale_owned = scale.contiguous()?;
-    let x = &x_owned;
-    let shift = &shift_owned;
-    let scale = &scale_owned;
     let x_dims = x.shape().dims();
     if x_dims.len() != 3 {
         return Err(Error::InvalidOperation(format!(
             "modulate_pre_fused: expected 3D [B,N,dim], got {:?}", x_dims
         )));
     }
+    if x.is_contiguous() && shift.is_contiguous() && scale.is_contiguous() {
+        modulate_pre_fused_bf16_contig(x, shift, scale, eps)
+    } else {
+        modulate_pre_fused_bf16_strided(x, shift, scale, eps)
+    }
+}
+
+fn modulate_pre_fused_bf16_contig(
+    x: &Tensor,
+    shift: &Tensor,
+    scale: &Tensor,
+    eps: f32,
+) -> Result<Tensor> {
+    let x_dims = x.shape().dims();
     let (b, n, dim) = (x_dims[0], x_dims[1], x_dims[2]);
     let rows = b * n;
     let total = rows * dim;
@@ -953,6 +1137,103 @@ pub fn modulate_pre_fused_bf16(
     Ok(out)
 }
 
+fn modulate_pre_fused_bf16_strided(
+    x: &Tensor,
+    shift: &Tensor,
+    scale: &Tensor,
+    eps: f32,
+) -> Result<Tensor> {
+    use cudarc::driver::{CudaSlice, LaunchAsync};
+    let device = x.device.clone();
+    let x_dims = x.shape().dims();
+    let (b, n, dim) = (x_dims[0], x_dims[1], x_dims[2]);
+    let rows = b * n;
+    let total = rows * dim;
+
+    let shift_dims = shift.shape().dims();
+    let scale_dims = scale.shape().dims();
+    if shift_dims.len() != 2 || scale_dims.len() != 2 {
+        return Err(Error::InvalidOperation(format!(
+            "modulate_pre_fused: shift/scale must be 2D [B,dim], got {:?}/{:?}",
+            shift_dims, scale_dims
+        )));
+    }
+    if shift_dims[0] != b || shift_dims[1] != dim
+        || scale_dims[0] != b || scale_dims[1] != dim {
+        return Err(Error::InvalidOperation(format!(
+            "modulate_pre_fused: shift/scale shape must be [B={},dim={}], got {:?}/{:?}",
+            b, dim, shift_dims, scale_dims
+        )));
+    }
+
+    let x_s = x.strides();
+    let shift_s = shift.strides();
+    let scale_s = scale.strides();
+    let strides_packed: Vec<i64> = vec![
+        x_s[0] as i64, x_s[1] as i64, x_s[2] as i64,
+        shift_s[0] as i64, shift_s[1] as i64,
+        scale_s[0] as i64, scale_s[1] as i64,
+    ];
+
+    let mut d_strides: CudaSlice<i64> = unsafe { device.alloc::<i64>(7) }
+        .map_err(|e| Error::Cuda(format!("alloc strides: {:?}", e)))?;
+    device
+        .htod_copy_into(strides_packed, &mut d_strides)
+        .map_err(|e| Error::Cuda(format!("htod strides: {:?}", e)))?;
+
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&device, total)?;
+    let mut out = Tensor {
+        storage: TensorStorage::BF16 { data: data.into(), numel: total },
+        shape: x.shape().clone(),
+        device: device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+    };
+
+    ensure(&device, "modulate_pre_strided_bf16_kernel", CUDA_MODULATE_PRE_STRIDED)?;
+    let f = device
+        .get_func(
+            "modulate_pre_strided_bf16_kernel",
+            "modulate_pre_strided_bf16_kernel",
+        )
+        .ok_or_else(|| Error::Cuda("modulate_pre_strided_bf16_kernel missing".into()))?;
+
+    let xs = match &x.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
+    let scs = match &scale.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
+    let shs = match &shift.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
+    let ys = match &mut out.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let ys = ensure_unique_slice(ys)?;
+
+    let x_offset = x.offset() as i64;
+    let shift_offset = shift.offset() as i64;
+    let scale_offset = scale.offset() as i64;
+
+    let threads = dim.min(256) as u32;
+    let smem = threads * 4;
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: smem,
+    };
+    unsafe {
+        f.launch(
+            cfg,
+            (
+                slice_ref(xs), x_offset,
+                slice_ref(scs), scale_offset,
+                slice_ref(shs), shift_offset,
+                ys,
+                rows as i32, dim as i32, n as i32, eps,
+                &d_strides,
+            ),
+        )
+        .map_err(|e| Error::Cuda(format!("launch modulate_pre_strided: {:?}", e)))?;
+    }
+    Ok(out)
+}
+
 /// B.3 — fused LayerNorm + modulate with SPLIT-APPLY from combined mod tensor.
 ///
 /// Semantically identical to `modulate_pre_fused_bf16` but takes the full
@@ -974,11 +1255,6 @@ pub fn modulate_pre_split_apply_bf16(
 ) -> Result<Tensor> {
     debug_assert_eq!(x.dtype(), DType::BF16);
     debug_assert_eq!(modulation.dtype(), DType::BF16);
-    // Stride refactor Phase 2a: kernel indexes modulation linearly.
-    let x_owned = x.contiguous()?;
-    let modulation_owned = modulation.contiguous()?;
-    let x = &x_owned;
-    let modulation = &modulation_owned;
     let x_dims = x.shape().dims();
     if x_dims.len() != 3 {
         return Err(Error::InvalidOperation(format!(
@@ -991,7 +1267,7 @@ pub fn modulate_pre_split_apply_bf16(
             "modulate_pre_split_apply: expected 3D modulation [B,mod_dim,dim], got {:?}", m_dims
         )));
     }
-    let (b, n, dim) = (x_dims[0], x_dims[1], x_dims[2]);
+    let (b, _n, dim) = (x_dims[0], x_dims[1], x_dims[2]);
     if m_dims[0] != b || m_dims[2] != dim {
         return Err(Error::InvalidOperation(format!(
             "modulate_pre_split_apply: x {:?} / mod {:?} batch or dim mismatch",
@@ -1005,11 +1281,24 @@ pub fn modulate_pre_split_apply_bf16(
             shift_idx, mod_dim
         )));
     }
+    if x.is_contiguous() && modulation.is_contiguous() {
+        modulate_pre_split_apply_bf16_contig(x, modulation, shift_idx, mod_dim, eps)
+    } else {
+        modulate_pre_split_apply_bf16_strided(x, modulation, shift_idx, eps)
+    }
+}
+
+fn modulate_pre_split_apply_bf16_contig(
+    x: &Tensor,
+    modulation: &Tensor,
+    shift_idx: usize,
+    mod_dim: usize,
+    eps: f32,
+) -> Result<Tensor> {
+    let x_dims = x.shape().dims();
+    let (b, n, dim) = (x_dims[0], x_dims[1], x_dims[2]);
     let rows = b * n;
     let total = rows * dim;
-
-    // Modulation must be contiguous (kernel reads via linear offsets).
-    let modulation = modulation.contiguous()?;
 
     let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, total)?;
     let mut out = Tensor {
@@ -1022,9 +1311,16 @@ pub fn modulate_pre_split_apply_bf16(
         view_offset: 0,
     };
 
-    ensure(&x.device, "modulate_pre_bf16_kernel", CUDA_MODULATE_PRE)?;
+    ensure(
+        &x.device,
+        "modulate_pre_split_apply_bf16_kernel",
+        CUDA_MODULATE_PRE_SPLIT_APPLY,
+    )?;
     let f = x.device
-        .get_func("modulate_pre_bf16_kernel", "modulate_pre_split_apply_bf16_kernel")
+        .get_func(
+            "modulate_pre_split_apply_bf16_kernel",
+            "modulate_pre_split_apply_bf16_kernel",
+        )
         .ok_or_else(|| Error::Cuda("modulate_pre_split_apply_bf16_kernel missing".into()))?;
 
     let xs = match &x.storage {
@@ -1064,7 +1360,151 @@ pub fn modulate_pre_split_apply_bf16(
     Ok(out)
 }
 
+fn modulate_pre_split_apply_bf16_strided(
+    x: &Tensor,
+    modulation: &Tensor,
+    shift_idx: usize,
+    eps: f32,
+) -> Result<Tensor> {
+    use cudarc::driver::{CudaSlice, LaunchAsync};
+    let device = x.device.clone();
+    let x_dims = x.shape().dims();
+    let (b, n, dim) = (x_dims[0], x_dims[1], x_dims[2]);
+    let rows = b * n;
+    let total = rows * dim;
+
+    let x_s = x.strides();
+    let mod_s = modulation.strides();
+    let strides_packed: Vec<i64> = vec![
+        x_s[0] as i64, x_s[1] as i64, x_s[2] as i64,
+        mod_s[0] as i64, mod_s[1] as i64, mod_s[2] as i64,
+    ];
+
+    let mut d_strides: CudaSlice<i64> = unsafe { device.alloc::<i64>(6) }
+        .map_err(|e| Error::Cuda(format!("alloc strides: {:?}", e)))?;
+    device
+        .htod_copy_into(strides_packed, &mut d_strides)
+        .map_err(|e| Error::Cuda(format!("htod strides: {:?}", e)))?;
+
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&device, total)?;
+    let mut out = Tensor {
+        storage: TensorStorage::BF16 { data: data.into(), numel: total },
+        shape: x.shape().clone(),
+        device: device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+    };
+
+    ensure(
+        &device,
+        "modulate_pre_split_apply_strided_bf16_kernel",
+        CUDA_MODULATE_PRE_SPLIT_APPLY_STRIDED,
+    )?;
+    let f = device
+        .get_func(
+            "modulate_pre_split_apply_strided_bf16_kernel",
+            "modulate_pre_split_apply_strided_bf16_kernel",
+        )
+        .ok_or_else(|| {
+            Error::Cuda("modulate_pre_split_apply_strided_bf16_kernel missing".into())
+        })?;
+
+    let xs = match &x.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16 x".into())),
+    };
+    let ms = match &modulation.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16 modulation".into())),
+    };
+    let ys = match &mut out.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
+    let ys = ensure_unique_slice(ys)?;
+
+    let x_offset = x.offset() as i64;
+    let mod_offset = modulation.offset() as i64;
+
+    let threads = dim.min(256) as u32;
+    let smem = threads * 4;
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: smem,
+    };
+    unsafe {
+        f.launch(
+            cfg,
+            (
+                slice_ref(xs), x_offset,
+                slice_ref(ms), mod_offset,
+                ys,
+                rows as i32, dim as i32, n as i32,
+                shift_idx as i32, eps,
+                &d_strides,
+            ),
+        )
+        .map_err(|e| Error::Cuda(format!("launch modulate_pre_split_apply_strided: {:?}", e)))?;
+    }
+    Ok(out)
+}
+
 // ---- Fused gate+residual: residual + gate * x, single kernel ----
+
+// Strided variant for narrow/permute-view inputs. Output is always a
+// freshly-allocated contig tensor so only inputs get strides.
+//
+// `strides_packed` layout (8 i64 entries):
+//     [0..2] r_s_b, r_s_n, r_s_d   — residual [B,N,dim] strides
+//     [3..4] g_s_b, g_s_d          — gate     [B,dim]   strides
+//     [5..7] x_s_b, x_s_n, x_s_d   — x        [B,N,dim] strides
+const CUDA_GATE_RESIDUAL_STRIDED: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void gate_residual_strided_bf16_kernel(
+    const __nv_bfloat16* __restrict__ RESIDUAL,
+    long long residual_offset,
+    const __nv_bfloat16* __restrict__ GATE,
+    long long gate_offset,
+    const __nv_bfloat16* __restrict__ X,
+    long long x_offset,
+    __nv_bfloat16* __restrict__ Y,
+    long long total, int dim, int seq_len,
+    const long long* __restrict__ strides_packed)
+{
+    long long r_s_b = strides_packed[0];
+    long long r_s_n = strides_packed[1];
+    long long r_s_d = strides_packed[2];
+    long long g_s_b = strides_packed[3];
+    long long g_s_d = strides_packed[4];
+    long long x_s_b = strides_packed[5];
+    long long x_s_n = strides_packed[6];
+    long long x_s_d = strides_packed[7];
+
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long step = (long long)gridDim.x * blockDim.x;
+    while (idx < total) {
+        long long d   = idx % (long long)dim;
+        long long row = idx / (long long)dim;
+        long long bi  = row / (long long)seq_len;
+        long long ni  = row - bi * (long long)seq_len;
+
+        long long r_addr = residual_offset + bi * r_s_b + ni * r_s_n + d * r_s_d;
+        long long g_addr = gate_offset     + bi * g_s_b + d * g_s_d;
+        long long x_addr = x_offset        + bi * x_s_b + ni * x_s_n + d * x_s_d;
+
+        float r = __bfloat162float(RESIDUAL[r_addr]);
+        float g = __bfloat162float(GATE[g_addr]);
+        float v = __bfloat162float(X[x_addr]);
+        Y[idx] = __float2bfloat16(r + g * v);
+
+        idx += step;
+    }
+}
+"#;
 
 const CUDA_GATE_RESIDUAL: &str = r#"
 #include <cuda_bf16.h>
@@ -1099,26 +1539,35 @@ void gate_residual_bf16_kernel(
 /// `x`: [B, N, dim] BF16.
 ///
 /// Returns [B, N, dim] BF16.
+///
+/// Stride-aware as of Phase 2b-4 (2026-04-23). Contig fast path when
+/// all three inputs are contiguous; strided path indexes narrow/permute
+/// views directly, eliminating the Phase-2a `.contiguous()` guards.
 pub fn gate_residual_fused_bf16(
     residual: &Tensor,
     gate: &Tensor,
     x: &Tensor,
 ) -> Result<Tensor> {
     debug_assert_eq!(residual.dtype(), DType::BF16);
-    // Stride refactor Phase 2a: kernel walks storage linearly; gate is a
-    // narrow slice of the shared modulation output.
-    let residual_owned = residual.contiguous()?;
-    let gate_owned = gate.contiguous()?;
-    let x_owned = x.contiguous()?;
-    let residual = &residual_owned;
-    let gate = &gate_owned;
-    let x = &x_owned;
     let dims = residual.shape().dims();
     if dims.len() != 3 {
         return Err(Error::InvalidOperation(format!(
             "gate_residual_fused: expected 3D [B,N,dim], got {:?}", dims
         )));
     }
+    if residual.is_contiguous() && gate.is_contiguous() && x.is_contiguous() {
+        gate_residual_fused_bf16_contig(residual, gate, x)
+    } else {
+        gate_residual_fused_bf16_strided(residual, gate, x)
+    }
+}
+
+fn gate_residual_fused_bf16_contig(
+    residual: &Tensor,
+    gate: &Tensor,
+    x: &Tensor,
+) -> Result<Tensor> {
+    let dims = residual.shape().dims();
     let (b, n, dim) = (dims[0], dims[1], dims[2]);
     let total = b * n * dim;
 
@@ -1147,6 +1596,97 @@ pub fn gate_residual_fused_bf16(
 
     unsafe {
         f.launch(lc(total), (slice_ref(rs), slice_ref(gs), slice_ref(xs_data), ys, total as i64, dim as i32, n as i32))?;
+    }
+    Ok(out)
+}
+
+fn gate_residual_fused_bf16_strided(
+    residual: &Tensor,
+    gate: &Tensor,
+    x: &Tensor,
+) -> Result<Tensor> {
+    use cudarc::driver::{CudaSlice, LaunchAsync};
+    let device = residual.device.clone();
+    let dims = residual.shape().dims();
+    let (b, n, dim) = (dims[0], dims[1], dims[2]);
+    let total = b * n * dim;
+
+    let gate_dims = gate.shape().dims();
+    let x_dims = x.shape().dims();
+    if gate_dims.len() != 2 {
+        return Err(Error::InvalidOperation(format!(
+            "gate_residual_fused: gate must be 2D [B,dim], got {:?}", gate_dims
+        )));
+    }
+    if x_dims.len() != 3 {
+        return Err(Error::InvalidOperation(format!(
+            "gate_residual_fused: x must be 3D [B,N,dim], got {:?}", x_dims
+        )));
+    }
+    if gate_dims[0] != b || gate_dims[1] != dim {
+        return Err(Error::InvalidOperation(format!(
+            "gate_residual_fused: gate shape must be [B={},dim={}], got {:?}",
+            b, dim, gate_dims
+        )));
+    }
+
+    let r_s = residual.strides();
+    let g_s = gate.strides();
+    let x_s = x.strides();
+    let strides_packed: Vec<i64> = vec![
+        r_s[0] as i64, r_s[1] as i64, r_s[2] as i64,
+        g_s[0] as i64, g_s[1] as i64,
+        x_s[0] as i64, x_s[1] as i64, x_s[2] as i64,
+    ];
+
+    let mut d_strides: CudaSlice<i64> = unsafe { device.alloc::<i64>(8) }
+        .map_err(|e| Error::Cuda(format!("alloc strides: {:?}", e)))?;
+    device
+        .htod_copy_into(strides_packed, &mut d_strides)
+        .map_err(|e| Error::Cuda(format!("htod strides: {:?}", e)))?;
+
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&device, total)?;
+    let mut out = Tensor {
+        storage: TensorStorage::BF16 { data: data.into(), numel: total },
+        shape: residual.shape().clone(),
+        device: device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+    };
+
+    ensure(&device, "gate_residual_strided_bf16_kernel", CUDA_GATE_RESIDUAL_STRIDED)?;
+    let f = device
+        .get_func(
+            "gate_residual_strided_bf16_kernel",
+            "gate_residual_strided_bf16_kernel",
+        )
+        .ok_or_else(|| Error::Cuda("gate_residual_strided_bf16_kernel missing".into()))?;
+
+    let rs = match &residual.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
+    let gs = match &gate.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
+    let xs_data = match &x.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
+    let ys = match &mut out.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let ys = ensure_unique_slice(ys)?;
+
+    let r_offset = residual.offset() as i64;
+    let g_offset = gate.offset() as i64;
+    let x_offset = x.offset() as i64;
+
+    unsafe {
+        f.launch(
+            lc(total),
+            (
+                slice_ref(rs), r_offset,
+                slice_ref(gs), g_offset,
+                slice_ref(xs_data), x_offset,
+                ys,
+                total as i64, dim as i32, n as i32,
+                &d_strides,
+            ),
+        )
+        .map_err(|e| Error::Cuda(format!("launch gate_residual_strided: {:?}", e)))?;
     }
     Ok(out)
 }
@@ -1762,6 +2302,44 @@ fn _qkv_rmsnorm_rope_cat_bf16_reserved(
 // with ONE kernel that reads the fused QKV tensor once and writes three
 // pre-permuted outputs at final [B,H,N,D] layout in a single pass.
 
+// Strided variant for narrow/permute-view `qkv` inputs. Outputs Q/K/V
+// are always fresh contig, so only the input needs strides. Caller's
+// most common input layout is already contig (linear3d output), so this
+// path is primarily a safety net — the dispatcher below only reaches
+// it when `qkv.is_contiguous()` is false.
+const CUDA_QKV_SPLIT_PERMUTE_STRIDED: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void qkv_split_permute_strided_bf16_kernel(
+    const __nv_bfloat16* __restrict__ QKV,
+    long long qkv_offset,
+    __nv_bfloat16* __restrict__ Q,
+    __nv_bfloat16* __restrict__ K,
+    __nv_bfloat16* __restrict__ V,
+    int B, int H, int N, int D,
+    long long qkv_s_b, long long qkv_s_n, long long qkv_s_c)
+{
+    long total = (long)B * H * N * D;
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int d = idx % D;
+    long t = idx / D;
+    int n = t % N;
+    t = t / N;
+    int h = t % H;
+    int b = t / H;
+
+    long HD = (long)H * D;
+    long head_off = (long)h * D + d;
+
+    long row_base = qkv_offset + (long)b * qkv_s_b + (long)n * qkv_s_n;
+    Q[idx] = QKV[row_base + (long long)(0 * HD + head_off) * qkv_s_c];
+    K[idx] = QKV[row_base + (long long)(1 * HD + head_off) * qkv_s_c];
+    V[idx] = QKV[row_base + (long long)(2 * HD + head_off) * qkv_s_c];
+}
+"#;
+
 const CUDA_QKV_SPLIT_PERMUTE: &str = r#"
 #include <cuda_bf16.h>
 extern "C" __global__
@@ -1812,10 +2390,6 @@ pub fn qkv_split_permute_bf16(
     heads: usize,
     head_dim: usize,
 ) -> Result<(Tensor, Tensor, Tensor)> {
-    // Stride refactor Phase 2a: qkv comes from a narrow of the fused linear
-    // output. Kernel walks the last-dim `[3*H*D]` block linearly per (b, n).
-    let qkv_owned = qkv.contiguous()?;
-    let qkv = &qkv_owned;
     debug_assert_eq!(qkv.dtype(), DType::BF16);
     let dims = qkv.shape().dims();
     if dims.len() != 3 {
@@ -1823,7 +2397,7 @@ pub fn qkv_split_permute_bf16(
             "qkv_split_permute_bf16: expected 3D [B,N,3*H*D], got {:?}", dims
         )));
     }
-    let (b, n, c) = (dims[0], dims[1], dims[2]);
+    let (_b, _n, c) = (dims[0], dims[1], dims[2]);
     let hd = heads * head_dim;
     if c != 3 * hd {
         return Err(Error::InvalidOperation(format!(
@@ -1831,6 +2405,20 @@ pub fn qkv_split_permute_bf16(
             3 * hd
         )));
     }
+    if qkv.is_contiguous() {
+        qkv_split_permute_bf16_contig(qkv, heads, head_dim)
+    } else {
+        qkv_split_permute_bf16_strided(qkv, heads, head_dim)
+    }
+}
+
+fn qkv_split_permute_bf16_contig(
+    qkv: &Tensor,
+    heads: usize,
+    head_dim: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let dims = qkv.shape().dims();
+    let (b, n, _c) = (dims[0], dims[1], dims[2]);
     let out_numel = b * heads * n * head_dim;
     let out_shape = Shape::from_dims(&[b, heads, n, head_dim]);
 
@@ -1886,6 +2474,90 @@ pub fn qkv_split_permute_bf16(
             lc(out_numel),
             (slice_ref(xs), qs, ks, vs, b as i32, heads as i32, n as i32, head_dim as i32),
         )?;
+    }
+    Ok((q, k, v))
+}
+
+fn qkv_split_permute_bf16_strided(
+    qkv: &Tensor,
+    heads: usize,
+    head_dim: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    use cudarc::driver::LaunchAsync;
+    let dims = qkv.shape().dims();
+    let (b, n, _c) = (dims[0], dims[1], dims[2]);
+    let out_numel = b * heads * n * head_dim;
+    let out_shape = Shape::from_dims(&[b, heads, n, head_dim]);
+    let device = qkv.device.clone();
+
+    let q_data = crate::cuda_alloc_pool::pool_alloc_u16(&device, out_numel)?;
+    let k_data = crate::cuda_alloc_pool::pool_alloc_u16(&device, out_numel)?;
+    let v_data = crate::cuda_alloc_pool::pool_alloc_u16(&device, out_numel)?;
+    let mut q = Tensor {
+        storage: TensorStorage::BF16 { data: q_data.into(), numel: out_numel },
+        shape: out_shape.clone(),
+        device: device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+    };
+    let mut k = Tensor {
+        storage: TensorStorage::BF16 { data: k_data.into(), numel: out_numel },
+        shape: out_shape.clone(),
+        device: device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+    };
+    let mut v = Tensor {
+        storage: TensorStorage::BF16 { data: v_data.into(), numel: out_numel },
+        shape: out_shape,
+        device: device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+    };
+
+    ensure(
+        &device,
+        "qkv_split_permute_strided_bf16_kernel",
+        CUDA_QKV_SPLIT_PERMUTE_STRIDED,
+    )?;
+    let f = device
+        .get_func(
+            "qkv_split_permute_strided_bf16_kernel",
+            "qkv_split_permute_strided_bf16_kernel",
+        )
+        .ok_or_else(|| Error::Cuda("qkv_split_permute_strided_bf16_kernel missing".into()))?;
+
+    let xs = match &qkv.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("qkv_split_permute_bf16: input must be BF16".into())) };
+    let qs = match &mut q.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let qs = ensure_unique_slice(qs)?;
+    let ks = match &mut k.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let ks = ensure_unique_slice(ks)?;
+    let vs = match &mut v.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let vs = ensure_unique_slice(vs)?;
+
+    let qkv_s = qkv.strides();
+    let qkv_offset = qkv.offset() as i64;
+    let qkv_s_b = qkv_s[0] as i64;
+    let qkv_s_n = qkv_s[1] as i64;
+    let qkv_s_c = qkv_s[2] as i64;
+
+    unsafe {
+        f.launch(
+            lc(out_numel),
+            (
+                slice_ref(xs), qkv_offset,
+                qs, ks, vs,
+                b as i32, heads as i32, n as i32, head_dim as i32,
+                qkv_s_b, qkv_s_n, qkv_s_c,
+            ),
+        )
+        .map_err(|e| Error::Cuda(format!("launch qkv_split_permute_strided: {:?}", e)))?;
     }
     Ok((q, k, v))
 }
