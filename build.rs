@@ -200,6 +200,12 @@ fn main() {
     cuda_sources.push("src/cuda/unary/neg.cu");
     cuda_sources.push("src/cuda/unary/sigmoid.cu");
     cuda_sources.push("src/cuda/unary/tanh.cu");
+    // Phase 7: transcendentals (f32 opmath inside functor).
+    cuda_sources.push("src/cuda/unary/sqrt.cu");
+    cuda_sources.push("src/cuda/unary/recip.cu");
+    cuda_sources.push("src/cuda/unary/rsqrt.cu");
+    cuda_sources.push("src/cuda/unary/exp.cu");
+    cuda_sources.push("src/cuda/unary/log.cu");
 
     if !cuda_sources.iter().all(|p| Path::new(p).exists()) {
         panic!("CUDA sources missing; ensure submodules are synced");

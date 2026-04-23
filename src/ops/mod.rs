@@ -30,3 +30,8 @@ pub mod relu_iter;
 pub mod neg_iter;
 pub mod sigmoid_iter;
 pub mod tanh_iter;
+pub mod sqrt_iter;
+pub mod recip_iter;
+pub mod rsqrt_iter;
+pub mod exp_iter;
+pub mod log_iter;

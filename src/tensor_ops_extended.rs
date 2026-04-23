@@ -649,11 +649,26 @@ impl Tensor {
 
     /// Compute natural logarithm (GPU)
     pub fn log(&self) -> Result<Tensor> {
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        if self.dtype() == DType::BF16 {
+            // Phase 7: BF16 routes through the TensorIterator pipeline
+            // (build_unary_op → launch_gpu_kernel<1, LogBF16Op>). No F32
+            // round-trip; f32 opmath is inside the functor.
+            return crate::ops::log_iter::log_bf16_iter(self);
+        }
         GpuOps::log(self)
     }
 
     /// Compute reciprocal square root
     pub fn rsqrt(&self) -> Result<Tensor> {
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        if self.dtype() == DType::BF16 {
+            // Phase 7: BF16 routes through the TensorIterator pipeline
+            // (build_unary_op → launch_gpu_kernel<1, RsqrtBF16Op>). Pre-Phase-7
+            // composed as sqrt().reciprocal() which did two F32 roundtrips;
+            // this is a single native path using __frsqrt_rn.
+            return crate::ops::rsqrt_iter::rsqrt_bf16_iter(self);
+        }
         self.sqrt()?.reciprocal()
     }
 

@@ -225,6 +225,30 @@ pub fn register_all_bf16_kernels() {
         crate::ops::tanh_iter::TANH_STUB,
         crate::ops::tanh_iter::tanh_bf16_kernel
     );
+    // Phase 7: transcendentals. All use f32 opmath inside the functor
+    // (bf16→f32 on load, f32 intrinsic, __float2bfloat16_rn on store).
+    // Pre-Phase-7 these were all F32 roundtrips; exp/log/sqrt had a
+    // `GpuOps::*` entry, rsqrt/recip were composed Rust-side.
+    crate::register_stub!(
+        crate::ops::sqrt_iter::SQRT_STUB,
+        crate::ops::sqrt_iter::sqrt_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::recip_iter::RECIP_STUB,
+        crate::ops::recip_iter::recip_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::rsqrt_iter::RSQRT_STUB,
+        crate::ops::rsqrt_iter::rsqrt_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::exp_iter::EXP_STUB,
+        crate::ops::exp_iter::exp_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::log_iter::LOG_STUB,
+        crate::ops::log_iter::log_bf16_kernel
+    );
 }
 
 #[cfg(not(feature = "cuda"))]

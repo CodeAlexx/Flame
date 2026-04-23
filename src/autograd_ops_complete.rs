@@ -492,6 +492,14 @@ impl Tensor {
 
     /// Compute reciprocal (1/x)
     pub fn reciprocal(&self) -> Result<Tensor> {
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        if self.dtype() == DType::BF16 {
+            // Phase 7: BF16 routes through the TensorIterator pipeline
+            // (build_unary_op → launch_gpu_kernel<1, RecipBF16Op>). Pre-Phase-7
+            // composed as `ones.div(self)` which allocated a BF16 ones tensor
+            // and ran elementwise div; this is a single native __frcp_rn path.
+            return crate::ops::recip_iter::recip_bf16_iter(self);
+        }
         let ones = Tensor::ones_dtype(self.shape().clone(), self.dtype(), self.device.clone())?;
         let result = ones.div(self)?;
         if self.dtype() == DType::BF16 {

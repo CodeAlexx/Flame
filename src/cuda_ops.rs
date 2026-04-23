@@ -801,6 +801,14 @@ impl GpuOps {
 
     /// Elementwise exponential
     pub fn exp(tensor: &Tensor) -> Result<Tensor> {
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        if tensor.dtype() == crate::DType::BF16 {
+            // Phase 7: BF16 routes through the TensorIterator pipeline. Same
+            // f32-opmath math as the old F32-roundtrip path, now without the
+            // intermediate materialization — enforces CLAUDE.md's "NEVER use
+            // F32 fallbacks in inference code" for BF16 inputs.
+            return crate::ops::exp_iter::exp_bf16_iter(tensor);
+        }
         let target_dtype = tensor.dtype();
         let tensor_f32 = Self::cast_to_f32_tensor(tensor)?;
         let kernels = Self::get_kernels(&tensor_f32.device)?;
@@ -810,6 +818,11 @@ impl GpuOps {
 
     /// Elementwise natural logarithm
     pub fn log(tensor: &Tensor) -> Result<Tensor> {
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        if tensor.dtype() == crate::DType::BF16 {
+            // Phase 7: BF16 routes through the TensorIterator pipeline.
+            return crate::ops::log_iter::log_bf16_iter(tensor);
+        }
         let target_dtype = tensor.dtype();
         let tensor_f32 = Self::cast_to_f32_tensor(tensor)?;
         let kernels = Self::get_kernels(&tensor_f32.device)?;
@@ -846,6 +859,11 @@ impl GpuOps {
 
     /// Elementwise square root
     pub fn sqrt(tensor: &Tensor) -> Result<Tensor> {
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        if tensor.dtype() == crate::DType::BF16 {
+            // Phase 7: BF16 routes through the TensorIterator pipeline.
+            return crate::ops::sqrt_iter::sqrt_bf16_iter(tensor);
+        }
         let target_dtype = tensor.dtype();
         let tensor_f32 = Self::cast_to_f32_tensor(tensor)?;
         let kernels = Self::get_kernels(&tensor_f32.device)?;

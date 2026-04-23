@@ -2256,6 +2256,13 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Exponential function (GPU)
     pub fn exp(&self) -> Result<Tensor> {
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        if self.dtype() == DType::BF16 {
+            // Phase 7: BF16 routes through the TensorIterator pipeline
+            // (build_unary_op → launch_gpu_kernel<1, ExpBF16Op>). No F32
+            // round-trip; f32 opmath is inside the functor.
+            return crate::ops::exp_iter::exp_bf16_iter(self);
+        }
         GpuOps::exp(self)
     }
 
