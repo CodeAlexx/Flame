@@ -9,6 +9,80 @@ use crate::DType;
 use cudarc::driver::DevicePtr;
 use crate::{Error, Result, Shape, Tensor};
 
+/// Persistent per-device cuBLASLt workspace for `fused_linear3d*`.
+///
+/// Both `fused_linear3d` and `fused_linear3d_native` used to
+/// `device.alloc::<u8>(4 MiB)` on every call. Klein 9B issues hundreds of
+/// linear calls per step, so that's hundreds of cudaMalloc/cudaFree
+/// cycles per step. This cache allocates once per device (on first use)
+/// and hands out the cached pointer on every call. The C-side shim
+/// (fused_linear3d.cu) explicitly says workspace ownership is the
+/// caller's concern — this is that cache on the caller side.
+///
+/// Thread-safety: the lock is held for the duration of the downstream
+/// FFI call to cublasLtMatmul. That's microseconds, and flame-core is
+/// single-device-per-process for inference; if multi-threaded training
+/// ever needs to call these concurrently, we'd want per-stream
+/// workspaces anyway (not per-device), so this design doesn't preclude
+/// that future extension.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+mod linear_workspace {
+    use super::*;
+    use cudarc::driver::DeviceSlice;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    struct Entry {
+        device: Arc<cudarc::driver::CudaDevice>,
+        slice: cudarc::driver::CudaSlice<u8>,
+    }
+
+    static CACHE: OnceLock<Mutex<Option<Entry>>> = OnceLock::new();
+
+    /// Returns a guard holding the workspace pointer + size. The mutex
+    /// stays locked for the guard's lifetime; callers should drop the
+    /// guard immediately after the FFI call completes.
+    pub(super) fn acquire(
+        device: &Arc<cudarc::driver::CudaDevice>,
+        min_bytes: usize,
+    ) -> Result<Guard> {
+        let mutex = CACHE.get_or_init(|| Mutex::new(None));
+        let mut guard = mutex
+            .lock()
+            .map_err(|_| Error::InvalidOperation("linear workspace mutex poisoned".into()))?;
+
+        let needs_alloc = match guard.as_ref() {
+            None => true,
+            Some(entry) => {
+                !Arc::ptr_eq(&entry.device, device) || entry.slice.len() < min_bytes
+            }
+        };
+        if needs_alloc {
+            let new_slice: cudarc::driver::CudaSlice<u8> =
+                unsafe { device.alloc(min_bytes) }
+                    .map_err(|e| Error::Cuda(format!("linear workspace alloc failed: {e:?}")))?;
+            *guard = Some(Entry { device: device.clone(), slice: new_slice });
+        }
+        // SAFETY: guard now holds a Some(Entry) that satisfies the size.
+        // We store the raw pointer + size; the guard keeps the mutex held
+        // so the CudaSlice isn't replaced while the caller uses the pointer.
+        let entry = guard.as_ref().unwrap();
+        let ptr = *entry.slice.device_ptr() as *mut u8;
+        let size = entry.slice.len();
+        Ok(Guard { _guard: guard, ptr, size })
+    }
+
+    pub(super) struct Guard<'a> {
+        _guard: std::sync::MutexGuard<'a, Option<Entry>>,
+        ptr: *mut u8,
+        size: usize,
+    }
+
+    impl<'a> Guard<'a> {
+        pub(super) fn ptr(&self) -> *mut u8 { self.ptr }
+        pub(super) fn size(&self) -> usize { self.size }
+    }
+}
+
 /// GPU-side FP8 E4M3 → BF16 dequantization.
 /// Input: raw FP8 bytes on GPU (CudaSlice<u8>), scale, shape.
 /// Output: new BF16 Tensor.
@@ -225,15 +299,14 @@ pub fn fused_linear3d(
     let stream = device_lt::stream_ptr(device)?;
     let lt = device_lt::cublaslt_handle_ptr(device)?;
 
-    // cublasLt workspace
-    let workspace_size: usize = 4 * 1024 * 1024; // 4MB
-    let workspace: cudarc::driver::CudaSlice<u8> = unsafe { device.alloc(workspace_size)? };
-
     let bias_ptr = if let Some(b) = bias {
         b.as_device_ptr_bf16("fused_linear3d:bias")? as *const _
     } else {
         std::ptr::null()
     };
+
+    let workspace_size: usize = 4 * 1024 * 1024;
+    let ws = linear_workspace::acquire(device, workspace_size)?;
 
     let ret = unsafe {
         crate::cuda::ffi::flame_linear3d_bf16(
@@ -246,11 +319,12 @@ pub fn fused_linear3d(
             seq_len as i32,
             in_features as i32,
             out_features as i32,
-            *workspace.device_ptr() as *mut _,
-            workspace_size,
+            ws.ptr() as *mut _,
+            ws.size(),
             stream,
         )
     };
+    drop(ws);
 
     if ret != 0 {
         return Err(Error::Cuda(format!("fused_linear3d cublasLt error: {ret}")));
@@ -310,14 +384,14 @@ pub fn fused_linear3d_native(
     let stream = device_lt::stream_ptr(device)?;
     let lt = device_lt::cublaslt_handle_ptr(device)?;
 
-    let workspace_size: usize = 4 * 1024 * 1024;
-    let workspace: cudarc::driver::CudaSlice<u8> = unsafe { device.alloc(workspace_size)? };
-
     let bias_ptr = if let Some(b) = bias {
         b.as_device_ptr_bf16("fused_linear3d_native:bias")? as *const _
     } else {
         std::ptr::null()
     };
+
+    let workspace_size: usize = 4 * 1024 * 1024;
+    let ws = linear_workspace::acquire(device, workspace_size)?;
 
     let ret = unsafe {
         crate::cuda::ffi::flame_linear3d_bf16_native(
@@ -330,11 +404,12 @@ pub fn fused_linear3d_native(
             seq_len as i32,
             in_features as i32,
             out_features as i32,
-            *workspace.device_ptr() as *mut _,
-            workspace_size,
+            ws.ptr() as *mut _,
+            ws.size(),
             stream,
         )
     };
+    drop(ws);
 
     if ret != 0 {
         return Err(Error::Cuda(format!("fused_linear3d_native cublasLt error: {ret}")));

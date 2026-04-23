@@ -204,7 +204,9 @@ pub fn matmul_bf16_trans(
     // is always the physical row-major row stride (= cols) of the underlying
     // memory, regardless of the trans flag — the flag only changes how
     // cuBLASLt interprets the logical dims, not the memory stride.
-    let mut out = Tensor::zeros_dtype(
+    // cuBLASLt call below uses beta=0 → output fully overwritten, no need
+    // to memset to zero first.
+    let mut out = Tensor::empty_dtype(
         Shape::from_dims(&[batch, m_eff, n_eff]),
         DType::BF16,
         a.device().clone(),

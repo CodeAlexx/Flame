@@ -234,7 +234,9 @@ fn bmm_f32(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, Error> {
         )));
     }
 
-    let mut out = Tensor::zeros_dtype(
+    // cuBLAS strided-batched GEMM below uses beta=0 → output fully
+    // overwritten, no need to memset first.
+    let mut out = Tensor::empty_dtype(
         Shape::from_dims(&[batch, m, n]),
         lhs.dtype(),
         lhs.device.clone(),
@@ -261,7 +263,9 @@ fn bmm_bf16_acc_f32(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, Error> {
         return Tensor::zeros_dtype(Shape::from_dims(&[batch, m, n]), DType::BF16, lhs.device.clone());
     }
 
-    let mut out = Tensor::zeros_dtype(
+    // cuBLASLt bmm_bf16_fp32acc_out below uses beta=0 → output fully
+    // overwritten, no need to memset first.
+    let mut out = Tensor::empty_dtype(
         Shape::from_dims(&[batch, m, n]),
         DType::BF16,
         lhs.device.clone(),
