@@ -293,6 +293,16 @@ impl Tensor {
             ));
         }
 
+        // Stride refactor Phase 2a safety net: cat copies via linear DMA /
+        // slice-slice assuming row-major contiguous storage. Materialize any
+        // strided views first.
+        let materialized: Vec<Tensor> = tensors
+            .iter()
+            .map(|t| if t.is_contiguous() { Ok((*t).clone()) } else { t.contiguous() })
+            .collect::<Result<Vec<_>>>()?;
+        let tensors_vec: Vec<&Tensor> = materialized.iter().collect();
+        let tensors: &[&Tensor] = &tensors_vec;
+
         // Check all tensors have same shape except for concat dimension
         let first_shape = tensors[0].shape().dims();
         let device = tensors[0].device().clone();

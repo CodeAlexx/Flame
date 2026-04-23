@@ -723,6 +723,45 @@ pub fn conv2d_forward(
         }
     }
 
+    // Fast path: dispatch BF16 4D conv to cuDNN (winograd/implicit_gemm
+    // algorithm selection). This replaces the im2col→GEMM→NHWC-to-NCHW→bias
+    // chain below (3-4 kernels + intermediate buffers) with a single cuDNN
+    // call. Used by SDXL/SD3/Cascade/VAEs — every conv-heavy model.
+    //
+    // The im2col path stays as fallback for F32 / unsupported shapes / when
+    // autograd is recording (cuDNN forward doesn't produce the intermediates
+    // the im2col backward uses).
+    #[cfg(feature = "cudnn")]
+    if input.dtype() == crate::DType::BF16
+        && !crate::autograd::AutogradContext::is_recording()
+    {
+        // cudnn_conv2d_bf16 reads raw BF16 pointers via as_device_ptr_bf16
+        // which requires contiguous storage. Materialize strided views
+        // once here so every conv call gets the winograd/implicit_gemm
+        // fast path instead of falling through to the old im2col chain.
+        let i = input.contiguous()?;
+        let w = weight.contiguous()?;
+        let b_owned;
+        let b_ref = match bias {
+            Some(b) => {
+                b_owned = b.contiguous()?;
+                Some(&b_owned)
+            }
+            None => None,
+        };
+        match crate::cudnn::conv2d::cudnn_conv2d_bf16(
+            &i, &w, b_ref, stride, padding, (1, 1), groups,
+        ) {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                log::warn!(
+                    "conv2d_forward: cuDNN path failed, falling back to im2col: {:?}",
+                    e
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "dtype_trace")]
     crate::dtype_trace!(
         "conv2d: dtype={:?}, stride={:?}, padding={:?}",

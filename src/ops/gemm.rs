@@ -181,6 +181,9 @@ fn gemm_f32(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, Error> {
         device: lhs.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     })
 }
 

@@ -89,6 +89,9 @@ pub fn create_output_tensor(data: CudaSlice<f32>, shape: Shape, device: Arc<Cuda
         device,
         id: crate::tensor::TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     }
 }
 

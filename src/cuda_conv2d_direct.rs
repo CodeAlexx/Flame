@@ -158,6 +158,9 @@ impl CudaConv2dDirect {
             device: device.clone(),
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
 
         // Reshape weight: [out_channels, in_channels, 3, 3] -> [out_channels, in_channels * 9]

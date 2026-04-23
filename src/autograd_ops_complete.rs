@@ -667,6 +667,9 @@ pub fn group_norm_backward(
         device: input.device.clone(),
         id: crate::tensor::TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     let grad_weight = grad_weight_data.map(|data| Tensor {
@@ -678,6 +681,9 @@ pub fn group_norm_backward(
         device: input.device.clone(),
         id: crate::tensor::TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     });
 
     let grad_bias = Some(Tensor {
@@ -689,6 +695,9 @@ pub fn group_norm_backward(
         device: input.device.clone(),
         id: crate::tensor::TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     });
 
     let grad_input = ensure_bf16(grad_input)?;

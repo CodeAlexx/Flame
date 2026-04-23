@@ -314,6 +314,9 @@ impl Conv3dBF16 {
             device: dev.clone(),
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
 
         // ---- allocate output [N, C_out, D_out, H_out, W_out] ----
@@ -330,6 +333,9 @@ impl Conv3dBF16 {
             device: dev.clone(),
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
 
         // ---- compile kernels ----

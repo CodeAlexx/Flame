@@ -149,6 +149,32 @@ pub struct Tensor {
 
     /// Whether gradients should be computed
     pub(crate) requires_grad: bool,
+
+    /// Custom strides. `None` = row-major contiguous (default).
+    /// Phase-1 of the stride refactor: field added, every constructor
+    /// initializes to `None`; behavior unchanged. Phase 2 wires view
+    /// ops (permute/transpose/narrow/chunk/view) to populate it
+    /// without materializing storage.
+    pub(crate) custom_strides: Option<Vec<usize>>,
+
+    /// Element offset into the underlying storage. Non-zero only for
+    /// narrow/chunk views. Default 0.
+    pub(crate) view_offset: usize,
+}
+
+/// Compute row-major (C-contiguous) strides for a shape.
+#[inline]
+pub(crate) fn row_major_strides(shape: &Shape) -> Vec<usize> {
+    let dims = shape.dims();
+    let n = dims.len();
+    if n == 0 {
+        return vec![];
+    }
+    let mut s = vec![1usize; n];
+    for i in (0..n.saturating_sub(1)).rev() {
+        s[i] = s[i + 1] * dims[i + 1];
+    }
+    s
 }
 
 impl AsRef<Tensor> for Tensor {
@@ -296,6 +322,9 @@ extern "C" __global__ void masked_fill_kernel(
             device: self.device.clone(),
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         })
     }
 
@@ -337,6 +366,9 @@ extern "C" __global__ void masked_fill_kernel(
             device,
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         })
     }
 
@@ -364,6 +396,9 @@ extern "C" __global__ void masked_fill_kernel(
             device,
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         })
     }
 
@@ -389,6 +424,9 @@ extern "C" __global__ void masked_fill_kernel(
             device: self.device.clone(),
             id: TensorId::new(),
             requires_grad: self.requires_grad,
+            custom_strides: None,
+            view_offset: 0,
+
         }
     }
 
@@ -718,6 +756,13 @@ extern "C" __global__ void masked_fill_kernel(
             return Ok(self.clone());
         }
 
+        // Stride refactor Phase 2a safety net: to_dtype reads storage
+        // linearly via `storage.to_f32`. A strided view would alias the
+        // wrong memory.
+        if !self.is_contiguous() {
+            return self.contiguous()?.to_dtype(dtype);
+        }
+
         // For now, we store everything as F32 but track the dtype
         // Use aligned allocation for the new tensor to avoid CUDA issues
         let numel = self.shape.elem_count();
@@ -792,6 +837,9 @@ extern "C" __global__ void masked_fill_kernel(
             device: self.device.clone(),
             id: TensorId::new(),
             requires_grad: self.requires_grad,
+            custom_strides: None,
+            view_offset: 0,
+
         };
         if self.requires_grad && AutogradContext::is_recording() {
             // Record autograd Cast op so gradients flow across dtype boundaries
@@ -899,6 +947,9 @@ extern "C" __global__ void masked_fill_kernel(
             device,
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         })
     }
 
@@ -984,6 +1035,9 @@ extern "C" __global__ void masked_fill_kernel(
             device,
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         })
     }
 
@@ -1009,6 +1063,9 @@ extern "C" __global__ void masked_fill_kernel(
             device,
             id: TensorId::new(),
             requires_grad,
+            custom_strides: None,
+            view_offset: 0,
+
         })
     }
 
@@ -1036,6 +1093,9 @@ extern "C" __global__ void masked_fill_kernel(
             device,
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         })
     }
 
@@ -1067,6 +1127,9 @@ extern "C" __global__ void masked_fill_kernel(
             device,
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         }
     }
 
@@ -1098,6 +1161,9 @@ extern "C" __global__ void masked_fill_kernel(
             device,
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         }
     }
 
@@ -1181,6 +1247,9 @@ extern "C" __global__ void masked_fill_kernel(
                 device,
                 id: TensorId::new(),
                 requires_grad: false,
+                custom_strides: None,
+                view_offset: 0,
+
             })
         }
         #[cfg(feature = "bf16_u16")]
@@ -1198,6 +1267,9 @@ extern "C" __global__ void masked_fill_kernel(
                 device,
                 id: TensorId::new(),
                 requires_grad: false,
+                custom_strides: None,
+                view_offset: 0,
+
             })
         }
     }
@@ -1730,6 +1802,9 @@ extern "C" __global__ void slice_kernel(
             device: self.device.clone(),
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         })
     }
 
@@ -2313,13 +2388,25 @@ extern "C" __global__ void f32_to_bool_kernel(
                 got: self.shape.clone(),
             });
         }
+        // Stride refactor Phase 2a: if self is a non-contiguous view
+        // (from permute/transpose) we must materialize before reshape;
+        // reshape assumes linear storage and would alias the wrong
+        // elements otherwise.
+        let base = if self.is_contiguous() {
+            self.clone()
+        } else {
+            self.contiguous()?
+        };
         // Create view tensor (shares storage) with new shape
         let out = Tensor {
             id: TensorId::new(),
-            storage: self.storage.clone(),
+            storage: base.storage.clone(),
             shape: new_shape.clone(),
-            device: self.device.clone(),
-            requires_grad: self.requires_grad,
+            device: base.device.clone(),
+            requires_grad: base.requires_grad,
+            custom_strides: None,
+            view_offset: 0,
+
         };
         // Record autograd op so gradients flow through reshape
         if self.requires_grad && AutogradContext::is_recording() {
@@ -2373,6 +2460,10 @@ extern "C" __global__ void f32_to_bool_kernel(
                 self.dtype(),
                 self.shape.dims()
             );
+        }
+        // Stride refactor Phase 2a safety net: to_vec reads storage linearly.
+        if !self.is_contiguous() {
+            return self.contiguous()?.to_vec();
         }
         match self.storage.try_as_slice_f32() {
             Ok(slice) => self
@@ -2428,13 +2519,32 @@ extern "C" __global__ void f32_to_bool_kernel(
             .all(|(a, b)| a.to_bits() == b.to_bits()))
     }
 
-    /// Transpose a 2D tensor
+    /// Transpose a 2D tensor.
+    ///
+    /// **Stride refactor Phase 2a**: metadata-only view (no kernel launch).
+    /// Underlying storage is shared with `self`; swapped strides are
+    /// recorded in `custom_strides`. Call `.contiguous()` on the result
+    /// before feeding to a kernel that walks storage linearly.
     pub fn transpose(&self) -> Result<Tensor> {
-        // Use BF16 kernel when available to avoid F32 staging.
-        let mut output = if self.dtype() == DType::BF16 {
-            crate::bf16_elementwise::transpose2d_bf16(self)?
-        } else {
-            GpuOps::transpose(self)?
+        let dims = self.shape.dims();
+        if dims.len() != 2 {
+            return Err(Error::InvalidOperation(format!(
+                "transpose() expects 2D tensor, got rank {}",
+                dims.len()
+            )));
+        }
+        let self_strides = self.strides();
+        let new_shape = vec![dims[1], dims[0]];
+        let new_strides = vec![self_strides[1], self_strides[0]];
+
+        let mut output = Tensor {
+            storage: self.storage.clone(),
+            shape: Shape::from_dims(&new_shape),
+            device: self.device.clone(),
+            id: TensorId::new(),
+            requires_grad: self.requires_grad,
+            custom_strides: Some(new_strides),
+            view_offset: self.view_offset,
         };
 
         // AUTOGRAD: Record operation if needed
@@ -2493,9 +2603,166 @@ extern "C" __global__ void f32_to_bool_kernel(
         crate::ops::broadcast::broadcast_to_impl(self, &target_i64)
     }
 
-    /// Get the strides of this tensor
-    /// Assumes C-contiguous (row-major) layout
+    /// Authoritative strides: returns the view strides if set, else row-major.
+    ///
+    /// Stride refactor Phase 2: view ops (permute/transpose/narrow/chunk)
+    /// populate `custom_strides` with a reordered-strides vector; everything
+    /// else produces contiguous tensors whose strides are row-major (computed
+    /// on demand, same as before the refactor).
+    pub fn strides(&self) -> Vec<usize> {
+        if let Some(s) = &self.custom_strides {
+            return s.clone();
+        }
+        row_major_strides(&self.shape)
+    }
+
+    /// Fill a caller-provided buffer with this tensor's real strides, returning
+    /// the rank. No heap allocation — callers on hot paths (FFI view setup,
+    /// kernel-wrapper entry) should prefer this to `strides()`.
+    ///
+    /// Panics if `out.len() < rank`. Caller is responsible for sizing.
+    #[inline]
+    pub fn fill_strides_into(&self, out: &mut [usize]) -> usize {
+        let rank = self.shape.rank();
+        if let Some(s) = &self.custom_strides {
+            out[..rank].copy_from_slice(&s[..rank]);
+        } else {
+            let dims = self.shape.dims();
+            if rank == 0 {
+                // nothing to write
+            } else {
+                out[rank - 1] = 1;
+                for i in (0..rank - 1).rev() {
+                    out[i] = out[i + 1] * dims[i + 1];
+                }
+            }
+        }
+        rank
+    }
+
+    /// Element offset into the underlying storage. Non-zero only for narrow/chunk views.
+    #[inline]
+    pub fn offset(&self) -> usize {
+        self.view_offset
+    }
+
+    /// Is this tensor laid out contiguously row-major in its storage (no view)?
+    ///
+    /// True when no custom strides are set AND the view offset is zero. A
+    /// row-major contiguous tensor is safe to read via a raw pointer that
+    /// indexes linearly from the storage base. Strided views must be passed
+    /// through `.contiguous()` (or a stride-aware kernel) before being fed to
+    /// a kernel that assumes linear storage.
+    #[inline]
+    pub fn is_contiguous(&self) -> bool {
+        self.custom_strides.is_none() && self.view_offset == 0
+    }
+
+    /// Return a contiguous, row-major copy if this tensor is a strided view;
+    /// otherwise return a cheap clone.
+    ///
+    /// Uses the existing `GpuOps::permute_generic` materializing kernel to
+    /// realize a view produced by `permute`/`transpose` (Phase 2) — the
+    /// permutation is recovered from the deviation between the view strides
+    /// and the row-major strides of the logical shape. `narrow`/`chunk`
+    /// produce views with non-zero `view_offset`; these are not yet covered
+    /// (Phase 2a scope: permute+transpose only — they're the attention hot
+    /// path). Non-zero offsets return `Err` clearly directing the caller to
+    /// update the op in the next phase rather than silently producing wrong
+    /// output.
+    pub fn contiguous(&self) -> Result<Tensor> {
+        if self.is_contiguous() {
+            return Ok(self.clone());
+        }
+        if self.view_offset != 0 {
+            return Err(Error::Unsupported(format!(
+                "contiguous() on a narrow/chunk view (offset={}) is not yet \
+                 implemented (stride refactor Phase 2a covers permute/transpose \
+                 only). Caller path should be audited in Phase 2b.",
+                self.view_offset
+            )));
+        }
+        // Recover the permutation from view strides vs row-major strides of
+        // the current shape. For a view produced by `permute(dims)`:
+        //   view_shape[i]   = orig_shape[dims[i]]
+        //   view_strides[i] = orig_strides[dims[i]]
+        //     = product(orig_shape[dims[i]+1 ..])
+        //
+        // We don't have `dims` recorded explicitly, but we can reconstruct it
+        // by matching each view-stride to the unique row-major stride of the
+        // corresponding original axis. The original shape = view_shape
+        // permuted backwards, but we only need `dims` (the forward mapping)
+        // to call `permute_generic` on the original-layout storage.
+        //
+        // The view's storage physically holds the ORIGINAL tensor. Its shape
+        // is `orig_shape` where each axis sits at position `inv_perm[axis]`.
+        // So if view_shape[i] = orig_shape[dims[i]], then
+        // orig_shape[j] = view_shape[inv_perm[j]] where inv_perm[dims[i]]=i.
+        let view_strides = self.custom_strides.as_ref().expect("custom_strides Some");
+        let view_shape = self.shape.dims();
+        let rank = view_shape.len();
+        if view_strides.len() != rank {
+            return Err(Error::InvalidOperation(format!(
+                "custom_strides len {} != shape rank {}",
+                view_strides.len(),
+                rank
+            )));
+        }
+        // Sort axes by descending stride: that recovers the original axis order.
+        // (Row-major strides are strictly decreasing in original order.)
+        let mut by_stride: Vec<(usize, usize)> = view_strides
+            .iter()
+            .copied()
+            .enumerate()
+            .collect(); // (view_axis, stride)
+        by_stride.sort_by(|a, b| b.1.cmp(&a.1));
+        // `dims[i] = orig_axis at view_axis i`.
+        // After sorting by stride desc, by_stride[j].0 is the view-axis whose
+        // original-axis index is j. So dims[by_stride[j].0] = j.
+        let mut dims = vec![0usize; rank];
+        for (j, (view_axis, _)) in by_stride.iter().enumerate() {
+            dims[*view_axis] = j;
+        }
+        // Build a contiguous tensor with original shape (permuted back), then
+        // permute it forward to recover view layout, materialized.
+        let mut orig_shape = vec![0usize; rank];
+        for i in 0..rank {
+            orig_shape[dims[i]] = view_shape[i];
+        }
+        // Reinterpret `self` as a contiguous tensor with `orig_shape` (the
+        // underlying storage IS contiguous in that layout — it was before the
+        // permute view was taken).
+        let as_orig = Tensor {
+            storage: self.storage.clone(),
+            shape: Shape::from_dims(&orig_shape),
+            device: self.device.clone(),
+            id: TensorId::new(),
+            requires_grad: self.requires_grad,
+            custom_strides: None,
+            view_offset: 0,
+        };
+        // Now apply the recorded permutation to materialize.
+        //
+        // Dispatch to the hand-written specialized kernels when the
+        // permutation matches a known fast path — same kernels the
+        // pre-refactor `Tensor::permute` used. Falls back to the general
+        // permute_generic kernel for anything else.
+        let contig = if rank == 3 && dims == [0, 2, 1] {
+            crate::cuda_ops::GpuOps::permute_021(&as_orig)?
+        } else if rank == 4 && dims == [0, 2, 1, 3] {
+            crate::cuda_ops::GpuOps::permute_0213(&as_orig)?
+        } else {
+            crate::cuda_ops::GpuOps::permute_generic(&as_orig, &dims)?
+        };
+        Ok(contig)
+    }
+
+    /// Get the strides of this tensor (compatibility shim — prefer `strides()`).
+    /// Row-major unless the tensor is a view.
     pub fn stride(&self) -> Vec<usize> {
+        if let Some(s) = &self.custom_strides {
+            return s.clone();
+        }
         let dims = self.shape.dims();
         let ndim = dims.len();
         if ndim == 0 {
@@ -2706,6 +2973,9 @@ extern "C" __global__ void f32_to_bool_kernel(
             device: self.device.clone(),
             id: TensorId::new(),
             requires_grad: self.requires_grad,
+            custom_strides: None,
+            view_offset: 0,
+
         })
     }
 
@@ -2781,7 +3051,19 @@ extern "C" __global__ void f32_to_bool_kernel(
         self.reshape(&[batch_size, feature_size])
     }
 
-    /// Permute/transpose dimensions
+    /// Permute/transpose dimensions.
+    ///
+    /// **Stride refactor Phase 2a**: metadata-only view — no kernel launch,
+    /// no storage copy. The returned `Tensor` shares the underlying storage
+    /// `Arc` with `self` and records the permuted strides in `custom_strides`.
+    /// Callers that need row-major contiguous layout (any kernel that walks
+    /// storage linearly) must call `.contiguous()` on the result; kernels
+    /// that accept per-tensor strides can consume the view directly and
+    /// skip the copy.
+    ///
+    /// Prior to this refactor `permute` materialized via `GpuOps::permute_*`
+    /// kernels on every call. After the refactor materialization happens
+    /// lazily only when a caller explicitly asks for contiguity.
     pub fn permute(&self, dims: &[usize]) -> Result<Tensor> {
         let shape = self.shape.dims();
         if dims.len() != shape.len() {
@@ -2809,29 +3091,25 @@ extern "C" __global__ void f32_to_bool_kernel(
             seen[d] = true;
         }
 
-        // Optimized special-cases.
-        //
-        // Everything that does not match a hand-written hot path routes
-        // through `GpuOps::permute_generic`, which JIT-loads
-        // `permute_generic_bf16_kernel` / `permute_generic_f32_kernel`
-        // (see `cuda_kernel_sources.rs`) — a real GPU scatter that
-        // supports arbitrary rank up to 8 and preserves BF16 storage.
-        //
-        // Before this wire-up the fallback was a `to_vec()` → scalar
-        // Rust loop → `from_vec` path that did a full GPU↔CPU round-trip
-        // and silently downcast BF16 → F32. That path regularly took 5+
-        // seconds per call on large tensors — see `PERF_VAE_PERMUTE.md`
-        // for the VAE-decode symptom and the measured 68× speedup from
-        // flipping NCHW↔NHWC off the CPU fallback.
-        let mut output = if shape.len() == 2 && dims == [1, 0] {
-            self.transpose()?
-        } else if shape.len() == 3 && dims == [0, 2, 1] {
-            GpuOps::permute_021(self)?
-        } else if shape.len() == 4 && dims == [0, 2, 1, 3] {
-            GpuOps::permute_0213(self)?
+        // Identity permutation → cheap clone, no view needed.
+        let is_identity = dims.iter().enumerate().all(|(i, &d)| i == d);
+
+        let self_strides = self.strides();
+        let new_shape: Vec<usize> = dims.iter().map(|&d| shape[d]).collect();
+        let new_strides: Vec<usize> = dims.iter().map(|&d| self_strides[d]).collect();
+
+        let mut output = if is_identity {
+            self.clone()
         } else {
-            // General N-D GPU permute (rank <= 8, BF16-preserving).
-            GpuOps::permute_generic(self, dims)?
+            Tensor {
+                storage: self.storage.clone(),
+                shape: Shape::from_dims(&new_shape),
+                device: self.device.clone(),
+                id: TensorId::new(),
+                requires_grad: self.requires_grad,
+                custom_strides: Some(new_strides),
+                view_offset: self.view_offset,
+            }
         };
 
         // AUTOGRAD: Record operation if needed

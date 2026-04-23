@@ -585,6 +585,40 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// cuDNN v9 Flash SDPA forward (host shim in `src/cuda/cudnn_sdpa.cpp`
+    /// via vendored NVIDIA `cudnn_frontend`). BF16 in/out, FP32 compute.
+    /// Q, K, V, O: 4D BF16 tensors on GPU with per-tensor 4-element stride
+    /// vectors in [B,H,N,D] order (element strides, not byte strides).
+    /// The shim uses these strides directly on the cuDNN Tensor_attributes
+    /// so callers can pass permute-views without materializing.
+    ///
+    /// `*_offset_elems`: element offset into the base pointer (for narrow
+    /// or sliced views). 0 for ordinary contiguous tensors.
+    ///
+    /// No mask (full self-attention). Graph cached per (shape, strides,
+    /// offsets, scale). Returns 0 on success, non-zero on cuDNN / arg error.
+    pub fn flame_cudnn_sdpa_bf16(
+        Q: *const core::ffi::c_void,
+        K: *const core::ffi::c_void,
+        V: *const core::ffi::c_void,
+        O: *mut core::ffi::c_void,
+        B: i32,
+        H: i32,
+        N_q: i32,
+        N_kv: i32,
+        D: i32,
+        scale: f32,
+        q_strides: *const i64,
+        k_strides: *const i64,
+        v_strides: *const i64,
+        o_strides: *const i64,
+        q_offset_elems: i64,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        o_offset_elems: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// Flash attention backward — wmma tensor core version.
     /// Computes dQ, dK, dV from Q, K, V, O, dO, and LSE.
     /// Q,K,V,O,dO: [B*H, N, HD] BF16. LSE: [B*H, N_q] FP32.

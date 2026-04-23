@@ -33,25 +33,13 @@ fn parse_env_flag(name: &str) -> Option<bool> {
 // SelfAttention / CrossAttention op, which is dozens to hundreds of calls
 // per denoise step. Each of these used to be a fresh syscall.
 
-/// Whether to run the in-tree flash attention kernel for head_dim ∈
-/// {64, 96, 128} inputs without a mask.
-///
-/// **Default: true.** The kernel at `src/cuda/flash_attention_fwd.cu`
-/// is a WMMA/tensor-core FlashAttention-2 implementation: BF16 fragments,
-/// FP32 accumulation, online softmax, BQ=32/BKV=64 tiling sized for the
-/// SM_86 (RTX 3090/Ti) 100 KB shared-memory limit. No atomics — the
-/// warp tile map is disjoint for QK^T, softmax, and PV stages, so output
-/// is deterministic given identical inputs. The scalar FP32 predecessor
-/// is preserved at `flash_attention_fwd_scalar.cu.bak` for reference.
-///
-/// Disable with `FLAME_NO_FLASH_ATTN=1` (e.g. when profiling the
-/// cuBLASLt materialized fallback on a GPU with enough VRAM to tolerate
-/// the 2 GB F32 softmax staging).
-#[inline]
-fn use_flash_attn() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| !parse_env_flag("FLAME_NO_FLASH_ATTN").unwrap_or(false))
-}
+// cuDNN v9 Flash SDPA is the default and only flash path for unmasked
+// head_dim ∈ {64, 96, 128} — see the dispatcher below. The in-tree WMMA
+// kernel (`flame_flash_attention_bf16` in ffi.rs + `flash_attention_fwd.cu`)
+// still exists because the training autograd paths (`flash_attention.rs`,
+// sdpa.rs:203 training branch) call it directly, but it is no longer part
+// of the inference dispatch. If cuDNN fails, the error surfaces; there is
+// no silent fall-through to WMMA.
 
 #[inline]
 fn force_stream_sdpa() -> bool {
@@ -532,15 +520,19 @@ fn forward_bf16(
     // is the canonical fast path and there is no libtorch linkage anywhere in
     // flame-core. See FA2 kernel docs for perf characteristics.
 
-    // Fallback path 1: in-tree flash kernel (scalar FP32, slow but memory-efficient).
+    // cuDNN v9 Flash SDPA — the only flash path for unmasked head_dim ∈
+    // {64, 96, 128}. Measured 12.1× faster than the previous in-tree WMMA
+    // kernel at Klein's shape. If cuDNN returns an error at this path we
+    // surface it — no silent fall-through to WMMA. Parity vs WMMA was
+    // validated on Klein+Chroma shapes at cos_sim = 1.000000 / mean_rel ~4e-6
+    // (see `flame-core/tests/cudnn_sdpa_parity.rs`).
     #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-    if (d_q == 64 || d_q == 96 || d_q == 128) && mask.is_none() && use_flash_attn() {
-        match forward_flash_bf16(q, k, v, b, h, q_len, k_len, d_q) {
-            Ok(out) => return Ok(out),
-            Err(e) => {
-                log::warn!("flash_attention failed, falling back: {:?}", e);
-            }
-        }
+    if (d_q == 64 || d_q == 96 || d_q == 128) && mask.is_none() {
+        return forward_cudnn_sdpa_bf16(q, k, v, b, h, q_len, k_len, d_q)
+            .map_err(|e| {
+                log::error!("cudnn SDPA failed (no WMMA fallback): {:?}", e);
+                e
+            });
     }
 
     // Auto-stream policy: the materialized fallback allocates an FP32 scores
@@ -614,6 +606,118 @@ fn forward_bf16(
     Err(Error::Unsupported(
         "sdpa_stream_bf16 unavailable (no fallback)".into(),
     ))
+}
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+/// cuDNN v9 Flash SDPA path. Same input layout as `forward_flash_bf16`:
+/// Q, K, V are [B, H, N, D] BF16 contiguous. The cuDNN shim accepts a
+/// 4D layout, so we pass `B*H` as the batch and `1` as the head dim —
+/// that's layout-equivalent because with H=1 the head stride collapses
+/// and memory walk order matches the [B*H, N, D] WMMA path.
+fn forward_cudnn_sdpa_bf16(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    b: usize,
+    h: usize,
+    q_len: usize,
+    k_len: usize,
+    d_q: usize,
+) -> SdpaResult<Tensor> {
+    use crate::cuda::device_lt;
+
+    // Stride refactor Phase 2b: thread per-tensor strides + offsets into the
+    // cuDNN graph so the hot-path permute-before-attention doesn't have to
+    // materialize. The cuDNN frontend SDPA op takes a 4D stride vector per
+    // tensor; we use each tensor's logical strides interpreted as [B,H,N,D]
+    // after collapsing B*H into the batch dim (see collapse note below).
+    //
+    // Collapse: we still pass B*H as batch / 1 as head to match the single
+    // graph key we've validated. Strides are in [B*H, 1, N, D] layout — we
+    // compute them by taking the tensor's real [B,H,N,D] strides and
+    // combining B-stride + H-stride into the collapsed dimension. When Q is
+    // a contiguous [B,H,N,D] BF16 tensor, H*stride_B + stride_H*1 == N*D,
+    // matching the hardcoded path. For a `permute([0,2,1,3])` view
+    // ([B,H,N,D] from an incoming [B,N,H,D] contiguous layout) the real
+    // strides are (N*H*D, D, H*D, 1), and cuDNN handles the non-contiguous
+    // walk directly.
+    let q_strides_4d = tensor_strides_as_4d_bhnd(q)?;
+    let k_strides_4d = tensor_strides_as_4d_bhnd(k)?;
+    let v_strides_4d = tensor_strides_as_4d_bhnd(v)?;
+
+    let bh = (b * h) as i32;
+    let device = q.device();
+    let stream = device_lt::stream_ptr(device)?;
+    let scale = 1.0f32 / (d_q as f32).sqrt();
+
+    let output = Tensor::empty_dtype(q.shape().clone(), DType::BF16, device.clone())?;
+    let o_strides_4d = tensor_strides_as_4d_bhnd(&output)?;
+
+    let q_ptr = q.as_device_ptr_bf16("cudnn_sdpa:q")? as *const core::ffi::c_void;
+    let k_ptr = k.as_device_ptr_bf16("cudnn_sdpa:k")? as *const core::ffi::c_void;
+    let v_ptr = v.as_device_ptr_bf16("cudnn_sdpa:v")? as *const core::ffi::c_void;
+    let o_ptr = output.as_device_ptr_bf16("cudnn_sdpa:o")? as *mut core::ffi::c_void;
+
+    // view_offset is in elements; the shim advances the pointer in elements
+    // (BF16 = 2 bytes).
+    let q_off = q.offset() as i64;
+    let k_off = k.offset() as i64;
+    let v_off = v.offset() as i64;
+    let o_off = output.offset() as i64;
+
+    // Pass native 4D [B, H, N, D] to cuDNN with the tensor's real strides.
+    // cudnn_frontend's SDPA supports arbitrary 4D strides natively, so there
+    // is no need to collapse B*H into the batch dim. This supports permute
+    // views ([B,N,H,D] contiguous → permute(0,2,1,3) = strided [B,H,N,D])
+    // without any materialization — the single biggest win of the stride
+    // refactor for attention.
+    let [s_b_q, s_h_q, s_n_q, s_d_q] = q_strides_4d;
+    let [s_b_k, s_h_k, s_n_k, s_d_k] = k_strides_4d;
+    let [s_b_v, s_h_v, s_n_v, s_d_v] = v_strides_4d;
+    let [s_b_o, s_h_o, s_n_o, s_d_o] = o_strides_4d;
+    let q_strides: [i64; 4] = [s_b_q, s_h_q, s_n_q, s_d_q];
+    let k_strides: [i64; 4] = [s_b_k, s_h_k, s_n_k, s_d_k];
+    let v_strides: [i64; 4] = [s_b_v, s_h_v, s_n_v, s_d_v];
+    let o_strides: [i64; 4] = [s_b_o, s_h_o, s_n_o, s_d_o];
+    let _ = bh; // kept for potential future diagnostic logging
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_cudnn_sdpa_bf16(
+            q_ptr, k_ptr, v_ptr, o_ptr,
+            b as i32,
+            h as i32,
+            q_len as i32,
+            k_len as i32,
+            d_q as i32,
+            scale,
+            q_strides.as_ptr(),
+            k_strides.as_ptr(),
+            v_strides.as_ptr(),
+            o_strides.as_ptr(),
+            q_off, k_off, v_off, o_off,
+            stream,
+        )
+    };
+
+    if ret != 0 {
+        return Err(Error::Cuda(format!("cudnn_sdpa CUDA error: {ret}")));
+    }
+    Ok(output)
+}
+
+/// Convert a tensor's strides to a fixed-length `[i64; 4]` in [B,H,N,D] order.
+/// Accepts a 4-D tensor only.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn tensor_strides_as_4d_bhnd(t: &Tensor) -> SdpaResult<[i64; 4]> {
+    let mut s = [0usize; 8];
+    let rank = t.fill_strides_into(&mut s);
+    if rank != 4 {
+        return Err(Error::InvalidInput(format!(
+            "cudnn_sdpa: expected 4D tensor, got rank {}",
+            rank
+        )));
+    }
+    Ok([s[0] as i64, s[1] as i64, s[2] as i64, s[3] as i64])
 }
 
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]

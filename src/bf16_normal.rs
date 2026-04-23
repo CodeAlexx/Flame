@@ -73,6 +73,9 @@ pub fn normal_bf16(
         device: device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
     if device
         .get_func("normal_bf16_kernel", "normal_bf16_kernel")

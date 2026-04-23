@@ -92,6 +92,9 @@ impl CudaTensor {
             device: gradient.device.clone(),
             id: crate::tensor::TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
         let self_tensor = Tensor {
             storage: crate::tensor_storage::TensorStorage::F32 {
@@ -102,6 +105,9 @@ impl CudaTensor {
             device: self.device.clone(),
             id: crate::tensor::TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
         let updated = kernels.update_weights(&self_tensor, &gradient_tensor, lr)?;
         // Extract the data from the Arc - we need to clone it
@@ -177,6 +183,9 @@ impl CudaTensor {
                 device: self.device.clone(),
                 id: crate::tensor::TensorId::new(),
                 requires_grad: false,
+                custom_strides: None,
+                view_offset: 0,
+
             };
             let other_tensor = Tensor {
                 storage: crate::tensor_storage::TensorStorage::F32 {
@@ -187,6 +196,9 @@ impl CudaTensor {
                 device: other.device.clone(),
                 id: crate::tensor::TensorId::new(),
                 requires_grad: false,
+                custom_strides: None,
+                view_offset: 0,
+
             };
             let result = kernels.add(&self_tensor, &other_tensor)?;
             // Extract data from result's storage
@@ -223,6 +235,9 @@ impl CudaTensor {
             device: self.device.clone(),
             id: crate::tensor::TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
         let other_tensor = Tensor {
             storage: crate::tensor_storage::TensorStorage::F32 {
@@ -233,6 +248,9 @@ impl CudaTensor {
             device: other.device.clone(),
             id: crate::tensor::TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
         let result = kernels.mul(&self_tensor, &other_tensor)?;
         // Extract data from result's storage
@@ -257,6 +275,9 @@ impl CudaTensor {
             device: self.device.clone(),
             id: crate::tensor::TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
         let result = kernels.mul_scalar(&self_tensor, scalar)?;
         // Extract data from result's storage
@@ -281,6 +302,9 @@ impl CudaTensor {
             device: self.device.clone(),
             id: crate::tensor::TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
         let result = kernels.relu(&self_tensor)?;
         // Extract data from result's storage
@@ -331,6 +355,9 @@ impl CudaTensor {
             device: self.device.clone(),
             id: crate::tensor::TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
         let sum_result = kernels.sum_kernel(&self_tensor)?;
 

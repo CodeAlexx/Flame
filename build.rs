@@ -40,19 +40,79 @@ fn main() {
         );
     }
 
-    // Check for cuDNN in python venvs
-    let cudnn_paths = [
+    // Locate cuDNN. Needed for link-search (so `#[link(name="cudnn")]` resolves),
+    // for -rpath so binaries find libcudnn at runtime, and to pass the include
+    // dir to the cudnn_sdpa.cpp cc::Build below.
+    //
+    // pip's cuDNN wheels ship ONLY versioned `libfoo.so.9` files — no
+    // unversioned `.so` symlinks. A plain `-lcudnn` / `-lcudnn_graph` can't
+    // find those. We build a "stub" directory under OUT_DIR with symlinks
+    // (`libcudnn.so -> libcudnn.so.9`, etc.) and add that dir to the link
+    // search path FIRST so every `-l<name>` resolves without touching the
+    // caller's system.
+    let cudnn_lib_candidates = [
+        "/home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib",
         "/home/alex/serenity/venv/lib/python3.12/site-packages/nvidia/cudnn/lib",
         "/home/alex/SimpleTuner/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib",
         "/home/alex/SimpleTuner/.venv/lib/python3.11/site-packages/nvidia/cudnn/lib",
+        "/home/alex/.serenity/cudnn/lib",
+        "/home/alex/libtorch-cu124/libtorch/lib",
     ];
-    for venv_cudnn in &cudnn_paths {
-        if Path::new(venv_cudnn).exists() {
-            println!("cargo:rustc-link-search=native={}", venv_cudnn);
-            // Set rpath so binary finds libcudnn at runtime
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", venv_cudnn);
+    let mut cudnn_lib: Option<String> = None;
+    let mut cudnn_include: Option<String> = None;
+    for candidate in &cudnn_lib_candidates {
+        if Path::new(candidate).join("libcudnn_graph.so.9").exists() {
+            println!("cargo:rustc-link-search=native={}", candidate);
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", candidate);
+            cudnn_lib = Some((*candidate).to_string());
+            // Prefer sibling `include/` next to the discovered `lib/`.
+            let sibling = Path::new(candidate)
+                .parent()
+                .map(|p| p.join("include"));
+            if let Some(s) = sibling {
+                if s.exists() {
+                    cudnn_include = Some(s.to_string_lossy().into_owned());
+                }
+            }
             break;
         }
+    }
+    let cudnn_lib = cudnn_lib.unwrap_or_else(|| {
+        panic!(
+            "cuDNN not found (looked for libcudnn_graph.so.9 in {:?}). Install \
+             nvidia-cudnn-cu12 via pip or add its lib dir to cudnn_lib_candidates.",
+            cudnn_lib_candidates
+        )
+    });
+
+    // Build OUT_DIR/cudnn_stubs/ with unversioned symlinks. We need the
+    // symlinks for `-lcudnn` (via `#[link(name="cudnn")]`) and for
+    // `-lcudnn_graph` below. Doing it here keeps the caller's cuDNN dir
+    // untouched.
+    {
+        let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
+        let stub_dir = PathBuf::from(&out_dir).join("cudnn_stubs");
+        std::fs::create_dir_all(&stub_dir)
+            .expect("create cudnn stub dir");
+        for (unversioned, versioned) in [
+            ("libcudnn.so", "libcudnn.so.9"),
+            ("libcudnn_graph.so", "libcudnn_graph.so.9"),
+        ] {
+            let link_path = stub_dir.join(unversioned);
+            let target = Path::new(&cudnn_lib).join(versioned);
+            if !target.exists() {
+                panic!(
+                    "cuDNN: expected {} in {} but it is missing",
+                    versioned, cudnn_lib
+                );
+            }
+            // Remove stale symlink if cuDNN dir moved.
+            let _ = std::fs::remove_file(&link_path);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &link_path)
+                .unwrap_or_else(|e| panic!("symlink {:?} -> {:?}: {e}", link_path, target));
+        }
+        println!("cargo:rustc-link-search=native={}", stub_dir.display());
     }
 
     println!("cargo:warning=CUDA_HOME={cuda_home}");
@@ -244,6 +304,38 @@ fn main() {
         .include(format!("{cuda_home}/include"))
         .flag_if_supported("-std=c++17")
         .compile("flame_cuda_ffi");
+
+    // ---- cuDNN v9 Flash SDPA host shim ----
+    // Host-only C++17. Does not participate in `-rdc=true` device link above:
+    // pure cuDNN graph API calls from the host, no CUDA __global__ code here.
+    println!("cargo:rerun-if-changed=src/cuda/cudnn_sdpa.cpp");
+    println!("cargo:rerun-if-changed=third_party/cudnn_frontend/include");
+    let mut sdpa_build = cc::Build::new();
+    sdpa_build
+        .cpp(true)
+        .file("src/cuda/cudnn_sdpa.cpp")
+        .include("third_party/cudnn_frontend/include")
+        .include(format!("{cuda_home}/include"))
+        .flag("-std=c++17")
+        .flag("-O2")
+        // cudnn_frontend headers trigger a lot of narrow warnings that are not
+        // ours to fix; silence them without hiding errors.
+        .flag_if_supported("-Wno-deprecated-declarations")
+        .flag_if_supported("-Wno-unused-parameter")
+        .flag_if_supported("-Wno-unused-variable")
+        .flag_if_supported("-Wno-unused-but-set-variable")
+        .flag_if_supported("-Wno-sign-compare")
+        .flag_if_supported("-Wno-reorder");
+    if let Some(inc) = &cudnn_include {
+        sdpa_build.include(inc);
+    }
+    sdpa_build.compile("flame_cudnn_sdpa");
+
+    // Link the libraries cudnn_frontend touches beyond base `cudnn`.
+    // `cudnn` itself is already linked via `#[link(name="cudnn")]` in
+    // `src/cudnn/handle.rs`.
+    println!("cargo:rustc-link-lib=dylib=cudnn_graph");
+    println!("cargo:rustc-link-lib=dylib=nvrtc");
 }
 
 #[cfg(not(feature = "cuda"))]

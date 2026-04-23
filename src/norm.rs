@@ -796,6 +796,9 @@ fn rms_norm_forward_bf16(
         device: device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     Ok(RmsNormForwardArtifacts {
@@ -860,6 +863,9 @@ pub(crate) fn rms_norm_backward(
             device,
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
         Some(grad_weight_f32_tensor.to_dtype(DType::BF16)?)
     } else {
@@ -954,6 +960,9 @@ fn rms_norm_backward_bf16(
         device: device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     Ok((grad_input, grad_weight_data))
@@ -1124,6 +1133,9 @@ pub fn rms_norm(
                 device: input.device.clone(),
                 id: TensorId::new(),
                 requires_grad: false,
+                custom_strides: None,
+                view_offset: 0,
+
             };
             let inv_rms_id = inv_rms_tensor.id;
             saved_tensors.push((inv_rms_id, inv_rms_tensor));

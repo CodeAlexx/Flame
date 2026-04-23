@@ -945,9 +945,24 @@ fn gemm_bf16_into_impl(
     debug_assert!(Arc::ptr_eq(out.device(), x.device()));
     debug_assert_eq!(out.shape().dims(), &[m, n]);
 
-    let stream = default_stream(x);
-    let vx = tensor_as_view_bf16(x, "gemm_bf16:x")?;
-    let vw = tensor_as_view_bf16(w, "gemm_bf16:w")?;
+    // Stride refactor: `fc_gemm_bf16` walks storage linearly; strided views
+    // (post-permute / narrow) would produce wrong output. Materialize here
+    // once. No-op when caller already passes contiguous. For cuBLASLt paths
+    // that accept lda/ldb we could skip this — separate work.
+    let x = x.contiguous()?;
+    let w = w.contiguous()?;
+    let b_owned;
+    let bias = match bias {
+        Some(b) => {
+            b_owned = b.contiguous()?;
+            Some(&b_owned)
+        }
+        None => None,
+    };
+
+    let stream = default_stream(&x);
+    let vx = tensor_as_view_bf16(&x, "gemm_bf16:x")?;
+    let vw = tensor_as_view_bf16(&w, "gemm_bf16:w")?;
     let vb = bias
         .map(|b| tensor_as_view_bf16(b, "gemm_bf16:bias"))
         .transpose()?;

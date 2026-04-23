@@ -409,6 +409,17 @@ impl CudaStream {
 use crate::{DType, Error, Result, Tensor};
 
 /// Convert a BF16 tensor into the FFI view structure.
+///
+/// Stride refactor Phase 2b: the FcTensorView carries REAL strides from
+/// `tensor.strides()`, which respects `custom_strides` set by view ops
+/// (permute/transpose/narrow/chunk). Downstream C kernels that honor
+/// `strides[]` (e.g. cuBLASLt via lda/ldb/ldc) consume views directly;
+/// kernels that ignore strides and walk linearly are the caller's
+/// responsibility to guard via `.contiguous()`.
+///
+/// Pre-Phase-2 the codebase produced contiguous tensors only and
+/// `shape.strides()` (row-major computed) always equaled real strides.
+/// With Phase 2 views, the two can differ and we must carry the real ones.
 pub fn tensor_as_view_bf16(tensor: &Tensor, tag: &str) -> Result<FcTensorView> {
     if tensor.dtype() != DType::BF16 {
         return Err(Error::InvalidInput(
@@ -417,11 +428,18 @@ pub fn tensor_as_view_bf16(tensor: &Tensor, tag: &str) -> Result<FcTensorView> {
     }
     let shape = tensor.shape();
     let rank = shape.rank() as i32;
+    if rank as usize > 8 {
+        return Err(Error::InvalidInput(format!(
+            "{tag}: tensor_as_view_bf16 supports rank ≤ 8, got {}",
+            rank
+        )));
+    }
     let mut dims = [0i64; 8];
     let mut strides = [0i64; 8];
+    let real_strides = tensor.strides();
     for i in 0..rank as usize {
         dims[i] = shape.dims()[i] as i64;
-        strides[i] = shape.strides()[i] as i64;
+        strides[i] = real_strides[i] as i64;
     }
     let ptr = tensor.as_device_ptr_bf16(tag)? as *mut c_void;
     Ok(FcTensorView {
@@ -468,11 +486,18 @@ pub fn tensor_as_view_bf16_mut(tensor: &mut Tensor, tag: &str) -> Result<FcTenso
     }
     let shape = tensor.shape();
     let rank = shape.rank() as i32;
+    if rank as usize > 8 {
+        return Err(Error::InvalidInput(format!(
+            "{tag}: tensor_as_view_bf16_mut supports rank ≤ 8, got {}",
+            rank
+        )));
+    }
     let mut dims = [0i64; 8];
     let mut strides = [0i64; 8];
+    let real_strides = tensor.strides();
     for i in 0..rank as usize {
         dims[i] = shape.dims()[i] as i64;
-        strides[i] = shape.strides()[i] as i64;
+        strides[i] = real_strides[i] as i64;
     }
     let ptr = tensor.as_mut_device_ptr_bf16(tag)? as *mut c_void;
     Ok(FcTensorView {

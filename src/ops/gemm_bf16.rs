@@ -21,6 +21,15 @@ pub fn bmm_bf16_fp32acc_out(
         ));
     }
 
+    // Stride refactor Phase 2a safety net: this cuBLASLt path derives lda/ldb
+    // from contiguous shape. A strided view would silently read the wrong
+    // memory. Phase 2b will teach trans_a/trans_b to absorb per-input
+    // transposes directly so callers can pass permute-views.
+    let a_owned;
+    let a = if a.is_contiguous() { a } else { a_owned = a.contiguous()?; &a_owned };
+    let b_owned;
+    let b = if b.is_contiguous() { b } else { b_owned = b.contiguous()?; &b_owned };
+
     let ashp = a.shape().dims();
     let bshp = b.shape().dims();
     let oshp = out.shape().dims();
@@ -134,6 +143,14 @@ pub fn matmul_bf16_trans(
             "matmul_bf16_trans: both inputs must be BF16".into(),
         ));
     }
+
+    // Stride refactor Phase 2a safety net: cuBLASLt path derives strides
+    // from contiguous shape; trans_a / trans_b only flip cuBLAS's logical
+    // interpretation, they don't accept arbitrary strided views yet.
+    let a_owned;
+    let a = if a.is_contiguous() { a } else { a_owned = a.contiguous()?; &a_owned };
+    let b_owned;
+    let b = if b.is_contiguous() { b } else { b_owned = b.contiguous()?; &b_owned };
 
     let a_dims = a.shape().dims();
     let b_dims = b.shape().dims();

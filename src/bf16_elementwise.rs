@@ -401,6 +401,9 @@ fn launch_bf16_elementwise(
         device: a.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     let f = ensure_and_get(&a.device, kernel_name, CUDA_ADD_MUL_BF16)?;
@@ -585,6 +588,9 @@ pub fn abs_bf16(x: &Tensor) -> Result<Tensor> {
         device: x.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     let f = ensure_and_get(&x.device, "abs_bf16_kernel", CUDA_ABS_BF16)?;
@@ -637,6 +643,9 @@ pub fn softmax_lastdim_bf16(x: &Tensor) -> Result<Tensor> {
         device: x.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     let f = ensure_and_get(&x.device, "softmax_lastdim_bf16_kernel", CUDA_SOFTMAX_LASTDIM_BF16)?;
@@ -721,6 +730,9 @@ fn launch_bf16_flat(
         device: a.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     let f = ensure_and_get(&a.device, kernel_name, CUDA_ADD_MUL_BF16_FLAT)?;
@@ -761,6 +773,14 @@ pub fn transpose2d_bf16(tensor: &Tensor) -> Result<Tensor> {
             "transpose2d_bf16 expects BF16 tensor".into(),
         ));
     }
+    // Stride refactor Phase 2a safety net: the kernel walks storage linearly.
+    let tensor_owned;
+    let tensor = if tensor.is_contiguous() {
+        tensor
+    } else {
+        tensor_owned = tensor.contiguous()?;
+        &tensor_owned
+    };
     let dims = tensor.shape().dims();
     if dims.len() != 2 {
         return Err(Error::InvalidInput(format!(
@@ -856,6 +876,9 @@ fn cmp_bf16(a: &Tensor, b: &Tensor, op: i32) -> Result<Tensor> {
         device: a.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     let f = ensure_and_get(&a.device, "cmp_bf16_kernel", CUDA_CMP_BF16)?;

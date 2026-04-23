@@ -44,6 +44,9 @@ pub fn clamp_bf16(x: &Tensor, lo: f32, hi: f32) -> Result<Tensor> {
         device: x.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
     if x.device
         .get_func("clamp_bf16_kernel", "clamp_bf16_kernel")

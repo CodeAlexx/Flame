@@ -130,6 +130,9 @@ pub fn gelu_bf16(x: &Tensor) -> Result<Tensor> {
         device: x.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
     ensure(&x.device, "gelu_bf16_kernel", CUDA_GELU)?;
     let f = x
@@ -164,6 +167,9 @@ pub fn square_bf16(x: &Tensor) -> Result<Tensor> {
         device: x.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
     ensure(&x.device, "square_bf16_kernel", CUDA_SQUARE)?;
     let f = x
@@ -259,6 +265,9 @@ pub fn softmax_last_dim_bf16(x: &Tensor) -> Result<Tensor> {
         device: x.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
     ensure(
         &x.device,
@@ -310,6 +319,9 @@ pub fn silu_bf16(x: &Tensor) -> Result<Tensor> {
         device: x.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
     ensure(&x.device, "silu_bf16_kernel", CUDA_SILU)?;
     let f = x
@@ -481,6 +493,9 @@ pub fn rope_fused_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor>
         device: x.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     ensure(&x.device, "rope_fused_bf16_kernel", CUDA_ROPE_FUSED)?;
@@ -573,6 +588,9 @@ pub fn rope_fused_bf16_f32pe(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<T
         device: x.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     ensure(&x.device, "rope_fused_bf16_f32pe_kernel", CUDA_ROPE_FUSED)?;
@@ -656,6 +674,9 @@ pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Ten
         device: x.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     ensure(&x.device, "rope_halfsplit_bf16_kernel", CUDA_ROPE_FUSED)?;
@@ -817,6 +838,9 @@ pub fn modulate_pre_fused_bf16(
         device: x.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     ensure(&x.device, "modulate_pre_bf16_kernel", CUDA_MODULATE_PRE)?;
@@ -900,6 +924,9 @@ pub fn gate_residual_fused_bf16(
         device: residual.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     ensure(&residual.device, "gate_residual_bf16_kernel", CUDA_GATE_RESIDUAL)?;
@@ -953,6 +980,9 @@ pub fn swiglu_fused_bf16(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         device: gate.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     ensure(&gate.device, "swiglu_fused_bf16_kernel", CUDA_SWIGLU_FUSED)?;
@@ -1059,6 +1089,9 @@ pub fn attn_split_txt_img_bf16(
         device: attn_out.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
     let mut img = Tensor {
         storage: TensorStorage::BF16 { data: img_data.into(), numel: img_numel },
@@ -1066,6 +1099,9 @@ pub fn attn_split_txt_img_bf16(
         device: attn_out.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     ensure(&attn_out.device, "attn_split_txt_img_bf16_kernel", CUDA_ATTN_SPLIT_TXT_IMG)?;
@@ -1270,6 +1306,9 @@ fn _qkv_rmsnorm_rope_cat_bf16_reserved(
         device: img_qkv.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
     let mut k = Tensor {
         storage: TensorStorage::BF16 { data: k_data.into(), numel: out_numel },
@@ -1277,6 +1316,9 @@ fn _qkv_rmsnorm_rope_cat_bf16_reserved(
         device: img_qkv.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
     let mut v = Tensor {
         storage: TensorStorage::BF16 { data: v_data.into(), numel: out_numel },
@@ -1284,6 +1326,9 @@ fn _qkv_rmsnorm_rope_cat_bf16_reserved(
         device: img_qkv.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     ensure(
@@ -1442,6 +1487,9 @@ pub fn qkv_split_permute_bf16(
         device: qkv.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
     let mut k = Tensor {
         storage: TensorStorage::BF16 { data: k_data.into(), numel: out_numel },
@@ -1449,6 +1497,9 @@ pub fn qkv_split_permute_bf16(
         device: qkv.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
     let mut v = Tensor {
         storage: TensorStorage::BF16 { data: v_data.into(), numel: out_numel },
@@ -1456,6 +1507,9 @@ pub fn qkv_split_permute_bf16(
         device: qkv.device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     ensure(&qkv.device, "qkv_split_permute_bf16_kernel", CUDA_QKV_SPLIT_PERMUTE)?;

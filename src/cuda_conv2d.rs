@@ -169,6 +169,9 @@ impl CudaConv2d {
             device: device.clone(),
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
 
         let weight_matrix = weight
@@ -427,6 +430,9 @@ impl CudaConv2d {
             device: device.clone(),
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
 
         // grad_weight = grad_output^T @ input_col
@@ -493,6 +499,9 @@ impl CudaConv2d {
             device: device.clone(),
             id: TensorId::new(),
             requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+
         };
 
         // Bias gradient is sum over batch and spatial dimensions
@@ -523,6 +532,9 @@ impl CudaConv2d {
                 device: device.clone(),
                 id: TensorId::new(),
                 requires_grad: false,
+                custom_strides: None,
+                view_offset: 0,
+
             })
         } else {
             None

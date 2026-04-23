@@ -387,6 +387,9 @@ pub fn layer_norm(
                 device: device.clone(),
                 id: crate::tensor::TensorId::new(),
                 requires_grad: false,
+                custom_strides: None,
+                view_offset: 0,
+
             };
             let rstd_tensor = Tensor {
                 storage: TensorStorage::F32 {
@@ -397,6 +400,9 @@ pub fn layer_norm(
                 device: device.clone(),
                 id: crate::tensor::TensorId::new(),
                 requires_grad: false,
+                custom_strides: None,
+                view_offset: 0,
+
             };
 
             saved_tensors.push((mean_tensor.id, mean_tensor));
@@ -661,6 +667,9 @@ fn layer_norm_forward_f32(
         device: device.clone(),
         id: crate::tensor::TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     Ok(LayerNormForwardArtifacts {

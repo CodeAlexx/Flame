@@ -27,9 +27,6 @@ pub mod linear;
 pub mod norm;
 
 #[cfg(feature = "cudnn")]
-pub mod attention;
-
-#[cfg(feature = "cudnn")]
 pub mod activation;
 
 // Core operations
@@ -52,12 +49,11 @@ pub use norm::{
     cudnn_batch_norm, cudnn_group_norm, cudnn_layer_norm, cudnn_rms_norm, is_cudnn_norm_compatible,
 };
 
-// Attention operations
-#[cfg(feature = "cudnn")]
-pub use attention::{
-    cudnn_flash_attention, cudnn_multi_head_attention, cudnn_scaled_dot_product_attention,
-    is_cudnn_attention_compatible,
-};
+// Attention: intentionally absent. The real cuDNN v9 SDPA wire-in lives in
+// `src/cuda/cudnn_sdpa.c` (C shim) and is exposed via `cuda::ffi`. A previous
+// `cudnn/attention.rs` was a stub that did matmul+softmax+matmul while
+// printing "Using cuDNN Flash Attention" — deleted 2026-04-22, had zero
+// callers outside itself.
 
 // Activation operations
 #[cfg(feature = "cudnn")]

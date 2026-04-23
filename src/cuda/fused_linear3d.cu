@@ -1,18 +1,25 @@
 // fused_linear3d.cu
-// Strided batched GEMM via cublasLt for 3D linear: no reshape kernels.
+// Single-call cublasLt GEMM for 3D linear: no reshape kernels.
 //
 // Row-major: output[B,N,Cout] = input[B,N,Cin] @ weight[Cin,Cout] + bias[Cout]
 //
 // Col-major trick: C^T = B^T @ A^T
 //   A (first operand in cublasLt)  = weight^T = [Cout,Cin] col-major = weight[Cin,Cout] row-major
-//   B (second operand in cublasLt) = input^T  = [Cin,N]   col-major = input[N,Cin]      row-major
-//   C (result in cublasLt)         = output^T = [Cout,N]  col-major = output[N,Cout]     row-major
+//   B (second operand in cublasLt) = input^T  = [Cin,N']   col-major = input[N',Cin]    row-major
+//   C (result in cublasLt)         = output^T = [Cout,N']  col-major = output[N',Cout]  row-major
+// where N' = B * N (batch folded into the sequence dim — see below).
 //
-// m=Cout, n=N, k=Cin
+// m=Cout, n=N', k=Cin
 // lda=Cout (leading dim of weight in col-major), ldb=Cin (leading dim of input in col-major)
 // ldc=Cout (leading dim of output in col-major)
 //
-// Weight is broadcast across batches (stride=0).
+// Batch handling: Linear is a per-position op and the [B, N, C] buffers are
+// row-major contiguous, so [B, N, C] and [1, B*N, C] share bit-identical
+// memory. We collapse the batch into the sequence dim (N' = B*N) and run as
+// one non-batched GEMM. This avoids a cuBLASLt heuristic gap that returned
+// CUBLAS_STATUS_INVALID_VALUE (err 7) at B>1 for the mixed-batch
+// configuration (BATCH_COUNT=1 on weight, BATCH_COUNT=B on input/output).
+//
 // Bias fused via CUBLASLT_EPILOGUE_BIAS.
 
 #include <cuda_bf16.h>
@@ -39,9 +46,17 @@ int flame_linear3d_bf16(
     cublasLtMatrixLayout_t layoutA, layoutB, layoutC;
     cublasStatus_t status;
 
-    // m=Cout, n=seq_len, k=Cin (col-major trick: swap operands)
+    // Linear is a per-position op, and the [B, N, C] buffers are row-major
+    // contiguous, so [B, N, C] and [1, B*N, C] are bit-identical in memory.
+    // Collapse the batch into the sequence dim and run as a single non-batched
+    // GEMM. This gives us BATCH_COUNT=1 on all three layouts, which sidesteps
+    // the cuBLASLt heuristic gap that rejects mixed-batch (weight batch=1 vs
+    // input/output batch=B) configurations for certain (M, N, K) at B>1.
+    int n_eff = (batch_size > 0 ? batch_size : 1) * seq_len;
+
+    // m=Cout, n=seq_len*batch, k=Cin (col-major trick: swap operands)
     int m = out_features;
-    int n = seq_len;
+    int n = n_eff;
     int k = in_features;
 
     // Create matmul descriptor: BF16 data, FP32 compute
@@ -62,27 +77,24 @@ int flame_linear3d_bf16(
         cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &biasType, sizeof(biasType));
     }
 
-    // A = weight: [m=Cout, k=Cin] col-major, lda=Cout
-    // No batch (broadcast): batch=1, stride=0
+    // All three layouts use BATCH_COUNT=1 (the batch has been folded into n).
     int batchOne = 1;
     int64_t strideZero = 0;
+
+    // A = weight: [m=Cout, k=Cin] col-major, lda=Cout
     cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_16BF, m, k, m);
     cublasLtMatrixLayoutSetAttribute(layoutA, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batchOne, sizeof(batchOne));
     cublasLtMatrixLayoutSetAttribute(layoutA, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideZero, sizeof(strideZero));
 
-    // B = input: [k=Cin, n=seq_len] col-major, ldb=Cin
-    // Batched: batch=batch_size, stride=seq_len*in_features
-    int64_t strideB = (int64_t)n * k;
+    // B = input: [k=Cin, n=B*seq_len] col-major, ldb=Cin
     cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_16BF, k, n, k);
-    cublasLtMatrixLayoutSetAttribute(layoutB, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_size, sizeof(batch_size));
-    cublasLtMatrixLayoutSetAttribute(layoutB, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideB, sizeof(strideB));
+    cublasLtMatrixLayoutSetAttribute(layoutB, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batchOne, sizeof(batchOne));
+    cublasLtMatrixLayoutSetAttribute(layoutB, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideZero, sizeof(strideZero));
 
-    // C = output: [m=Cout, n=seq_len] col-major, ldc=Cout
-    // Batched: batch=batch_size, stride=seq_len*out_features
-    int64_t strideC = (int64_t)n * m;
+    // C = output: [m=Cout, n=B*seq_len] col-major, ldc=Cout
     cublasLtMatrixLayoutCreate(&layoutC, CUDA_R_16BF, m, n, m);
-    cublasLtMatrixLayoutSetAttribute(layoutC, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_size, sizeof(batch_size));
-    cublasLtMatrixLayoutSetAttribute(layoutC, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideC, sizeof(strideC));
+    cublasLtMatrixLayoutSetAttribute(layoutC, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batchOne, sizeof(batchOne));
+    cublasLtMatrixLayoutSetAttribute(layoutC, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideZero, sizeof(strideZero));
 
     float alpha = 1.0f;
     float beta = 0.0f;
@@ -150,8 +162,16 @@ int flame_linear3d_bf16_native(
     cublasLtMatrixLayout_t layoutA, layoutB, layoutC;
     cublasStatus_t status;
 
+    // Linear is a per-position op, and the [B, N, C] buffers are row-major
+    // contiguous, so [B, N, C] and [1, B*N, C] are bit-identical in memory.
+    // Collapse batch into the sequence dim and run as a single non-batched
+    // GEMM. With BATCH_COUNT=1 on all three layouts we avoid the cuBLASLt
+    // heuristic gap that returned CUBLAS_STATUS_INVALID_VALUE (err 7) for the
+    // (weight batch=1, input/output batch=B) mixed-batch configuration at B>1.
+    int n_eff = (batch_size > 0 ? batch_size : 1) * seq_len;
+
     int m = out_features;
-    int n = seq_len;
+    int n = n_eff;
     int k = in_features;
 
     status = cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
@@ -172,25 +192,25 @@ int flame_linear3d_bf16_native(
         cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &biasType, sizeof(biasType));
     }
 
-    // A = weight: stored col-major as [k=Cin, m=Cout], lda = k
-    // After TRANSA=T, cuBLAS sees A as [m, k].
+    // All three layouts use BATCH_COUNT=1 (the batch has been folded into n).
     int batchOne = 1;
     int64_t strideZero = 0;
+
+    // A = weight: stored col-major as [k=Cin, m=Cout], lda = k.
+    // After TRANSA=T, cuBLAS sees A as [m, k].
     cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_16BF, k, m, k);
     cublasLtMatrixLayoutSetAttribute(layoutA, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batchOne, sizeof(batchOne));
     cublasLtMatrixLayoutSetAttribute(layoutA, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideZero, sizeof(strideZero));
 
-    // B = input: [k=Cin, n=seq_len] col-major, ldb = k
-    int64_t strideB = (int64_t)n * k;
+    // B = input: [k=Cin, n=B*seq_len] col-major, ldb = k
     cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_16BF, k, n, k);
-    cublasLtMatrixLayoutSetAttribute(layoutB, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_size, sizeof(batch_size));
-    cublasLtMatrixLayoutSetAttribute(layoutB, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideB, sizeof(strideB));
+    cublasLtMatrixLayoutSetAttribute(layoutB, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batchOne, sizeof(batchOne));
+    cublasLtMatrixLayoutSetAttribute(layoutB, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideZero, sizeof(strideZero));
 
-    // C = output: [m=Cout, n=seq_len] col-major, ldc = m
-    int64_t strideC = (int64_t)n * m;
+    // C = output: [m=Cout, n=B*seq_len] col-major, ldc = m
     cublasLtMatrixLayoutCreate(&layoutC, CUDA_R_16BF, m, n, m);
-    cublasLtMatrixLayoutSetAttribute(layoutC, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_size, sizeof(batch_size));
-    cublasLtMatrixLayoutSetAttribute(layoutC, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideC, sizeof(strideC));
+    cublasLtMatrixLayoutSetAttribute(layoutC, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batchOne, sizeof(batchOne));
+    cublasLtMatrixLayoutSetAttribute(layoutC, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideZero, sizeof(strideZero));
 
     float alpha = 1.0f;
     float beta = 0.0f;

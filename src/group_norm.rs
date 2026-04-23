@@ -308,6 +308,9 @@ fn group_norm_forward_f32(
         device: device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     Ok(GroupNormForwardArtifacts {
@@ -405,6 +408,9 @@ fn finalize_group_norm(
                 device: input.device.clone(),
                 id: TensorId::new(),
                 requires_grad: false,
+                custom_strides: None,
+                view_offset: 0,
+
             };
             let var_tensor = Tensor {
                 storage: TensorStorage::F32 {
@@ -415,6 +421,9 @@ fn finalize_group_norm(
                 device: input.device.clone(),
                 id: TensorId::new(),
                 requires_grad: false,
+                custom_strides: None,
+                view_offset: 0,
+
             };
 
             saved_tensors.push((mean_tensor.id, mean_tensor));

@@ -38,6 +38,9 @@ pub fn zeros_bf16(shape: Shape, device: Arc<CudaDevice>) -> Result<Tensor> {
         device,
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     })
 }
 
@@ -96,6 +99,9 @@ pub fn uniform_bf16(
         device: device.clone(),
         id: TensorId::new(),
         requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+
     };
 
     // Compile once and launch
