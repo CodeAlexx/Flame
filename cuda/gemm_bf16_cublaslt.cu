@@ -5,8 +5,11 @@
 #include <cublasLt.h>
 
 #include <cstdlib>
+#include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <limits>
+#include <unordered_map>
 #include <vector>
 
 extern "C" cublasStatus_t gemm_bf16_fp32acc_stridedBatched(
@@ -202,6 +205,76 @@ struct LtPreference {
     }
 };
 
+// Per-shape cache. Without this, every GEMM rebuilds 5 descriptors and
+// runs cublasLtMatmulAlgoGetHeuristic (which internally issues tens of
+// 64-byte D2D copies for algorithm-descriptor propagation). nsys on Klein
+// 9B showed 147k of those tiny copies per step — more than the entire
+// gap to PyTorch. PyTorch's ATen caches the winning algo per (M,N,K);
+// this is the same treatment.
+//
+// The raw handles (op/layouts/pref) are leaked on process exit. That's
+// fine — there's one entry per unique shape, bounded by the model's
+// kernel roster. Each entry is ~few hundred bytes of host memory.
+struct LtMatmulKey {
+    int64_t m;
+    int64_t n;
+    int64_t k;
+    int64_t stride_a;
+    int64_t stride_b;
+    int64_t stride_c;
+    int64_t bias_stride;
+    int32_t batch_count;
+    int32_t has_bias;
+    int64_t lda;
+    int64_t ldb;
+    int64_t ldc;
+
+    bool operator==(const LtMatmulKey& o) const noexcept {
+        return m == o.m && n == o.n && k == o.k &&
+               stride_a == o.stride_a && stride_b == o.stride_b &&
+               stride_c == o.stride_c && bias_stride == o.bias_stride &&
+               batch_count == o.batch_count && has_bias == o.has_bias &&
+               lda == o.lda && ldb == o.ldb && ldc == o.ldc;
+    }
+};
+
+struct LtMatmulKeyHash {
+    size_t operator()(const LtMatmulKey& k) const noexcept {
+        size_t h = 0xcbf29ce484222325ULL;
+        auto mix = [&](uint64_t v) {
+            h ^= v;
+            h *= 0x100000001b3ULL;
+        };
+        mix((uint64_t)k.m);
+        mix((uint64_t)k.n);
+        mix((uint64_t)k.k);
+        mix((uint64_t)k.stride_a);
+        mix((uint64_t)k.stride_b);
+        mix((uint64_t)k.stride_c);
+        mix((uint64_t)k.bias_stride);
+        mix((uint64_t)k.batch_count);
+        mix((uint64_t)k.has_bias);
+        mix((uint64_t)k.lda);
+        mix((uint64_t)k.ldb);
+        mix((uint64_t)k.ldc);
+        return h;
+    }
+};
+
+struct LtMatmulEntry {
+    cublasLtMatmulDesc_t     op         = nullptr;
+    cublasLtMatrixLayout_t   a_layout   = nullptr;
+    cublasLtMatrixLayout_t   b_layout   = nullptr;
+    cublasLtMatrixLayout_t   c_layout   = nullptr;
+    cublasLtMatmulPreference_t pref     = nullptr;
+    cublasLtMatmulAlgo_t     algo;        // Winning algo from heuristic.
+    size_t                   workspace_bytes = 0;
+    bool                     algo_valid = false;
+};
+
+std::mutex g_lt_cache_mutex;
+std::unordered_map<LtMatmulKey, LtMatmulEntry, LtMatmulKeyHash> g_lt_cache;
+
 fc_status_t lt_matmul_run(const fc_tensor_view_t* a,
                           const fc_tensor_view_t* b,
                           const fc_tensor_view_t* bias,
@@ -217,29 +290,7 @@ fc_status_t lt_matmul_run(const fc_tensor_view_t* a,
         return FC_ERR_LAUNCH;
     }
 
-    LtDescriptor op_desc_holder;
-    LT_CHECK(cublasLtMatmulDescCreate(&op_desc_holder.op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-
-    cublasOperation_t op_n = CUBLAS_OP_N;
-    LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc_holder.op, CUBLASLT_MATMUL_DESC_TRANSA, &op_n, sizeof(op_n)));
-    LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc_holder.op, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)));
-
     const bool has_bias = bias && bias->data;
-    if (has_bias) {
-        cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
-        LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc_holder.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
-        const void* bias_ptr = bias->data;
-        LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc_holder.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_ptr, sizeof(bias_ptr)));
-        cublasDataType_t bias_type = CUDA_R_16BF;
-        LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc_holder.op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type, sizeof(bias_type)));
-        if (batch_count > 1 && bias_stride > 0) {
-            LT_CHECK(cublasLtMatmulDescSetAttribute(
-                op_desc_holder.op,
-                CUBLASLT_MATMUL_DESC_BIAS_BATCH_STRIDE,
-                &bias_stride,
-                sizeof(bias_stride)));
-        }
-    }
 
     const int64_t m64 = a->dims[a->rank - 2];
     const int64_t k64 = a->dims[a->rank - 1];
@@ -250,36 +301,27 @@ fc_status_t lt_matmul_run(const fc_tensor_view_t* a,
         n64 > std::numeric_limits<int32_t>::max()) {
         return FC_ERR_INVALID_ARGUMENT;
     }
-    LtLayout a_layout;
-    LtLayout b_layout;
-    LtLayout c_layout;
 
-    const int32_t m = static_cast<int32_t>(m64);
-    const int32_t k = static_cast<int32_t>(k64);
-    const int32_t n = static_cast<int32_t>(n64);
+    const int64_t lda = static_cast<int64_t>(a->strides[a->rank - 2]);
+    const int64_t ldb = static_cast<int64_t>(b->strides[b->rank - 2]);
+    const int64_t ldc = static_cast<int64_t>(c->strides[c->rank - 2]);
 
-    LT_CHECK(cublasLtMatrixLayoutCreate(&a_layout.layout, CUDA_R_16BF, static_cast<uint64_t>(m), static_cast<uint64_t>(k), static_cast<int64_t>(a->strides[a->rank - 2])));
-    LT_CHECK(cublasLtMatrixLayoutCreate(&b_layout.layout, CUDA_R_16BF, static_cast<uint64_t>(k), static_cast<uint64_t>(n), static_cast<int64_t>(b->strides[b->rank - 2])));
-    LT_CHECK(cublasLtMatrixLayoutCreate(&c_layout.layout, CUDA_R_16BF, static_cast<uint64_t>(m), static_cast<uint64_t>(n), static_cast<int64_t>(c->strides[c->rank - 2])));
+    LtMatmulKey key{};
+    key.m = m64;
+    key.n = n64;
+    key.k = k64;
+    key.stride_a = stride_a;
+    key.stride_b = stride_b;
+    key.stride_c = stride_c;
+    key.bias_stride = bias_stride;
+    key.batch_count = batch_count;
+    key.has_bias = has_bias ? 1 : 0;
+    key.lda = lda;
+    key.ldb = ldb;
+    key.ldc = ldc;
 
-    cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
-    LT_CHECK(cublasLtMatrixLayoutSetAttribute(a_layout.layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
-    LT_CHECK(cublasLtMatrixLayoutSetAttribute(b_layout.layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
-    LT_CHECK(cublasLtMatrixLayoutSetAttribute(c_layout.layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
-
-    if (batch_count > 1) {
-        LT_CHECK(cublasLtMatrixLayoutSetAttribute(a_layout.layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
-        LT_CHECK(cublasLtMatrixLayoutSetAttribute(b_layout.layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
-        LT_CHECK(cublasLtMatrixLayoutSetAttribute(c_layout.layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
-
-        LT_CHECK(cublasLtMatrixLayoutSetAttribute(a_layout.layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_a, sizeof(stride_a)));
-        LT_CHECK(cublasLtMatrixLayoutSetAttribute(b_layout.layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_b, sizeof(stride_b)));
-        LT_CHECK(cublasLtMatrixLayoutSetAttribute(c_layout.layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_c, sizeof(stride_c)));
-    }
-
-    LtPreference pref;
-    LT_CHECK(cublasLtMatmulPreferenceCreate(&pref.pref));
-
+    // Workspace: pulled from the same global pool the original path used.
+    // Sized once (per cap_bytes); reused across all cache entries.
     size_t workspace_bytes = linear_workspace_cap_bytes();
     void* workspace_ptr = nullptr;
     if (workspace_bytes > 0) {
@@ -289,27 +331,133 @@ fc_status_t lt_matmul_run(const fc_tensor_view_t* a,
         }
     }
 
-    LT_CHECK(cublasLtMatmulPreferenceSetAttribute(
-        pref.pref,
-        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-        &workspace_bytes,
-        sizeof(workspace_bytes)));
+    // Cache hit → skip all descriptor/heuristic work.
+    // Cache miss → build descriptors, run heuristic once, store the winner.
+    LtMatmulEntry entry;
+    {
+        std::lock_guard<std::mutex> lock(g_lt_cache_mutex);
+        auto it = g_lt_cache.find(key);
+        if (it != g_lt_cache.end()) {
+            entry = it->second;
+        }
+    }
 
-    cublasLtMatmulHeuristicResult_t results[8];
-    int returned_results = 0;
-    cublasStatus_t stat = cublasLtMatmulAlgoGetHeuristic(
-        lt,
-        op_desc_holder.op,
-        a_layout.layout,
-        b_layout.layout,
-        c_layout.layout,
-        c_layout.layout,
-        pref.pref,
-        sizeof(results) / sizeof(results[0]),
-        results,
-        &returned_results);
-    if (stat != CUBLAS_STATUS_SUCCESS || returned_results == 0) {
-        return FC_ERR_UNSUPPORTED;
+    if (!entry.algo_valid) {
+        // --- Build path: cache miss for this shape ---
+        LtDescriptor op_desc_holder;
+        LT_CHECK(cublasLtMatmulDescCreate(&op_desc_holder.op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+
+        cublasOperation_t op_n = CUBLAS_OP_N;
+        LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc_holder.op, CUBLASLT_MATMUL_DESC_TRANSA, &op_n, sizeof(op_n)));
+        LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc_holder.op, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)));
+
+        if (has_bias) {
+            cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+            LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc_holder.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+            // Note: BIAS_POINTER is set per-call below (pointer changes per
+            // invocation), not here. Only the epilogue type is baked into
+            // the cached descriptor.
+            cublasDataType_t bias_type = CUDA_R_16BF;
+            LT_CHECK(cublasLtMatmulDescSetAttribute(op_desc_holder.op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type, sizeof(bias_type)));
+            if (batch_count > 1 && bias_stride > 0) {
+                LT_CHECK(cublasLtMatmulDescSetAttribute(
+                    op_desc_holder.op,
+                    CUBLASLT_MATMUL_DESC_BIAS_BATCH_STRIDE,
+                    &bias_stride,
+                    sizeof(bias_stride)));
+            }
+        }
+
+        LtLayout a_layout_holder;
+        LtLayout b_layout_holder;
+        LtLayout c_layout_holder;
+
+        const int32_t m = static_cast<int32_t>(m64);
+        const int32_t k = static_cast<int32_t>(k64);
+        const int32_t n = static_cast<int32_t>(n64);
+
+        LT_CHECK(cublasLtMatrixLayoutCreate(&a_layout_holder.layout, CUDA_R_16BF, static_cast<uint64_t>(m), static_cast<uint64_t>(k), lda));
+        LT_CHECK(cublasLtMatrixLayoutCreate(&b_layout_holder.layout, CUDA_R_16BF, static_cast<uint64_t>(k), static_cast<uint64_t>(n), ldb));
+        LT_CHECK(cublasLtMatrixLayoutCreate(&c_layout_holder.layout, CUDA_R_16BF, static_cast<uint64_t>(m), static_cast<uint64_t>(n), ldc));
+
+        cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
+        LT_CHECK(cublasLtMatrixLayoutSetAttribute(a_layout_holder.layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
+        LT_CHECK(cublasLtMatrixLayoutSetAttribute(b_layout_holder.layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
+        LT_CHECK(cublasLtMatrixLayoutSetAttribute(c_layout_holder.layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
+
+        if (batch_count > 1) {
+            LT_CHECK(cublasLtMatrixLayoutSetAttribute(a_layout_holder.layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+            LT_CHECK(cublasLtMatrixLayoutSetAttribute(b_layout_holder.layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+            LT_CHECK(cublasLtMatrixLayoutSetAttribute(c_layout_holder.layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+
+            LT_CHECK(cublasLtMatrixLayoutSetAttribute(a_layout_holder.layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_a, sizeof(stride_a)));
+            LT_CHECK(cublasLtMatrixLayoutSetAttribute(b_layout_holder.layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_b, sizeof(stride_b)));
+            LT_CHECK(cublasLtMatrixLayoutSetAttribute(c_layout_holder.layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_c, sizeof(stride_c)));
+        }
+
+        LtPreference pref_holder;
+        LT_CHECK(cublasLtMatmulPreferenceCreate(&pref_holder.pref));
+        LT_CHECK(cublasLtMatmulPreferenceSetAttribute(
+            pref_holder.pref,
+            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &workspace_bytes,
+            sizeof(workspace_bytes)));
+
+        cublasLtMatmulHeuristicResult_t results[8];
+        int returned_results = 0;
+        cublasStatus_t stat = cublasLtMatmulAlgoGetHeuristic(
+            lt,
+            op_desc_holder.op,
+            a_layout_holder.layout,
+            b_layout_holder.layout,
+            c_layout_holder.layout,
+            c_layout_holder.layout,
+            pref_holder.pref,
+            sizeof(results) / sizeof(results[0]),
+            results,
+            &returned_results);
+        if (stat != CUBLAS_STATUS_SUCCESS || returned_results == 0) {
+            return FC_ERR_UNSUPPORTED;
+        }
+
+        // Release ownership from RAII wrappers — these now live in the cache.
+        entry.op         = op_desc_holder.op;     op_desc_holder.op = nullptr;
+        entry.a_layout   = a_layout_holder.layout; a_layout_holder.layout = nullptr;
+        entry.b_layout   = b_layout_holder.layout; b_layout_holder.layout = nullptr;
+        entry.c_layout   = c_layout_holder.layout; c_layout_holder.layout = nullptr;
+        entry.pref       = pref_holder.pref;      pref_holder.pref = nullptr;
+        entry.algo       = results[0].algo;       // first heuristic result wins
+        entry.workspace_bytes = workspace_bytes;
+        entry.algo_valid = true;
+
+        {
+            std::lock_guard<std::mutex> lock(g_lt_cache_mutex);
+            // Another thread may have inserted this key between our lookup
+            // and build — in that case, destroy our just-built handles and
+            // use theirs. Avoids leaking.
+            auto [it, inserted] = g_lt_cache.emplace(key, entry);
+            if (!inserted) {
+                if (entry.op)       cublasLtMatmulDescDestroy(entry.op);
+                if (entry.a_layout) cublasLtMatrixLayoutDestroy(entry.a_layout);
+                if (entry.b_layout) cublasLtMatrixLayoutDestroy(entry.b_layout);
+                if (entry.c_layout) cublasLtMatrixLayoutDestroy(entry.c_layout);
+                if (entry.pref)     cublasLtMatmulPreferenceDestroy(entry.pref);
+                entry = it->second;
+            }
+        }
+    }
+
+    // Per-call-only: if bias is present, update the BIAS_POINTER on the
+    // cached descriptor. The pointer changes per invocation (different
+    // bias tensor), but the other descriptor state (epilogue type, dtype,
+    // batch stride) is stable and stays cached.
+    if (has_bias) {
+        const void* bias_ptr = bias->data;
+        LT_CHECK(cublasLtMatmulDescSetAttribute(
+            entry.op,
+            CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+            &bias_ptr,
+            sizeof(bias_ptr)));
     }
 
     const float alpha = 1.0f;
@@ -318,37 +466,42 @@ fc_status_t lt_matmul_run(const fc_tensor_view_t* a,
     const void* b_ptr = b->data;
     void* c_ptr = c->data;
 
-    cublasStatus_t launch_status = CUBLAS_STATUS_SUCCESS;
-    for (int algo_idx = 0; algo_idx < returned_results; ++algo_idx) {
-        launch_status = cublasLtMatmul(
-            lt,
-            op_desc_holder.op,
-            &alpha,
-            a_ptr,
-            a_layout.layout,
-            b_ptr,
-            b_layout.layout,
-            &beta,
-            c_ptr,
-            c_layout.layout,
-            c_ptr,
-            c_layout.layout,
-            &results[algo_idx].algo,
-            workspace_ptr,
-            workspace_bytes,
-            stream);
-        if (launch_status == CUBLAS_STATUS_SUCCESS) {
-            return FC_OK;
-        }
-        // Retry with the next heuristic when the current choice is unsupported.
-        if (launch_status == CUBLAS_STATUS_NOT_SUPPORTED ||
-            launch_status == CUBLAS_STATUS_ARCH_MISMATCH) {
-            continue;
-        }
-        // For all other failures, break early and propagate the error.
-        break;
+    cublasStatus_t launch_status = cublasLtMatmul(
+        lt,
+        entry.op,
+        &alpha,
+        a_ptr,
+        entry.a_layout,
+        b_ptr,
+        entry.b_layout,
+        &beta,
+        c_ptr,
+        entry.c_layout,
+        c_ptr,
+        entry.c_layout,
+        &entry.algo,
+        workspace_ptr,
+        workspace_bytes,
+        stream);
+    if (launch_status == CUBLAS_STATUS_SUCCESS) {
+        return FC_OK;
     }
 
+    // Cached algo failed — likely the workspace shrank or something
+    // hardware-level changed. Invalidate the cache entry and fall through
+    // to re-heuristic on the next call.
+    {
+        std::lock_guard<std::mutex> lock(g_lt_cache_mutex);
+        auto it = g_lt_cache.find(key);
+        if (it != g_lt_cache.end()) {
+            if (it->second.op)       cublasLtMatmulDescDestroy(it->second.op);
+            if (it->second.a_layout) cublasLtMatrixLayoutDestroy(it->second.a_layout);
+            if (it->second.b_layout) cublasLtMatrixLayoutDestroy(it->second.b_layout);
+            if (it->second.c_layout) cublasLtMatrixLayoutDestroy(it->second.c_layout);
+            if (it->second.pref)     cublasLtMatmulPreferenceDestroy(it->second.pref);
+            g_lt_cache.erase(it);
+        }
+    }
     return status_from_cublas(launch_status);
 }
 
