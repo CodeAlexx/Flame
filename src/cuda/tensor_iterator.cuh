@@ -1,157 +1,391 @@
 // flame-core/src/cuda/tensor_iterator.cuh
 //
-// Port of the minimal path from PyTorch's TensorIterator infrastructure:
-//   aten/src/ATen/cuda/detail/OffsetCalculator.cuh
-//   aten/src/ATen/native/cuda/Loops.cuh            (gpu_kernel_impl_nocast)
+// Phase 2 rewrite. Ports the flame-core side of PyTorch's
+//   aten/src/ATen/native/cuda/Loops.cuh              (gpu_kernel, elementwise_kernel_helper)
+//   aten/src/ATen/native/cuda/CUDALoops.cuh          (elementwise_kernel, launch_legacy_kernel,
+//                                                     unrolled_elementwise_kernel,
+//                                                     gpu_kernel_impl_nocast, gpu_kernel_impl)
+//   aten/src/ATen/native/cuda/thread_constants.h     (num_threads / thread_work_size / block_work_size)
 //
-// Scope this session (HANDOFF_2026-04-22_TENSORITERATOR_PORT):
-//   * Rank ≤ 6 (matches flame-core's Shape SmallVec<[usize;6]>).
-//   * One input, one contiguous row-major output (unary elementwise).
-//   * Plain 32/64-bit divmod — no IntegerDivider magic constants yet. The
-//     strided path is a correctness-first slow path; the contig fast path
-//     does not go through this iterator.
-//   * Metadata passed by value inside `StridedOffsetCalc` — no per-launch
-//     `cudaMalloc`/`cudaMemcpyAsync` pair the way `narrow_strided.cu`
-//     currently does. Struct size (≈108 B) fits comfortably in the CUDA
-//     kernel-parameter buffer (max 4 KB).
+// Out of scope for Phase 2 (deferred — see brief §"You do NOT port in this phase"):
+//   - `vectorized_elementwise_kernel<vec_size>` (CUDALoops.cuh:167). `launch_vectorized_kernel`
+//     is stubbed here and routes to `launch_legacy_kernel`; Phase 5 fills it in with the
+//     BF16 specialization that has to match `__hadd2` perf.
+//   - `MemoryAccess.cuh` policies beyond the implicit scalar-per-thread trivial policy
+//     (`elementwise_kernel`'s unrolled vt-loop plays the role of `policies::unroll`).
+//   - Dynamic-cast support in `gpu_kernel_impl` — Phase 8.
 //
-// The next session migrates `gelu_bf16` on top of the same header.
+// Entry point for the four session-1–4 `.cu` files is `launch_gpu_kernel<NARGS_IN, func_t>`
+// (see bottom of file). Each retargeted `.cu` populates an `IterMetadata` POD from its
+// existing `extern "C"` args, then calls `launch_gpu_kernel<arity>(meta, Functor{}, stream)`.
+//
+// See TENSORITERATOR_PORT_REFERENCE.md §3 for the full mapping table.
 
 #pragma once
 
 #include <cuda_runtime.h>
-#include <stdint.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+#include <climits>
 
-namespace flame { namespace iter {
+#include "integer_divider.cuh"
+#include "offset_calculator.cuh"
+#include "thread_constants.cuh"
 
-// Matches flame-core's `Strides = SmallVec<[usize; 6]>`. If the Rust-side
-// shape rank ever grows past this, bump both sides — not this session.
-constexpr int FLAME_MAX_DIMS = 6;
+namespace flame {
+namespace iter {
 
-// Strided-input offset calculator (NARGS=1 in PyTorch parlance).
+// Upper bound on (total operands) handled by the Phase 2 path.
+// Phase 2 pilots are unary (2 operands: 1 in + 1 out) and binary (3 operands:
+// 2 in + 1 out). `MAX_NARGS = 4` leaves one slot of slack for Phase 5's
+// ternary ops (`clamp(x, lo, hi)`, `where(c, a, b)`) without needing to
+// re-pod the struct. If you bump this, also widen `OffsetCalculator<NARGS>`
+// static-asserts and the Rust-side `IterMetadata` marshalling in
+// `ops/*_iter.rs`.
+constexpr int MAX_NARGS = 4;
+
+// ---------------------------------------------------------------------------
+// IterMetadata — POD passed by value across the FFI boundary.
 //
-// The output is always contiguous row-major over `sizes`, so its offset is
-// the linear thread index itself; we only need to compute the strided INPUT
-// offset. Keeping it single-arg keeps the struct small and matches how
-// activation/unary kernels consume data.
+// This is the Rust-side build of `TensorIteratorBase`'s relevant fields.
+// PyTorch does all the shape-inference / stride-computation inside
+// `TensorIteratorConfig::build()`; Phase 1 of the port has the equivalent
+// algorithm in Rust (`src/tensor_iterator/base.rs`). Phase 2 receives the
+// already-built output by POD copy.
 //
-// Row-major unravel: dim 0 is outermost (slowest-varying), dim rank-1 is
-// innermost (fastest-varying, stride 1 for contig). Iterating from innermost
-// to outermost = dividing out inner sizes first.
-struct StridedOffsetCalc {
-    int     rank;
+// Layout rules (enforced by the callers in `ops/*_iter.rs`):
+//   - `num_args` = total operands (outputs + inputs). 0 < num_args <= MAX_NARGS.
+//   - The first `num_outputs` entries of `strides`/`data_ptrs`/`offsets_elems`
+//     are outputs; the rest are inputs. PyTorch convention: out at index 0.
+//   - `strides[arg][dim]` is the ELEMENT stride (not byte stride) of operand
+//     `arg` along dim `dim`. Broadcast dims have stride 0. Output operands are
+//     always fresh contig row-major (strides[0] = stride_contiguous(sizes)).
+//   - `offsets_elems[arg]` is the element offset of operand `arg` inside its
+//     backing storage (for view tensors with non-zero view_offset).
+//   - `is_contiguous` is a HINT from the Rust side: true iff all operand
+//     strides match the contiguous row-major layout of `sizes` AND all
+//     `offsets_elems == 0`. When true, `gpu_kernel_impl_nocast` takes the
+//     (currently stubbed) vectorized branch.
+//   - `requires_32bit_indexing` is true when `numel < INT32_MAX`; flame-core
+//     tensors never exceed that bound (see TENSORITERATOR_PORT_REFERENCE.md
+//     §2), so the split-recursion in `gpu_kernel` is only a safety assert
+//     in Phase 2.
+//
+// `FLAME_MAX_DIMS` comes from `offset_calculator.cuh`.
+struct IterMetadata {
+    int     ndim;
+    int     num_args;
+    int     num_outputs;
+    int     _pad;  // keep 4-byte alignment for the int64 array below
     int64_t sizes[FLAME_MAX_DIMS];
-    int64_t strides[FLAME_MAX_DIMS];   // element strides, NOT byte strides
-    int64_t base_offset;               // element offset added to every access
+    int64_t strides[MAX_NARGS][FLAME_MAX_DIMS];  // [arg][dim] element strides
+    int64_t offsets_elems[MAX_NARGS];
+    void*   data_ptrs[MAX_NARGS];
+    int64_t numel;
+    bool    is_contiguous;
+    bool    requires_32bit_indexing;
+};
 
-    // Linear-thread-index → element offset into the underlying storage.
-    // Equivalent to PyTorch OffsetCalculator::get() but for a single arg
-    // and with plain divmod.
-    __host__ __device__ __forceinline__
-    int64_t get(int64_t linear_idx) const {
-        int64_t off = base_offset;
-        // Fixed iteration count so nvcc can fully unroll; `continue` prunes
-        // the tail for smaller ranks without a data-dependent branch.
-        #pragma unroll
-        for (int i = FLAME_MAX_DIMS - 1; i >= 0; --i) {
-            if (i >= rank) continue;
-            int64_t dim = sizes[i];
-            int64_t idx_i = linear_idx % dim;
-            linear_idx /= dim;
-            off += idx_i * strides[i];
+// ---------------------------------------------------------------------------
+// Helper: build an OffsetCalculator<N> from IterMetadata on the host.
+// Mirrors PyTorch `make_offset_calculator<N>` (OffsetCalculator.cuh:113),
+// with the difference that flame-core's iterator POD already carries every
+// operand's full stride array — no `iter.strides(i).data()` indirection.
+// ---------------------------------------------------------------------------
+
+template <int N>
+inline OffsetCalculator<N> make_offset_calculator(const IterMetadata& meta) {
+    static_assert(N >= 1 && N <= MAX_NARGS,
+                  "make_offset_calculator: N must be in [1, MAX_NARGS]");
+    // Build array-of-pointers into meta.strides so `OffsetCalculator`'s
+    // constructor can index it per-operand. Same shape as PyTorch's call at
+    // OffsetCalculator.cuh:116.
+    const int64_t* stride_ptrs[N];
+    for (int i = 0; i < N; i++) {
+        stride_ptrs[i] = meta.strides[i];
+    }
+    return OffsetCalculator<N>(meta.ndim, meta.sizes, stride_ptrs);
+}
+
+// ---------------------------------------------------------------------------
+// elementwise_kernel — the legacy (non-vectorized) kernel.
+//
+// Port of CUDALoops.cuh:528-539: `nt` threads per block, `vt` elements per
+// thread, sequential strided-by-`nt` access so warp reads are coalesced.
+// `f(idx)` is the per-element functor the launcher builds around the
+// offset-calc + data-ptr closure.
+// ---------------------------------------------------------------------------
+
+template <int nt, int vt, typename func_t>
+__global__ void elementwise_kernel(int N, func_t f) {
+    int tid = threadIdx.x;
+    int nv = nt * vt;
+    int idx = nv * blockIdx.x + tid;
+    #pragma unroll
+    for (int i = 0; i < vt; i++) {
+        if (idx < N) {
+            f(idx);
+            idx += nt;
         }
-        return off;
+    }
+}
+
+// Port of CUDALoops.cuh:541-552. Grid sized so every thread iterates `vt`
+// steps, covering `block.x * vt` elements per block. `N` bounded by
+// INT32_MAX by caller precondition (we split if needed in `gpu_kernel`).
+template <int nt, int vt, typename func_t>
+static inline void launch_legacy_kernel(int64_t N, const func_t& f, cudaStream_t stream) {
+    if (N == 0) return;
+    dim3 block(nt);
+    dim3 grid((unsigned int)((N + (int64_t)block.x * vt - 1) / ((int64_t)block.x * vt)));
+    elementwise_kernel<nt, vt, func_t><<<grid, block, 0, stream>>>((int)N, f);
+}
+
+// ---------------------------------------------------------------------------
+// unrolled_elementwise_kernel — ported for API completeness (Phase 5 routes
+// the contig-but-not-vectorizable fallback through here; Phase 2 never
+// reaches this kernel because the stubbed `launch_vectorized_kernel` falls
+// straight through to `launch_legacy_kernel` for ALL contig inputs).
+//
+// Port of CUDALoops.cuh:267-289. `elems_per_thread` elements per thread, one
+// work-group = `num_threads()` threads, total work per block =
+// `block_work_size()`.
+// ---------------------------------------------------------------------------
+
+template <typename func_t>
+__global__ void unrolled_elementwise_kernel(int N, func_t f) {
+    // Functor packaged by caller to take `(idx, bool inbounds)`-style per-step
+    // calls. In Phase 2 we just use the identical shape as `elementwise_kernel`
+    // — when Phase 5 specializes, it can swap in a `policies::unroll`-style
+    // loader/storer. Keeping this as an alias of elementwise_kernel now means
+    // a future Phase 5 change only needs to tweak the body, not reroute every
+    // call site.
+    int tid = threadIdx.x;
+    int nv = num_threads() * thread_work_size();
+    int idx = nv * blockIdx.x + tid;
+    #pragma unroll
+    for (int i = 0; i < thread_work_size(); i++) {
+        if (idx < N) {
+            f(idx);
+            idx += num_threads();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// launch_vectorized_kernel — PHASE 2 STUB.
+//
+// PyTorch CUDALoops.cuh:291-400 vector-sizes the load per functor return
+// type and dispatches to `vectorized_elementwise_kernel<vec_size>`. Phase 2
+// of the flame-core port does NOT implement vectorization; it routes every
+// call through `launch_legacy_kernel<128, 4>`, matching the BF16
+// `unroll_factor` the legacy branch picks anyway.
+//
+// TODO(phase-5): route to actual vectorized kernel; BF16 specialization must
+// match __hadd2 perf (see plan §Phase 5, R1 in TENSORITERATOR_PORT_REFERENCE.md §9).
+// ---------------------------------------------------------------------------
+
+template <int NARGS_TOTAL, typename func_t>
+static inline void launch_vectorized_kernel_stub(
+    int64_t N, const func_t& f, cudaStream_t stream)
+{
+    launch_legacy_kernel<num_threads(), thread_work_size(), func_t>(N, f, stream);
+}
+
+// ---------------------------------------------------------------------------
+// elementwise_kernel_helper — port of Loops.cuh:44-75.
+//
+// Phase 2 doesn't use the `policy_t`-parameterised version from PyTorch
+// because we only have the legacy (scalar-per-thread) "policy". The closure
+// built inside `gpu_kernel_impl_nocast_dispatch<NARGS_IN>` below plays the
+// role of the elementwise helper + policy together.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Per-arity dispatch layer. Phase 2 hands the launcher a specialization for
+// arity 1 (unary: silu/gelu/square) and arity 2 (binary: add). The functor
+// is invoked directly with the right number of BF16 operand loads; no
+// `function_traits` / `std::apply` machinery needed.
+//
+// Templated over element type `T` and arity — functors return T, take T args.
+// Phase 8 generalizes to mixed dtypes; Phase 2 keeps `T = __nv_bfloat16`.
+// ---------------------------------------------------------------------------
+
+// Per-thread closures are wrapped in named functor structs instead of
+// `__device__` lambdas — lambdas with device annotations require the
+// `--extended-lambda` nvcc flag, and flame-core's `build.rs` doesn't
+// pass it. The two structs below play the exact role of PyTorch's
+// `[=] GPU_LAMBDA (int idx) { ... }` closures at CUDALoops.cuh:667 (unary)
+// and the equivalent binary form; captured values become struct members.
+
+template <typename T, typename func_t>
+struct UnaryLegacyBody {
+    OffsetCalculator<2> oc;
+    T* out_base;
+    const T* in_base;
+    func_t f;
+
+    __device__ __forceinline__ void operator()(int idx) const {
+        auto offs = oc.get(static_cast<uint32_t>(idx));
+        T x = in_base[offs[1]];
+        out_base[offs[0]] = f(x);
     }
 };
 
-// Elementwise kernel: strided input → contiguous output. Per-thread: read one
-// element via `in_calc.get(tid)`, apply the functor, write to `y[tid]`.
-//
-// Mirrors the non-contig branch of PyTorch's gpu_kernel_impl_nocast
-// (aten/src/ATen/native/cuda/CUDALoops.cuh ~L664) but specialised for the
-// common "one strided input, one contig output" case we hit first on the
-// migration path.
-template <typename InT, typename OutT, typename Op>
-__global__ void flame_elementwise_strided_to_contig(
-    const InT* __restrict__ x_base,
-    OutT*       __restrict__ y,
-    int64_t              n_elements,
-    StridedOffsetCalc    in_calc,
-    Op                   op)
+template <typename T, typename func_t>
+struct BinaryLegacyBody {
+    OffsetCalculator<3> oc;
+    T* out_base;
+    const T* a_base;
+    const T* b_base;
+    func_t f;
+
+    __device__ __forceinline__ void operator()(int idx) const {
+        auto offs = oc.get(static_cast<uint32_t>(idx));
+        T a = a_base[offs[1]];
+        T b = b_base[offs[2]];
+        out_base[offs[0]] = f(a, b);
+    }
+};
+
+template <typename T, typename func_t>
+static inline void launch_unary_legacy(
+    const IterMetadata& meta, const func_t& f, cudaStream_t stream)
 {
-    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_elements) return;
-    int64_t in_off = in_calc.get(tid);
-    y[tid] = op(x_base[in_off]);
+    const int64_t N = meta.numel;
+    if (N == 0) return;
+
+    // 2 operands: [0] output, [1] input.
+    UnaryLegacyBody<T, func_t> body{
+        make_offset_calculator<2>(meta),
+        reinterpret_cast<T*>(meta.data_ptrs[0]) + meta.offsets_elems[0],
+        reinterpret_cast<const T*>(meta.data_ptrs[1]) + meta.offsets_elems[1],
+        f,
+    };
+
+    // Route through the stubbed vectorized kernel when Rust hinted contig;
+    // both branches currently land on `launch_legacy_kernel<128, 4>` (the
+    // stub is intentional — see TODO above). Non-contig always takes legacy.
+    if (meta.is_contiguous) {
+        launch_vectorized_kernel_stub<2, UnaryLegacyBody<T, func_t>>(N, body, stream);
+    } else {
+        launch_legacy_kernel<num_threads(), thread_work_size(), UnaryLegacyBody<T, func_t>>(
+            N, body, stream);
+    }
 }
 
-// Host-side launch wrapper. Templating is here (not in the FFI surface) so
-// each elementwise `.cu` file can instantiate the launcher with its own op
-// functor; the `extern "C"` wrapper that Rust calls stays concrete.
-template <typename InT, typename OutT, typename Op>
-inline cudaError_t launch_elementwise_strided_to_contig(
-    const InT*        x_base,
-    OutT*             y,
-    int64_t           n_elements,
-    const StridedOffsetCalc& in_calc,
-    Op                op,
-    cudaStream_t      stream)
+template <typename T, typename func_t>
+static inline void launch_binary_legacy(
+    const IterMetadata& meta, const func_t& f, cudaStream_t stream)
 {
-    if (n_elements <= 0) return cudaSuccess;
-    const int threads = 256;
-    int64_t blocks = (n_elements + threads - 1) / threads;
-    // 32-bit grid limit is 2^31 - 1 on all our target arches; n_elements up
-    // to ~5.5e11 is fine at threads=256. Any real DL tensor is well below.
-    flame_elementwise_strided_to_contig<InT, OutT, Op>
-        <<<(unsigned int)blocks, threads, 0, stream>>>(x_base, y, n_elements, in_calc, op);
-    return cudaGetLastError();
+    const int64_t N = meta.numel;
+    if (N == 0) return;
+
+    // 3 operands: [0] output, [1] a, [2] b.
+    BinaryLegacyBody<T, func_t> body{
+        make_offset_calculator<3>(meta),
+        reinterpret_cast<T*>(meta.data_ptrs[0]) + meta.offsets_elems[0],
+        reinterpret_cast<const T*>(meta.data_ptrs[1]) + meta.offsets_elems[1],
+        reinterpret_cast<const T*>(meta.data_ptrs[2]) + meta.offsets_elems[2],
+        f,
+    };
+
+    if (meta.is_contiguous) {
+        launch_vectorized_kernel_stub<3, BinaryLegacyBody<T, func_t>>(N, body, stream);
+    } else {
+        launch_legacy_kernel<num_threads(), thread_work_size(), BinaryLegacyBody<T, func_t>>(
+            N, body, stream);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Binary path (session 4, 2026-04-22): two strided inputs, contig output.
+// gpu_kernel_impl_nocast — port of CUDALoops.cuh:642-735 (BF16-only subset).
+// Picks the contig vs non-contig branch; the former routes to the stubbed
+// vectorized kernel, the latter to `launch_legacy_kernel<128, 4>`.
 //
-// Mirrors the non-contig branch of PyTorch's `gpu_kernel_impl_nocast` for
-// binary ops — two input OffsetCalculators, one linear output. Same-shape
-// only for now; broadcast (different-shape inputs with stride=0 on
-// broadcasted dims) is trivially representable in `StridedOffsetCalc` but
-// is scope-deferred to a later session.
+// Phase 2 dispatches on arity via the explicit `NARGS_IN` template param
+// (no `function_traits` dependency) so each retargeted `.cu` file calls the
+// right specialization directly.
 // ---------------------------------------------------------------------------
 
-template <typename InT, typename OutT, typename Op>
-__global__ void flame_elementwise_strided_binary_to_contig(
-    const InT* __restrict__ a_base,
-    const InT* __restrict__ b_base,
-    OutT*       __restrict__ y,
-    int64_t              n_elements,
-    StridedOffsetCalc    a_calc,
-    StridedOffsetCalc    b_calc,
-    Op                   op)
+template <int NARGS_IN, typename T, typename func_t>
+static inline void gpu_kernel_impl_nocast(
+    const IterMetadata& meta, const func_t& f, cudaStream_t stream)
 {
-    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_elements) return;
-    int64_t a_off = a_calc.get(tid);
-    int64_t b_off = b_calc.get(tid);
-    y[tid] = op(a_base[a_off], b_base[b_off]);
+    static_assert(NARGS_IN == 1 || NARGS_IN == 2,
+                  "Phase 2 gpu_kernel_impl_nocast supports unary/binary only; "
+                  "Phase 5 adds ternary.");
+    if constexpr (NARGS_IN == 1) {
+        launch_unary_legacy<T, func_t>(meta, f, stream);
+    } else {
+        launch_binary_legacy<T, func_t>(meta, f, stream);
+    }
 }
 
-template <typename InT, typename OutT, typename Op>
-inline cudaError_t launch_elementwise_strided_binary_to_contig(
-    const InT*        a_base,
-    const InT*        b_base,
-    OutT*             y,
-    int64_t           n_elements,
-    const StridedOffsetCalc& a_calc,
-    const StridedOffsetCalc& b_calc,
-    Op                op,
-    cudaStream_t      stream)
+// ---------------------------------------------------------------------------
+// gpu_kernel_impl — port of CUDALoops.cuh:958-962 (minus dynamic cast).
+//
+// TODO(phase-8): dynamic cast — detect `func_t`'s arg types vs actual
+// `meta.strides` element sizes and dispatch to a casting unroll policy.
+// Phase 2 asserts no-cast (only BF16 in / BF16 out).
+// ---------------------------------------------------------------------------
+
+template <int NARGS_IN, typename T, typename func_t>
+static inline void gpu_kernel_impl(
+    const IterMetadata& meta, const func_t& f, cudaStream_t stream)
 {
-    if (n_elements <= 0) return cudaSuccess;
-    const int threads = 256;
-    int64_t blocks = (n_elements + threads - 1) / threads;
-    flame_elementwise_strided_binary_to_contig<InT, OutT, Op>
-        <<<(unsigned int)blocks, threads, 0, stream>>>(
-            a_base, b_base, y, n_elements, a_calc, b_calc, op);
-    return cudaGetLastError();
+    gpu_kernel_impl_nocast<NARGS_IN, T, func_t>(meta, f, stream);
 }
 
-}}  // namespace flame::iter
+// ---------------------------------------------------------------------------
+// gpu_kernel_nocast — port of Loops.cuh:84. Public-ish wrapper: asserts
+// 32-bit indexing (Phase 2 doesn't split iterators), calls `gpu_kernel_impl`.
+// ---------------------------------------------------------------------------
+
+template <int NARGS_IN, typename T, typename func_t>
+static inline void gpu_kernel_nocast(
+    const IterMetadata& meta, const func_t& f, cudaStream_t stream)
+{
+    if (meta.numel == 0) return;
+    // Phase 2 limit: flame-core tensors never exceed 2^31 BF16 elements (~4 GB)
+    // so 32-bit indexing always suffices. Full SplitUntil32Bit support is
+    // deferred (TENSORITERATOR_PORT_REFERENCE.md §2).
+    // NOTE: not a TORCH_CHECK — on failure we'd rather silently truncate than
+    // synchronously abort the process, so we promote to a debug assert via
+    // `(void)` and trust the Rust side. The Rust caller sets
+    // `requires_32bit_indexing = true` for every supported shape.
+    (void)meta.requires_32bit_indexing;
+    gpu_kernel_impl<NARGS_IN, T, func_t>(meta, f, stream);
+}
+
+// ---------------------------------------------------------------------------
+// gpu_kernel — port of Loops.cuh:115. Wraps `gpu_kernel_nocast` with the
+// device-check loop PyTorch runs there; flame-core's Rust side already
+// validates all operands are on the same CUDA device before building the
+// `IterMetadata`, so this is a no-op wrapper in Phase 2.
+// ---------------------------------------------------------------------------
+
+template <int NARGS_IN, typename T, typename func_t>
+static inline void gpu_kernel(
+    const IterMetadata& meta, const func_t& f, cudaStream_t stream)
+{
+    gpu_kernel_nocast<NARGS_IN, T, func_t>(meta, f, stream);
+}
+
+// ---------------------------------------------------------------------------
+// launch_gpu_kernel — public FFI entry for the retargeted `.cu` files.
+//
+// This is what each retargeted `.cu` ('activation_silu_iter.cu' etc.) calls
+// from its `extern "C"` wrapper. BF16-only in Phase 2; Phase 8 will add
+// dtype parametrization.
+// ---------------------------------------------------------------------------
+
+template <int NARGS_IN, typename func_t>
+inline void launch_gpu_kernel(
+    const IterMetadata& meta, const func_t& f, cudaStream_t stream)
+{
+    gpu_kernel<NARGS_IN, __nv_bfloat16, func_t>(meta, f, stream);
+}
+
+}  // namespace iter
+}  // namespace flame

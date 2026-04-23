@@ -1,24 +1,14 @@
 // flame-core/src/cuda/add_bf16_iter.cu
 //
-// Session 4, 2026-04-22: first BINARY op on the TensorIterator scaffolding.
-// Same-shape elementwise BF16 add with strided inputs and a contiguous
-// row-major output. Broadcast (different-shape inputs) stays on the
-// existing `launch_bf16_elementwise` path — scope-deferred.
+// Phase 2 retarget. Binary functor unchanged from session 4; launcher now
+// goes through `flame::iter::launch_gpu_kernel<2, AddBF16Op>`.
 //
-// Contig+contig same-shape callers short-circuit in
-// `ops::add_iter::add_bf16_iter` straight back to
-// `bf16_elementwise::add_bf16` (whose fast path uses the vectorized
-// `__hadd2` kernel). This file only fires when at least one input is
-// strided.
-//
-// Math: fp32 round-trip, matching `launch_bf16_elementwise`
-// (the broadcast slow path that already handles arbitrary strides in
-// pre-migration code). Gate is cos_sim ≥ 0.9999, not bit-exact vs the
-// vectorized `__hadd2` flat kernel.
+// Math: fp32 round-trip add (matches pre-migration `launch_bf16_elementwise`
+// broadcast path).
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include <stdint.h>
+#include <cstdint>
 
 #include "tensor_iterator.cuh"
 
@@ -34,27 +24,8 @@ struct AddBF16Op {
     }
 };
 
-inline void fill_calc(
-    flame::iter::StridedOffsetCalc& calc,
-    int rank,
-    const int64_t* sizes,
-    const int64_t* strides,
-    int64_t base_offset)
-{
-    calc.rank        = rank;
-    calc.base_offset = base_offset;
-    for (int i = 0; i < flame::iter::FLAME_MAX_DIMS; ++i) {
-        calc.sizes[i]   = (i < rank) ? sizes[i]    : 1;
-        calc.strides[i] = (i < rank) ? strides[i]  : 0;
-    }
-}
-
 }  // namespace
 
-/// Rust-visible entry. Both inputs must have the same logical shape
-/// (no broadcast). `a_strides`, `b_strides`, `sizes` are host pointers,
-/// `rank` elements each. Output is always a fresh contig BF16 buffer
-/// with element count `n_elements` = product(sizes).
 extern "C" int flame_add_bf16_strided(
     const void*    a_ptr,
     int64_t        a_offset_elems,
@@ -78,23 +49,35 @@ extern "C" int flame_add_bf16_strided(
         return 1;
     }
 
-    flame::iter::StridedOffsetCalc a_calc;
-    flame::iter::StridedOffsetCalc b_calc;
-    fill_calc(a_calc, rank, sizes, a_strides, a_offset_elems);
-    fill_calc(b_calc, rank, sizes, b_strides, b_offset_elems);
+    // PyTorch operand convention: [0] output, [1] a, [2] b. Rust caller
+    // guarantees `a` and `b` have the same logical shape; output is fresh
+    // contig row-major over `sizes`.
+    flame::iter::IterMetadata meta = {};
+    meta.ndim        = rank;
+    meta.num_args    = 3;
+    meta.num_outputs = 1;
+    meta.numel       = n_elements;
+    meta.is_contiguous = false;
+    meta.requires_32bit_indexing = (n_elements < INT_MAX);
+
+    int64_t out_stride = 1;
+    for (int i = rank - 1; i >= 0; --i) {
+        meta.sizes[i]          = sizes[i];
+        meta.strides[0][i]     = out_stride;
+        meta.strides[1][i]     = a_strides[i];
+        meta.strides[2][i]     = b_strides[i];
+        out_stride            *= sizes[i];
+    }
+    meta.offsets_elems[0] = 0;
+    meta.offsets_elems[1] = a_offset_elems;
+    meta.offsets_elems[2] = b_offset_elems;
+    meta.data_ptrs[0]     = y_ptr;
+    meta.data_ptrs[1]     = const_cast<void*>(a_ptr);
+    meta.data_ptrs[2]     = const_cast<void*>(b_ptr);
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_void);
 
-    cudaError_t err = flame::iter::launch_elementwise_strided_binary_to_contig<
-        __nv_bfloat16, __nv_bfloat16, AddBF16Op>(
-            reinterpret_cast<const __nv_bfloat16*>(a_ptr),
-            reinterpret_cast<const __nv_bfloat16*>(b_ptr),
-            reinterpret_cast<__nv_bfloat16*>(y_ptr),
-            n_elements,
-            a_calc,
-            b_calc,
-            AddBF16Op{},
-            stream);
-
+    flame::iter::launch_gpu_kernel<2, AddBF16Op>(meta, AddBF16Op{}, stream);
+    cudaError_t err = cudaGetLastError();
     return (err == cudaSuccess) ? 0 : static_cast<int>(err);
 }
