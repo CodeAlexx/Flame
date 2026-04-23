@@ -805,6 +805,71 @@ void modulate_pre_bf16_kernel(
         y_row[d] = __float2bfloat16((1.0f + sc) * normed + sh);
     }
 }
+
+// B.3 — same LN + modulate as above, but reads shift/scale from a
+// COMBINED modulation tensor [B, mod_dim, dim] via shift_idx. Replaces
+// two narrow(mod, idx) calls in the caller with a single kernel that
+// indexes directly. Every DiT block's modulate_pre fires this pattern
+// (shift_msa/scale_msa pair, shift_mlp/scale_mlp pair, etc.) — so every
+// block now has 2 fewer slice_copy kernel launches.
+extern "C" __global__
+void modulate_pre_split_apply_bf16_kernel(
+    const __nv_bfloat16* __restrict__ X,     // [rows, dim]
+    const __nv_bfloat16* __restrict__ MOD,    // [B, mod_dim, dim]
+    __nv_bfloat16* __restrict__ Y,            // [rows, dim]
+    int rows, int dim, int seq_len, int mod_dim, int shift_idx, float eps)
+{
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int batch_idx = row / seq_len;
+
+    const __nv_bfloat16* x_row = X + (long)row * dim;
+    __nv_bfloat16* y_row = Y + (long)row * dim;
+    // Shift is at mod[batch_idx, shift_idx, :]; scale is the next entry
+    // (shift_idx + 1). Keep matching the original call order where callers
+    // narrowed (mod, shift_idx, 1) then (mod, shift_idx+1, 1).
+    const __nv_bfloat16* shift_row =
+        MOD + ((long)batch_idx * mod_dim + shift_idx)     * dim;
+    const __nv_bfloat16* scale_row =
+        MOD + ((long)batch_idx * mod_dim + shift_idx + 1) * dim;
+
+    // 1) mean
+    float local_sum = 0.0f;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x)
+        local_sum += __bfloat162float(x_row[d]);
+    smem[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = smem[0] / dim;
+    __syncthreads();
+
+    // 2) variance
+    float local_var = 0.0f;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float v = __bfloat162float(x_row[d]) - mean;
+        local_var += v * v;
+    }
+    smem[threadIdx.x] = local_var;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(smem[0] / dim + eps);
+    __syncthreads();
+
+    // 3) normalize + modulate
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float normed = (__bfloat162float(x_row[d]) - mean) * inv_std;
+        float sc = __bfloat162float(scale_row[d]);
+        float sh = __bfloat162float(shift_row[d]);
+        y_row[d] = __float2bfloat16((1.0f + sc) * normed + sh);
+    }
+}
 "#;
 
 /// Fused modulate_pre: LayerNorm + (1+scale)*x + shift in one kernel.
@@ -863,6 +928,112 @@ pub fn modulate_pre_fused_bf16(
     };
     unsafe {
         f.launch(cfg, (slice_ref(xs), slice_ref(scs), slice_ref(shs), ys, rows as i32, dim as i32, n as i32, eps))?;
+    }
+    Ok(out)
+}
+
+/// B.3 — fused LayerNorm + modulate with SPLIT-APPLY from combined mod tensor.
+///
+/// Semantically identical to `modulate_pre_fused_bf16` but takes the full
+/// modulation tensor `[B, mod_dim, dim]` and a `shift_idx`, reading shift
+/// and scale rows directly inside the kernel. Replaces two `Tensor::narrow`
+/// calls + the LN-modulate call chain with a single kernel.
+///
+/// Convention (matches prior caller code): shift = mod[:, shift_idx, :],
+/// scale = mod[:, shift_idx + 1, :]. For DiT blocks with 6-way modulation
+/// packed as (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp)
+/// pass shift_idx = 0 for MSA pair, shift_idx = 3 for MLP pair.
+///
+/// Requires shift_idx + 1 < mod_dim (kernel asserts before launch).
+pub fn modulate_pre_split_apply_bf16(
+    x: &Tensor,
+    modulation: &Tensor,
+    shift_idx: usize,
+    eps: f32,
+) -> Result<Tensor> {
+    debug_assert_eq!(x.dtype(), DType::BF16);
+    debug_assert_eq!(modulation.dtype(), DType::BF16);
+    let x_dims = x.shape().dims();
+    if x_dims.len() != 3 {
+        return Err(Error::InvalidOperation(format!(
+            "modulate_pre_split_apply: expected 3D x [B,N,dim], got {:?}", x_dims
+        )));
+    }
+    let m_dims = modulation.shape().dims();
+    if m_dims.len() != 3 {
+        return Err(Error::InvalidOperation(format!(
+            "modulate_pre_split_apply: expected 3D modulation [B,mod_dim,dim], got {:?}", m_dims
+        )));
+    }
+    let (b, n, dim) = (x_dims[0], x_dims[1], x_dims[2]);
+    if m_dims[0] != b || m_dims[2] != dim {
+        return Err(Error::InvalidOperation(format!(
+            "modulate_pre_split_apply: x {:?} / mod {:?} batch or dim mismatch",
+            x_dims, m_dims
+        )));
+    }
+    let mod_dim = m_dims[1];
+    if shift_idx + 1 >= mod_dim {
+        return Err(Error::InvalidOperation(format!(
+            "modulate_pre_split_apply: shift_idx {} + 1 >= mod_dim {}",
+            shift_idx, mod_dim
+        )));
+    }
+    let rows = b * n;
+    let total = rows * dim;
+
+    // Modulation must be contiguous (kernel reads via linear offsets).
+    let modulation = modulation.contiguous()?;
+
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, total)?;
+    let mut out = Tensor {
+        storage: TensorStorage::BF16 { data: data.into(), numel: total },
+        shape: x.shape().clone(),
+        device: x.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+    };
+
+    ensure(&x.device, "modulate_pre_bf16_kernel", CUDA_MODULATE_PRE)?;
+    let f = x.device
+        .get_func("modulate_pre_bf16_kernel", "modulate_pre_split_apply_bf16_kernel")
+        .ok_or_else(|| Error::Cuda("modulate_pre_split_apply_bf16_kernel missing".into()))?;
+
+    let xs = match &x.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16 x".into())),
+    };
+    let ms = match &modulation.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16 modulation".into())),
+    };
+    let ys = match &mut out.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
+    let ys = ensure_unique_slice(ys)?;
+
+    let threads = dim.min(256) as u32;
+    let smem = threads * 4;
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: smem,
+    };
+    unsafe {
+        f.launch(cfg, (
+            slice_ref(xs),
+            slice_ref(ms),
+            ys,
+            rows as i32,
+            dim as i32,
+            n as i32,
+            mod_dim as i32,
+            shift_idx as i32,
+            eps,
+        ))?;
     }
     Ok(out)
 }
