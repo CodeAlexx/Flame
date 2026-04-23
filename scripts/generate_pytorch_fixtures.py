@@ -81,6 +81,12 @@ MATMUL_SHAPES = {
     "klein_mlp_down":     ((1, 256, 2048), (1024, 2048)),
     "sdxl_linear":        ((1, 512, 512), (512, 512)),
     "chroma_linear":      ((1, 256, 768), (768, 768)),
+    # Production-scale rows to check whether the small-shape gap narrows
+    # at Klein's real dimensions. At ~170 MB weight the per-call overhead
+    # (transpose-materialize + heuristic) drops from ~75% of compute to
+    # ~10%, so the ratio should converge toward 1.0×.
+    "klein_prod_linear":  ((1, 1024, 4608), (4608, 4608)),
+    "klein_prod_mlp_up":  ((1, 1024, 4608), (18432, 4608)),
 }
 
 # Conv2d shapes: (N, C_in, H, W), (C_out, C_in, kH, kW)
