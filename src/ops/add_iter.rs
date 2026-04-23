@@ -1,128 +1,61 @@
-//! Stride-aware BF16 elementwise add dispatcher — first BINARY kernel on
-//! the TensorIterator port (session 4, 2026-04-22).
+//! Phase 4 add on the TensorIterator pipeline — first binary op on the new
+//! path. Covers:
+//!   - same-shape contig+contig
+//!   - same-shape ≥1 strided
+//!   - broadcast (compute_shape handles the shape math; operand stride=0
+//!     on broadcasted dims, as in PyTorch)
 //!
-//! Routes:
-//!   * Different-shape inputs (broadcast)       → `bf16_elementwise::add_bf16`
-//!                                                 (broadcast path, unchanged).
-//!   * Same-shape + both contig                 → `bf16_elementwise::add_bf16`
-//!                                                 (fast `__hadd2` path,
-//!                                                 unchanged).
-//!   * Same-shape + ≥1 strided (permute / narrow)
-//!                                              → `flame_add_bf16_strided`
-//!                                                 (new iterator path).
+//! Unlike the Phase 3 router (`add_iter.rs` pre-Phase-4), there is no
+//! short-circuit to the legacy `bf16_elementwise::add_bf16` flat path.
+//! Every BF16 add call routes through `build_binary_op` + the new kernel.
+//! This is the point of the plan (one dispatch path; fast-path gates
+//! deleted, not patched).
 //!
-//! The existing `shapes_equal_no_broadcast` fast path in
-//! `bf16_elementwise::add_bf16` does NOT inspect strides or `view_offset`
-//! — it reads storage-base-linear, which produces wrong bytes for strided
-//! inputs. The iterator path fixes that latent issue for real callers
-//! whenever narrow eventually flips to view-return.
+//! Klein byte-equal gate: on contig inputs the new functor's fp32
+//! round-trip add (`__float2bfloat16_rn(va + vb)`) may diverge bit-for-bit
+//! from the pre-Phase-4 `__hadd2` flat kernel at rounding-tie boundaries.
+//! That drift, if it shows up in Klein, surfaces as a Phase 4 blocker;
+//! see the Phase 4 section of plan-this-and-fix-encapsulated-hennessy.md
+//! and R5 in TENSORITERATOR_PORT_REFERENCE.md §9 for the escalation path.
+
+use crate::tensor_iterator::TensorIteratorBase;
+use crate::{Error, Result, Tensor};
+
+crate::declare_stub!(pub ADD_STUB);
 
 #[cfg(feature = "cuda")]
-use crate::cuda::ffi;
-#[cfg(feature = "cuda")]
-use crate::device::CudaStreamRawPtrExt;
-#[cfg(feature = "cuda")]
-use crate::tensor_storage::TensorStorage;
-use crate::{DType, Error, Result, Tensor, TensorId};
-#[cfg(feature = "cuda")]
-use std::ffi::c_void;
-
-pub fn add_bf16_iter(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    debug_assert_eq!(a.dtype(), DType::BF16, "add_bf16_iter expects BF16");
-    debug_assert_eq!(b.dtype(), DType::BF16, "add_bf16_iter expects BF16");
-
-    // Different-shape → broadcast path (unchanged).
-    if a.shape().dims() != b.shape().dims() {
-        return crate::bf16_elementwise::add_bf16(a, b);
-    }
-
-    // Same-shape + both contig → fast path (unchanged).
-    if a.is_contiguous() && b.is_contiguous() {
-        return crate::bf16_elementwise::add_bf16(a, b);
-    }
-
-    // Same-shape + at least one strided → new iterator path.
-    #[cfg(feature = "cuda")]
-    {
-        strided_impl(a, b)
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        Err(Error::InvalidOperation(
-            "add_bf16_iter strided path requires the cuda feature".into(),
-        ))
-    }
-}
-
-#[cfg(feature = "cuda")]
-fn strided_impl(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    const FLAME_MAX_DIMS: usize = 6;
-
-    let shape = a.shape().clone();
-    let rank = shape.rank();
-    if rank > FLAME_MAX_DIMS {
-        return Err(Error::InvalidOperation(format!(
-            "add_bf16_iter: rank {} exceeds FLAME_MAX_DIMS ({})",
-            rank, FLAME_MAX_DIMS
-        )));
-    }
-    let n = shape.elem_count();
-
-    let mut sizes_i64: [i64; FLAME_MAX_DIMS] = [1; FLAME_MAX_DIMS];
-    let mut a_strides_i64: [i64; FLAME_MAX_DIMS] = [0; FLAME_MAX_DIMS];
-    let mut b_strides_i64: [i64; FLAME_MAX_DIMS] = [0; FLAME_MAX_DIMS];
-    {
-        let dims = shape.dims();
-        let a_strides = a.strides();
-        let b_strides = b.strides();
-        for i in 0..rank {
-            sizes_i64[i] = dims[i] as i64;
-            a_strides_i64[i] = a_strides[i] as i64;
-            b_strides_i64[i] = b_strides[i] as i64;
-        }
-    }
-    let a_offset = a.offset() as i64;
-    let b_offset = b.offset() as i64;
-
-    let data = crate::cuda_alloc_pool::pool_alloc_u16(&a.device, n)?;
-    let mut out = Tensor {
-        storage: TensorStorage::BF16 {
-            data: data.into(),
-            numel: n,
-        },
-        shape,
-        device: a.device.clone(),
-        id: TensorId::new(),
-        requires_grad: false,
-        custom_strides: None,
-        view_offset: 0,
-    };
-
-    let a_ptr = a.as_device_ptr_bf16("add_bf16_iter:a")? as *const c_void;
-    let b_ptr = b.as_device_ptr_bf16("add_bf16_iter:b")? as *const c_void;
-    let y_ptr = out.as_mut_device_ptr_bf16("add_bf16_iter:y")? as *mut c_void;
-    let stream: *mut c_void = a.device.cuda_stream_raw_ptr();
-
-    let status = unsafe {
-        ffi::flame_add_bf16_strided(
-            a_ptr,
-            a_offset,
-            a_strides_i64.as_ptr(),
-            b_ptr,
-            b_offset,
-            b_strides_i64.as_ptr(),
-            y_ptr,
-            rank as i32,
-            sizes_i64.as_ptr(),
-            n as i64,
-            stream,
-        )
-    };
+pub(crate) fn add_bf16_kernel(iter: &mut TensorIteratorBase<'_>) -> Result<()> {
+    let meta = iter.build_iter_metadata()?;
+    let stream = iter.stream()?;
+    let status = unsafe { flame_add_bf16_kernel(&meta, stream) };
     if status != 0 {
         return Err(Error::Cuda(format!(
-            "flame_add_bf16_strided failed with code {}",
+            "flame_add_bf16_kernel failed with code {}",
             status
         )));
     }
-    Ok(out)
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn add_bf16_kernel(_iter: &mut TensorIteratorBase<'_>) -> Result<()> {
+    Err(Error::InvalidOperation(
+        "add_bf16_kernel requires the cuda feature".into(),
+    ))
+}
+
+pub fn add_bf16_iter(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    debug_assert_eq!(a.dtype(), crate::DType::BF16, "add_bf16_iter expects BF16");
+    debug_assert_eq!(b.dtype(), crate::DType::BF16, "add_bf16_iter expects BF16");
+    let mut iter = TensorIteratorBase::build_binary_op(None, a, b)?;
+    add_bf16_kernel(&mut iter)?;
+    iter.take_output(0)
+}
+
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn flame_add_bf16_kernel(
+        meta: *const crate::tensor_iterator::IterMetadata,
+        stream: *mut std::os::raw::c_void,
+    ) -> i32;
 }

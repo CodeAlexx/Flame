@@ -1842,15 +1842,10 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Element-wise addition
     pub fn add(&self, other: &Tensor) -> Result<Tensor> {
-        // Use BF16 elementwise kernels when available to avoid F32 staging.
-        // BF16 + BF16 routes through the TensorIterator dispatcher, which
-        // short-circuits same-shape contig+contig to the existing fast path
-        // (bit-exact) and delegates different-shape (broadcast) to the
-        // same slow path as before. The only new behavior is same-shape
-        // strided inputs, which previously hit a latent
-        // storage-base-linear bug in `bf16_elementwise::add_bf16`'s fast
-        // branch (it ignored `view_offset`/custom strides). Session 4 of
-        // the TensorIterator port (HANDOFF_2026-04-22_TENSORITERATOR_PORT).
+        // BF16+BF16 routes through the TensorIterator pipeline
+        // (build_binary_op → launch_gpu_kernel<2, AddBF16Op>). Non-cuda
+        // builds fall back to the legacy NVRTC flat kernel. Other dtypes
+        // go through GpuOps::add (F32 path).
         let mut output = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
             #[cfg(feature = "cuda")]
             {
@@ -2010,12 +2005,8 @@ extern "C" __global__ void f32_to_bool_kernel(
         let mut output = if self.dtype() == DType::BF16 {
             #[cfg(feature = "cuda")]
             {
-                // Same dispatch pattern as Tensor::silu — route through the
-                // TensorIterator dispatcher; contig inputs short-circuit to
-                // the existing NVRTC vectorized kernel so every current
-                // caller pays zero iterator overhead. Strided inputs hit
-                // `flame_gelu_bf16_strided` in
-                // `cuda/activation_gelu_iter.cu`.
+                // BF16 routes through the TensorIterator pipeline
+                // (build_unary_op → launch_gpu_kernel<1, GeluBF16Op>).
                 crate::ops::gelu_iter::gelu_bf16_iter(self)?
             }
             #[cfg(not(feature = "cuda"))]
@@ -2045,12 +2036,8 @@ extern "C" __global__ void f32_to_bool_kernel(
         let mut output = if self.dtype() == DType::BF16 {
             #[cfg(feature = "cuda")]
             {
-                // Route through the TensorIterator dispatcher. It short-
-                // circuits `is_contiguous()` to the existing vectorized
-                // `bf16_ops::silu_bf16` unchanged, so contig callers
-                // (every current call site) pay zero iterator overhead.
-                // Strided inputs hit the new `flame_silu_bf16_strided`
-                // FFI path backed by `cuda/activation_silu_iter.cu`.
+                // BF16 routes through the TensorIterator pipeline
+                // (build_unary_op → launch_gpu_kernel<1, SiluBF16Op>).
                 crate::ops::silu_iter::silu_bf16_iter(self)?
             }
             #[cfg(not(feature = "cuda"))]
@@ -2178,12 +2165,9 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Square all elements
     pub fn square(&self) -> Result<Tensor> {
-        // BF16 → TensorIterator dispatcher (short-circuits contig to
-        // `bf16_ops::square_bf16`, bit-equivalent to the pre-migration
-        // `GpuOps::mul(self, self)` path since both compute
-        // `bf16(fp32(x) * fp32(x))`). Other dtypes stay on the original
-        // mul-self-self path. Session 3 of the TensorIterator port
-        // (HANDOFF_2026-04-22_TENSORITERATOR_PORT).
+        // BF16 routes through the TensorIterator pipeline (build_unary_op
+        // → launch_gpu_kernel<1, SquareBF16Op>). Other dtypes go through
+        // the mul-self-self F32 path.
         let mut output = if self.dtype() == DType::BF16 {
             #[cfg(feature = "cuda")]
             {

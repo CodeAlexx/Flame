@@ -235,70 +235,14 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
-    /// TensorIterator strided-path BF16 elementwise add (same-shape only;
-    /// broadcast stays on `launch_bf16_elementwise`). Used by
-    /// `ops::add_iter::add_bf16_iter` when at least one input is strided.
-    /// Contig+contig same-shape callers short-circuit to the existing
-    /// `bf16_elementwise::add_bf16` fast path (`__hadd2` vectorized).
-    pub fn flame_add_bf16_strided(
-        a_ptr: *const core::ffi::c_void,
-        a_offset_elems: i64,
-        a_strides: *const i64,
-        b_ptr: *const core::ffi::c_void,
-        b_offset_elems: i64,
-        b_strides: *const i64,
-        y_ptr: *mut core::ffi::c_void,
-        rank: i32,
-        sizes: *const i64,
-        n_elements: i64,
-        stream: *mut core::ffi::c_void,
-    ) -> i32;
-
-    /// TensorIterator strided-path BF16 square (y = x*x). Used only by
-    /// `ops::square_iter::square_bf16_iter` when input is NOT contiguous —
-    /// contig BF16 callers short-circuit to `bf16_ops::square_bf16`.
-    pub fn flame_square_bf16_strided(
-        x_ptr: *const core::ffi::c_void,
-        x_offset_elems: i64,
-        y_ptr: *mut core::ffi::c_void,
-        rank: i32,
-        sizes: *const i64,
-        in_strides: *const i64,
-        n_elements: i64,
-        stream: *mut core::ffi::c_void,
-    ) -> i32;
-
-    /// TensorIterator strided-path BF16 GELU (tanh approximation). Shape +
-    /// offset + strides handling matches `flame_silu_bf16_strided`. Used
-    /// only by `ops::gelu_iter::gelu_bf16_iter` when the input is NOT
-    /// contiguous — contig callers short-circuit to `bf16_ops::gelu_bf16`.
-    pub fn flame_gelu_bf16_strided(
-        x_ptr: *const core::ffi::c_void,
-        x_offset_elems: i64,
-        y_ptr: *mut core::ffi::c_void,
-        rank: i32,
-        sizes: *const i64,
-        in_strides: *const i64,
-        n_elements: i64,
-        stream: *mut core::ffi::c_void,
-    ) -> i32;
-
-    /// TensorIterator strided-path BF16 SiLU. Output is contiguous row-major
-    /// over `sizes`; input carries `in_strides` + `x_offset_elems` element
-    /// offset. Used only by `ops::silu_iter::silu_bf16_iter` when the input
-    /// is NOT contiguous — contig callers short-circuit to the existing
-    /// `bf16_ops::silu_bf16` vectorized NVRTC kernel before this FFI is hit.
-    /// Rank ≤ FLAME_MAX_DIMS (6). Returns 0 on success.
-    pub fn flame_silu_bf16_strided(
-        x_ptr: *const core::ffi::c_void,
-        x_offset_elems: i64,
-        y_ptr: *mut core::ffi::c_void,
-        rank: i32,
-        sizes: *const i64,
-        in_strides: *const i64,
-        n_elements: i64,
-        stream: *mut core::ffi::c_void,
-    ) -> i32;
+    // Phase 4 of the TensorIterator port collapsed the four per-op strided
+    // FFI entries (`flame_silu_bf16_strided`, `flame_gelu_bf16_strided`,
+    // `flame_square_bf16_strided`, `flame_add_bf16_strided`) into one
+    // `IterMetadata`-taking entry point per op
+    // (`flame_silu_bf16_kernel` etc.) declared inline in the corresponding
+    // `ops/*_iter.rs` file. They are not exported through this module
+    // anymore — the shape of the call is identical across all four ops, so
+    // lifting the declaration out is unnecessary boilerplate.
 
     pub fn flame_silu_backward_bf16(
         grad_out: *const core::ffi::c_void,

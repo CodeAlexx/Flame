@@ -178,10 +178,13 @@ fn main() {
     cuda_sources.push("src/cuda/fused_dequant_transpose.cu");
     cuda_sources.push("src/cuda/grouped_mm.cu");
     cuda_sources.push("src/cuda/fused_gated_scatter_add.cu");
-    cuda_sources.push("src/cuda/activation_silu_iter.cu");
-    cuda_sources.push("src/cuda/activation_gelu_iter.cu");
-    cuda_sources.push("src/cuda/activation_square_iter.cu");
-    cuda_sources.push("src/cuda/add_bf16_iter.cu");
+    // Phase 4: pilot ops on the new dispatch pipeline. Each `.cu` now holds
+    // only a functor + a one-line extern "C" entry calling
+    // `flame::iter::launch_gpu_kernel<NARGS, Op>(meta, Op{}, stream)`.
+    cuda_sources.push("src/cuda/unary/silu.cu");
+    cuda_sources.push("src/cuda/unary/gelu.cu");
+    cuda_sources.push("src/cuda/unary/square.cu");
+    cuda_sources.push("src/cuda/binary/add.cu");
 
     if !cuda_sources.iter().all(|p| Path::new(p).exists()) {
         panic!("CUDA sources missing; ensure submodules are synced");

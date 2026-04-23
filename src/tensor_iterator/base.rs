@@ -578,3 +578,152 @@ impl<'a> TensorIteratorBase<'a> {
         }
     }
 }
+
+// ---------- Phase 4 plumbing: IterMetadata marshalling + stream ----------
+
+#[cfg(feature = "cuda")]
+impl<'a> TensorIteratorBase<'a> {
+    /// Build a `IterMetadata` POD from the current iterator state. Callable
+    /// after `TensorIteratorConfig::build()` finished (i.e. the full shape /
+    /// stride / alloc / reorder / coalesce pipeline has run).
+    ///
+    /// Narrow views: the iterator's per-operand `stride_bytes` does NOT
+    /// include the source tensor's `view_offset`; that's passed through
+    /// `offsets_elems[arg]` as element offsets so the device side can add
+    /// it after casting `data_ptrs[arg]` to the typed pointer.
+    ///
+    /// Iterator-allocated outputs always have offset 0 (fresh contig row-
+    /// major), so `offsets_elems[0] = 0` whenever the caller used
+    /// `add_output(None)`.
+    ///
+    /// Operand layout in the POD matches PyTorch's convention: outputs
+    /// first (indices `[0..num_outputs)`) then inputs
+    /// (`[num_outputs..num_args)`).
+    pub fn build_iter_metadata(&self) -> Result<super::iter_metadata::IterMetadata> {
+        use super::iter_metadata::{IterMetadata, FLAME_MAX_DIMS, MAX_NARGS};
+
+        let ndim = self.shape_.len();
+        if ndim > FLAME_MAX_DIMS {
+            return Err(Error::InvalidOperation(format!(
+                "build_iter_metadata: ndim {ndim} exceeds FLAME_MAX_DIMS ({FLAME_MAX_DIMS})"
+            )));
+        }
+        let num_args = self.operands.len();
+        if num_args == 0 || num_args > MAX_NARGS {
+            return Err(Error::InvalidOperation(format!(
+                "build_iter_metadata: num_args {num_args} out of [1, {MAX_NARGS}]"
+            )));
+        }
+
+        let mut meta = IterMetadata::zeroed();
+        meta.ndim = ndim as i32;
+        meta.num_args = num_args as i32;
+        meta.num_outputs = self.num_outputs_ as i32;
+        meta._pad = 0;
+        meta.numel = self.numel() as i64;
+        meta.is_contiguous = self.is_contiguous();
+        meta.requires_32bit_indexing = self.requires_32bit_indexing_;
+
+        // Sizes (post-coalesce iteration shape).
+        for dim in 0..ndim {
+            meta.sizes[dim] = self.shape_[dim] as i64;
+        }
+
+        // Per-operand element strides + offsets + base pointers.
+        for (arg, op) in self.operands.iter().enumerate() {
+            if op.stride_bytes.len() != ndim {
+                return Err(Error::InvalidOperation(format!(
+                    "build_iter_metadata: operand {arg} has stride len {} != ndim {ndim}",
+                    op.stride_bytes.len()
+                )));
+            }
+            let elem_size = op.target_dtype.size_in_bytes() as i64;
+            if elem_size == 0 {
+                return Err(Error::InvalidOperation(format!(
+                    "build_iter_metadata: operand {arg} has zero-byte dtype"
+                )));
+            }
+            for dim in 0..ndim {
+                let b = op.stride_bytes[dim];
+                let es = if b == 0 {
+                    // Broadcast dim — stride stays 0.
+                    0
+                } else {
+                    if b % elem_size != 0 {
+                        return Err(Error::InvalidOperation(format!(
+                            "build_iter_metadata: operand {arg} dim {dim} byte-stride {b} \
+                             not divisible by elem_size {elem_size}"
+                        )));
+                    }
+                    b / elem_size
+                };
+                meta.strides[arg][dim] = es;
+            }
+
+            // Offset + data_ptr. Iterator-allocated (Owned) outputs have
+            // offset 0. Borrowed inputs/outputs carry their source
+            // tensor's view_offset.
+            let (ptr, offset_elems) = match op.src.as_ref() {
+                Some(OperandSrc::Owned(t)) => {
+                    let raw = match t.dtype() {
+                        DType::BF16 => t.as_device_ptr_bf16(
+                            "build_iter_metadata: owned output ptr",
+                        )?,
+                        other => {
+                            return Err(Error::InvalidOperation(format!(
+                                "build_iter_metadata: operand {arg} dtype {other:?} \
+                                 not supported in Phase 4 (BF16-only)"
+                            )))
+                        }
+                    };
+                    (raw as *mut std::os::raw::c_void, t.offset() as i64)
+                }
+                Some(OperandSrc::Borrowed(t)) => {
+                    let raw = match t.dtype() {
+                        DType::BF16 => t.as_device_ptr_bf16(
+                            "build_iter_metadata: borrowed operand ptr",
+                        )?,
+                        other => {
+                            return Err(Error::InvalidOperation(format!(
+                                "build_iter_metadata: operand {arg} dtype {other:?} \
+                                 not supported in Phase 4 (BF16-only)"
+                            )))
+                        }
+                    };
+                    (raw as *mut std::os::raw::c_void, t.offset() as i64)
+                }
+                None => {
+                    return Err(Error::InvalidOperation(format!(
+                        "build_iter_metadata: operand {arg} slot is empty — \
+                         allocate_or_resize_outputs must run before this call"
+                    )))
+                }
+            };
+            meta.data_ptrs[arg] = ptr;
+            meta.offsets_elems[arg] = offset_elems;
+        }
+
+        Ok(meta)
+    }
+
+    /// Device stream for the iterator's operands. All defined operands are
+    /// on the same device (enforced by `check_all_same_device` in the
+    /// Phase-3 config), so any of them works; we take the first defined
+    /// operand.
+    ///
+    /// Returns `Err` if no operand is defined. Flame-core's stream handle
+    /// is a raw `*mut c_void` because the cudarc stream lifetime is managed
+    /// by the device, not the caller.
+    pub fn stream(&self) -> Result<*mut std::os::raw::c_void> {
+        use crate::device::CudaStreamRawPtrExt;
+
+        for op in &self.operands {
+            if let Some(src) = op.src.as_ref() {
+                return Ok(src.tensor().device().cuda_stream_raw_ptr());
+            }
+        }
+        Err(Error::InvalidOperation(
+            "TensorIteratorBase::stream: no defined operand".into(),
+        ))
+    }
+}

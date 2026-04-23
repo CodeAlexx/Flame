@@ -145,20 +145,40 @@ macro_rules! register_stub {
     };
 }
 
-/// Single central init point. Phase 3 leaves this empty on purpose — the
-/// dispatch plumbing is wired but no ops have been migrated yet. Phase 4
-/// will populate the body with `register_stub!` calls per migrated op:
-///
-/// ```ignore
-/// register_stub!(SILU_STUB, silu_bf16_kernel);
-/// register_stub!(GELU_STUB, gelu_bf16_kernel);
-/// // ...
-/// ```
+/// Single central init point. Phase 4 populates this with the four pilot
+/// ops: silu, gelu, square (unary) and add (binary). Each `register_stub!`
+/// call is the flame-core analogue of PyTorch's
+/// `REGISTER_DISPATCH(silu_stub, &silu_kernel)` in
+/// aten/src/ATen/native/cuda/ActivationSiluKernel.cu.
 ///
 /// Called exactly once at library load via the `#[ctor::ctor]` hook in
 /// `src/lib.rs`. Matches PyTorch's behaviour where every
 /// `REGISTER_DISPATCH` static constructor runs before `main` on library
 /// link.
+///
+/// CUDA-only: the four ops live in `.cu` files that only compile with
+/// the `cuda` feature, so the non-cuda build has nothing to register.
+#[cfg(feature = "cuda")]
 pub fn register_all_bf16_kernels() {
-    // Phase 4 populates this with register_stub!(SILU_STUB, silu_bf16_kernel) etc.
+    crate::register_stub!(
+        crate::ops::silu_iter::SILU_STUB,
+        crate::ops::silu_iter::silu_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::gelu_iter::GELU_STUB,
+        crate::ops::gelu_iter::gelu_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::square_iter::SQUARE_STUB,
+        crate::ops::square_iter::square_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::add_iter::ADD_STUB,
+        crate::ops::add_iter::add_bf16_kernel
+    );
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn register_all_bf16_kernels() {
+    // No CUDA, no kernels to register.
 }

@@ -16,6 +16,8 @@ pub mod broadcast;
 pub mod config;
 pub mod dim_vec;
 pub mod dispatch;
+#[cfg(feature = "cuda")]
+pub mod iter_metadata;
 
 pub use base::{FastSetupType, OperandInfo, OperandSrc, TensorIteratorBase};
 pub use broadcast::{
@@ -25,3 +27,5 @@ pub use broadcast::{
 pub use config::TensorIteratorConfig;
 pub use dim_vec::{contiguous_element_strides, element_strides_to_bytes, DimVec, I64StrideVec, StrideVec};
 pub use dispatch::{BF16ElementwiseKernel, StubEntry};
+#[cfg(feature = "cuda")]
+pub use iter_metadata::{IterMetadata, FLAME_MAX_DIMS as ITER_FLAME_MAX_DIMS, MAX_NARGS};

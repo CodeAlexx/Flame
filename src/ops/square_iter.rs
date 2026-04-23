@@ -1,101 +1,43 @@
-//! Stride-aware BF16 square dispatcher — third kernel on the
-//! TensorIterator port. Contig BF16 short-circuits to
-//! `bf16_ops::square_bf16` (bit-equivalent to the prior
-//! `GpuOps::mul(x, x)` dispatch); strided inputs drop through to
-//! `flame_square_bf16_strided` backed by `src/cuda/activation_square_iter.cu`.
+//! Phase 4 square on the TensorIterator pipeline. Mirror of `silu_iter.rs`.
+//! Y = X * X (fp32 round-trip).
+
+use crate::tensor_iterator::TensorIteratorBase;
+use crate::{Error, Result, Tensor};
+
+crate::declare_stub!(pub SQUARE_STUB);
 
 #[cfg(feature = "cuda")]
-use crate::cuda::ffi;
-#[cfg(feature = "cuda")]
-use crate::device::CudaStreamRawPtrExt;
-#[cfg(feature = "cuda")]
-use crate::tensor_storage::TensorStorage;
-use crate::{DType, Error, Result, Tensor, TensorId};
-#[cfg(feature = "cuda")]
-use std::ffi::c_void;
-
-/// Stride-aware BF16 square (y = x*x). Output is a freshly allocated
-/// contiguous row-major BF16 tensor with `x.shape()`.
-pub fn square_bf16_iter(x: &Tensor) -> Result<Tensor> {
-    debug_assert_eq!(x.dtype(), DType::BF16, "square_bf16_iter expects BF16");
-
-    if x.is_contiguous() {
-        return crate::bf16_ops::square_bf16(x);
-    }
-
-    #[cfg(feature = "cuda")]
-    {
-        strided_impl(x)
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        Err(Error::InvalidOperation(
-            "square_bf16_iter strided path requires the cuda feature".into(),
-        ))
-    }
-}
-
-#[cfg(feature = "cuda")]
-fn strided_impl(x: &Tensor) -> Result<Tensor> {
-    const FLAME_MAX_DIMS: usize = 6;
-
-    let shape = x.shape().clone();
-    let rank = shape.rank();
-    if rank > FLAME_MAX_DIMS {
-        return Err(Error::InvalidOperation(format!(
-            "square_bf16_iter: rank {} exceeds FLAME_MAX_DIMS ({})",
-            rank, FLAME_MAX_DIMS
-        )));
-    }
-    let n = shape.elem_count();
-
-    let mut sizes_i64: [i64; FLAME_MAX_DIMS] = [1; FLAME_MAX_DIMS];
-    let mut strides_i64: [i64; FLAME_MAX_DIMS] = [0; FLAME_MAX_DIMS];
-    {
-        let dims = shape.dims();
-        let strides = x.strides();
-        for i in 0..rank {
-            sizes_i64[i] = dims[i] as i64;
-            strides_i64[i] = strides[i] as i64;
-        }
-    }
-    let x_offset_elems = x.offset() as i64;
-
-    let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, n)?;
-    let mut out = Tensor {
-        storage: TensorStorage::BF16 {
-            data: data.into(),
-            numel: n,
-        },
-        shape,
-        device: x.device.clone(),
-        id: TensorId::new(),
-        requires_grad: false,
-        custom_strides: None,
-        view_offset: 0,
-    };
-
-    let x_ptr = x.as_device_ptr_bf16("square_bf16_iter:x")? as *const c_void;
-    let y_ptr = out.as_mut_device_ptr_bf16("square_bf16_iter:y")? as *mut c_void;
-    let stream: *mut c_void = x.device.cuda_stream_raw_ptr();
-
-    let status = unsafe {
-        ffi::flame_square_bf16_strided(
-            x_ptr,
-            x_offset_elems,
-            y_ptr,
-            rank as i32,
-            sizes_i64.as_ptr(),
-            strides_i64.as_ptr(),
-            n as i64,
-            stream,
-        )
-    };
+pub(crate) fn square_bf16_kernel(iter: &mut TensorIteratorBase<'_>) -> Result<()> {
+    let meta = iter.build_iter_metadata()?;
+    let stream = iter.stream()?;
+    let status = unsafe { flame_square_bf16_kernel(&meta, stream) };
     if status != 0 {
         return Err(Error::Cuda(format!(
-            "flame_square_bf16_strided failed with code {}",
+            "flame_square_bf16_kernel failed with code {}",
             status
         )));
     }
-    Ok(out)
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn square_bf16_kernel(_iter: &mut TensorIteratorBase<'_>) -> Result<()> {
+    Err(Error::InvalidOperation(
+        "square_bf16_kernel requires the cuda feature".into(),
+    ))
+}
+
+pub fn square_bf16_iter(x: &Tensor) -> Result<Tensor> {
+    debug_assert_eq!(x.dtype(), crate::DType::BF16, "square_bf16_iter expects BF16");
+    let mut iter = TensorIteratorBase::build_unary_op(None, x)?;
+    square_bf16_kernel(&mut iter)?;
+    iter.take_output(0)
+}
+
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn flame_square_bf16_kernel(
+        meta: *const crate::tensor_iterator::IterMetadata,
+        stream: *mut std::os::raw::c_void,
+    ) -> i32;
 }
