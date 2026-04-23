@@ -176,6 +176,32 @@ pub fn register_all_bf16_kernels() {
         crate::ops::add_iter::ADD_STUB,
         crate::ops::add_iter::add_bf16_kernel
     );
+    // Phase 5b: 5 new binary ops. Scalar ops (mul_scalar, add_scalar) are
+    // NOT registered here — their wrappers call the FFI directly because
+    // BF16ElementwiseKernel's fn-pointer signature can't carry the
+    // f32 scalar argument. PyTorch mirror: `opmath_gpu_kernel_with_scalars`
+    // captures the scalar inside the lambda at the call site, not via
+    // REGISTER_DISPATCH.
+    crate::register_stub!(
+        crate::ops::sub_iter::SUB_STUB,
+        crate::ops::sub_iter::sub_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::mul_iter::MUL_STUB,
+        crate::ops::mul_iter::mul_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::div_iter::DIV_STUB,
+        crate::ops::div_iter::div_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::maximum_iter::MAXIMUM_STUB,
+        crate::ops::maximum_iter::maximum_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::minimum_iter::MINIMUM_STUB,
+        crate::ops::minimum_iter::minimum_bf16_kernel
+    );
 }
 
 #[cfg(not(feature = "cuda"))]

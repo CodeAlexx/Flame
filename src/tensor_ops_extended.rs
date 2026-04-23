@@ -717,23 +717,35 @@ impl Tensor {
 
     /// Compute element-wise maximum with another tensor (GPU)
     pub fn maximum(&self, other: &Tensor) -> Result<Tensor> {
-        // Check shapes are compatible for broadcasting
-        let broadcast_shape = broadcast_shapes(self.shape().dims(), other.shape().dims())?;
-
-        // Broadcast to common shape
-        let a = if self.shape().dims() != broadcast_shape {
-            self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+        // BF16: route to TensorIterator pipeline, which handles broadcast
+        // internally via stride=0. Other dtypes: broadcast explicitly and
+        // fall through to GpuOps::max_elemwise (F32 path).
+        let mut out = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
+            #[cfg(feature = "cuda")]
+            {
+                crate::ops::maximum_iter::maximum_bf16_iter(self, other)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                return Err(Error::InvalidOperation(
+                    "Tensor::maximum on BF16 requires the `cuda` feature".into(),
+                ));
+            }
         } else {
-            self.clone_result()?
+            let broadcast_shape =
+                broadcast_shapes(self.shape().dims(), other.shape().dims())?;
+            let a = if self.shape().dims() != broadcast_shape {
+                self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+            } else {
+                self.clone_result()?
+            };
+            let b = if other.shape().dims() != broadcast_shape {
+                other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+            } else {
+                other.clone_result()?
+            };
+            crate::cuda_ops::GpuOps::max_elemwise(&a, &b)?
         };
-        let b = if other.shape().dims() != broadcast_shape {
-            other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-        } else {
-            other.clone_result()?
-        };
-
-        // GPU elementwise max
-        let mut out = crate::cuda_ops::GpuOps::max_elemwise(&a, &b)?;
 
         // Autograd record
         if self.requires_grad || other.requires_grad {
@@ -757,27 +769,40 @@ impl Tensor {
 
     /// Compute element-wise minimum with another tensor
     pub fn minimum(&self, other: &Tensor) -> Result<Tensor> {
-        // Check shapes are compatible for broadcasting
-        let broadcast_shape = broadcast_shapes(self.shape().dims(), other.shape().dims())?;
-
-        // Broadcast both tensors if needed
-        let a = if self.shape().dims() != broadcast_shape {
-            self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+        // BF16: direct native minimum via TensorIterator pipeline. Other
+        // dtypes: preserve the composite `-max(-a, -b)` path — that path
+        // goes through GpuOps::max_elemwise (F32) and neg (F32 via
+        // mul_scalar(-1)), which is unchanged.
+        let mut out = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
+            #[cfg(feature = "cuda")]
+            {
+                crate::ops::minimum_iter::minimum_bf16_iter(self, other)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                return Err(Error::InvalidOperation(
+                    "Tensor::minimum on BF16 requires the `cuda` feature".into(),
+                ));
+            }
         } else {
-            self.clone_result()?
+            let broadcast_shape =
+                broadcast_shapes(self.shape().dims(), other.shape().dims())?;
+            let a = if self.shape().dims() != broadcast_shape {
+                self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+            } else {
+                self.clone_result()?
+            };
+            let b = if other.shape().dims() != broadcast_shape {
+                other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+            } else {
+                other.clone_result()?
+            };
+            // -max(-a, -b) path (unchanged for non-BF16).
+            let neg_a = a.neg()?;
+            let neg_b = b.neg()?;
+            let neg_max = neg_a.maximum(&neg_b)?;
+            neg_max.neg()?
         };
-
-        let b = if other.shape().dims() != broadcast_shape {
-            other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-        } else {
-            other.clone_result()?
-        };
-
-        // Compute minimum via -max(-a, -b)
-        let neg_a = a.neg()?;
-        let neg_b = b.neg()?;
-        let neg_max = neg_a.maximum(&neg_b)?;
-        let mut out = neg_max.neg()?;
 
         if self.requires_grad || other.requires_grad {
             out.requires_grad = true;
@@ -832,29 +857,46 @@ impl Tensor {
 
     /// Divide by another tensor
     pub fn div(&self, other: &Tensor) -> Result<Tensor> {
-        // Broadcast both tensors to common shape if needed
-        let mut lhs = if self.shape == other.shape {
-            self.clone_result()?
+        // BF16: TensorIterator pipeline handles broadcasting internally.
+        // Other dtypes: fall through to the prior explicit-broadcast +
+        // GpuOps::div F32 path (autograd record is the same either way).
+        let mut output = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
+            #[cfg(feature = "cuda")]
+            {
+                crate::ops::div_iter::div_bf16_iter(self, other)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                return Err(Error::InvalidOperation(
+                    "Tensor::div on BF16 requires the `cuda` feature".into(),
+                ));
+            }
         } else {
-            let broadcast_shape = broadcast_shapes(self.shape().dims(), other.shape().dims())?;
-            if self.shape().dims() == broadcast_shape {
+            // Non-BF16: explicit broadcast then GpuOps::div.
+            let lhs = if self.shape == other.shape {
                 self.clone_result()?
             } else {
-                self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-            }
-        };
-        let rhs = if self.shape == other.shape {
-            other.clone_result()?
-        } else {
-            let broadcast_shape = broadcast_shapes(self.shape().dims(), other.shape().dims())?;
-            if other.shape().dims() == broadcast_shape {
+                let broadcast_shape =
+                    broadcast_shapes(self.shape().dims(), other.shape().dims())?;
+                if self.shape().dims() == broadcast_shape {
+                    self.clone_result()?
+                } else {
+                    self.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+                }
+            };
+            let rhs = if self.shape == other.shape {
                 other.clone_result()?
             } else {
-                other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
-            }
+                let broadcast_shape =
+                    broadcast_shapes(self.shape().dims(), other.shape().dims())?;
+                if other.shape().dims() == broadcast_shape {
+                    other.clone_result()?
+                } else {
+                    other.broadcast_to(&Shape::from_dims(&broadcast_shape))?
+                }
+            };
+            GpuOps::div(&lhs, &rhs)?
         };
-
-        let mut output = GpuOps::div(&lhs, &rhs)?;
 
         // AUTOGRAD: Record with ORIGINAL tensor IDs so gradients flow
         // back to the actual inputs, not broadcast intermediates.

@@ -185,6 +185,15 @@ fn main() {
     cuda_sources.push("src/cuda/unary/gelu.cu");
     cuda_sources.push("src/cuda/unary/square.cu");
     cuda_sources.push("src/cuda/binary/add.cu");
+    // Phase 5b: 5 binary ops + 2 scalar ops. Scalar ops bypass DispatchStub
+    // (scalar captured in functor state; see src/ops/mul_scalar_iter.rs).
+    cuda_sources.push("src/cuda/binary/sub.cu");
+    cuda_sources.push("src/cuda/binary/mul.cu");
+    cuda_sources.push("src/cuda/binary/div.cu");
+    cuda_sources.push("src/cuda/binary/maximum.cu");
+    cuda_sources.push("src/cuda/binary/minimum.cu");
+    cuda_sources.push("src/cuda/binary/mul_scalar.cu");
+    cuda_sources.push("src/cuda/binary/add_scalar.cu");
 
     if !cuda_sources.iter().all(|p| Path::new(p).exists()) {
         panic!("CUDA sources missing; ensure submodules are synced");

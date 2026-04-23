@@ -1,8 +1,13 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
+// Phase 5b: this test previously called `bf16_elementwise::{add_bf16, mul_bf16}`
+// directly. Those legacy entry points were deleted; the ops now live on the
+// TensorIterator pipeline in `ops::{add_iter, mul_iter}`. The broadcast
+// behaviour tested here is preserved — `build_binary_op` handles broadcast
+// via stride=0 internally.
 use anyhow::Result;
 use flame_core::{
-    bf16_elementwise::{add_bf16, mul_bf16},
+    ops::{add_iter::add_bf16_iter, mul_iter::mul_bf16_iter},
     DType, Device, Shape, Tensor,
 };
 
@@ -35,8 +40,8 @@ fn add_mul_broadcast_match_fp32() -> Result<()> {
     let a = make_tensor(&device, &a_data, &[2, 4])?;
     let b = make_tensor(&device, &b_data, &[1, 4])?;
 
-    let sum_bf16 = add_bf16(&a, &b)?;
-    let prod_bf16 = mul_bf16(&a, &b)?;
+    let sum_bf16 = add_bf16_iter(&a, &b)?;
+    let prod_bf16 = mul_bf16_iter(&a, &b)?;
 
     let sum_f32 = bf16_to_f32(&sum_bf16)?;
     let prod_f32 = bf16_to_f32(&prod_bf16)?;

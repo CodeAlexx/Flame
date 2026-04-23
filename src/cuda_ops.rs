@@ -492,7 +492,10 @@ impl GpuOps {
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
         {
             if a.dtype() == crate::DType::BF16 && b.dtype() == crate::DType::BF16 {
-                return crate::bf16_elementwise::div_bf16(a, b);
+                // Phase 5b: the legacy `bf16_elementwise::div_bf16` was
+                // deleted. Route through the TensorIterator pipeline
+                // (handles broadcasting via stride=0 internally).
+                return crate::ops::div_iter::div_bf16_iter(a, b);
             }
         }
         let target_dtype = Self::binary_target_dtype(a.dtype(), b.dtype());
@@ -513,7 +516,8 @@ impl GpuOps {
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
         {
             if a.dtype() == crate::DType::BF16 && b.dtype() == crate::DType::BF16 {
-                return crate::bf16_elementwise::max_bf16(a, b);
+                // Phase 5b: route BF16 to the TensorIterator pipeline.
+                return crate::ops::maximum_iter::maximum_bf16_iter(a, b);
             }
         }
         let kernels = Self::get_kernels(&a.device)?;

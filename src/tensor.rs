@@ -1843,9 +1843,9 @@ extern "C" __global__ void f32_to_bool_kernel(
     /// Element-wise addition
     pub fn add(&self, other: &Tensor) -> Result<Tensor> {
         // BF16+BF16 routes through the TensorIterator pipeline
-        // (build_binary_op → launch_gpu_kernel<2, AddBF16Op>). Non-cuda
-        // builds fall back to the legacy NVRTC flat kernel. Other dtypes
-        // go through GpuOps::add (F32 path).
+        // (build_binary_op → launch_gpu_kernel<2, AddBF16Op>). Other dtypes
+        // go through GpuOps::add (F32 path). Phase 5b: non-cuda builds
+        // return an error — the legacy BF16 NVRTC kernels were deleted.
         let mut output = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
             #[cfg(feature = "cuda")]
             {
@@ -1853,7 +1853,9 @@ extern "C" __global__ void f32_to_bool_kernel(
             }
             #[cfg(not(feature = "cuda"))]
             {
-                crate::bf16_elementwise::add_bf16(self, other)?
+                return Err(Error::InvalidOperation(
+                    "Tensor::add on BF16 requires the `cuda` feature".into(),
+                ));
             }
         } else {
             GpuOps::add(self, other)?
@@ -1881,22 +1883,40 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Subtract another tensor
     pub fn sub(&self, other: &Tensor) -> Result<Tensor> {
-        // Implement as self + (-1 * other)
-        // This automatically handles broadcasting through the add operation
-        let neg_other = other.mul_scalar(-1.0)?;
-        let output = self.add(&neg_other)?;
+        // BF16: route to the TensorIterator pipeline
+        // (build_binary_op → launch_gpu_kernel<2, SubBF16Op>). Other dtypes
+        // fall through to the add+neg composition used pre-Phase-5b, which
+        // still works (autograd records Sub afterwards either way).
+        let mut output = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
+            #[cfg(feature = "cuda")]
+            {
+                crate::ops::sub_iter::sub_bf16_iter(self, other)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                return Err(Error::InvalidOperation(
+                    "Tensor::sub on BF16 requires the `cuda` feature".into(),
+                ));
+            }
+        } else {
+            // Non-BF16 path: a - b = a + (-1 * b), composed via add.
+            let neg_other = other.mul_scalar(-1.0)?;
+            self.add(&neg_other)?
+        };
 
-        // Record subtraction operation if needed
-        if (self.requires_grad || other.requires_grad) && AutogradContext::is_recording() {
-            // Note: output.requires_grad is already set by add() above
-            AutogradContext::record_op(
-                output.id,
-                Op::Sub {
-                    lhs: self.id,
-                    rhs: other.id,
-                },
-                Vec::new(),
-            );
+        // Record subtraction operation if needed.
+        if self.requires_grad || other.requires_grad {
+            output.requires_grad = true;
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::Sub {
+                        lhs: self.id,
+                        rhs: other.id,
+                    },
+                    Vec::new(),
+                );
+            }
         }
 
         Ok(output)
@@ -1904,9 +1924,19 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Element-wise multiplication (Hadamard product)
     pub fn mul(&self, other: &Tensor) -> Result<Tensor> {
-        // Use BF16 elementwise kernels when available to avoid F32 staging.
+        // BF16 path: TensorIterator pipeline
+        // (build_binary_op → launch_gpu_kernel<2, MulBF16Op>).
         let mut output = if self.dtype() == DType::BF16 && other.dtype() == DType::BF16 {
-            crate::bf16_elementwise::mul_bf16(self, other)?
+            #[cfg(feature = "cuda")]
+            {
+                crate::ops::mul_iter::mul_bf16_iter(self, other)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                return Err(Error::InvalidOperation(
+                    "Tensor::mul on BF16 requires the `cuda` feature".into(),
+                ));
+            }
         } else {
             GpuOps::mul(self, other)?
         };
@@ -1931,8 +1961,23 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Scalar multiplication
     pub fn mul_scalar(&self, scalar: f32) -> Result<Tensor> {
-        // Use CUDA kernel for GPU-accelerated scalar multiplication
-        let mut output = GpuOps::mul_scalar(self, scalar)?;
+        // BF16 path: TensorIterator pipeline with the scalar captured in a
+        // stateful functor (mirrors PyTorch's opmath_gpu_kernel_with_scalars).
+        // Other dtypes go through GpuOps::mul_scalar (F32 path).
+        let mut output = if self.dtype() == DType::BF16 {
+            #[cfg(feature = "cuda")]
+            {
+                crate::ops::mul_scalar_iter::mul_scalar_bf16_iter(self, scalar)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                return Err(Error::InvalidOperation(
+                    "Tensor::mul_scalar on BF16 requires the `cuda` feature".into(),
+                ));
+            }
+        } else {
+            GpuOps::mul_scalar(self, scalar)?
+        };
 
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
@@ -1959,8 +2004,23 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Add scalar to all elements
     pub fn add_scalar(&self, scalar: f32) -> Result<Tensor> {
-        // Use CUDA kernel for GPU-accelerated scalar addition
-        let mut output = GpuOps::add_scalar(self, scalar)?;
+        // BF16 path: TensorIterator pipeline with captured scalar
+        // (see mul_scalar for the stateful-functor design). Other dtypes
+        // go through GpuOps::add_scalar (F32 path).
+        let mut output = if self.dtype() == DType::BF16 {
+            #[cfg(feature = "cuda")]
+            {
+                crate::ops::add_scalar_iter::add_scalar_bf16_iter(self, scalar)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                return Err(Error::InvalidOperation(
+                    "Tensor::add_scalar on BF16 requires the `cuda` feature".into(),
+                ));
+            }
+        } else {
+            GpuOps::add_scalar(self, scalar)?
+        };
 
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {

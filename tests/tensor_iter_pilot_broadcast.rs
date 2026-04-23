@@ -85,18 +85,42 @@ fn make_bf16_tensor(dev: Arc<CudaDevice>, dims: &[usize], seed: u64) -> Result<T
 
 #[test]
 fn add_iter_broadcast_same_shape_bit_exact() -> Result<()> {
-    // Regression gate: with the new pipeline, same-shape contig inputs
-    // must still produce the same bits as the pre-Phase-4 `__hadd2` flat
-    // path through `bf16_elementwise::add_bf16`. If this ever breaks, look
-    // at the functor's `__float2bfloat16_rn` vs `__hadd2` rounding first.
+    // Regression gate: the new pipeline's same-shape contig output must
+    // match a direct CPU fp32-round-trip-with-rne-rounding reference
+    // element-for-element. Phase 5b rewrite: the previous reference
+    // (`bf16_elementwise::add_bf16`) was deleted; CPU reference is the
+    // equivalent math performed by `AddBF16Op` in src/cuda/binary/add.cu.
     let dev = cuda_device();
     let a = make_bf16_tensor(dev.clone(), &[4, 3, 2], 0xBCA51_0001u64)?;
     let b = make_bf16_tensor(dev, &[4, 3, 2], 0xBCA51_0002u64)?;
 
-    let ref_out = flame_core::bf16_elementwise::add_bf16(&a, &b)?;
-    let new_out = add_bf16_iter(&a, &b)?;
+    let a_f = a.to_vec_f32()?;
+    let b_f = b.to_vec_f32()?;
+    let rne_to_bf16_as_f32 = |v: f32| -> f32 {
+        if v.is_nan() {
+            return v;
+        }
+        let bits = v.to_bits();
+        let bias = 0x0000_7FFFu32 + ((bits >> 16) & 1);
+        let bf16_bits = (bits.wrapping_add(bias)) >> 16;
+        f32::from_bits(bf16_bits << 16)
+    };
+    let ref_f: Vec<f32> = a_f
+        .iter()
+        .zip(b_f.iter())
+        .map(|(x, y)| rne_to_bf16_as_f32(x + y))
+        .collect();
 
-    assert_bit_exact_bf16(&ref_out, &new_out, "add_iter same-shape [4,3,2]")?;
+    let new_out = add_bf16_iter(&a, &b)?;
+    let new_f = new_out.to_vec_f32()?;
+    assert_eq!(ref_f.len(), new_f.len());
+    for (i, (r, n)) in ref_f.iter().zip(new_f.iter()).enumerate() {
+        assert_eq!(
+            r.to_bits(),
+            n.to_bits(),
+            "add_iter same-shape [4,3,2]: byte mismatch at {i}: ref={r} new={n}"
+        );
+    }
     Ok(())
 }
 
