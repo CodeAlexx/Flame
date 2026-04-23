@@ -899,6 +899,14 @@ pub fn modulate_pre_fused_bf16(
     eps: f32,
 ) -> Result<Tensor> {
     debug_assert_eq!(x.dtype(), DType::BF16);
+    // Stride refactor Phase 2a: kernel assumes row-major contig storage.
+    // shift/scale come from shared_modulation's narrow chain.
+    let x_owned = x.contiguous()?;
+    let shift_owned = shift.contiguous()?;
+    let scale_owned = scale.contiguous()?;
+    let x = &x_owned;
+    let shift = &shift_owned;
+    let scale = &scale_owned;
     let x_dims = x.shape().dims();
     if x_dims.len() != 3 {
         return Err(Error::InvalidOperation(format!(
@@ -966,6 +974,11 @@ pub fn modulate_pre_split_apply_bf16(
 ) -> Result<Tensor> {
     debug_assert_eq!(x.dtype(), DType::BF16);
     debug_assert_eq!(modulation.dtype(), DType::BF16);
+    // Stride refactor Phase 2a: kernel indexes modulation linearly.
+    let x_owned = x.contiguous()?;
+    let modulation_owned = modulation.contiguous()?;
+    let x = &x_owned;
+    let modulation = &modulation_owned;
     let x_dims = x.shape().dims();
     if x_dims.len() != 3 {
         return Err(Error::InvalidOperation(format!(
@@ -1092,6 +1105,14 @@ pub fn gate_residual_fused_bf16(
     x: &Tensor,
 ) -> Result<Tensor> {
     debug_assert_eq!(residual.dtype(), DType::BF16);
+    // Stride refactor Phase 2a: kernel walks storage linearly; gate is a
+    // narrow slice of the shared modulation output.
+    let residual_owned = residual.contiguous()?;
+    let gate_owned = gate.contiguous()?;
+    let x_owned = x.contiguous()?;
+    let residual = &residual_owned;
+    let gate = &gate_owned;
+    let x = &x_owned;
     let dims = residual.shape().dims();
     if dims.len() != 3 {
         return Err(Error::InvalidOperation(format!(
@@ -1155,6 +1176,14 @@ void swiglu_fused_bf16_kernel(
 /// Fused SwiGLU: silu(gate) * up in one kernel (no intermediate silu tensor).
 pub fn swiglu_fused_bf16(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     debug_assert_eq!(gate.dtype(), DType::BF16);
+    // Stride refactor Phase 2a: this kernel walks storage linearly. If a
+    // caller hands us a view (post-narrow/permute), materialize first.
+    // When both inputs are already contiguous (current Klein path today),
+    // `.contiguous()` is a cheap Arc clone.
+    let gate_owned = gate.contiguous()?;
+    let up_owned = up.contiguous()?;
+    let gate = &gate_owned;
+    let up = &up_owned;
     let total = gate.shape().elem_count();
 
     let data = crate::cuda_alloc_pool::pool_alloc_u16(&gate.device, total)?;
@@ -1644,6 +1673,10 @@ pub fn qkv_split_permute_bf16(
     heads: usize,
     head_dim: usize,
 ) -> Result<(Tensor, Tensor, Tensor)> {
+    // Stride refactor Phase 2a: qkv comes from a narrow of the fused linear
+    // output. Kernel walks the last-dim `[3*H*D]` block linearly per (b, n).
+    let qkv_owned = qkv.contiguous()?;
+    let qkv = &qkv_owned;
     debug_assert_eq!(qkv.dtype(), DType::BF16);
     let dims = qkv.shape().dims();
     if dims.len() != 3 {

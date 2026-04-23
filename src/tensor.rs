@@ -2668,12 +2668,54 @@ extern "C" __global__ void f32_to_bool_kernel(
     ///     view_offset == 0). Recovers the permutation by sorting strides.
     ///   * `materialize_view` — for narrow/chunk views (view_offset != 0) and
     ///     any composition thereof. Walks the source with (strides + offset).
+    /// True iff `self.custom_strides` corresponds to some permutation of the
+    /// row-major stride pattern of `self.shape`. Safe permute-recovery path.
+    /// False for narrow-views where the stored strides correspond to the
+    /// PARENT tensor's shape, not self's shape. Used to gate the
+    /// permutation-recovery optimization in `contiguous()`.
+    fn strides_match_permute_of_shape(&self) -> bool {
+        let Some(strides) = self.custom_strides.as_ref() else {
+            return true;
+        };
+        let dims = self.shape.dims();
+        if strides.len() != dims.len() {
+            return false;
+        }
+        // The multiset of (dim_i * stride_i)-product piece widths would only
+        // tile the storage exactly when strides reflect a permutation. The
+        // tightest sufficient check: sorting strides descending and
+        // pairing each with the corresponding dim, the resulting
+        // [prod_of_smaller_dims] sequence must equal the inner-to-outer
+        // stride pattern of a contig shape. Equivalently: sort by stride,
+        // the smallest stride must be 1, and each stride must equal the
+        // product of all smaller dims.
+        let mut pairs: Vec<(usize, usize)> =
+            strides.iter().copied().zip(dims.iter().copied()).collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected: usize = 1;
+        for (stride, dim) in &pairs {
+            if *stride != expected {
+                return false;
+            }
+            expected *= *dim;
+        }
+        true
+    }
+
     pub fn contiguous(&self) -> Result<Tensor> {
         if self.is_contiguous() {
             return Ok(self.clone());
         }
-        if self.view_offset != 0 {
-            // narrow/chunk or narrow-of-permute: generic stride-plus-offset gather.
+        // Always route non-contig views through materialize_view. It handles
+        // permute, narrow, and any compositions uniformly via a strided
+        // gather. The old "recover permutation from strides" path below is
+        // preserved behind a strict check: only viable for pure permute
+        // views (view_offset == 0 AND strides match a known permutation of
+        // the shape's row-major layout). narrow-at-start-0 has offset == 0
+        // but strides from the LARGER parent, which the permute-recovery
+        // path misinterprets as an identity permutation and reads the wrong
+        // storage region. Fix 2026-04-23 Phase 2a.
+        if self.view_offset != 0 || !self.strides_match_permute_of_shape() {
             return crate::cuda_ops::GpuOps::materialize_view(self);
         }
         // Recover the permutation from view strides vs row-major strides of
@@ -3489,20 +3531,24 @@ extern "C" __global__ void f32_to_bool_kernel(
 
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
         if self.dtype() == DType::BF16 && self.storage_dtype() == DType::BF16 {
-            let mut out = cuda_ops_bf16::slice_axis_bf16(self, dim, start, length)?;
-            // Autograd: the BF16 fast path previously dropped `requires_grad`
-            // silently. Training code (klein-trainer) splits fused QKV/MLP
-            // projections with `narrow`, so every split broke the gradient
-            // chain. Record `Op::Slice` here to keep backward working.
+            // Stride refactor Phase 2a: narrow is a zero-copy view.
+            let self_strides = self.strides();
+            let new_offset = self.view_offset + start * self_strides[dim];
+            let mut out = Tensor {
+                storage: self.storage.clone(),
+                shape: output_shape.clone(),
+                device: self.device.clone(),
+                id: TensorId::new(),
+                requires_grad: false,
+                custom_strides: Some(self_strides.clone()),
+                view_offset: new_offset,
+            };
             if self.requires_grad {
                 out.requires_grad = true;
                 if AutogradContext::is_recording() {
                     let mut ranges: Vec<(usize, usize)> =
                         dims.iter().map(|&d| (0, d)).collect();
                     ranges[dim] = (start, start + length);
-                    // Op::Slice backward reads only `input_shape` from the Op
-                    // variant — no saved tensor data is needed. Avoid cloning
-                    // the (potentially huge) input; empty saved_tensors vec.
                     AutogradContext::record_op(
                         out.id,
                         Op::Slice {
