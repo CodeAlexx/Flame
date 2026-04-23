@@ -87,7 +87,7 @@ pub struct FlameSdpaAutotuneStats {
 
 extern "C" {
     pub fn fc_ws_ensure_capacity(ws: *mut FcWorkspace, bytes: usize, stream: *mut c_void) -> i32;
-    pub fn fc_relu_bf16(x: *const FcTensorView, y: *mut FcTensorView, stream: *mut c_void) -> i32;
+    // fc_relu_bf16 deleted in Phase 6 — see src/cuda/unary/relu.cu.
     pub fn fc_gelu_bf16(x: *const FcTensorView, y: *mut FcTensorView, stream: *mut c_void) -> i32;
     pub fn fc_silu_bf16(x: *const FcTensorView, y: *mut FcTensorView, stream: *mut c_void) -> i32;
     pub fn fc_axpby_bf16(

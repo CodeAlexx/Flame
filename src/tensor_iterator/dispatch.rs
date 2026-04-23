@@ -202,6 +202,29 @@ pub fn register_all_bf16_kernels() {
         crate::ops::minimum_iter::MINIMUM_STUB,
         crate::ops::minimum_iter::minimum_bf16_kernel
     );
+    // Phase 6: unary activations. abs/relu/neg are native BF16 (sign-bit
+    // manipulation or __hgt comparison), sigmoid/tanh use f32 opmath
+    // inside the functor (matching PyTorch's opmath_t=float for BF16).
+    crate::register_stub!(
+        crate::ops::abs_iter::ABS_STUB,
+        crate::ops::abs_iter::abs_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::relu_iter::RELU_STUB,
+        crate::ops::relu_iter::relu_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::neg_iter::NEG_STUB,
+        crate::ops::neg_iter::neg_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::sigmoid_iter::SIGMOID_STUB,
+        crate::ops::sigmoid_iter::sigmoid_bf16_kernel
+    );
+    crate::register_stub!(
+        crate::ops::tanh_iter::TANH_STUB,
+        crate::ops::tanh_iter::tanh_bf16_kernel
+    );
 }
 
 #[cfg(not(feature = "cuda"))]

@@ -2042,8 +2042,20 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// ReLU activation
     pub fn relu(&self) -> Result<Tensor> {
-        // Use CUDA kernel for GPU-accelerated ReLU
-        let mut output = GpuOps::relu(self)?;
+        let mut output = if self.dtype() == DType::BF16 {
+            #[cfg(feature = "cuda")]
+            {
+                // Phase 6: BF16 routes through the TensorIterator pipeline
+                // (build_unary_op → launch_gpu_kernel<1, ReluBF16Op>).
+                crate::ops::relu_iter::relu_bf16_iter(self)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                GpuOps::relu(self)?
+            }
+        } else {
+            GpuOps::relu(self)?
+        };
 
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
@@ -2152,8 +2164,20 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Tanh activation
     pub fn tanh(&self) -> Result<Tensor> {
-        // Use CUDA kernel for GPU-accelerated Tanh
-        let mut output = GpuOps::tanh(self)?;
+        let mut output = if self.dtype() == DType::BF16 {
+            #[cfg(feature = "cuda")]
+            {
+                // Phase 6: BF16 routes through the TensorIterator pipeline
+                // (build_unary_op → launch_gpu_kernel<1, TanhBF16Op>).
+                crate::ops::tanh_iter::tanh_bf16_iter(self)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                GpuOps::tanh(self)?
+            }
+        } else {
+            GpuOps::tanh(self)?
+        };
 
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {
@@ -2172,8 +2196,20 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Sigmoid activation
     pub fn sigmoid(&self) -> Result<Tensor> {
-        // Use CUDA kernel for GPU-accelerated sigmoid
-        let mut output = GpuOps::sigmoid(self)?;
+        let mut output = if self.dtype() == DType::BF16 {
+            #[cfg(feature = "cuda")]
+            {
+                // Phase 6: BF16 routes through the TensorIterator pipeline
+                // (build_unary_op → launch_gpu_kernel<1, SigmoidBF16Op>).
+                crate::ops::sigmoid_iter::sigmoid_bf16_iter(self)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                GpuOps::sigmoid(self)?
+            }
+        } else {
+            GpuOps::sigmoid(self)?
+        };
 
         // AUTOGRAD: Record operation if needed
         if self.requires_grad {

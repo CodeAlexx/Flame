@@ -355,7 +355,10 @@ impl GpuOps {
     pub fn relu(tensor: &Tensor) -> Result<Tensor> {
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
         if tensor.dtype() == crate::DType::BF16 {
-            return cuda_ops_bf16::relu_bf16(tensor);
+            // Phase 6: BF16 routes through the TensorIterator pipeline.
+            // Replaced the legacy `cuda_ops_bf16::relu_bf16` → `fc_relu_bf16`
+            // FFI. Both paths produce bit-identical output for finite inputs.
+            return crate::ops::relu_iter::relu_bf16_iter(tensor);
         }
 
         scope("cuda_ops.relu", GuardMode::env_default(), || {
@@ -369,6 +372,14 @@ impl GpuOps {
 
     /// Sigmoid activation
     pub fn sigmoid(tensor: &Tensor) -> Result<Tensor> {
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        if tensor.dtype() == crate::DType::BF16 {
+            // Phase 6: BF16 routes through the TensorIterator pipeline. Same
+            // f32-opmath math as the old F32-roundtrip path, now without the
+            // intermediate materialization — enforces CLAUDE.md's "NEVER use
+            // F32 fallbacks in inference code" for BF16 inputs.
+            return crate::ops::sigmoid_iter::sigmoid_bf16_iter(tensor);
+        }
         scope("cuda_ops.sigmoid", GuardMode::env_default(), || {
             let target_dtype = tensor.dtype();
             let tensor_f32 = Self::cast_to_f32_tensor(tensor)?;
@@ -410,6 +421,11 @@ impl GpuOps {
 
     /// Tanh activation
     pub fn tanh(tensor: &Tensor) -> Result<Tensor> {
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        if tensor.dtype() == crate::DType::BF16 {
+            // Phase 6: BF16 routes through the TensorIterator pipeline.
+            return crate::ops::tanh_iter::tanh_bf16_iter(tensor);
+        }
         scope("cuda_ops.tanh", GuardMode::env_default(), || {
             let target_dtype = tensor.dtype();
             let tensor_f32 = Self::cast_to_f32_tensor(tensor)?;

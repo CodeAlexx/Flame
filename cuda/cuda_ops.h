@@ -34,7 +34,7 @@ typedef struct {
 fc_status_t fc_ws_ensure_capacity(fc_workspace_t* arena, size_t bytes, cudaStream_t stream);
 
 // ======================== Elementwise ========================
-fc_status_t fc_relu_bf16 (const fc_tensor_view_t* x, fc_tensor_view_t* y, cudaStream_t stream);
+// fc_relu_bf16 removed in Phase 6 — see src/cuda/unary/relu.cu.
 fc_status_t fc_gelu_bf16 (const fc_tensor_view_t* x, fc_tensor_view_t* y, cudaStream_t stream);
 fc_status_t fc_silu_bf16 (const fc_tensor_view_t* x, fc_tensor_view_t* y, cudaStream_t stream);
 fc_status_t fc_axpby_bf16(const fc_tensor_view_t* x, float a, fc_tensor_view_t* y, float b, cudaStream_t stream);

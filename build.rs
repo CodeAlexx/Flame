@@ -194,6 +194,12 @@ fn main() {
     cuda_sources.push("src/cuda/binary/minimum.cu");
     cuda_sources.push("src/cuda/binary/mul_scalar.cu");
     cuda_sources.push("src/cuda/binary/add_scalar.cu");
+    // Phase 6: unary activations.
+    cuda_sources.push("src/cuda/unary/abs.cu");
+    cuda_sources.push("src/cuda/unary/relu.cu");
+    cuda_sources.push("src/cuda/unary/neg.cu");
+    cuda_sources.push("src/cuda/unary/sigmoid.cu");
+    cuda_sources.push("src/cuda/unary/tanh.cu");
 
     if !cuda_sources.iter().all(|p| Path::new(p).exists()) {
         panic!("CUDA sources missing; ensure submodules are synced");

@@ -25,3 +25,8 @@ pub mod maximum_iter;
 pub mod minimum_iter;
 pub mod mul_scalar_iter;
 pub mod add_scalar_iter;
+pub mod abs_iter;
+pub mod relu_iter;
+pub mod neg_iter;
+pub mod sigmoid_iter;
+pub mod tanh_iter;

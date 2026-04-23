@@ -20,7 +20,7 @@ use crate::{
     cuda_ops_ffi::{
         fc_axpby_bf16, fc_bf16_broadcast, fc_bf16_index_select, fc_bf16_repeat_axis,
         fc_bf16_repeat_nd, fc_bf16_slice, fc_gelu_bf16, fc_gemm_bf16, fc_group_norm_backward_bf16,
-        fc_group_norm_bf16, fc_layer_norm_backward_bf16, fc_layer_norm_bf16, fc_relu_bf16,
+        fc_group_norm_bf16, fc_layer_norm_backward_bf16, fc_layer_norm_bf16,
         fc_rms_norm_bf16, fc_rms_norm_bf16_to_f32, fc_silu_bf16, flame_conv2d_nhwc_bf16,
         flame_sdpa_chunked_bf16,
         flame_status_to_result, sdpa_stream_bf16_launch, tensor_as_view_bf16,
@@ -183,19 +183,9 @@ fn default_stream(t: &Tensor) -> CudaStream {
     CudaStream::from_raw(raw)
 }
 
-pub fn relu_bf16(x: &Tensor) -> Result<Tensor> {
-    ensure_bf16(x, "relu_bf16:x")?;
-    let mut out = Tensor::empty_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
-    debug_assert_eq!(out.dtype(), DType::BF16);
-
-    let stream = default_stream(x);
-    let vx = tensor_as_view_bf16(x, "relu_bf16:x")?;
-    let mut vy = tensor_as_view_bf16_mut(&mut out, "relu_bf16:out")?;
-
-    let status = unsafe { fc_relu_bf16(&vx, &mut vy, stream.as_raw()) };
-    status_to_result(status, "fc_relu_bf16")?;
-    Ok(out)
-}
+// Phase 6 (2026-04-22): `relu_bf16` removed. BF16 relu dispatches through
+// the TensorIterator pipeline (`ops::relu_iter::relu_bf16_iter` → functor
+// in src/cuda/unary/relu.cu).
 
 pub fn gelu_bf16(x: &Tensor) -> Result<Tensor> {
     ensure_bf16(x, "gelu_bf16:x")?;

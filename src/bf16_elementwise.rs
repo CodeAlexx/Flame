@@ -306,65 +306,9 @@ void softmax_lastdim_bf16_kernel(const __nv_bfloat16* __restrict__ X,
 }
 "#;
 
-// BF16 abs: clear the sign bit (bit 15). No float math needed.
-const CUDA_ABS_BF16: &str = r#"
-#include <cuda_bf16.h>
-extern "C" __global__
-void abs_bf16_kernel(const unsigned short* __restrict__ X,
-                     unsigned short* __restrict__ Y,
-                     long n) {
-    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        Y[i] = X[i] & 0x7FFF;  // clear sign bit
-    }
-}
-"#;
-
-/// BF16 absolute value — single kernel, sign-bit clear.
-pub fn abs_bf16(x: &Tensor) -> Result<Tensor> {
-    if x.dtype() != DType::BF16 {
-        return Err(Error::InvalidInput("abs_bf16: input must be BF16".into()));
-    }
-    let n = x.shape().elem_count();
-    let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, n)?;
-    let mut out = Tensor {
-        storage: TensorStorage::BF16 {
-            data: data.into(),
-            numel: n,
-        },
-        shape: x.shape().clone(),
-        device: x.device.clone(),
-        id: TensorId::new(),
-        requires_grad: false,
-        custom_strides: None,
-        view_offset: 0,
-
-    };
-
-    let f = ensure_and_get(&x.device, "abs_bf16_kernel", CUDA_ABS_BF16)?;
-    let block = 256u32;
-    let grid = ((n as u32 + block - 1) / block, 1, 1);
-    let cfg = LaunchConfig {
-        grid_dim: grid,
-        block_dim: (block, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    let x_ptr = x.as_device_ptr_bf16("abs_bf16:x")? as u64;
-    let o_ptr = out.as_mut_device_ptr_bf16("abs_bf16:out")? as u64;
-    let n_i = n as i64;
-
-    let mut params: [*mut std::ffi::c_void; 3] = [
-        &x_ptr as *const u64 as *mut std::ffi::c_void,
-        &o_ptr as *const u64 as *mut std::ffi::c_void,
-        &n_i as *const i64 as *mut std::ffi::c_void,
-    ];
-    unsafe {
-        f.launch(cfg, &mut params[..])
-            .map_err(|e| Error::Cuda(format!("abs_bf16 launch: {:?}", e)))?;
-    }
-    Ok(out)
-}
+// Phase 6 (2026-04-22): `abs_bf16` removed. The sign-bit-clear kernel lives
+// in src/cuda/unary/abs.cu now; dispatch goes through the TensorIterator
+// pipeline via `ops::abs_iter::abs_bf16_iter`, registered on the ABS_STUB.
 
 /// Fused BF16 softmax along the last dim. Replaces the 5-step pipeline
 /// (max → sub → exp → sum → div) with one kernel and zero extra allocations.

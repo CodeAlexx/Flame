@@ -106,24 +106,8 @@ namespace {
 // kernels were running at ~3% of memory bandwidth (3.6 ms for [1,4096,15360]
 // vs PyTorch's 0.29 ms = 13× slower). The vectorized versions hit ~80% of
 // peak memory bandwidth.
-__global__ void relu_kernel(const __nv_bfloat16* x, __nv_bfloat16* y, size_t n) {
-  size_t i2 = blockIdx.x * blockDim.x + threadIdx.x;
-  size_t n2 = n >> 1;
-  if (i2 < n2) {
-    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
-    __nv_bfloat162* y2 = reinterpret_cast<__nv_bfloat162*>(y);
-    float2 v = __bfloat1622float2(x2[i2]);
-    float2 r;
-    r.x = v.x > 0.f ? v.x : 0.f;
-    r.y = v.y > 0.f ? v.y : 0.f;
-    y2[i2] = __floats2bfloat162_rn(r.x, r.y);
-  }
-  if (i2 == n2 && (n & 1)) {
-    size_t last = n - 1;
-    float v = f32_from_bf16(x[last]);
-    y[last] = bf16_from_f32(v > 0.f ? v : 0.f);
-  }
-}
+// Phase 6 (2026-04-22): `relu_kernel` removed. Dispatch moved to
+// src/cuda/unary/relu.cu through the TensorIterator pipeline.
 
 __global__ void silu_kernel(const __nv_bfloat16* x, __nv_bfloat16* y, size_t n) {
   size_t i2 = blockIdx.x * blockDim.x + threadIdx.x;
@@ -203,9 +187,11 @@ fc_status_t launch_unary_elementwise(const fc_tensor_view_t* x, fc_tensor_view_t
   return FC_OK;
 }
 
-extern "C" fc_status_t fc_relu_bf16(const fc_tensor_view_t* x, fc_tensor_view_t* y, cudaStream_t stream) {
-  return launch_unary_elementwise(x, y, stream, relu_kernel);
-}
+// fc_relu_bf16 removed in Phase 6 — Tensor::relu and GpuOps::relu now route
+// BF16 through src/cuda/unary/relu.cu via the TensorIterator pipeline.
+// The `relu_kernel` device kernel at line ~109 is no longer called, but
+// kept in the file for now because it's defined in an anonymous namespace
+// alongside `gelu_kernel` and `silu_kernel` which are still live.
 
 extern "C" fc_status_t fc_gelu_bf16(const fc_tensor_view_t* x, fc_tensor_view_t* y, cudaStream_t stream) {
   return launch_unary_elementwise(x, y, stream, gelu_kernel);

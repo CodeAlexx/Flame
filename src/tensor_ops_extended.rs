@@ -659,6 +659,14 @@ impl Tensor {
 
     /// Negate tensor
     pub fn neg(&self) -> Result<Tensor> {
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        if self.dtype() == DType::BF16 {
+            // Phase 6: BF16 routes through the TensorIterator pipeline
+            // (build_unary_op → launch_gpu_kernel<1, NegBF16Op>). Native
+            // sign-bit flip; bit-exact with the prior mul_scalar(-1.0)
+            // path for finite BF16 values.
+            return crate::ops::neg_iter::neg_bf16_iter(self);
+        }
         self.mul_scalar(-1.0)
     }
 
@@ -666,7 +674,9 @@ impl Tensor {
     pub fn abs(&self) -> Result<Tensor> {
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
         if self.dtype() == DType::BF16 {
-            let mut output = crate::bf16_elementwise::abs_bf16(self)?;
+            // Phase 6: BF16 routes through the TensorIterator pipeline
+            // (build_unary_op → launch_gpu_kernel<1, AbsBF16Op>).
+            let mut output = crate::ops::abs_iter::abs_bf16_iter(self)?;
             if self.requires_grad {
                 output.requires_grad = true;
                 if crate::AutogradContext::is_recording() {
