@@ -557,8 +557,12 @@ def generate_pattern_fixtures(out_dir: Path):
     # QKV projection → split → permute → RoPE → SDPA → permute back → output projection
     print("  pattern/klein_attention_path...", end=" ", flush=True)
 
-    B, N, D = 4, 1024, 4608
-    H, HD = 16, 288  # 16 heads, 288 head_dim (4608 / 16)
+    # Shapes chosen to be cuDNN-SDPA compatible (HD ∈ {64, 96, 128}) so
+    # flame-core can run the same pattern — the HD=288 dims the original
+    # drop used caused PyTorch's SDPA to fall through to math-attention
+    # with a warning, and flame-core can't run them at all.
+    B, N, D = 1, 256, 1024
+    H, HD = 8, 128  # 8 heads × 128 head_dim = 1024
 
     x = make_input((B, N, D), seed=SEED)
     w_qkv = make_input((D * 3, D), seed=SEED + 1)
@@ -566,7 +570,7 @@ def generate_pattern_fixtures(out_dir: Path):
     b_qkv = make_input((D * 3,), seed=SEED + 3)
     b_out = make_input((D,), seed=SEED + 4)
 
-    # Precompute RoPE freqs (simplified — real RoPE is more complex)
+    # Precompute RoPE freqs (simplified — real RoPE is complex rotation).
     freqs = make_input((1, 1, N, HD), seed=SEED + 5)
 
     def klein_attn_pattern():
@@ -575,18 +579,25 @@ def generate_pattern_fixtures(out_dir: Path):
         q = q.view(B, N, H, HD).permute(0, 2, 1, 3)          # [B, H, N, HD]
         k = k.view(B, N, H, HD).permute(0, 2, 1, 3)
         v = v.view(B, N, H, HD).permute(0, 2, 1, 3)
-        # Simplified RoPE (real is complex rotation, this is a stand-in)
         q = q * freqs
         k = k * freqs
-        # SDPA
         attn = F.scaled_dot_product_attention(q, k, v)        # [B, H, N, HD]
         attn = attn.permute(0, 2, 1, 3).reshape(B, N, D)     # [B, N, D]
         out = F.linear(attn, w_out, b_out)                     # [B, N, D]
         return out
 
     y_attn = klein_attn_pattern()
+    # Save weights too — Rust side needs them to replicate the computation.
     save_file(
-        {"input": x.cpu(), "output": y_attn.contiguous().cpu()},
+        {
+            "input":  x.cpu(),
+            "w_qkv":  w_qkv.cpu(),
+            "w_out":  w_out.cpu(),
+            "b_qkv":  b_qkv.cpu(),
+            "b_out":  b_out.cpu(),
+            "freqs":  freqs.cpu(),
+            "output": y_attn.contiguous().cpu(),
+        },
         str(fixture_dir / "klein_attention_path.safetensors")
     )
 
@@ -599,7 +610,7 @@ def generate_pattern_fixtures(out_dir: Path):
     # Linear → SwiGLU (split + silu + mul) → Linear
     print("  pattern/klein_mlp_path...", end=" ", flush=True)
 
-    MLP_DIM = D * 4  # 18432
+    MLP_DIM = D * 4
     w_up = make_input((MLP_DIM * 2, D), seed=SEED + 10)
     b_up = make_input((MLP_DIM * 2,), seed=SEED + 11)
     w_down = make_input((D, MLP_DIM), seed=SEED + 12)
@@ -614,7 +625,14 @@ def generate_pattern_fixtures(out_dir: Path):
 
     y_mlp = klein_mlp_pattern()
     save_file(
-        {"input": x.cpu(), "output": y_mlp.contiguous().cpu()},
+        {
+            "input":  x.cpu(),
+            "w_up":   w_up.cpu(),
+            "b_up":   b_up.cpu(),
+            "w_down": w_down.cpu(),
+            "b_down": b_down.cpu(),
+            "output": y_mlp.contiguous().cpu(),
+        },
         str(fixture_dir / "klein_mlp_path.safetensors")
     )
 
@@ -643,7 +661,14 @@ def generate_pattern_fixtures(out_dir: Path):
 
     y_mod = dit_modulate_residual_pattern()
     save_file(
-        {"input": x.cpu(), "residual": residual.cpu(), "output": y_mod.contiguous().cpu()},
+        {
+            "input":    x.cpu(),
+            "shift":    shift.cpu(),
+            "scale":    scale.cpu(),
+            "gate":     gate.cpu(),
+            "residual": residual.cpu(),
+            "output":   y_mod.contiguous().cpu(),
+        },
         str(fixture_dir / "dit_modulate_residual.safetensors")
     )
 
@@ -670,7 +695,16 @@ def generate_pattern_fixtures(out_dir: Path):
 
     y_block = klein_double_block()
     save_file(
-        {"input": x.cpu(), "output": y_block.contiguous().cpu()},
+        {
+            "input":  x.cpu(),
+            "w_qkv":  w_qkv.cpu(),  "b_qkv":  b_qkv.cpu(),
+            "w_out":  w_out.cpu(),  "b_out":  b_out.cpu(),
+            "freqs":  freqs.cpu(),
+            "w_up":   w_up.cpu(),   "b_up":   b_up.cpu(),
+            "w_down": w_down.cpu(), "b_down": b_down.cpu(),
+            "gate":   gate.cpu(),
+            "output": y_block.contiguous().cpu(),
+        },
         str(fixture_dir / "klein_double_block.safetensors")
     )
 
@@ -700,7 +734,11 @@ def generate_pattern_fixtures(out_dir: Path):
 
     y_pnl = permute_narrow_linear()
     save_file(
-        {"input": x_pnl.cpu(), "output": y_pnl.contiguous().cpu()},
+        {
+            "input":  x_pnl.cpu(),
+            "weight": w_pnl.cpu(),
+            "output": y_pnl.contiguous().cpu(),
+        },
         str(fixture_dir / "permute_narrow_linear.safetensors")
     )
 

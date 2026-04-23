@@ -496,11 +496,192 @@ fn parity_fused_rmsnorm() {
 // ---------------------------------------------------------------------------
 // Section 9: Pattern parity (combined sequences)
 // ---------------------------------------------------------------------------
+//
+// Replicate the end-to-end sequences `generate_pattern_fixtures` ran in
+// PyTorch, using flame-core's actual op surface. Weights come from the
+// fixture so we don't have to match the Python random seeds.
+//
+// Linear layers use `fused_linear3d_native` — the fast path that every
+// serious inference-flame model file routes through. Weight layout is
+// `[Cout, Cin]` (PyTorch nn.Linear convention); cuBLAS handles the
+// transpose via TRANSA=T. No runtime .contiguous() materialization.
+
+/// Klein attention pattern:
+///   qkv = Linear(x, w_qkv, b_qkv)
+///   split into q/k/v, reshape to [B,H,N,HD], permute to [B,H,N,HD]
+///   q *= freqs, k *= freqs   (RoPE stand-in)
+///   attn = SDPA(q, k, v)
+///   attn = permute back to [B,N,D]
+///   out = Linear(attn, w_out, b_out)
+fn run_klein_attn(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
+    let x      = ts.get("input").unwrap();
+    let w_qkv  = ts.get("w_qkv").unwrap();
+    let b_qkv  = ts.get("b_qkv").unwrap();
+    let w_out  = ts.get("w_out").unwrap();
+    let b_out  = ts.get("b_out").unwrap();
+    let freqs  = ts.get("freqs").unwrap();
+    let dims = x.shape().dims();
+    let (b, n, d) = (dims[0], dims[1], dims[2]);
+    // Derive H/HD from the freqs fixture (shape [1, 1, N, HD]).
+    let hd = *freqs.shape().dims().last().unwrap();
+    let h = d / hd;
+
+    let qkv = flame_core::ops::fused_inference::fused_linear3d_native(x, w_qkv, Some(b_qkv))?;
+    // Chunk into 3 along the last dim using narrow (returns views).
+    let q3 = qkv.narrow(2, 0 * d, d)?;
+    let k3 = qkv.narrow(2, 1 * d, d)?;
+    let v3 = qkv.narrow(2, 2 * d, d)?;
+    // Reshape views to [B, N, H, HD] then permute to [B, H, N, HD].
+    // reshape requires contig, so materialize the narrow views first.
+    let q = q3.contiguous()?.reshape(&[b, n, h, hd])?.permute(&[0, 2, 1, 3])?.contiguous()?;
+    let k = k3.contiguous()?.reshape(&[b, n, h, hd])?.permute(&[0, 2, 1, 3])?.contiguous()?;
+    let v = v3.contiguous()?.reshape(&[b, n, h, hd])?.permute(&[0, 2, 1, 3])?.contiguous()?;
+    let q = q.mul(freqs)?;
+    let k = k.mul(freqs)?;
+    let attn = flame_core::sdpa::forward(&q, &k, &v, None)?;
+    let attn = attn.permute(&[0, 2, 1, 3])?.contiguous()?.reshape(&[b, n, d])?;
+    let out = flame_core::ops::fused_inference::fused_linear3d_native(&attn, w_out, Some(b_out))?;
+    Ok(out)
+}
+
+/// Klein MLP pattern:
+///   gate_up = Linear(x, w_up, b_up)   → [B, N, 2*MLP]
+///   gate, up = chunk along last dim
+///   hidden = SwiGLU(gate, up)         (fused)
+///   out = Linear(hidden, w_down, b_down)
+fn run_klein_mlp(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
+    let x      = ts.get("input").unwrap();
+    let w_up   = ts.get("w_up").unwrap();
+    let b_up   = ts.get("b_up").unwrap();
+    let w_down = ts.get("w_down").unwrap();
+    let b_down = ts.get("b_down").unwrap();
+
+    let gate_up = flame_core::ops::fused_inference::fused_linear3d_native(x, w_up, Some(b_up))?;
+    let last_axis = gate_up.shape().dims().len() - 1;
+    let two_mlp = gate_up.shape().dims()[last_axis];
+    let half = two_mlp / 2;
+    let gate = gate_up.narrow(last_axis, 0, half)?;
+    let up = gate_up.narrow(last_axis, half, half)?;
+    let hidden = flame_core::bf16_ops::swiglu_fused_bf16(&gate, &up)?;
+    let out = flame_core::ops::fused_inference::fused_linear3d_native(&hidden, w_down, Some(b_down))?;
+    Ok(out)
+}
+
+/// DiT modulate+residual pattern:
+///   norm = RMSNorm(x)
+///   modulated = norm * (1 + scale) + shift
+///   out = residual + gate * modulated
+///
+/// flame-core has `fused_rms_norm_modulate` which does RMSNorm + (1+scale)·x
+/// + shift in ONE kernel — that's the fused-path to use.
+fn run_dit_modulate_residual(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
+    let x        = ts.get("input").unwrap();
+    let shift    = ts.get("shift").unwrap();
+    let scale    = ts.get("scale").unwrap();
+    let gate     = ts.get("gate").unwrap();
+    let residual = ts.get("residual").unwrap();
+    // shift/scale/gate are [B, 1, D] from the fixture; fused_rms_norm_modulate
+    // wants [B, D] so we need to handle that. Simpler: use the unfused path
+    // for the test — we're measuring flame-core's total pattern cost, not
+    // forcing it to use a specific kernel.
+    let dummy_weight = Tensor::ones_dtype(
+        flame_core::Shape::from_dims(&[*x.shape().dims().last().unwrap()]),
+        flame_core::DType::BF16,
+        x.device().clone(),
+    )?;
+    let norm = flame_core::ops::fused_inference::fused_rms_norm(x, &dummy_weight, 1e-5)?;
+    // modulated = norm * (1 + scale) + shift. Broadcast handled by Tensor::mul/add.
+    let one_plus_scale = scale.add_scalar(1.0)?;
+    let scaled = norm.mul(&one_plus_scale)?;
+    let modulated = scaled.add(shift)?;
+    let gated = gate.mul(&modulated)?;
+    let out = residual.add(&gated)?;
+    Ok(out)
+}
+
+/// Klein double-block pattern: attention + residual + MLP + residual.
+fn run_klein_double_block(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
+    let x    = ts.get("input").unwrap();
+    let gate = ts.get("gate").unwrap();
+
+    let attn_out = run_klein_attn(ts)?;
+    let gated_attn = gate.mul(&attn_out)?;
+    let h = x.add(&gated_attn)?;
+
+    // Reuse MLP sub-helper. run_klein_mlp reads its inputs from the same
+    // fixture which also has w_up/b_up/w_down/b_down. It expects "input"
+    // to be the MLP input — but the block feeds `h` here, not the raw `x`.
+    // So inline the MLP with the right input instead.
+    let w_up   = ts.get("w_up").unwrap();
+    let b_up   = ts.get("b_up").unwrap();
+    let w_down = ts.get("w_down").unwrap();
+    let b_down = ts.get("b_down").unwrap();
+    let gate_up = flame_core::ops::fused_inference::fused_linear3d_native(&h, w_up, Some(b_up))?;
+    let last_axis = gate_up.shape().dims().len() - 1;
+    let two_mlp = gate_up.shape().dims()[last_axis];
+    let half = two_mlp / 2;
+    let g = gate_up.narrow(last_axis, 0, half)?;
+    let u = gate_up.narrow(last_axis, half, half)?;
+    let hidden = flame_core::bf16_ops::swiglu_fused_bf16(&g, &u)?;
+    let mlp_out = flame_core::ops::fused_inference::fused_linear3d_native(&hidden, w_down, Some(b_down))?;
+
+    let gated_mlp = gate.mul(&mlp_out)?;
+    let out = h.add(&gated_mlp)?;
+    Ok(out)
+}
 
 #[test]
-#[ignore] // Requires reconstructing the pattern with matching weights; see fixture README.
+fn parity_pattern_klein_attention() {
+    if skip_if_no_fixtures() { return; }
+    let path = fixtures_dir().join("patterns/klein_attention_path.safetensors");
+    if !path.exists() { println!("SKIP: klein_attention_path fixture missing"); return; }
+    let ts = load_fixture(&path);
+    let got = run_klein_attn(&ts).unwrap_or_else(|e| panic!("klein_attention: {e:?}"));
+    let expected = ts.get("output").unwrap();
+    assert_cos_sim("pattern/klein_attention", &got, expected, 0.99);
+    println!("  pattern/klein_attention: ok");
+}
+
+#[test]
+fn parity_pattern_klein_mlp() {
+    if skip_if_no_fixtures() { return; }
+    let path = fixtures_dir().join("patterns/klein_mlp_path.safetensors");
+    if !path.exists() { println!("SKIP: klein_mlp_path fixture missing"); return; }
+    let ts = load_fixture(&path);
+    let got = run_klein_mlp(&ts).unwrap_or_else(|e| panic!("klein_mlp: {e:?}"));
+    let expected = ts.get("output").unwrap();
+    assert_cos_sim("pattern/klein_mlp", &got, expected, 0.99);
+    println!("  pattern/klein_mlp: ok");
+}
+
+#[test]
+fn parity_pattern_dit_modulate_residual() {
+    if skip_if_no_fixtures() { return; }
+    let path = fixtures_dir().join("patterns/dit_modulate_residual.safetensors");
+    if !path.exists() { println!("SKIP: dit_modulate_residual fixture missing"); return; }
+    let ts = load_fixture(&path);
+    let got = run_dit_modulate_residual(&ts)
+        .unwrap_or_else(|e| panic!("dit_modulate_residual: {e:?}"));
+    let expected = ts.get("output").unwrap();
+    // Lower threshold because flame-core's fused_rms_norm uses learned weight=1
+    // while Python's pattern is a hand-rolled RMSNorm (no affine). The
+    // pre-modulate normalization output may diverge slightly between the
+    // two formulations; post-modulate shift/scale dominates.
+    assert_cos_sim("pattern/dit_modulate_residual", &got, expected, 0.99);
+    println!("  pattern/dit_modulate_residual: ok");
+}
+
+#[test]
 fn parity_pattern_klein_double_block() {
-    println!("klein_double_block pattern test pending weight-reconstruction infra");
+    if skip_if_no_fixtures() { return; }
+    let path = fixtures_dir().join("patterns/klein_double_block.safetensors");
+    if !path.exists() { println!("SKIP: klein_double_block fixture missing"); return; }
+    let ts = load_fixture(&path);
+    let got = run_klein_double_block(&ts)
+        .unwrap_or_else(|e| panic!("klein_double_block: {e:?}"));
+    let expected = ts.get("output").unwrap();
+    assert_cos_sim("pattern/klein_double_block", &got, expected, 0.99);
+    println!("  pattern/klein_double_block: ok");
 }
 
 // ---------------------------------------------------------------------------
@@ -717,7 +898,49 @@ fn bench_flame_for(op_path: &str, shape_name: &str) -> Option<f64> {
             }
         }
 
-        // conv2d / pattern/* left unwired; see README for the follow-up.
+        // Pattern: fixture files are `patterns/<subop>.safetensors`.
+        // Dispatch key has form `pattern/<subop>` → subop here is the
+        // name after "pattern/" (e.g. `klein_attention`, `klein_mlp`).
+        "pattern" => {
+            let op = subop?;
+            // timing_results.json subops are `klein_attention`,
+            // `klein_mlp`, `dit_modulate_residual`, `klein_double_block`,
+            // `permute_narrow_linear`, `sdpa_backward`. The fixture file
+            // names in `patterns/` use slightly different suffixes:
+            //   klein_attention       → klein_attention_path.safetensors
+            //   klein_mlp             → klein_mlp_path.safetensors
+            //   dit_modulate_residual → dit_modulate_residual.safetensors
+            //   klein_double_block    → klein_double_block.safetensors
+            let file = match op {
+                "klein_attention"       => "klein_attention_path.safetensors",
+                "klein_mlp"             => "klein_mlp_path.safetensors",
+                "dit_modulate_residual" => "dit_modulate_residual.safetensors",
+                "klein_double_block"    => "klein_double_block.safetensors",
+                // permute_narrow_linear / sdpa_backward not wired.
+                _ => return None,
+            };
+            let path = root.join("patterns").join(file);
+            if !path.exists() { return None; }
+            let ts = load_fixture(&path);
+            Some(match op {
+                "klein_attention" => bench_flame(
+                    || { let _ = run_klein_attn(&ts)?; Ok(()) }, 3, 10,
+                ),
+                "klein_mlp" => bench_flame(
+                    || { let _ = run_klein_mlp(&ts)?; Ok(()) }, 3, 10,
+                ),
+                "dit_modulate_residual" => bench_flame(
+                    || { let _ = run_dit_modulate_residual(&ts)?; Ok(()) }, 3, 10,
+                ),
+                "klein_double_block" => bench_flame(
+                    || { let _ = run_klein_double_block(&ts)?; Ok(()) }, 3, 10,
+                ),
+                _ => return None,
+            })
+        }
+
+        // conv2d left unwired (needs Conv2d wrapper); pattern/sdpa_backward
+        // left unwired (needs autograd + backward harness).
         _ => None,
     }
 }
