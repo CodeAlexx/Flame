@@ -1995,7 +1995,13 @@ extern "C" __global__ void f32_to_bool_kernel(
         let mut output = if self.dtype() == DType::BF16 {
             #[cfg(feature = "cuda")]
             {
-                bf16_ops::gelu_bf16(self)?
+                // Same dispatch pattern as Tensor::silu — route through the
+                // TensorIterator dispatcher; contig inputs short-circuit to
+                // the existing NVRTC vectorized kernel so every current
+                // caller pays zero iterator overhead. Strided inputs hit
+                // `flame_gelu_bf16_strided` in
+                // `cuda/activation_gelu_iter.cu`.
+                crate::ops::gelu_iter::gelu_bf16_iter(self)?
             }
             #[cfg(not(feature = "cuda"))]
             {

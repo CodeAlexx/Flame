@@ -235,6 +235,21 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// TensorIterator strided-path BF16 GELU (tanh approximation). Shape +
+    /// offset + strides handling matches `flame_silu_bf16_strided`. Used
+    /// only by `ops::gelu_iter::gelu_bf16_iter` when the input is NOT
+    /// contiguous — contig callers short-circuit to `bf16_ops::gelu_bf16`.
+    pub fn flame_gelu_bf16_strided(
+        x_ptr: *const core::ffi::c_void,
+        x_offset_elems: i64,
+        y_ptr: *mut core::ffi::c_void,
+        rank: i32,
+        sizes: *const i64,
+        in_strides: *const i64,
+        n_elements: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// TensorIterator strided-path BF16 SiLU. Output is contiguous row-major
     /// over `sizes`; input carries `in_strides` + `x_offset_elems` element
     /// offset. Used only by `ops::silu_iter::silu_bf16_iter` when the input

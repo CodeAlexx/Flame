@@ -99,6 +99,13 @@ harness = false
 name = "silu_iter_alloc"
 harness = false
 
+# TensorIterator gelu dispatcher overhead (2026-04-22, session 2). Same
+# gate as silu — contig path through `gelu_bf16_iter` must stay within
+# 5% of the direct `bf16_ops::gelu_bf16` call.
+[[bench]]
+name = "gelu_iter_alloc"
+harness = false
+
 [build-dependencies]
 cbindgen = "0.26"
 cc = "1.0"

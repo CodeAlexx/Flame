@@ -424,7 +424,8 @@ fallback.
 - `flame::iter::StridedOffsetCalc` — `tensor_iterator.cuh:41` — rank ≤ 6, NARGS=1 (single input arg). Plain divmod; IntegerDivider magic-constants deferred until perf becomes a gate.
 - `flame::iter::launch_elementwise_strided_to_contig<InT, OutT, Op>` — `tensor_iterator.cuh:96` — templated host launcher; takes a device functor instead of a lambda to avoid `--extended-lambda`.
 - `flame_silu_bf16_strided` — `activation_silu_iter.cu:55` — first migrated kernel. Entry for `ops::silu_iter::silu_bf16_iter`'s strided branch. Scalar BF16 (strided input is not guaranteed 2-aligned, so no `__nv_bfloat162` vectorization).
-- Perf note: contig path is UNTOUCHED (short-circuited in Rust to `bf16_ops::silu_bf16` — the vectorized NVRTC kernel). Strided path is a correctness-first fallback; 4096×4096 T-view measures ~277 µs (vs ~141 µs contig), acceptable given it only fires on non-contig inputs. Per-kernel speedup across models does NOT materialize until enough kernels route through the iterator that `Tensor::narrow` can flip to view-return.
+- `flame_gelu_bf16_strided` — `activation_gelu_iter.cu:40` — second migrated kernel (tanh approximation, matches `CUDA_GELU` in bf16_ops.rs). Same scaffolding; only the functor differs.
+- Perf note: contig path is UNTOUCHED for both (short-circuited in Rust to `bf16_ops::{silu,gelu}_bf16` — the vectorized NVRTC kernels). Strided path is a correctness-first fallback; 4096×4096 T-view measures ~270 µs (vs ~100-140 µs contig), acceptable given it only fires on non-contig inputs. Per-kernel speedup across models does NOT materialize until enough kernels route through the iterator that `Tensor::narrow` can flip to view-return.
 
 ### `src/kernels/silu_backward.cu` — fused SiLU backward
 - `flame_silu_backward_bf16` / `flame_silu_backward_f32` — single-kernel `g * sig(x) * (1 + x*(1-sig(x)))`. Same ABI as every fused unary backward kernel: `(grad_out, input, grad_in, n, stream) -> i32`.
