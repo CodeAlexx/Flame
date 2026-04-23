@@ -38,9 +38,12 @@ fn parse_env_flag(name: &str) -> Option<bool> {
 // Inference goes through `forward_cudnn_sdpa_bf16` (fwd only); training
 // goes through `forward_cudnn_sdpa_train_bf16` (fwd + Stats emit) and
 // `flame_cudnn_sdpa_bwd_bf16` on backward. The in-tree WMMA forward
-// (`flame_flash_attention_bf16` in `flash_attention_fwd.cu`) is currently
-// unreferenced and will be deleted in a follow-up cleanup. If cuDNN
-// fails, the error surfaces; there is no silent fall-through to WMMA.
+// (`flame_flash_attention_bf16` in `flash_attention_fwd.cu`) is retained
+// solely as the reference kernel for `tests/cudnn_sdpa_parity.rs`. It
+// is NOT on the Rust dispatch path — `forward_flash_bf16` was deleted
+// in Phase 2c follow-up (2026-04-23) after Phase 2c made it unreachable.
+// If cuDNN fails, the error surfaces; there is no silent fall-through
+// to WMMA.
 
 #[inline]
 fn force_stream_sdpa() -> bool {
@@ -779,54 +782,6 @@ fn tensor_strides_as_4d_bhnd(t: &Tensor) -> SdpaResult<[i64; 4]> {
         )));
     }
     Ok([s[0] as i64, s[1] as i64, s[2] as i64, s[3] as i64])
-}
-
-#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-/// Flash attention: single fused kernel for the entire attention computation.
-/// Q, K, V must be [B, H, N, D] BF16, contiguous. D = 64, 96, or 128. No mask support.
-#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-fn forward_flash_bf16(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    b: usize,
-    h: usize,
-    q_len: usize,
-    k_len: usize,
-    d_q: usize,
-) -> SdpaResult<Tensor> {
-    use crate::cuda::device_lt;
-
-    let bh = (b * h) as i32;
-    let device = q.device();
-    let stream = device_lt::stream_ptr(device)?;
-
-    // Output tensor: same shape as Q. Flash attention fully writes every
-    // element, so skip the zero init.
-    let output = Tensor::empty_dtype(q.shape().clone(), DType::BF16, device.clone())?;
-
-    let q_ptr = q.as_device_ptr_bf16("flash_attn:q")? as *const core::ffi::c_void;
-    let k_ptr = k.as_device_ptr_bf16("flash_attn:k")? as *const core::ffi::c_void;
-    let v_ptr = v.as_device_ptr_bf16("flash_attn:v")? as *const core::ffi::c_void;
-    let o_ptr = output.as_device_ptr_bf16("flash_attn:o")? as *mut core::ffi::c_void;
-
-    let ret = unsafe {
-        crate::cuda::ffi::flame_flash_attention_bf16(
-            q_ptr, k_ptr, v_ptr, o_ptr,
-            core::ptr::null_mut(), // LSE: not needed for inference-only forward
-            bh,
-            q_len as i32,
-            k_len as i32,
-            d_q as i32,
-            stream,
-        )
-    };
-
-    if ret != 0 {
-        return Err(Error::Cuda(format!("flash_attention CUDA error: {ret}")));
-    }
-
-    Ok(output)
 }
 
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
