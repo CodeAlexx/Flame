@@ -147,6 +147,13 @@ config: `block=256, grid=(n+255)/256`.
 | `adam_fused_f32param_f32grad_kernel` | F32 param, F32 grad, F32 m/v | F32-param fast path (biases, F32 embeddings, F32 LoRA alphas). |
 | `adam_fused_f32param_bf16grad_kernel` | F32 param, BF16 grad, F32 m/v | F32-param with BF16 grad for callers that bypass `Parameter::set_grad`. |
 
+### `cuda_kernel_sources.rs` — shared kernel source constants (NVRTC)
+
+| Kernel | Purpose |
+|---|---|
+| `permute_generic_{f32,bf16}_kernel` | Generic 8-D permute via (in_strides, out_strides, perm) table. Dispatched by `GpuOps::permute_generic` as the fallback from `Tensor::permute`. Assumes row-major contiguous input. |
+| `materialize_strided_{f32,bf16}_kernel` ⭐ | Generic strided-plus-offset gather into contiguous row-major output. Used by `Tensor::contiguous()` to realize narrow/chunk views (and any narrow-of-permute composition). `src_addr = in_offset + sum(out_coord[d] * in_strides[d])`. |
+
 ### `cuda_kernels_gpu.rs` — F32 framework kernels (training)
 
 Two notable broadcast kernels:

@@ -750,6 +750,11 @@ impl GpuOps {
         kernels.permute_generic(tensor, dims)
     }
 
+    pub fn materialize_view(tensor: &Tensor) -> Result<Tensor> {
+        let kernels = Self::get_kernels(&tensor.device)?;
+        kernels.materialize_view(tensor)
+    }
+
     /// NHWC -> NCHW
     pub fn permute_nhwc_to_nchw(tensor: &Tensor) -> Result<Tensor> {
         let kernels = Self::get_kernels(&tensor.device)?;

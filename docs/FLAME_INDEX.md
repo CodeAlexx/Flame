@@ -82,6 +82,8 @@
 - `.transpose() / .t() / .transpose_dims(d0, d1)`
 - `.narrow(dim, start, len)`
 - `.chunk(num, dim)` — returns `Vec<Tensor>`
+- `.as_strided(shape, strides, offset)` ⭐ — zero-copy view primitive used by
+  narrow/chunk and parity tests. No autograd; caller records op.
 - `.cat(&[&Tensor], dim)` — `Tensor::cat` static
 - `.expand(&[usize])` — broadcast view
 - `.flatten / .flatten_to_2d`
@@ -428,8 +430,11 @@ convention (`fc_status_t` returns), different file generation:
 
 ### `cuda_ops.rs` — `GpuOps` namespace
 - 59 `pub fn` methods on `GpuOps`. F32 ops surface used by the autograd v3 engine.
-- `GpuOps::add / sub / mul / div / matmul / sum_dim_keepdim / max_dim / mean_dim / permute_generic` etc.
+- `GpuOps::add / sub / mul / div / matmul / sum_dim_keepdim / max_dim / mean_dim / permute_generic / materialize_view` etc.
 - ⚠️ Most paths are training-only; `permute_generic` is the live fallback used by `Tensor::permute` for non-fast-path orders.
+- `GpuOps::materialize_view` ⭐ — materializes any strided-plus-offset view
+  into contiguous row-major. Called by `Tensor::contiguous()` when
+  `view_offset != 0`. Dispatches to `materialize_strided_{f32,bf16}_kernel`.
 
 ### `cuda_ops_bf16.rs` — the BF16 op surface (LIVE)
 - See "Norms" / "Conv" / "Linear" sections above for the live entries.

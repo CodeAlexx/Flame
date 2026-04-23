@@ -363,6 +363,23 @@ impl CudaKernels {
             )?,
         );
         kernels.insert(
+            "materialize_strided_f32_kernel".to_string(),
+            compile_and_load_kernel(
+                &device,
+                MATERIALIZE_STRIDED_F32_KERNEL,
+                "materialize_strided_f32_kernel",
+            )?,
+        );
+        #[cfg(feature = "bf16_u16")]
+        kernels.insert(
+            "materialize_strided_bf16_kernel".to_string(),
+            compile_and_load_kernel(
+                &device,
+                MATERIALIZE_STRIDED_BF16_KERNEL,
+                "materialize_strided_bf16_kernel",
+            )?,
+        );
+        kernels.insert(
             "permute_w_khwkicoc_to_ocickhkw".to_string(),
             compile_and_load_kernel(
                 &device,
@@ -2764,6 +2781,143 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             }
             other => Err(Error::Unsupported(format!(
                 "permute_generic unsupported dtype {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// Materialize a strided view (custom_strides and/or non-zero view_offset)
+    /// into a contiguous row-major tensor of the same shape and dtype.
+    ///
+    /// Handles narrow/chunk views (strides from source, view_offset = start *
+    /// stride[dim]) and any composition such as narrow-of-permute. Called by
+    /// `Tensor::contiguous()` when the view cannot be represented as a pure
+    /// permute of a contiguous buffer.
+    pub fn materialize_view(&self, tensor: &Tensor) -> Result<Tensor> {
+        let shape = tensor.shape.dims();
+        let rank = shape.len();
+        if rank == 0 {
+            return tensor.clone_result();
+        }
+        if rank > 8 {
+            return Err(Error::Unsupported(format!(
+                "materialize_view supports up to 8 dimensions, got {}",
+                rank
+            )));
+        }
+
+        let total = tensor.shape.elem_count();
+        if total == 0 {
+            return Tensor::empty_dtype(
+                Shape::from_dims(shape),
+                tensor.dtype(),
+                tensor.device.clone(),
+            );
+        }
+
+        let in_strides_usize = tensor.strides();
+        let in_strides: Vec<i64> = in_strides_usize.iter().map(|&s| s as i64).collect();
+        let mut out_strides = vec![1i64; rank];
+        for i in (0..rank.saturating_sub(1)).rev() {
+            out_strides[i] = out_strides[i + 1] * shape[i + 1] as i64;
+        }
+        let in_offset_i64 = tensor.offset() as i64;
+
+        let mut d_in_strides = unsafe { self.device.alloc::<i64>(rank) }
+            .map_err(|_| Error::Cuda("alloc in_strides".into()))?;
+        self.device
+            .htod_copy_into(in_strides, &mut d_in_strides)?;
+        let mut d_out_strides = unsafe { self.device.alloc::<i64>(rank) }
+            .map_err(|_| Error::Cuda("alloc out_strides".into()))?;
+        self.device
+            .htod_copy_into(out_strides, &mut d_out_strides)?;
+
+        let block = 256u32;
+        let grid = std::cmp::max(
+            1,
+            std::cmp::min(
+                ((total + block as usize - 1) / block as usize) as u32,
+                65_535,
+            ),
+        );
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        match tensor.dtype() {
+            DType::F32 => {
+                let kernel = self
+                    .device
+                    .get_func(
+                        "materialize_strided_f32_kernel",
+                        "materialize_strided_f32_kernel",
+                    )
+                    .ok_or_else(|| {
+                        Error::Cuda("materialize_strided_f32_kernel not found".into())
+                    })?;
+                let output = Tensor::empty_dtype(
+                    Shape::from_dims(shape),
+                    DType::F32,
+                    tensor.device.clone(),
+                )?;
+                launch_kernel!(
+                    kernel,
+                    cfg,
+                    tensor.storage.try_as_slice_f32()?,
+                    output.storage.try_as_slice_f32()?,
+                    rank as i32,
+                    &d_in_strides,
+                    &d_out_strides,
+                    in_offset_i64,
+                    total as i64
+                )?;
+                Ok(output)
+            }
+            DType::BF16 => {
+                #[cfg(feature = "bf16_u16")]
+                {
+                    let kernel = self
+                        .device
+                        .get_func(
+                            "materialize_strided_bf16_kernel",
+                            "materialize_strided_bf16_kernel",
+                        )
+                        .ok_or_else(|| {
+                            Error::Cuda("materialize_strided_bf16_kernel not found".into())
+                        })?;
+                    let mut output = Tensor::empty_dtype(
+                        Shape::from_dims(shape),
+                        DType::BF16,
+                        tensor.device.clone(),
+                    )?;
+                    let input_ptr =
+                        tensor.as_device_ptr_bf16("materialize_view:input")? as u64;
+                    let output_ptr =
+                        output.as_mut_device_ptr_bf16("materialize_view:output")? as u64;
+                    launch_kernel!(
+                        kernel,
+                        cfg,
+                        input_ptr,
+                        output_ptr,
+                        rank as i32,
+                        &d_in_strides,
+                        &d_out_strides,
+                        in_offset_i64,
+                        total as i64
+                    )?;
+                    Ok(output)
+                }
+                #[cfg(not(feature = "bf16_u16"))]
+                {
+                    Err(Error::Unsupported(
+                        "BF16 materialize_view requires the bf16_u16 feature".into(),
+                    ))
+                }
+            }
+            other => Err(Error::Unsupported(format!(
+                "materialize_view unsupported dtype {:?}",
                 other
             ))),
         }

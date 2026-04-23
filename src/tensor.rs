@@ -2661,26 +2661,18 @@ extern "C" __global__ void f32_to_bool_kernel(
     /// Return a contiguous, row-major copy if this tensor is a strided view;
     /// otherwise return a cheap clone.
     ///
-    /// Uses the existing `GpuOps::permute_generic` materializing kernel to
-    /// realize a view produced by `permute`/`transpose` (Phase 2) — the
-    /// permutation is recovered from the deviation between the view strides
-    /// and the row-major strides of the logical shape. `narrow`/`chunk`
-    /// produce views with non-zero `view_offset`; these are not yet covered
-    /// (Phase 2a scope: permute+transpose only — they're the attention hot
-    /// path). Non-zero offsets return `Err` clearly directing the caller to
-    /// update the op in the next phase rather than silently producing wrong
-    /// output.
+    /// Dispatches to one of two materializing kernels:
+    ///   * `permute_generic` — for permute/transpose views (custom_strides set,
+    ///     view_offset == 0). Recovers the permutation by sorting strides.
+    ///   * `materialize_view` — for narrow/chunk views (view_offset != 0) and
+    ///     any composition thereof. Walks the source with (strides + offset).
     pub fn contiguous(&self) -> Result<Tensor> {
         if self.is_contiguous() {
             return Ok(self.clone());
         }
         if self.view_offset != 0 {
-            return Err(Error::Unsupported(format!(
-                "contiguous() on a narrow/chunk view (offset={}) is not yet \
-                 implemented (stride refactor Phase 2a covers permute/transpose \
-                 only). Caller path should be audited in Phase 2b.",
-                self.view_offset
-            )));
+            // narrow/chunk or narrow-of-permute: generic stride-plus-offset gather.
+            return crate::cuda_ops::GpuOps::materialize_view(self);
         }
         // Recover the permutation from view strides vs row-major strides of
         // the current shape. For a view produced by `permute(dims)`:
@@ -3064,6 +3056,59 @@ extern "C" __global__ void f32_to_bool_kernel(
     /// Prior to this refactor `permute` materialized via `GpuOps::permute_*`
     /// kernels on every call. After the refactor materialization happens
     /// lazily only when a caller explicitly asks for contiguity.
+    /// Build a zero-copy view over this tensor's storage with caller-supplied
+    /// shape, strides, and element offset (PyTorch's `as_strided`). Used by
+    /// `narrow`/`chunk` and by parity tests that need to construct views
+    /// without going through a materializing op.
+    ///
+    /// The caller is responsible for ensuring every reachable coordinate falls
+    /// inside the underlying storage; a debug-only bounds check is performed.
+    /// No autograd op is recorded here — the higher-level op (narrow, chunk,
+    /// etc.) is responsible for recording the appropriate backward op.
+    pub fn as_strided(
+        &self,
+        shape: &[usize],
+        strides: &[usize],
+        offset: usize,
+    ) -> Result<Tensor> {
+        if shape.len() != strides.len() {
+            return Err(Error::InvalidOperation(format!(
+                "as_strided: shape rank {} != strides rank {}",
+                shape.len(),
+                strides.len()
+            )));
+        }
+        #[cfg(debug_assertions)]
+        {
+            if !shape.is_empty() {
+                let max_linear: usize = shape
+                    .iter()
+                    .zip(strides.iter())
+                    .map(|(&d, &s)| if d == 0 { 0 } else { (d - 1) * s })
+                    .sum();
+                let storage_elems = self.storage.len();
+                debug_assert!(
+                    offset + max_linear < storage_elems || (shape.iter().any(|&d| d == 0)),
+                    "as_strided: view [shape={:?}, strides={:?}, offset={}] exceeds \
+                     storage ({} elements)",
+                    shape,
+                    strides,
+                    offset,
+                    storage_elems
+                );
+            }
+        }
+        Ok(Tensor {
+            storage: self.storage.clone(),
+            shape: Shape::from_dims(shape),
+            device: self.device.clone(),
+            id: TensorId::new(),
+            requires_grad: false,
+            custom_strides: Some(strides.to_vec()),
+            view_offset: offset,
+        })
+    }
+
     pub fn permute(&self, dims: &[usize]) -> Result<Tensor> {
         let shape = self.shape.dims();
         if dims.len() != shape.len() {

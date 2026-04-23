@@ -717,6 +717,74 @@ extern "C" __global__ void permute_generic_bf16_kernel(
 }
 "#;
 
+// Materialize a strided view with an element-level offset into contiguous
+// row-major output. Unlike permute_generic_*_kernel, the caller passes the
+// view's own strides directly (no `perm` indirection) and an explicit
+// `in_offset` measured in elements into the source storage. Covers
+// narrow/chunk views (custom_strides + view_offset) and by extension any
+// future stride-plus-offset view without needing a specialized kernel per
+// pattern. See flame-core/docs/FLAME_KERNELS.md for usage.
+pub const MATERIALIZE_STRIDED_F32_KERNEL: &str = r#"
+extern "C" __global__ void materialize_strided_f32_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int ndim,
+    const long long* __restrict__ in_strides,
+    const long long* __restrict__ out_strides,
+    long long in_offset,
+    long long total
+) {
+    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)blockDim.x * (long long)gridDim.x;
+    while (idx < total) {
+        long long rem = idx;
+        long long src_index = in_offset;
+        for (int d = 0; d < ndim; ++d) {
+            long long coord = 0;
+            long long stride_out = out_strides[d];
+            if (stride_out > 0) {
+                coord = rem / stride_out;
+                rem = rem % stride_out;
+            }
+            src_index += coord * in_strides[d];
+        }
+        output[idx] = input[src_index];
+        idx += stride;
+    }
+}
+"#;
+
+#[cfg(feature = "bf16_u16")]
+pub const MATERIALIZE_STRIDED_BF16_KERNEL: &str = r#"
+extern "C" __global__ void materialize_strided_bf16_kernel(
+    const unsigned short* __restrict__ input,
+    unsigned short* __restrict__ output,
+    int ndim,
+    const long long* __restrict__ in_strides,
+    const long long* __restrict__ out_strides,
+    long long in_offset,
+    long long total
+) {
+    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)blockDim.x * (long long)gridDim.x;
+    while (idx < total) {
+        long long rem = idx;
+        long long src_index = in_offset;
+        for (int d = 0; d < ndim; ++d) {
+            long long coord = 0;
+            long long stride_out = out_strides[d];
+            if (stride_out > 0) {
+                coord = rem / stride_out;
+                rem = rem % stride_out;
+            }
+            src_index += coord * in_strides[d];
+        }
+        output[idx] = input[src_index];
+        idx += stride;
+    }
+}
+"#;
+
 // Sum along a dimension, keeping that dimension (size 1)
 pub const SUM_DIM_KEEPDIM_KERNEL: &str = r#"
 extern "C" __global__ void sum_dim_keepdim_kernel(
