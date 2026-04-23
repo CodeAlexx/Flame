@@ -1002,10 +1002,99 @@ pub fn gemm_bf16_into(
     })
 }
 
+/// If `t` is a 2D permute([1,0]) view of a contiguous tensor, return the
+/// underlying contiguous tensor's `(rows, cols)`. Otherwise None.
+///
+/// The underlying is the `transpose_2d(x)` input, i.e. a `[rows, cols]`
+/// row-major contig tensor, where `t.shape() == [cols, rows]` with strides
+/// `[1, rows]`. That's the exact layout `fused_linear3d_native` expects as
+/// its weight (PyTorch `[Cout, Cin]`), which means we can skip materializing
+/// the transpose view and let cuBLAS handle it via TRANSA=T.
+///
+/// Returns None if `t` is already contiguous, is a narrow-view (nonzero
+/// offset), has unusual rank, or has strides that don't match the pure
+/// 2D-permute pattern.
+fn transpose_view_underlying_2d(t: &Tensor) -> Option<(usize, usize)> {
+    let dims = t.shape().dims();
+    if dims.len() != 2 {
+        return None;
+    }
+    if t.offset() != 0 {
+        return None;
+    }
+    // Strides come from either custom_strides (for views) or the contig
+    // row-major pattern (for contig tensors). A transpose view ALWAYS has
+    // custom_strides; a contig tensor never does.
+    let mut s = [0usize; 8];
+    let rank = t.fill_strides_into(&mut s);
+    if rank != 2 {
+        return None;
+    }
+    // Permute([1,0]) of a `[rows, cols]` contig tensor produces shape
+    // `[cols, rows]` and strides `[1, rows]`. Detect exactly that pattern.
+    let shape_rows = dims[0]; // = "cols" of underlying
+    let shape_cols = dims[1]; // = "rows" of underlying
+    if s[0] == 1 && s[1] == shape_rows {
+        // Underlying contig is `[cols, rows] = [shape_cols, shape_rows]`
+        // in the caller's naming. But the function caller wants the
+        // "standard nn.Linear" layout which is `[Cout, Cin]`. For the
+        // matmul `x[M,K] @ t[K,N]`, we have K = shape_rows, N = shape_cols,
+        // and the underlying is `[N, K] = [shape_cols, shape_rows]`.
+        Some((shape_cols, shape_rows))
+    } else {
+        None
+    }
+}
+
 pub fn gemm_bf16(x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     strict::scope("cuda_ops.gemm_bf16", GuardMode::env_default(), || {
         let (m, k, n) = validate_gemm_bf16_inputs(x, w, bias)?;
         strict_block_lt_fallback(m, n)?;
+
+        // Fast path: `w` is a `permute([1,0])` view of a contiguous tensor
+        // in PyTorch `[Cout, Cin]` layout. Skip the per-call materialize
+        // (which at Klein-MLP-up scale is a 170 MB memcpy plus a
+        // non-coalesced transpose kernel — ~10 ms on a 3090 Ti, 5× the
+        // GEMM itself) by routing to `fused_linear3d_native`. That path
+        // passes the underlying weight to cuBLASLt with TRANSA=T, so
+        // cuBLAS handles the transpose during the matmul — zero
+        // materialize.
+        //
+        // Applies when:
+        //   - `x` is contig 2D `[M, K]`
+        //   - `w` is a 2D `permute([1,0])` view of a contig `[N, K]`
+        //   - `bias` is None (Tensor::matmul's only call site; the
+        //     with-bias case would also work but needs `fused_linear3d_native`
+        //     to accept a 2D bias epilogue — out of scope here).
+        //
+        // The 37 model/trainer files that use `let wt = transpose_2d(weight);
+        // x.matmul(&wt)` (SDXL, FLUX.1, SD3, Chroma, Z-Image, ACEStep,
+        // Qwen-Image, and most trainers) get the full speedup from this
+        // path. Klein's inference path uses `fused_linear3d_native`
+        // directly via `linear3d_nt`, so it bypasses this entirely.
+        if bias.is_none() && x.is_contiguous() && x.shape().dims().len() == 2 {
+            if let Some((n_native, k_native)) = transpose_view_underlying_2d(w) {
+                if k_native == k && n_native == n {
+                    // Synthesize a contig view of the underlying `[N, K]`
+                    // storage. Same memory, drops the permute strides.
+                    let w_native = Tensor {
+                        storage: w.storage.clone(),
+                        shape: Shape::from_dims(&[n_native, k_native]),
+                        device: w.device().clone(),
+                        id: crate::tensor::TensorId::new(),
+                        requires_grad: false,
+                        custom_strides: None,
+                        view_offset: 0,
+                    };
+                    let x_3d = x.reshape(&[1, m, k])?;
+                    let out_3d = crate::ops::fused_inference::fused_linear3d_native(
+                        &x_3d, &w_native, None,
+                    )?;
+                    return out_3d.reshape(&[m, n]);
+                }
+            }
+        }
+
         let out_shape = Shape::from_dims(&[m, n]);
         // cuBLASLt writes every output element in `gemm_bf16_into_impl`;
         // no need to memset-zero the buffer first.
