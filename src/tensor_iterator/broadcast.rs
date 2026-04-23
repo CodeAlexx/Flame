@@ -220,9 +220,11 @@ pub fn reorder_dimensions(
                        dim1: usize|
      -> i32 {
         for op_strides in strides_ref.iter() {
-            // TODO(phase-3): also skip operands where will_resize == true,
-            // per PyTorch TensorIterator.cpp:258. No-op in Phase 1 because
-            // no operand has will_resize set.
+            // NOTE (will_resize unsupported): PyTorch TensorIterator.cpp:258
+            // also skips operands where will_resize == true. flame-core has
+            // no implicit-resize path (allocate_or_resize_outputs errors on
+            // shape mismatch instead), so this skip is a no-op in the
+            // current port and carries no runtime cost.
             if op_strides.is_empty() {
                 continue;
             }

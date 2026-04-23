@@ -304,6 +304,20 @@ fn auto_init() {
     init();
 }
 
+// TensorIterator Phase 3: register all BF16 CUDA dispatch stubs once at
+// process start. Mirrors PyTorch's per-REGISTER_DISPATCH file-scope static
+// constructors, collapsed into a single init list. Phase 3 ships the
+// registration function empty — Phase 4 populates it as ops migrate.
+//
+// Runs under both lib and test loads (no `#[cfg(not(test))]` gate) so
+// registration semantics are identical whether flame-core is consumed as
+// a library or exercised from `cargo test`. The stubs are inert until
+// Phase 4 adds ops, so this is cost-free today.
+#[ctor::ctor]
+fn __flame_register_all_bf16_kernels() {
+    crate::tensor_iterator::dispatch::register_all_bf16_kernels();
+}
+
 #[cfg(test)]
 mod __flame_test_defaults {
     use super::{set_default_dtype, DType};

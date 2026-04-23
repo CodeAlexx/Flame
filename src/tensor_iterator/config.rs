@@ -14,12 +14,16 @@
 // encodes this at the type level via the `'a` lifetime, and
 // `add_output(None)` is the signal for "iterator should allocate".
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::tensor::Tensor;
 use crate::DType;
 
 use super::base::{OperandInfo, OperandSrc, TensorIteratorBase};
-use super::dim_vec::DimVec;
+use super::broadcast::{
+    can_use_32bit_indexing, coalesce_dimensions, compute_shape, compute_strides, reorder_dimensions,
+    OperandView,
+};
+use super::dim_vec::{DimVec, I64StrideVec};
 
 /// Port of `at::TensorIteratorConfig`. Constructed via `new()`, chained
 /// with the fluent methods, terminated with one of the `build_*` calls
@@ -62,9 +66,12 @@ pub struct TensorIteratorConfig<'a> {
     /// false. Used by Phase 8 promotion.
     pub(crate) enforce_safe_casting_to_output: bool,
 
-    // TODO(phase-3): add enforce_linear_iteration — see PyTorch
-    // TensorIterator.cpp:248-251. Not wired in Phase 1 because the full
-    // build pipeline is Phase 3; the flag would be a dead setter here.
+    // NOTE (enforce_linear_iteration deferred): PyTorch TensorIterator.cpp:
+    // 248-251 short-circuits reorder_dimensions when this flag is true.
+    // Not wired in flame-core — no Phase 1-11 op needs forced linear
+    // iteration (no affine-strided custom kernels that bypass reorder).
+    // If a future phase adds one, thread the flag through config → base
+    // → broadcast::reorder_dimensions.
 
     /// Port of `promote_inputs_to_common_dtype` (h:897). Phase 1 stores
     /// the flag but does not act on it (no promotion until Phase 8).
@@ -229,17 +236,32 @@ impl<'a> TensorIteratorConfig<'a> {
         self
     }
 
-    /// Build into a base iterator. Phase 1 populates the `OperandInfo`
-    /// array from the pending tensor list but does NOT run
-    /// compute_shape / compute_strides / reorder / coalesce — those
-    /// land in Phase 3 when the full pipeline is wired. The returned
-    /// iterator is "pre-geometry": `shape()` is empty, `ndim()` is 0.
+    /// Build into a base iterator.
     ///
-    /// Phase 1 tests that need post-geometry state run the public
-    /// `broadcast::{compute_shape, compute_strides, reorder_dimensions,
-    /// coalesce_dimensions}` pipeline directly against the operand
-    /// tensors. That test-only plumbing is removed in Phase 3 when the
-    /// full builder is wired.
+    /// Phase 3 wires the full pipeline. The PyTorch reference is
+    /// `TensorIteratorBase::build` at TensorIterator.cpp:1493:
+    ///
+    ///   1. `populate_operands`           → push OperandInfo array.
+    ///   2. `compute_shape`               → broadcast inputs to one shape.
+    ///   3. `compute_strides`             → broadcast byte-strides per operand.
+    ///   4. `reorder_dimensions`          → stride-ascending (innermost-first).
+    ///   5. `allocate_or_resize_outputs`  → allocate any `None` outputs.
+    ///   6. `coalesce_dimensions`         → merge adjacent compatible dims.
+    ///   7. set `requires_32bit_indexing_` and `all_ops_same_shape_`.
+    ///
+    /// What is *not* implemented in Phase 3:
+    ///
+    ///   * `mark_outputs` / `compute_mem_overlaps` — flame-core has no
+    ///     equivalent of PyTorch's `is_read_write` flag, and mem-overlap
+    ///     detection is a separate Phase-3-deferred item.
+    ///   * `compute_names` / `compute_types` beyond the Phase-1 static-dtype
+    ///     fallback. dtype promotion lands at Phase 8.
+    ///   * `fast_set_up` — the fast-path short-circuit is still off; every
+    ///     iterator runs the full geometry pipeline. Adding fast-setup is
+    ///     deferred because it buys no correctness, only throughput.
+    ///   * `will_resize` — flame-core tensors are shape-fixed; a provided
+    ///     output whose shape disagrees with the iteration shape is
+    ///     rejected with `ShapeMismatch`, never silently resized.
     pub fn build(self) -> Result<TensorIteratorBase<'a>> {
         let mut base = TensorIteratorBase::new();
         base.num_outputs_ = self.num_outputs;
@@ -247,7 +269,8 @@ impl<'a> TensorIteratorConfig<'a> {
         base.is_reduction_ = self.is_reduction;
         base.static_dtype_ = self.static_dtype;
 
-        // Push the operands into the base. Phase 1's target_dtype logic:
+        // --- Step 1: populate_operands --------------------------------
+        // target_dtype resolution logic:
         //   1. If `static_dtype` was declared, every operand gets that.
         //   2. Otherwise each operand's target_dtype is inherited from
         //      its source tensor (a pending output has no tensor yet, so
@@ -255,8 +278,9 @@ impl<'a> TensorIteratorConfig<'a> {
         //      PyTorch does when `add_output(undefined)` is used without
         //      a static dtype).
         //   3. If BOTH are unset (pending output + no inputs yet), we
-        //      leave target_dtype as BF16 (flame-core's Phase-1 default)
-        //      and the Phase 3 `compute_types` will correct it.
+        //      leave target_dtype as BF16 (flame-core's Phase-3 default)
+        //      and the full-promotion Phase 8 `compute_types` will
+        //      correct it.
         let fallback_dtype = self
             .static_dtype
             .or_else(|| {
@@ -272,10 +296,16 @@ impl<'a> TensorIteratorConfig<'a> {
             })
             .unwrap_or(DType::BF16);
 
+        let static_dtype = self.static_dtype;
+        let num_outputs = self.num_outputs;
+        let static_shape = self.static_shape.clone();
+        let check_same_dtype = self.check_all_same_dtype;
+        let is_reduction = self.is_reduction;
+
         for (i, src) in self.tensors.into_iter().enumerate() {
-            let is_output = i < self.num_outputs;
+            let is_output = i < num_outputs;
             let target_dtype = match &src {
-                Some(s) => self.static_dtype.unwrap_or_else(|| s.tensor().dtype()),
+                Some(s) => static_dtype.unwrap_or_else(|| s.tensor().dtype()),
                 None => fallback_dtype,
             };
             base.operands.push(OperandInfo {
@@ -286,21 +316,158 @@ impl<'a> TensorIteratorConfig<'a> {
             });
         }
 
-        // Phase 1: if a static shape was declared, record it. Otherwise
-        // shape remains empty until Phase 3 wiring.
-        if let Some(s) = self.static_shape {
-            base.shape_ = s;
+        // Phase-3 dtype check: if `check_all_same_dtype` is on (default),
+        // every defined operand must match. Mirrors the invariant PyTorch
+        // enforces during `compute_types` for the common-case builders
+        // (`build_unary_op` / `build_binary_op`) that pass `check_all_same_dtype(true)`.
+        // Skipped when promotion was requested (the promote-setters clear
+        // the flag as a side effect, matching PyTorch).
+        if check_same_dtype {
+            let mut common: Option<DType> = static_dtype;
+            for op in &base.operands {
+                if let Some(src) = op.src.as_ref() {
+                    let t_dtype = src.tensor().dtype();
+                    match common {
+                        None => common = Some(t_dtype),
+                        Some(c) if c != t_dtype => {
+                            return Err(Error::InvalidOperation(format!(
+                                "TensorIteratorConfig::build: check_all_same_dtype=true but \
+                                 operands disagree: first={:?}, later={:?}",
+                                c, t_dtype
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
 
-        // common_dtype: Phase 1 pre-fills with `static_dtype` when set,
+        // common_dtype: Phase 3 pre-fills with `static_dtype` when set,
         // or the first input's dtype. Phase 8 adds the full promotion
         // table.
-        base.common_dtype_ = self.static_dtype.or_else(|| {
+        base.common_dtype_ = static_dtype.or_else(|| {
             base.operands
                 .iter()
                 .find(|op| !op.is_output && op.src.is_some())
                 .map(|op| op.target_dtype)
         });
+
+        // If a static shape was declared, record it and skip broadcast
+        // shape inference. PyTorch honours `declare_static_shape` by
+        // setting `shape_` directly and marking resize-outputs off.
+        if let Some(s) = static_shape {
+            base.shape_ = s;
+            base.all_ops_same_shape_ = true;
+        } else {
+            // --- Step 2: compute_shape --------------------------------
+            // Only INPUTS contribute to broadcast inference. Output
+            // slots — whether pending (`None`) or pre-provided — are
+            // excluded when `resize_outputs=true` (default). PyTorch
+            // `TensorIterator.cpp:1237` skips outputs-to-be-resized.
+            // flame-core doesn't resize; it verifies provided outputs
+            // match the iteration shape in `allocate_or_resize_outputs`
+            // and errors with `ShapeMismatch` on disagreement. Skipping
+            // outputs here keeps the contract "shape inference from
+            // inputs only" regardless of whether the output exists yet.
+            let skip_outputs_in_shape_inference = self.resize_outputs;
+            let mut views_owned: Vec<(Vec<usize>, Vec<usize>, usize)> = Vec::new();
+            for op in &base.operands {
+                if op.is_output && skip_outputs_in_shape_inference {
+                    continue;
+                }
+                let t = match op.src.as_ref() {
+                    Some(s) => s.tensor(),
+                    None => continue,
+                };
+                let strides = t.strides();
+                views_owned.push((
+                    t.shape().dims().to_vec(),
+                    strides.to_vec(),
+                    op.target_dtype.size_in_bytes(),
+                ));
+            }
+            let views: Vec<OperandView<'_>> = views_owned
+                .iter()
+                .map(|(s, es, sz)| OperandView {
+                    shape: s.as_slice(),
+                    element_strides: es.as_slice(),
+                    elem_size: *sz,
+                })
+                .collect();
+            if views.is_empty() && !is_reduction {
+                return Err(Error::InvalidOperation(
+                    "TensorIteratorConfig::build: no defined operand to infer shape from".into(),
+                ));
+            }
+            let (shape, all_same) = compute_shape(&views)?;
+            base.shape_ = shape;
+            base.all_ops_same_shape_ = all_same;
+        }
+
+        // --- Step 3: compute_strides ----------------------------------
+        // Build the per-operand broadcast byte-stride array. Pending
+        // outputs get a zero-filled array of the right length here; the
+        // allocator in step 5 overwrites it with the real contig stride.
+        {
+            let ndim = base.shape_.len();
+            let mut per_operand: Vec<I64StrideVec> = Vec::with_capacity(base.operands.len());
+            for op in &base.operands {
+                if let Some(src) = op.src.as_ref() {
+                    let t = src.tensor();
+                    let es = t.strides();
+                    let view = OperandView {
+                        shape: t.shape().dims(),
+                        element_strides: es.as_slice(),
+                        elem_size: op.target_dtype.size_in_bytes(),
+                    };
+                    // Reuse the shared compute_strides via a 1-operand call;
+                    // saves duplicating the padding logic here.
+                    let mut strides = compute_strides(base.shape_.as_slice(), &[view]);
+                    per_operand.push(strides.remove(0));
+                } else {
+                    // Pending output: placeholder zero-filled stride array.
+                    per_operand.push(smallvec::smallvec![0i64; ndim]);
+                }
+            }
+            for (op, s) in base.operands.iter_mut().zip(per_operand.into_iter()) {
+                op.stride_bytes = s;
+            }
+        }
+
+        // --- Step 4: reorder_dimensions -------------------------------
+        // Drives the innermost-stride-first ordering. Invalid for rank<=1
+        // (the helper returns identity in that case).
+        {
+            let mut all_strides: Vec<I64StrideVec> =
+                base.operands.iter().map(|op| op.stride_bytes.clone()).collect();
+            let perm = reorder_dimensions(&mut base.shape_, &mut all_strides);
+            base.perm_ = perm;
+            for (op, s) in base.operands.iter_mut().zip(all_strides.into_iter()) {
+                op.stride_bytes = s;
+            }
+        }
+
+        // --- Step 5: allocate_or_resize_outputs -----------------------
+        base.allocate_or_resize_outputs()?;
+
+        // --- Step 6: coalesce_dimensions ------------------------------
+        {
+            let mut all_strides: Vec<I64StrideVec> =
+                base.operands.iter().map(|op| op.stride_bytes.clone()).collect();
+            let changed = coalesce_dimensions(&mut base.shape_, &mut all_strides);
+            base.has_coalesced_dimensions_ = changed;
+            for (op, s) in base.operands.iter_mut().zip(all_strides.into_iter()) {
+                op.stride_bytes = s;
+            }
+        }
+
+        // --- Step 7: finalize flags -----------------------------------
+        {
+            let all_strides: Vec<I64StrideVec> =
+                base.operands.iter().map(|op| op.stride_bytes.clone()).collect();
+            base.requires_32bit_indexing_ =
+                can_use_32bit_indexing(base.shape_.as_slice(), &all_strides);
+        }
 
         Ok(base)
     }

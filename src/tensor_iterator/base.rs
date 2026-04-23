@@ -8,10 +8,11 @@
 //         them in after DispatchStub lands.
 
 use crate::error::{Error, Result};
+use crate::shape::Shape;
 use crate::tensor::Tensor;
 use crate::DType;
 
-use super::dim_vec::{element_strides_to_bytes, DimVec, I64StrideVec};
+use super::dim_vec::{contiguous_element_strides, element_strides_to_bytes, DimVec, I64StrideVec};
 
 /// Port of `at::FastSetupType` (TensorIterator.h:238). Phase 1 only
 /// meaningfully uses `Contiguous`; the other variants are present so
@@ -344,31 +345,196 @@ impl<'a> TensorIteratorBase<'a> {
         }
     }
 
-    // ---------- Stubbed build entries (Phase 3 filler) ----------
+    // ---------- Build entries (Phase 3) ----------
 
-    /// Unary builder stub. Phase 3 replaces with the real pipeline per
-    /// TensorIterator.h:585.
+    /// Port of `TensorIteratorBase::build_unary_op` (TensorIterator.h:585).
+    ///
+    /// The PyTorch version is a method that mutates `*this`; flame-core
+    /// keeps Phase 1's free-function signature returning a fresh
+    /// `TensorIteratorBase<'a>` so the iterator's lifetime matches the
+    /// borrowed input. The behaviour matches PyTorch's:
+    ///
+    ///   * `set_check_mem_overlap(true)` — noted but no mem-overlap check
+    ///     yet (Phase-3-deferred per config.rs doc).
+    ///   * `cast_common_dtype_to_outputs(false)`
+    ///   * `enforce_safe_casting_to_output(false)`
+    ///   * `check_all_same_dtype(true)` — Phase 3 enforces this in
+    ///     `TensorIteratorConfig::build`.
+    ///
+    /// When `out` is `None`, the iterator allocates a fresh contiguous
+    /// output via `allocate_or_resize_outputs`. When `out` is `Some`, its
+    /// shape must match the broadcast iteration shape or `build` returns
+    /// `ShapeMismatch` (flame-core does not implement implicit resize —
+    /// see config.rs `will_resize` discussion).
     pub fn build_unary_op(
-        _out: Option<&'a Tensor>,
-        _a: &'a Tensor,
+        out: Option<&'a Tensor>,
+        a: &'a Tensor,
     ) -> Result<TensorIteratorBase<'a>> {
-        Err(Error::NotImplemented {
-            reason: "TensorIteratorBase::build_unary_op — Phase 3".into(),
-        })
+        super::config::TensorIteratorConfig::new()
+            .set_check_mem_overlap(true)
+            .cast_common_dtype_to_outputs(false)
+            .enforce_safe_casting_to_output(false)
+            .check_all_same_dtype(true)
+            .add_output(out)
+            .add_input(a)
+            .build()
     }
 
-    /// Binary builder stub. Phase 3 replaces with the real pipeline per
-    /// TensorIterator.h:571.
+    /// Port of `TensorIteratorBase::build_binary_op` (TensorIterator.h:571).
+    ///
+    /// PyTorch's `BINARY_OP_CONFIG()` defaults:
+    ///   * `set_check_mem_overlap(true)`
+    ///   * `allow_cpu_scalars(true)` — irrelevant on flame-core (no CPU
+    ///     tensors), but we set the flag for fidelity.
+    ///   * `promote_inputs_to_common_dtype(true)` — stored but not acted on
+    ///     in Phase 3 (promotion lands at Phase 8). The `compute_types`
+    ///     flow still picks the first defined operand's dtype, matching
+    ///     the current BF16-only contract.
+    ///   * `cast_common_dtype_to_outputs(true)`
+    ///   * `enforce_safe_casting_to_output(true)`
     pub fn build_binary_op(
-        _out: Option<&'a Tensor>,
-        _a: &'a Tensor,
-        _b: &'a Tensor,
+        out: Option<&'a Tensor>,
+        a: &'a Tensor,
+        b: &'a Tensor,
     ) -> Result<TensorIteratorBase<'a>> {
-        Err(Error::NotImplemented {
-            reason: "TensorIteratorBase::build_binary_op — Phase 3".into(),
-        })
+        super::config::TensorIteratorConfig::new()
+            .set_check_mem_overlap(true)
+            .allow_cpu_scalars(true)
+            .promote_inputs_to_common_dtype(true)
+            .cast_common_dtype_to_outputs(true)
+            .enforce_safe_casting_to_output(true)
+            .add_output(out)
+            .add_input(a)
+            .add_input(b)
+            .build()
     }
 
+    // ---------- allocate_or_resize_outputs (Phase 3) ----------
+
+    /// Port of `TensorIteratorBase::allocate_or_resize_outputs`
+    /// (TensorIterator.cpp:574).
+    ///
+    /// Runs after `reorder_dimensions` has populated `shape_` and `perm_`,
+    /// and before `coalesce_dimensions`. For each output:
+    ///
+    ///   * If the slot is `None` (caller wrote `add_output(None)`):
+    ///     allocate a fresh **contiguous** tensor of shape `invert_perm(shape_)`
+    ///     and element-strides `invert_perm(reordered contig strides)`. In
+    ///     flame-core's Phase 3 this reduces to a row-major contig output
+    ///     — the iterator-side byte-strides for the new output are then
+    ///     the reordered contig strides.
+    ///
+    ///   * If the slot is `Some` and the output is already defined:
+    ///     verify its shape matches the iteration shape (post-reorder).
+    ///     Mismatch → `ShapeMismatch`. flame-core tensors are shape-fixed;
+    ///     PyTorch's implicit resize path is intentionally omitted.
+    ///
+    /// PyTorch's `inverted` fast-path (contig row-major output) is the
+    /// only path taken in Phase 3 — flame-core's freshly-allocated output
+    /// is always row-major contig in its invert-perm'd shape.
+    pub fn allocate_or_resize_outputs(&mut self) -> Result<()> {
+        // Compute invert-perm of the current (reordered) shape: the
+        // "logical" output shape the user sees. For rank ≤ 1 this is a
+        // no-op identity.
+        let ndim = self.shape_.len();
+        let perm_slice = self.perm_.as_slice();
+        // invert_perm[old_dim] = new_dim
+        let inverted_shape: DimVec = if ndim == 0 {
+            DimVec::new()
+        } else if perm_slice.len() == ndim {
+            let mut out: DimVec = smallvec::smallvec![0usize; ndim];
+            for new_dim in 0..ndim {
+                let old_dim = perm_slice[new_dim];
+                debug_assert!(old_dim < ndim, "perm out of range");
+                out[old_dim] = self.shape_[new_dim];
+            }
+            out
+        } else {
+            // Defensive: no perm recorded (e.g. rank-0/1 fast path) —
+            // treat as identity.
+            self.shape_.clone()
+        };
+
+        for i in 0..self.num_outputs_ {
+            let op = &mut self.operands[i];
+            match &op.src {
+                None => {
+                    // Need device + dtype to allocate. Device comes from
+                    // the first defined operand (every operand must be on
+                    // the same device per `check_all_same_device`). Dtype
+                    // is the operand's target_dtype (already resolved in
+                    // populate_operands).
+                    let dtype = op.target_dtype;
+                    if ndim == 0 && inverted_shape.is_empty() {
+                        return Err(Error::InvalidOperation(
+                            "allocate_or_resize_outputs: cannot allocate rank-0 output in Phase 3"
+                                .into(),
+                        ));
+                    }
+                    // Hunt for the device. Phase 3 looks at inputs first.
+                    let device = {
+                        let mut found = None;
+                        for j in self.num_outputs_..self.operands.len() {
+                            if let Some(src) = self.operands[j].src.as_ref() {
+                                found = Some(src.tensor().device().clone());
+                                break;
+                            }
+                        }
+                        match found {
+                            Some(d) => d,
+                            None => {
+                                return Err(Error::InvalidOperation(
+                                    "allocate_or_resize_outputs: no defined operand to infer \
+                                     output device from"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    };
+                    let shape_obj = Shape::from_dims(inverted_shape.as_slice());
+                    let allocated = Tensor::empty_dtype(shape_obj, dtype, device)?;
+                    // Recompute byte-strides for the newly-allocated
+                    // contig output in the iterator's reordered frame.
+                    // The new tensor is row-major contig → its
+                    // element-strides in the LOGICAL (invert-perm) shape
+                    // are contiguous_element_strides(inverted_shape).
+                    // Broadcast those back into the iterator frame by
+                    // applying `perm_` to produce stride_bytes of length
+                    // `ndim` in post-reorder order.
+                    let logical_es =
+                        contiguous_element_strides(inverted_shape.as_slice());
+                    let elem_size = dtype.size_in_bytes();
+                    let mut reordered: I64StrideVec =
+                        smallvec::smallvec![0i64; ndim];
+                    for new_dim in 0..ndim {
+                        let old_dim = perm_slice[new_dim];
+                        reordered[new_dim] =
+                            (logical_es[old_dim] as i64) * (elem_size as i64);
+                    }
+                    // Also patch the just-allocated output's
+                    // element-stride field in the operand info.
+                    let op = &mut self.operands[i];
+                    op.src = Some(super::base::OperandSrc::Owned(allocated));
+                    op.stride_bytes = reordered;
+                }
+                Some(src) => {
+                    // Provided output: verify the shape matches the
+                    // iteration shape (in logical/invert-perm frame).
+                    let t = src.tensor();
+                    let provided = t.shape().dims();
+                    if provided != inverted_shape.as_slice() {
+                        return Err(Error::ShapeMismatch {
+                            expected: Shape::from_dims(inverted_shape.as_slice()),
+                            got: t.shape().clone(),
+                        });
+                    }
+                    // Byte-strides were already populated in
+                    // compute_strides + reorder. Nothing more to do.
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Convenience: produce a stride_bytes vector matching a tensor's real
@@ -378,4 +544,37 @@ impl<'a> TensorIteratorBase<'a> {
 pub(crate) fn tensor_byte_strides(t: &Tensor) -> I64StrideVec {
     let elem_size = t.dtype().size_in_bytes();
     element_strides_to_bytes(&t.strides(), elem_size)
+}
+
+// ---------- Phase 4 plumbing: owned-output extraction ----------
+
+impl<'a> TensorIteratorBase<'a> {
+    /// Extract an iterator-allocated output by index, consuming the iterator.
+    /// Returns `Err(InvalidOperation)` if the output slot is out of range,
+    /// or if the slot holds a borrowed tensor (caller-provided output) —
+    /// borrowed outputs stay with the caller, the iterator owns nothing.
+    ///
+    /// Phase 4 calls this after `build_unary_op(None, &input)` /
+    /// `build_binary_op(None, &a, &b)` to retrieve the freshly-allocated
+    /// output tensor for returning from `Tensor::silu()` / etc.
+    pub fn take_output(mut self, idx: usize) -> Result<Tensor> {
+        if idx >= self.num_outputs_ {
+            return Err(Error::InvalidOperation(format!(
+                "take_output({idx}): only {} outputs exist",
+                self.num_outputs_
+            )));
+        }
+        let slot = self.operands[idx].src.take();
+        match slot {
+            Some(OperandSrc::Owned(t)) => Ok(t),
+            Some(OperandSrc::Borrowed(_)) => Err(Error::InvalidOperation(format!(
+                "take_output({idx}): output was caller-provided; \
+                 iterator cannot take ownership of a borrowed tensor"
+            ))),
+            None => Err(Error::InvalidOperation(format!(
+                "take_output({idx}): output slot is empty (was it \
+                 already taken?)"
+            ))),
+        }
+    }
 }

@@ -8,9 +8,12 @@
 //!   4. dim coalesce (merge adjacent when stride chain connects);
 //!   5. 32-bit indexing flag;
 //!   6. `is_contiguous` behaviour on a standard contiguous tensor vs a
-//!      permuted `as_strided` view;
-//!   7. `build_unary_op`/`build_binary_op` are Phase-3 stubs that return
-//!      `Err(Error::NotImplemented { reason })`.
+//!      permuted `as_strided` view.
+//!
+//! Phase 3 wired real `build_unary_op`/`build_binary_op` — the end-to-end
+//! coverage for those lives in `tests/tensor_iter_builders.rs`. The
+//! "Phase-3 stub" assertions that were here in Phase 1 are gone because
+//! the stubs themselves are gone.
 //!
 //! These are deliberately *not* tautological — each test asserts a
 //! property the spec dictates (PyTorch behaviour or flame-core
@@ -18,7 +21,7 @@
 
 use flame_core::tensor_iterator::{
     broadcast_pair, can_use_32bit_indexing, coalesce_dimensions, compute_shape, compute_strides,
-    reorder_dimensions, OperandView, TensorIteratorBase, TensorIteratorConfig,
+    reorder_dimensions, OperandView, TensorIteratorConfig,
 };
 use flame_core::Error;
 
@@ -402,59 +405,12 @@ fn is_contiguous_false_on_permuted_as_strided_view() {
     );
 }
 
-// ---------- 7. `build_unary_op` / `build_binary_op` stubs ----------
+// Phase 3 wired the real `build_unary_op`/`build_binary_op` — the
+// previously-present "stub returns NotImplemented" assertions were
+// deleted when Phase 3 landed. End-to-end coverage of the real builders
+// lives in `tests/tensor_iter_builders.rs`.
 
-#[test]
-#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-fn build_unary_op_is_phase_3_stub() {
-    use flame_core::{DType, Shape, Tensor};
-
-    let dev = flame_core::global_cuda_device();
-    let x = Tensor::zeros_dtype(Shape::from_dims(&[2, 2]), DType::BF16, dev).unwrap();
-
-    // Extract the error via `.err()` so the `Result<TensorIteratorBase<'a>, _>`
-    // temporary (which borrows `x`) drops at the end of this expression,
-    // not at the end of the function — avoids E0597 in the match arm.
-    let err = TensorIteratorBase::build_unary_op(None, &x).err();
-    match err {
-        Some(Error::NotImplemented { reason }) => {
-            // Name the phase explicitly so the stub can be found by
-            // grep when Phase 3 lands.
-            assert!(
-                reason.contains("Phase 3"),
-                "stub reason must name the phase that fills it in, got {:?}",
-                reason
-            );
-        }
-        Some(other) => panic!("expected NotImplemented, got {:?}", other),
-        None => panic!("Phase 1 build_unary_op must remain a stub"),
-    }
-}
-
-#[test]
-#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-fn build_binary_op_is_phase_3_stub() {
-    use flame_core::{DType, Shape, Tensor};
-
-    let dev = flame_core::global_cuda_device();
-    let a = Tensor::zeros_dtype(Shape::from_dims(&[2, 2]), DType::BF16, dev.clone()).unwrap();
-    let b = Tensor::zeros_dtype(Shape::from_dims(&[2, 2]), DType::BF16, dev).unwrap();
-
-    let err = TensorIteratorBase::build_binary_op(None, &a, &b).err();
-    match err {
-        Some(Error::NotImplemented { reason }) => {
-            assert!(
-                reason.contains("Phase 3"),
-                "stub reason must name the phase that fills it in, got {:?}",
-                reason
-            );
-        }
-        Some(other) => panic!("expected NotImplemented, got {:?}", other),
-        None => panic!("Phase 1 build_binary_op must remain a stub"),
-    }
-}
-
-// ---------- 8. Sanity: broadcast_pair leak-through ----------
+// ---------- 7. Sanity: broadcast_pair leak-through ----------
 
 #[test]
 fn broadcast_pair_left_align_scalar_shape() {
