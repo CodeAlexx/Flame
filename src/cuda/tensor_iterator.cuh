@@ -27,10 +27,12 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <climits>
+#include <type_traits>
 
 #include "integer_divider.cuh"
 #include "offset_calculator.cuh"
 #include "thread_constants.cuh"
+#include "memory_access.cuh"
 
 namespace flame {
 namespace iter {
@@ -173,23 +175,202 @@ __global__ void unrolled_elementwise_kernel(int N, func_t f) {
 }
 
 // ---------------------------------------------------------------------------
-// launch_vectorized_kernel — PHASE 2 STUB.
+// Vectorized elementwise kernels (Phase 5 fill-in of the Phase 2 stub).
 //
-// PyTorch CUDALoops.cuh:291-400 vector-sizes the load per functor return
-// type and dispatches to `vectorized_elementwise_kernel<vec_size>`. Phase 2
-// of the flame-core port does NOT implement vectorization; it routes every
-// call through `launch_legacy_kernel<128, 4>`, matching the BF16
-// `unroll_factor` the legacy branch picks anyway.
+// PyTorch reference: `vectorized_elementwise_kernel<vec_size, func_t, array_t>`
+// at CUDALoops.cuh:165-226 (non-ROCm, non-sm_90 branch) and the per-vec_size
+// dispatch in `launch_vectorized_kernel` at CUDALoops.cuh:293-366.
 //
-// TODO(phase-5): route to actual vectorized kernel; BF16 specialization must
-// match __hadd2 perf (see plan §Phase 5, R1 in TENSORITERATOR_PORT_REFERENCE.md §9).
+// flame-core keeps two differences from the reference:
+//   1. The scalar type (`__nv_bfloat16`) is fixed; PyTorch templates
+//      `scalar_t` so the same machinery services F16/F32/BF16. Phase 8
+//      generalises.
+//   2. The full PyTorch policies/traits stack (`policies::vectorized`,
+//      `function_traits<func_t>::arity`, `std::apply`) is collapsed into
+//      explicit per-arity kernel specialisations (`UnaryVectorizedKernel`,
+//      `BinaryVectorizedKernel`). flame-core doesn't need the generality
+//      and avoiding function_traits keeps nvcc happy without
+//      `--extended-lambda`.
+//
+// Correctness contract: the functor is called once per scalar element with
+// bit-exact the same inputs as the legacy path would pass it, so output
+// values are bit-identical to `launch_legacy_kernel`'s output (the only
+// difference is load/store width). That makes the Klein byte-equal gate a
+// statement about load-reordering having no observable effect for BF16
+// elementwise arithmetic — which it doesn't, because the functor is pure.
+//
+// Vec size selection: caller passes `vec_size ∈ {1, 2, 4}` based on
+// `can_vectorize_up_to_bf16` over the operand pointers. vec_size=1 falls
+// through to `launch_legacy_kernel` because the vectorized kernel body
+// assumes a power-of-two pack width > 1.
 // ---------------------------------------------------------------------------
 
-template <int NARGS_TOTAL, typename func_t>
-static inline void launch_vectorized_kernel_stub(
-    int64_t N, const func_t& f, cudaStream_t stream)
+template <int vec_size, typename func_t>
+__global__ void unary_vectorized_kernel(
+    int N,
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ in,
+    func_t f)
 {
-    launch_legacy_kernel<num_threads(), thread_work_size(), func_t>(N, f, stream);
+    constexpr int tws = thread_work_size();          // elements/thread (= 4)
+    constexpr int bws = tws * num_threads();         // elements/block (= 512)
+    constexpr int loop_size = tws / vec_size;        // vector iterations/thread
+
+    static_assert(vec_size == 2 || vec_size == 4,
+                  "unary_vectorized_kernel supports vec_size in {2,4}; "
+                  "vec_size=1 routes to launch_legacy_kernel");
+    static_assert(tws % vec_size == 0,
+                  "thread_work_size must be a multiple of vec_size");
+
+    int block_base = bws * blockIdx.x;
+    int remaining = N - block_base;
+
+    if (remaining >= bws) {
+        // Full block — every thread writes `tws` elements via `loop_size`
+        // vectorized ops. Mirrors CUDALoops.cuh:205-208 (the full-block
+        // branch of `vectorized_elementwise_kernel`).
+        const __nv_bfloat16* in_block = in + block_base;
+        __nv_bfloat16* out_block = out + block_base;
+        int thread_idx = threadIdx.x;
+
+        #pragma unroll
+        for (int i = 0; i < loop_size; i++) {
+            int index = thread_idx + i * num_threads();
+            aligned_vector<__nv_bfloat16, vec_size> v =
+                load_vector<vec_size, __nv_bfloat16>(in_block, index);
+            aligned_vector<__nv_bfloat16, vec_size> o;
+            #pragma unroll
+            for (int j = 0; j < vec_size; j++) {
+                o.val[j] = f(v.val[j]);
+            }
+            store_vector<vec_size, __nv_bfloat16>(out_block, index, o);
+        }
+    } else {
+        // Tail block — fall back to scalar per-thread loop. Same shape as
+        // `elementwise_kernel<128,4>`; mirrors the unrolled branch at
+        // CUDALoops.cuh:209-224.
+        int idx = block_base + threadIdx.x;
+        #pragma unroll
+        for (int i = 0; i < tws; i++) {
+            if (idx < N) {
+                out[idx] = f(in[idx]);
+                idx += num_threads();
+            }
+        }
+    }
+}
+
+template <int vec_size, typename func_t>
+__global__ void binary_vectorized_kernel(
+    int N,
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    func_t f)
+{
+    constexpr int tws = thread_work_size();
+    constexpr int bws = tws * num_threads();
+    constexpr int loop_size = tws / vec_size;
+
+    static_assert(vec_size == 2 || vec_size == 4,
+                  "binary_vectorized_kernel supports vec_size in {2,4}");
+    static_assert(tws % vec_size == 0,
+                  "thread_work_size must be a multiple of vec_size");
+
+    int block_base = bws * blockIdx.x;
+    int remaining = N - block_base;
+
+    if (remaining >= bws) {
+        const __nv_bfloat16* a_block = a + block_base;
+        const __nv_bfloat16* b_block = b + block_base;
+        __nv_bfloat16* out_block = out + block_base;
+        int thread_idx = threadIdx.x;
+
+        #pragma unroll
+        for (int i = 0; i < loop_size; i++) {
+            int index = thread_idx + i * num_threads();
+            aligned_vector<__nv_bfloat16, vec_size> va =
+                load_vector<vec_size, __nv_bfloat16>(a_block, index);
+            aligned_vector<__nv_bfloat16, vec_size> vb =
+                load_vector<vec_size, __nv_bfloat16>(b_block, index);
+            aligned_vector<__nv_bfloat16, vec_size> o;
+            #pragma unroll
+            for (int j = 0; j < vec_size; j++) {
+                o.val[j] = f(va.val[j], vb.val[j]);
+            }
+            store_vector<vec_size, __nv_bfloat16>(out_block, index, o);
+        }
+    } else {
+        int idx = block_base + threadIdx.x;
+        #pragma unroll
+        for (int i = 0; i < tws; i++) {
+            if (idx < N) {
+                out[idx] = f(a[idx], b[idx]);
+                idx += num_threads();
+            }
+        }
+    }
+}
+
+// Unary launcher: given vec_size chosen by the caller, dispatch to the
+// correct template instantiation. Grid sized so every thread handles exactly
+// `thread_work_size()` elements (`block_work_size()` total per block).
+// Mirrors `launch_vectorized_kernel`'s grid math at CUDALoops.cuh:326-327.
+template <typename func_t>
+static inline void launch_unary_vectorized(
+    int vec_size,
+    int64_t N,
+    __nv_bfloat16* out,
+    const __nv_bfloat16* in,
+    const func_t& f,
+    cudaStream_t stream)
+{
+    if (N == 0) return;
+    const int bws = block_work_size();
+    dim3 block(num_threads());
+    dim3 grid((unsigned int)((N + bws - 1) / bws));
+    switch (vec_size) {
+        case 4:
+            unary_vectorized_kernel<4, func_t><<<grid, block, 0, stream>>>(
+                (int)N, out, in, f);
+            break;
+        case 2:
+            unary_vectorized_kernel<2, func_t><<<grid, block, 0, stream>>>(
+                (int)N, out, in, f);
+            break;
+        default:
+            // vec_size=1 is handled by the caller (falls through to
+            // `launch_legacy_kernel`). Reaching this branch is a bug.
+            break;
+    }
+}
+
+template <typename func_t>
+static inline void launch_binary_vectorized(
+    int vec_size,
+    int64_t N,
+    __nv_bfloat16* out,
+    const __nv_bfloat16* a,
+    const __nv_bfloat16* b,
+    const func_t& f,
+    cudaStream_t stream)
+{
+    if (N == 0) return;
+    const int bws = block_work_size();
+    dim3 block(num_threads());
+    dim3 grid((unsigned int)((N + bws - 1) / bws));
+    switch (vec_size) {
+        case 4:
+            binary_vectorized_kernel<4, func_t><<<grid, block, 0, stream>>>(
+                (int)N, out, a, b, f);
+            break;
+        case 2:
+            binary_vectorized_kernel<2, func_t><<<grid, block, 0, stream>>>(
+                (int)N, out, a, b, f);
+            break;
+        default:
+            break;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -256,22 +437,39 @@ static inline void launch_unary_legacy(
     if (N == 0) return;
 
     // 2 operands: [0] output, [1] input.
+    T* out_base = reinterpret_cast<T*>(meta.data_ptrs[0]) + meta.offsets_elems[0];
+    const T* in_base = reinterpret_cast<const T*>(meta.data_ptrs[1]) + meta.offsets_elems[1];
+
+    // Contig + BF16 → vectorized fast path (Phase 5). The offset-adjusted
+    // base pointers are what must be checked for alignment, not the raw
+    // storage pointers, because the element-offset in a view can push a
+    // 4-byte-aligned storage into 2-byte alignment.
+    if (meta.is_contiguous) {
+        if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+            const void* ptrs[2] = {
+                reinterpret_cast<const void*>(out_base),
+                reinterpret_cast<const void*>(in_base),
+            };
+            int vec = can_vectorize_up_to_bf16<__nv_bfloat16>(ptrs, 2);
+            if (vec >= 2) {
+                launch_unary_vectorized<func_t>(
+                    vec, N, out_base, in_base, f, stream);
+                return;
+            }
+        }
+        // vec_size=1 or non-BF16 T: fall through to legacy. Same behaviour
+        // as PyTorch's `case 1:` branch at CUDALoops.cuh:351-362.
+    }
+
+    // Non-contig or vec_size=1: legacy strided path via OffsetCalculator.
     UnaryLegacyBody<T, func_t> body{
         make_offset_calculator<2>(meta),
-        reinterpret_cast<T*>(meta.data_ptrs[0]) + meta.offsets_elems[0],
-        reinterpret_cast<const T*>(meta.data_ptrs[1]) + meta.offsets_elems[1],
+        out_base,
+        in_base,
         f,
     };
-
-    // Route through the stubbed vectorized kernel when Rust hinted contig;
-    // both branches currently land on `launch_legacy_kernel<128, 4>` (the
-    // stub is intentional — see TODO above). Non-contig always takes legacy.
-    if (meta.is_contiguous) {
-        launch_vectorized_kernel_stub<2, UnaryLegacyBody<T, func_t>>(N, body, stream);
-    } else {
-        launch_legacy_kernel<num_threads(), thread_work_size(), UnaryLegacyBody<T, func_t>>(
-            N, body, stream);
-    }
+    launch_legacy_kernel<num_threads(), thread_work_size(), UnaryLegacyBody<T, func_t>>(
+        N, body, stream);
 }
 
 template <typename T, typename func_t>
@@ -281,21 +479,36 @@ static inline void launch_binary_legacy(
     const int64_t N = meta.numel;
     if (N == 0) return;
 
+    T* out_base = reinterpret_cast<T*>(meta.data_ptrs[0]) + meta.offsets_elems[0];
+    const T* a_base = reinterpret_cast<const T*>(meta.data_ptrs[1]) + meta.offsets_elems[1];
+    const T* b_base = reinterpret_cast<const T*>(meta.data_ptrs[2]) + meta.offsets_elems[2];
+
+    if (meta.is_contiguous) {
+        if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+            const void* ptrs[3] = {
+                reinterpret_cast<const void*>(out_base),
+                reinterpret_cast<const void*>(a_base),
+                reinterpret_cast<const void*>(b_base),
+            };
+            int vec = can_vectorize_up_to_bf16<__nv_bfloat16>(ptrs, 3);
+            if (vec >= 2) {
+                launch_binary_vectorized<func_t>(
+                    vec, N, out_base, a_base, b_base, f, stream);
+                return;
+            }
+        }
+    }
+
     // 3 operands: [0] output, [1] a, [2] b.
     BinaryLegacyBody<T, func_t> body{
         make_offset_calculator<3>(meta),
-        reinterpret_cast<T*>(meta.data_ptrs[0]) + meta.offsets_elems[0],
-        reinterpret_cast<const T*>(meta.data_ptrs[1]) + meta.offsets_elems[1],
-        reinterpret_cast<const T*>(meta.data_ptrs[2]) + meta.offsets_elems[2],
+        out_base,
+        a_base,
+        b_base,
         f,
     };
-
-    if (meta.is_contiguous) {
-        launch_vectorized_kernel_stub<3, BinaryLegacyBody<T, func_t>>(N, body, stream);
-    } else {
-        launch_legacy_kernel<num_threads(), thread_work_size(), BinaryLegacyBody<T, func_t>>(
-            N, body, stream);
-    }
+    launch_legacy_kernel<num_threads(), thread_work_size(), BinaryLegacyBody<T, func_t>>(
+        N, body, stream);
 }
 
 // ---------------------------------------------------------------------------

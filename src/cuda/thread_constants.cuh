@@ -26,14 +26,16 @@ namespace flame {
 namespace iter {
 
 // Threads per block (PyTorch default for CUDA: 4 warps × 32 = 128).
-constexpr int num_threads() { return 128; }
+// __host__ __device__ so device-side kernels (vectorized path, Phase 5)
+// can use these as compile-time constants inside the kernel body.
+__host__ __device__ constexpr int num_threads() { return 128; }
 
 // Elements per thread for the legacy (non-vectorized) kernel path. Matches
 // the BF16 branch of `gpu_kernel_impl_nocast` (`unroll_factor = 4`).
-constexpr int thread_work_size() { return 4; }
+__host__ __device__ constexpr int thread_work_size() { return 4; }
 
 // Elements per block = threads × elements/thread.
-constexpr int block_work_size() {
+__host__ __device__ constexpr int block_work_size() {
     return num_threads() * thread_work_size();
 }
 
