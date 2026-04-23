@@ -534,108 +534,192 @@ fn bench_flame<F: FnMut() -> Result<()>>(mut f: F, warmup: usize, iters: usize) 
     times[times.len() / 2]
 }
 
-/// Try to run a flame-core equivalent for the given (category, op, shape
-/// fixture name). Returns `None` if the category/op isn't wired up here yet.
+/// Try to run a flame-core equivalent for the given (op_path, shape_name)
+/// entry from `timing_results.json`. Returns `None` when the op isn't
+/// wired up (conv2d needs Conv2d wrapping; pattern/* needs weight
+/// reconstruction infra — both deferred).
+///
+/// Op paths in the JSON come in two forms:
+///   - "category/subop"  — unary/silu, binary/add, matmul/linear, etc.
+///   - "category"        — sdpa, conv2d (no sub-op)
+///
+/// Fixture file layout differs by category; see `PYTORCH_PARITY_README.md`
+/// or the discover calls in the per-category blocks below.
 fn bench_flame_for(op_path: &str, shape_name: &str) -> Option<f64> {
-    // op_path has the form "unary/silu", "binary/add", "scalar/add_scalar",
-    // "comparison/gt", etc.
-    let mut parts = op_path.splitn(2, '/');
-    let category = parts.next()?;
-    let op = parts.next()?;
+    let (category, subop) = match op_path.split_once('/') {
+        Some((c, o)) => (c, Some(o)),
+        None => (op_path, None),
+    };
     let root = fixtures_dir();
 
-    // Unary ops
-    if category == "unary" {
-        let path = root.join("unary").join(op).join(format!("{shape_name}.safetensors"));
-        if !path.exists() { return None; }
-        let ts = load_fixture(&path);
-        let x = ts.get("input")?.clone();
-        let f: fn(&Tensor) -> Result<Tensor> = match op {
-            "silu"    => |t| t.silu(),
-            "gelu"    => |t| t.gelu(),
-            "relu"    => |t| t.relu(),
-            "sigmoid" => |t| t.sigmoid(),
-            "tanh"    => |t| t.tanh(),
-            "abs"     => |t| t.abs(),
-            "neg"     => |t| t.neg(),
-            "square"  => |t| t.square(),
-            "exp"     => |t| t.exp(),
-            "log"     => |t| t.log(),
-            "sqrt"    => |t| t.sqrt(),
-            "rsqrt"   => |t| t.rsqrt(),
-            "recip"   => |t| t.reciprocal(),
-            _ => return None,
-        };
-        return Some(bench_flame(|| { let _ = f(&x)?; Ok(()) }, 3, 10));
-    }
+    match category {
+        "unary" => {
+            let op = subop?;
+            let path = root.join("unary").join(op).join(format!("{shape_name}.safetensors"));
+            if !path.exists() { return None; }
+            let ts = load_fixture(&path);
+            let x = ts.get("input")?.clone();
+            let f: fn(&Tensor) -> Result<Tensor> = match op {
+                "silu"    => |t| t.silu(),
+                "gelu"    => |t| t.gelu(),
+                "relu"    => |t| t.relu(),
+                "sigmoid" => |t| t.sigmoid(),
+                "tanh"    => |t| t.tanh(),
+                "abs"     => |t| t.abs(),
+                "neg"     => |t| t.neg(),
+                "square"  => |t| t.square(),
+                "exp"     => |t| t.exp(),
+                "log"     => |t| t.log(),
+                "sqrt"    => |t| t.sqrt(),
+                "rsqrt"   => |t| t.rsqrt(),
+                "recip"   => |t| t.reciprocal(),
+                _ => return None,
+            };
+            Some(bench_flame(|| { let _ = f(&x)?; Ok(()) }, 3, 10))
+        }
 
-    // Binary ops
-    if category == "binary" {
-        let path = root.join("binary").join(op).join(format!("{shape_name}.safetensors"));
-        if !path.exists() { return None; }
-        let ts = load_fixture(&path);
-        let a = ts.get("input_a")?.clone();
-        let b = ts.get("input_b")?.clone();
-        let f: fn(&Tensor, &Tensor) -> Result<Tensor> = match op {
-            "add"     => |x, y| x.add(y),
-            "sub"     => |x, y| x.sub(y),
-            "mul"     => |x, y| x.mul(y),
-            "div"     => |x, y| x.div(y),
-            "maximum" => |x, y| x.maximum(y),
-            "minimum" => |x, y| x.minimum(y),
-            _ => return None,
-        };
-        return Some(bench_flame(|| { let _ = f(&a, &b)?; Ok(()) }, 3, 10));
-    }
+        "binary" => {
+            let op = subop?;
+            let path = root.join("binary").join(op).join(format!("{shape_name}.safetensors"));
+            if !path.exists() { return None; }
+            let ts = load_fixture(&path);
+            let a = ts.get("input_a")?.clone();
+            let b = ts.get("input_b")?.clone();
+            let f: fn(&Tensor, &Tensor) -> Result<Tensor> = match op {
+                "add"     => |x, y| x.add(y),
+                "sub"     => |x, y| x.sub(y),
+                "mul"     => |x, y| x.mul(y),
+                "div"     => |x, y| x.div(y),
+                "maximum" => |x, y| x.maximum(y),
+                "minimum" => |x, y| x.minimum(y),
+                _ => return None,
+            };
+            Some(bench_flame(|| { let _ = f(&a, &b)?; Ok(()) }, 3, 10))
+        }
 
-    // Scalar ops
-    if category == "scalar" {
-        let path = root.join("scalar").join(op).join(format!("{shape_name}.safetensors"));
-        if !path.exists() { return None; }
-        let ts = load_fixture(&path);
-        let x = ts.get("input")?.clone();
-        return Some(match op {
-            "add_scalar" => bench_flame(|| { let _ = x.add_scalar(0.5)?; Ok(()) }, 3, 10),
-            "mul_scalar" => bench_flame(|| { let _ = x.mul_scalar(2.0)?; Ok(()) }, 3, 10),
-            _ => return None,
-        });
-    }
+        "scalar" => {
+            let op = subop?;
+            let path = root.join("scalar").join(op).join(format!("{shape_name}.safetensors"));
+            if !path.exists() { return None; }
+            let ts = load_fixture(&path);
+            let x = ts.get("input")?.clone();
+            Some(match op {
+                "add_scalar" => bench_flame(|| { let _ = x.add_scalar(0.5)?; Ok(()) }, 3, 10),
+                "mul_scalar" => bench_flame(|| { let _ = x.mul_scalar(2.0)?; Ok(()) }, 3, 10),
+                _ => return None,
+            })
+        }
 
-    // Comparison ops
-    if category == "comparison" {
-        let path = root.join("comparison").join(op).join(format!("{shape_name}.safetensors"));
-        if !path.exists() { return None; }
-        let ts = load_fixture(&path);
-        let a = ts.get("input_a")?.clone();
-        let b = ts.get("input_b")?.clone();
-        let f: fn(&Tensor, &Tensor) -> Result<Tensor> = match op {
-            "gt" => |x, y| x.gt(y),
-            "ge" => |x, y| x.ge(y),
-            "lt" => |x, y| x.lt(y),
-            "le" => |x, y| x.le(y),
-            "eq" => |x, y| x.eq(y),
-            "ne" => |x, y| x.ne(y),
-            _ => return None,
-        };
-        return Some(bench_flame(|| { let _ = f(&a, &b)?; Ok(()) }, 3, 10));
-    }
+        "comparison" => {
+            let op = subop?;
+            let path = root.join("comparison").join(op).join(format!("{shape_name}.safetensors"));
+            if !path.exists() { return None; }
+            let ts = load_fixture(&path);
+            let a = ts.get("input_a")?.clone();
+            let b = ts.get("input_b")?.clone();
+            let f: fn(&Tensor, &Tensor) -> Result<Tensor> = match op {
+                "gt" => |x, y| x.gt(y),
+                "ge" => |x, y| x.ge(y),
+                "lt" => |x, y| x.lt(y),
+                "le" => |x, y| x.le(y),
+                "eq" => |x, y| x.eq(y),
+                "ne" => |x, y| x.ne(y),
+                _ => return None,
+            };
+            Some(bench_flame(|| { let _ = f(&a, &b)?; Ok(()) }, 3, 10))
+        }
 
-    // SDPA
-    if category == "sdpa" {
-        // op here is actually the shape name for sdpa (no sub-op)
-        let path = root.join("sdpa").join(format!("{shape_name}.safetensors"));
-        if !path.exists() { return None; }
-        let ts = load_fixture(&path);
-        let q = ts.get("q")?.clone();
-        let k = ts.get("k")?.clone();
-        let v = ts.get("v")?.clone();
-        return Some(bench_flame(
-            || { let _ = flame_core::sdpa::forward(&q, &k, &v, None)?; Ok(()) },
-            3, 10,
-        ));
-    }
+        // SDPA: fixture path is `sdpa/<shape_name>.safetensors`; shape_name
+        // has `_contig` or `_strided` suffix already.
+        "sdpa" => {
+            let path = root.join("sdpa").join(format!("{shape_name}.safetensors"));
+            if !path.exists() { return None; }
+            let ts = load_fixture(&path);
+            let q = ts.get("q")?.clone();
+            let k = ts.get("k")?.clone();
+            let v = ts.get("v")?.clone();
+            Some(bench_flame(
+                || { let _ = flame_core::sdpa::forward(&q, &k, &v, None)?; Ok(()) },
+                3, 10,
+            ))
+        }
 
-    None
+        // Matmul/Linear: fixture path is `matmul/<shape_name>.safetensors`;
+        // `_nobias` variants are matmul without the bias add.
+        "matmul" => {
+            let op = subop?;
+            let path = root.join("matmul").join(format!("{shape_name}.safetensors"));
+            if !path.exists() { return None; }
+            let ts = load_fixture(&path);
+            let input = ts.get("input")?.clone();
+            let weight = ts.get("weight")?.clone();
+            match op {
+                "linear" => {
+                    let bias = ts.get("bias")?.clone();
+                    let w_t = weight.transpose().ok()?;
+                    Some(bench_flame(
+                        || {
+                            let logits = input.matmul(&w_t)?;
+                            let _ = logits.add(&bias)?;
+                            Ok(())
+                        },
+                        3, 10,
+                    ))
+                }
+                "mm" => {
+                    let w_t = weight.transpose().ok()?;
+                    Some(bench_flame(
+                        || { let _ = input.matmul(&w_t)?; Ok(()) },
+                        3, 10,
+                    ))
+                }
+                _ => None,
+            }
+        }
+
+        // Fused: fixture path is `fused/<sub>_<shape>.safetensors` (e.g.
+        // `swiglu_klein_hidden`). Timing entry's shape_name is just
+        // `<shape>` (`klein_hidden`), so we prepend `<sub>_` here.
+        "fused" => {
+            let op = subop?;
+            let path = root.join("fused").join(format!("{op}_{shape_name}.safetensors"));
+            if !path.exists() { return None; }
+            let ts = load_fixture(&path);
+            match op {
+                "swiglu" => {
+                    let gate_up = ts.get("input")?.clone();
+                    let dims = gate_up.shape().dims().to_vec();
+                    let last_axis = dims.len() - 1;
+                    let last = dims[last_axis];
+                    if last % 2 != 0 { return None; }
+                    let half = last / 2;
+                    let gate = gate_up.narrow(last_axis, 0, half).ok()?;
+                    let up = gate_up.narrow(last_axis, half, half).ok()?;
+                    Some(bench_flame(
+                        || { let _ = flame_core::bf16_ops::swiglu_fused_bf16(&gate, &up)?; Ok(()) },
+                        3, 10,
+                    ))
+                }
+                "rmsnorm" => {
+                    let input = ts.get("input")?.clone();
+                    let weight = ts.get("weight")?.clone();
+                    Some(bench_flame(
+                        || {
+                            let _ = flame_core::ops::fused_inference::fused_rms_norm(
+                                &input, &weight, 1e-5,
+                            )?;
+                            Ok(())
+                        },
+                        3, 10,
+                    ))
+                }
+                _ => None,
+            }
+        }
+
+        // conv2d / pattern/* left unwired; see README for the follow-up.
+        _ => None,
+    }
 }
 
 #[test]
