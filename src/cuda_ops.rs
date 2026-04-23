@@ -72,17 +72,18 @@ impl GpuOps {
         }
     }
 
+    /// Compute the target dtype for a binary op. Phase 8 consolidates
+    /// this onto the TensorIterator promotion ladder — PyTorch's
+    /// `promoteTypes` table, ported at
+    /// `src/tensor_iterator/promote.rs`. This replaces the ad-hoc
+    /// F32>F16>BF16 cascade that lived here before.
+    ///
+    /// Note: the old cascade returned F16 for F16+BF16; PyTorch's
+    /// promote-table (and now this function) returns F32 for that pair.
+    /// No flame-core op currently produces F16+BF16 inputs in practice,
+    /// but the divergence is worth naming.
     fn binary_target_dtype(a: crate::DType, b: crate::DType) -> crate::DType {
-        use crate::DType::{BF16, F16, F32};
-        if a == F32 || b == F32 {
-            F32
-        } else if a == F16 || b == F16 {
-            F16
-        } else if a == BF16 || b == BF16 {
-            BF16
-        } else {
-            a
-        }
+        crate::tensor_iterator::promote_dtypes(a, b)
     }
 
     /// Get or create CudaKernels instance for a device

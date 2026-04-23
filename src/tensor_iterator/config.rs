@@ -342,15 +342,35 @@ impl<'a> TensorIteratorConfig<'a> {
             }
         }
 
-        // common_dtype: Phase 3 pre-fills with `static_dtype` when set,
-        // or the first input's dtype. Phase 8 adds the full promotion
-        // table.
-        base.common_dtype_ = static_dtype.or_else(|| {
+        // common_dtype: when `promote_inputs_to_common_dtype` is set
+        // (Phase 8 — matches PyTorch TensorIterator.cpp ~L285
+        // `compute_common_dtype_only_for_inputs`), fold the input dtypes
+        // through the promotion ladder. Otherwise keep Phase 3's
+        // behaviour: static_dtype, else first input's dtype.
+        base.common_dtype_ = if let Some(sd) = static_dtype {
+            Some(sd)
+        } else if self.promote_inputs_to_common_dtype {
+            let input_dtypes: Vec<DType> = base
+                .operands
+                .iter()
+                .filter(|op| !op.is_output && op.src.is_some())
+                .map(|op| op.src.as_ref().unwrap().tensor().dtype())
+                .collect();
+            super::promote::promote_many(input_dtypes).or_else(|| {
+                // No inputs at all (e.g. reduction with only outputs) —
+                // match Phase 3 fallback, inheriting from the output
+                // slot if any.
+                base.operands
+                    .iter()
+                    .find(|op| op.src.is_some())
+                    .map(|op| op.target_dtype)
+            })
+        } else {
             base.operands
                 .iter()
                 .find(|op| !op.is_output && op.src.is_some())
                 .map(|op| op.target_dtype)
-        });
+        };
 
         // If a static shape was declared, record it and skip broadcast
         // shape inference. PyTorch honours `declare_static_shape` by
