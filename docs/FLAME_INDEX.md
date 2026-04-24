@@ -635,6 +635,7 @@ backward. Foundation of the "offload instead of recompute" checkpoint path.
 - `python/*` — feature-gated PyO3 bindings
 - `capi.rs` — feature-gated C API surface
 - `debug_device.rs` — `assert_cuda(tag, t) / log_device(tag, t)`
+- `debug_finite.rs` — `FLAME_DEBUG_FINITE=1` tripwire. `is_enabled() / reset() / check(site, t)`. When enabled, `check` syncs + scans the tensor for NaN/±Inf, logs a finite-range summary per call-site, errors on the first non-finite and self-disables so the trace isn't spammed. Training bring-up diagnostic — used by `autograd::backward` to tag per-op grads automatically.
 - `logging.rs` — logging setup
 - `env_flags.rs` — env var caching
 - `kernel_launcher.rs` — `LaunchConfig` helpers
