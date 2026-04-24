@@ -853,6 +853,28 @@ pub(crate) fn rms_norm_backward(
         ));
     }
 
+    // Same contiguity fix as the forward: the backward kernel reads the
+    // device pointer as a contiguous `[batch * norm_size]` buffer. Klein's
+    // `split_qkv → permute` saves a strided view into the autograd tape;
+    // without this, the backward computes gradients in physical-memory
+    // order but labels them with logical shape → scrambled grads on the
+    // same class of inputs as the forward bug. Observed as step-1
+    // grad_norm ~5e10 on LoRA B parameters that flow through QK RMSNorm.
+    let input_owned;
+    let input = if input.is_contiguous() {
+        input
+    } else {
+        input_owned = input.contiguous()?;
+        &input_owned
+    };
+    let grad_out_owned;
+    let grad_out_bf16 = if grad_out_bf16.is_contiguous() {
+        grad_out_bf16
+    } else {
+        grad_out_owned = grad_out_bf16.contiguous()?;
+        &grad_out_owned
+    };
+
     let total_elems = input.shape().elem_count();
     let batch_size = inv_rms.shape().elem_count();
     if batch_size == 0 || total_elems % batch_size != 0 {

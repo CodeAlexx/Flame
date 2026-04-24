@@ -2672,6 +2672,24 @@ fn compute_gradients(
                 input_bf16_owned = input_tensor.to_dtype_no_grad(DType::BF16)?;
                 &input_bf16_owned
             };
+            // Same contiguity fix as the layer_norm forward helper: the bwd
+            // kernel reads the device pointer as a contiguous `[batch *
+            // norm_size]` buffer. Saved tensors from strided callers (narrow,
+            // permute) must be contiguified or the gradient is scrambled.
+            let input_bf16_contig;
+            let input_bf16 = if input_bf16.is_contiguous() {
+                input_bf16
+            } else {
+                input_bf16_contig = input_bf16.contiguous()?;
+                &input_bf16_contig
+            };
+            let grad_bf16_contig;
+            let grad_bf16 = if grad_bf16.is_contiguous() {
+                grad_bf16
+            } else {
+                grad_bf16_contig = grad_bf16.contiguous()?;
+                &grad_bf16_contig
+            };
             // Extract weight and bias from saved_tensors if present.
             // Forward saves: [input, weight?, bias?, mean, rstd]
             // Weight is at index 1 if it was saved (affine LayerNorm).
