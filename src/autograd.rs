@@ -670,6 +670,16 @@ fn try_cudnn_sdpa_backward(
     scale: f32,
     device: &Arc<cudarc::driver::CudaDevice>,
 ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    // FLAME_NO_CUDNN_SDPA_BWD=1 forces the decomposed-recompute backward.
+    // Diagnostic escape hatch: the cuDNN sdpa-bwd path can produce
+    // extreme-magnitude gradients on certain BF16 Q/K magnitudes (observed
+    // during Klein 4B LoRA training as step-1 grad_norm spikes of 1e10+).
+    static NO_CUDNN_SDPA_BWD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NO_CUDNN_SDPA_BWD.get_or_init(|| {
+        std::env::var("FLAME_NO_CUDNN_SDPA_BWD").ok().as_deref() == Some("1")
+    }) {
+        return Ok(None);
+    }
     // All the reasons to bail out.
     if mask.is_some() { return Ok(None); }
     let (Some(o), Some(stats)) = (o, stats) else { return Ok(None); };
