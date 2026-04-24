@@ -88,6 +88,7 @@ pub mod cuda_conv2d;
 pub mod cuda_conv2d_direct;
 pub mod cuda_conv2d_fast;
 pub mod debug_device;
+pub mod debug_finite;
 pub mod pinned;
 pub use pinned::{
     memcpy_async_device_to_host, memcpy_async_host_to_device, register_slice_as_pinned,

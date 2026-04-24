@@ -709,6 +709,25 @@ fn rms_norm_forward(
         ));
     }
 
+    // The `rms_norm_forward_bf16` kernel assumes row-major contiguous layout
+    // (reads `row * norm_size + i` directly from the raw pointer, ignoring
+    // strides). If the caller hands us a permuted view — e.g. Klein's
+    // `split_qkv` produces `[B, H, L, D]` via `.permute([0, 2, 1, 3])` on a
+    // `[B, L, H, D]` contiguous buffer — the kernel reads the wrong element
+    // ordering, silently shipping a tensor whose logical [b, h, l, d] index
+    // returns the value that was physically at (b, l, h, d). The output has
+    // correct per-row RMS, so it's invisible to unit tests that only check
+    // magnitude; but downstream ops that rely on the logical axis labels
+    // (cat on dim=2, RoPE keyed on `l`) see scrambled data.
+    // Bit-exact by construction once `contiguous()` is enforced.
+    let input_owned;
+    let input = if input.is_contiguous() {
+        input
+    } else {
+        input_owned = input.contiguous()?;
+        &input_owned
+    };
+
     let batch_size = total_elems / norm_size;
     rms_norm_forward_bf16(input, weight, batch_size, norm_size, eps)
 }

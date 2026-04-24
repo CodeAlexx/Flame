@@ -347,6 +347,21 @@ pub fn layer_norm(
     let batch_size: usize = input_dims[..offset].iter().product();
     let norm_size: usize = normalized_shape.iter().product();
 
+    // The layer_norm_forward_* kernels read the raw device pointer as a
+    // `[batch_size * norm_size]` contiguous buffer. Strided views (narrow,
+    // permute) silently produce wrong output — the kernel normalizes each
+    // `norm_size`-chunk of PHYSICAL memory as a row, but the caller labels
+    // the output with the logical shape. See matching fix in
+    // `flame-core/src/norm.rs::rms_norm_forward`. Bit-exact parity vs
+    // musubi's torch LayerNorm once inputs are contiguified here.
+    let input_owned;
+    let input = if input.is_contiguous() {
+        input
+    } else {
+        input_owned = input.contiguous()?;
+        &input_owned
+    };
+
     let artifacts = if input.dtype() == DType::BF16 && input.storage.dtype() == DType::BF16 {
         layer_norm_forward_bf16(input, weight, bias, batch_size, norm_size, eps)?
     } else {

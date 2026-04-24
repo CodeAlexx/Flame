@@ -1277,9 +1277,22 @@ impl AutogradContext {
                 std::collections::HashMap::new();
 
             let backward_result: Result<()> = (|| {
+                let finite_check = crate::debug_finite::is_enabled();
                 for entry in tape_entries.iter().rev() {
                     if let Some(output_grad) = gradients.take(entry.output_id) {
                         let t_node = std::time::Instant::now();
+
+                        // FLAME_DEBUG_FINITE: check incoming grad before the
+                        // op computes anything. If NaN/Inf arrived here it
+                        // was produced by the next-later op in the tape.
+                        if finite_check {
+                            let site = format!(
+                                "bwd:{}@{}:output_grad",
+                                op_tag(&entry.op),
+                                entry.output_id.0
+                            );
+                            crate::debug_finite::check(&site, &output_grad)?;
+                        }
 
                         // Compute input gradients
                         let input_grads = match compute_gradients(entry, &output_grad, &device) {
@@ -1299,6 +1312,21 @@ impl AutogradContext {
                         let e = per_op_time.entry(disc_u64).or_insert((std::time::Duration::ZERO, 0));
                         e.0 += kernel_dt;
                         e.1 += 1;
+
+                        // FLAME_DEBUG_FINITE: check the produced input_grads.
+                        // A non-finite result here means THIS op's backward
+                        // formula produced garbage from a finite output_grad.
+                        if finite_check {
+                            for (tid, g) in &input_grads {
+                                let site = format!(
+                                    "bwd:{}@{}:grad_for:{}",
+                                    op_tag(&entry.op),
+                                    entry.output_id.0,
+                                    tid.0
+                                );
+                                crate::debug_finite::check(&site, g)?;
+                            }
+                        }
 
                         // Accumulate gradients (skip frozen weight IDs to save memory).
                         // Checkpoint backward returns ALL internal gradients (including
@@ -3928,4 +3956,68 @@ fn guard_optional_tensor(op: &str, tensor: Option<&Tensor>) -> Result<()> {
         guard_tensor(op, t)?;
     }
     Ok(())
+}
+
+/// Short stable tag for an `Op` variant — used by FLAME_DEBUG_FINITE so
+/// backward traces show which op emitted a non-finite grad.
+fn op_tag(op: &Op) -> &'static str {
+    match op {
+        Op::Add { .. } => "Add",
+        Op::Sub { .. } => "Sub",
+        Op::Mul { .. } => "Mul",
+        Op::Div { .. } => "Div",
+        Op::MulScalar { .. } => "MulScalar",
+        Op::AddScalar { .. } => "AddScalar",
+        Op::MatMul { .. } => "MatMul",
+        Op::BatchMatMul { .. } => "BatchMatMul",
+        Op::Linear { .. } => "Linear",
+        Op::ReLU { .. } => "ReLU",
+        Op::GELU { .. } => "GELU",
+        Op::SiLU { .. } => "SiLU",
+        Op::Tanh { .. } => "Tanh",
+        Op::Sigmoid { .. } => "Sigmoid",
+        Op::Square { .. } => "Square",
+        Op::Sqrt { .. } => "Sqrt",
+        Op::Abs { .. } => "Abs",
+        Op::Log { .. } => "Log",
+        Op::Sum { .. } => "Sum",
+        Op::Mean { .. } => "Mean",
+        Op::SumDim { .. } => "SumDim",
+        Op::SumDimKeepdim { .. } => "SumDimKeepdim",
+        Op::SumDims { .. } => "SumDims",
+        Op::MaxDim { .. } => "MaxDim",
+        Op::Maximum { .. } => "Maximum",
+        Op::Minimum { .. } => "Minimum",
+        Op::Clamp { .. } => "Clamp",
+        Op::Softmax { .. } => "Softmax",
+        Op::LogSoftmax { .. } => "LogSoftmax",
+        Op::Transpose { .. } => "Transpose",
+        Op::Reshape { .. } => "Reshape",
+        Op::Permute { .. } => "Permute",
+        Op::Repeat { .. } => "Repeat",
+        Op::Cast { .. } => "Cast",
+        Op::Cat { .. } => "Cat",
+        Op::Split { .. } => "Split",
+        Op::Slice { .. } => "Slice",
+        Op::Where { .. } => "Where",
+        Op::Conv2d { .. } => "Conv2d",
+        Op::Conv2dNHWC { .. } => "Conv2dNHWC",
+        Op::AddBias { .. } => "AddBias",
+        Op::LayerNorm { .. } => "LayerNorm",
+        Op::RMSNorm { .. } => "RMSNorm",
+        Op::GroupNorm { .. } => "GroupNorm",
+        Op::Embedding { .. } => "Embedding",
+        Op::IndexSelect { .. } => "IndexSelect",
+        Op::MSELoss { .. } => "MSELoss",
+        Op::L1Loss { .. } => "L1Loss",
+        Op::HuberLoss { .. } => "HuberLoss",
+        Op::BCELoss { .. } => "BCELoss",
+        Op::NLLLoss { .. } => "NLLLoss",
+        Op::FlashAttention { .. } => "FlashAttention",
+        Op::SageAttention { .. } => "SageAttention",
+        Op::FusedSwiGLU { .. } => "FusedSwiGLU",
+        Op::RoPePrecomputed { .. } => "RoPePrecomputed",
+        Op::Checkpoint { .. } => "Checkpoint",
+        Op::CheckpointOffload { .. } => "CheckpointOffload",
+    }
 }
