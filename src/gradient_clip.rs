@@ -67,6 +67,23 @@ impl GradientClipper {
         // Compute total norm
         let total_norm = self.compute_grad_norm(grads)?;
 
+        // Non-finite total norm (inf / NaN) means at least one gradient
+        // element is itself non-finite. The naive scale path below would
+        // compute `scale = max_norm / inf = 0` and then `grad * 0 = NaN`
+        // (because `0 * inf = NaN`), cascading NaN into the optimizer state
+        // and bricking training. PyTorch's `clip_grad_norm_` documents this
+        // exact case — when `error_if_nonfinite=False`, the fallback is to
+        // element-wise clamp grads to `[-max_norm, max_norm]` instead of
+        // scaling by an ill-defined factor.
+        if !total_norm.is_finite() {
+            let ops = crate::cuda_gradient_ops::cached_gradient_ops(grads[0].device())?;
+            for grad in grads {
+                let g: &mut Tensor = *grad;
+                ops.clamp_tensor(g, -max_norm, max_norm)?;
+            }
+            return Ok(total_norm);
+        }
+
         if total_norm > max_norm {
             // Scale all gradients
             let scale_factor = max_norm / total_norm;
