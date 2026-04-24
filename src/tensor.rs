@@ -2716,7 +2716,8 @@ extern "C" __global__ void f32_to_bool_kernel(
         // path misinterprets as an identity permutation and reads the wrong
         // storage region. Fix 2026-04-23 Phase 2a.
         if self.view_offset != 0 || !self.strides_match_permute_of_shape() {
-            return crate::cuda_ops::GpuOps::materialize_view(self);
+            let contig = crate::cuda_ops::GpuOps::materialize_view(self)?;
+            return self.finalize_contiguous_autograd(contig);
         }
         // Recover the permutation from view strides vs row-major strides of
         // the current shape. For a view produced by `permute(dims)`:
@@ -2790,6 +2791,34 @@ extern "C" __global__ void f32_to_bool_kernel(
         } else {
             crate::cuda_ops::GpuOps::permute_generic(&as_orig, &dims)?
         };
+        self.finalize_contiguous_autograd(contig)
+    }
+
+    /// Propagate `requires_grad` across a `contiguous()` materialization and
+    /// record an autograd op so backward can route gradients back to the
+    /// strided source. `contiguous()` is value-preserving and shape-
+    /// preserving, so the backward is an identity (same-shape) reshape —
+    /// we reuse `Op::Reshape` whose backward already handles that.
+    ///
+    /// Prior to 2026-04-23 this was a no-op because `narrow()` materialized
+    /// eagerly. Phase 2a made `narrow()` a zero-copy view, so the first
+    /// op forced through `contiguous()` (typically `to_dtype` on a narrow
+    /// result) used to silently drop autograd. This finalizer restores
+    /// the chain.
+    fn finalize_contiguous_autograd(&self, mut contig: Tensor) -> Result<Tensor> {
+        if self.requires_grad {
+            contig.requires_grad = true;
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    contig.id,
+                    Op::Reshape {
+                        input: self.id,
+                        new_shape: contig.shape.dims().to_vec(),
+                    },
+                    vec![(self.id, self.alias())],
+                );
+            }
+        }
         Ok(contig)
     }
 

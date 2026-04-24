@@ -115,7 +115,9 @@
 ### Materialize / read back
 - `.to_vec() / to_vec_f32() / to_vec_bf16() / to_vec_i32()`
 - `.item() -> f32` — scalar tensor → host scalar
-- `.contiguous()` — force contig copy
+- `.contiguous()` — force contig copy. Propagates `requires_grad` and records
+  `Op::Reshape { new_shape = input shape }` as an identity-reshape backward, so
+  autograd flows through `narrow → to_dtype` chains (fix 2026-04-23 Phase 2a)
 
 ### Storage / pointer access (low-level)
 - `.as_device_ptr_bf16(label) -> *const u16`

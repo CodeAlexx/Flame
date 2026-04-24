@@ -201,6 +201,27 @@ So:
 The fused inference primitives in `ops::fused_inference::*` also do NOT
 record. They're designed for inference, not training.
 
+### `contiguous()` and friends on non-contig views
+
+`Tensor::contiguous()` on a non-contig view (the typical post-`narrow` /
+`permute` case) dispatches to `GpuOps::materialize_view` or one of the
+permute fast-paths. Those kernels allocate the output via
+`Tensor::empty_dtype`, which sets `requires_grad: false`. Without
+`contiguous()`'s own autograd wiring, the result would not carry a grad,
+and anything downstream (notably `to_dtype`, which re-routes non-contig
+inputs through `self.contiguous()?.to_dtype(dtype)`) would silently drop
+the chain.
+
+`contiguous()` itself closes that gap — it propagates `requires_grad`
+and records an identity-reshape (`Op::Reshape { new_shape = self.shape }`)
+whose backward is a no-op shape match. Gradients from the contig output
+route unchanged back to the strided source, which then carries them
+through its own `Op::Slice` / `Op::Permute`.
+
+If you add another path inside `contiguous()` (a new fast-path kernel,
+say), route it through `finalize_contiguous_autograd(contig)` before
+returning.
+
 ---
 
 ## Layout conventions
