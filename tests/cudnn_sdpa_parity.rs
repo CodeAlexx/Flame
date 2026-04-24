@@ -161,3 +161,21 @@ fn cudnn_sdpa_matches_wmma_klein() {
 fn cudnn_sdpa_matches_wmma_chroma() {
     run_parity(1, 24, 4096, 128);
 }
+
+// Z-Image NextDiT joint-attn — never previously tested. H=30 is unique to
+// Z-Image and N=4128 = 32 cap pad + 4096 image patches at 1024². If this
+// fails while Klein/Chroma pass, cuDNN has a bug at H=30 (or at this N).
+#[test]
+fn cudnn_sdpa_matches_wmma_zimage_main() {
+    run_parity(1, 30, 4128, 128);
+}
+
+#[test]
+fn cudnn_sdpa_matches_wmma_zimage_noise_refiner() {
+    run_parity(1, 30, 4096, 128);
+}
+
+#[test]
+fn cudnn_sdpa_matches_wmma_zimage_context_refiner() {
+    run_parity(1, 30, 32, 128);
+}
