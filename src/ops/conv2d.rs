@@ -797,7 +797,7 @@ pub fn conv2d_forward(
     let prev_dtype = config::default_dtype();
     config::set_default_dtype(input.dtype());
 
-    let result = (|| {
+    let result: Result<Tensor> = (|| {
         let col = launch_im2col(
             input,
             batch,
@@ -830,7 +830,41 @@ pub fn conv2d_forward(
     })();
 
     config::set_default_dtype(prev_dtype);
-    result
+
+    // Autograd recording for the NCHW im2col path. The cuDNN fast path
+    // earlier in this function only fires when autograd is NOT recording,
+    // so any conv reachable from a trainer with `requires_grad` set on
+    // its inputs/weights/bias arrives here. Without this, SDXL trainer's
+    // first `input_blocks.0.0` conv strips `requires_grad` from the
+    // forward chain and `loss.backward()` errors with "tensor that
+    // doesn't require grad". The backward dispatcher (`Op::Conv2d`) is
+    // already wired in `autograd.rs:2644` — this just records.
+    let mut output = result?;
+    let needs_grad = input.requires_grad
+        || weight.requires_grad
+        || bias.map(|b| b.requires_grad).unwrap_or(false);
+    if needs_grad {
+        output.requires_grad = true;
+        if crate::autograd::AutogradContext::is_recording() {
+            let mut saved =
+                vec![(input.id, input.alias()), (weight.id, weight.alias())];
+            if let Some(b) = bias {
+                saved.push((b.id, b.alias()));
+            }
+            // `Op::Conv2d` variant takes scalar stride/padding (square).
+            crate::autograd::AutogradContext::record_op(
+                output.id,
+                crate::autograd::Op::Conv2d {
+                    input: input.id,
+                    weight: weight.id,
+                    stride: stride.0,
+                    padding: padding.0,
+                },
+                saved,
+            );
+        }
+    }
+    Ok(output)
 }
 fn copy_i32_to_device(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<i32>> {
     let mut buf = unsafe { device.alloc::<i32>(data.len()) }

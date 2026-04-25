@@ -776,16 +776,46 @@ impl GpuOps {
         kernels.materialize_view(tensor)
     }
 
-    /// NHWC -> NCHW
+    /// NHWC -> NCHW. Records `Op::Permute` so the inverse permute backward
+    /// runs and the autograd chain stays intact through SDXL/SD3 trainers
+    /// that rely on this for VAE/UNet conv setups.
     pub fn permute_nhwc_to_nchw(tensor: &Tensor) -> Result<Tensor> {
         let kernels = Self::get_kernels(&tensor.device)?;
-        kernels.permute_nhwc_to_nchw(tensor)
+        let mut out = kernels.permute_nhwc_to_nchw(tensor)?;
+        if tensor.requires_grad {
+            out.requires_grad = true;
+            if crate::autograd::AutogradContext::is_recording() {
+                crate::autograd::AutogradContext::record_op(
+                    out.id,
+                    crate::autograd::Op::Permute {
+                        input: tensor.id,
+                        dims: vec![0, 3, 1, 2],
+                    },
+                    vec![(tensor.id, tensor.alias())],
+                );
+            }
+        }
+        Ok(out)
     }
 
-    /// NCHW -> NHWC
+    /// NCHW -> NHWC. Records `Op::Permute` (see `permute_nhwc_to_nchw`).
     pub fn permute_nchw_to_nhwc(tensor: &Tensor) -> Result<Tensor> {
         let kernels = Self::get_kernels(&tensor.device)?;
-        kernels.permute_nchw_to_nhwc(tensor)
+        let mut out = kernels.permute_nchw_to_nhwc(tensor)?;
+        if tensor.requires_grad {
+            out.requires_grad = true;
+            if crate::autograd::AutogradContext::is_recording() {
+                crate::autograd::AutogradContext::record_op(
+                    out.id,
+                    crate::autograd::Op::Permute {
+                        input: tensor.id,
+                        dims: vec![0, 2, 3, 1],
+                    },
+                    vec![(tensor.id, tensor.alias())],
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// Weights [KH,KW,IC,OC] -> [OC,IC,KH,KW]
