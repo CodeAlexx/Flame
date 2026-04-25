@@ -2515,10 +2515,25 @@ fn compute_gradients(
         }
 
         Op::RoPePrecomputed { input, cos, sin } => {
-            // RoPE is an orthogonal rotation. Backward = apply_rope(grad, cos, -sin).
-            // Use rope_halfsplit_bf16 which handles both broadcast [1, N, half]
-            // and per-head [BH, N, half] cos/sin layouts (unlike rope_fused_bf16
-            // which only handles broadcast).
+            // RoPE is an orthogonal rotation; backward = forward with
+            // -sin. LAYOUT MUST MATCH FORWARD or the gradient direction
+            // is essentially random while magnitude looks fine.
+            //
+            // Klein, Chroma, Wan, FLUX call `bf16_ops::rope_fused_bf16`
+            // (Interleaved layout: pairs (2d, 2d+1)). The previous
+            // backward called `rope_halfsplit_bf16` (Halfsplit layout:
+            // pairs (d, d+half)) — different rotation entirely. The
+            // bug surfaced as cos_sim ≈ 0.05 on `dx` against PyTorch
+            // (almost orthogonal) at production HD=128/N=1536, while
+            // ||dx|| matched within bf16 noise — a magnitude-only
+            // sanity check was hiding it.
+            //
+            // Dispatch by cos shape: broadcast cos (`[1,1,N,half]` or
+            // `[1,N,half]`) → forward used Interleaved fused → backward
+            // uses fused. Per-head cos (`[BH,N,half]`) is the LTX-2
+            // path → halfsplit. Until `Op::RoPePrecomputed` carries an
+            // explicit `layout` field, this shape sniff is the most
+            // robust dispatch.
             let grad_bf16 = if output_grad.dtype() != DType::BF16 {
                 output_grad.to_dtype_no_grad(DType::BF16)?
             } else {
@@ -2527,8 +2542,16 @@ fn compute_gradients(
             let cos_tensor = fetch_saved(cos)?;
             let sin_tensor = fetch_saved(sin)?;
             let neg_sin = GpuOps::mul_scalar(&sin_tensor, -1.0)?;
-            let grad_input =
-                crate::bf16_ops::rope_halfsplit_bf16(&grad_bf16, &cos_tensor, &neg_sin)?;
+            let cos_dims = cos_tensor.shape().dims();
+            let is_broadcast_cos = matches!(
+                cos_dims,
+                [1, _, _, _] | [1, 1, _, _] | [1, _, _]
+            );
+            let grad_input = if is_broadcast_cos {
+                crate::bf16_ops::rope_fused_bf16(&grad_bf16, &cos_tensor, &neg_sin)?
+            } else {
+                crate::bf16_ops::rope_halfsplit_bf16(&grad_bf16, &cos_tensor, &neg_sin)?
+            };
             Ok(smallvec![(*input, grad_input)])
         }
 
