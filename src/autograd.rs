@@ -2851,23 +2851,28 @@ fn compute_gradients(
             inv_rms,
             normalized_shape,
         } => {
-            let input_tensor = entry
-                .get_saved(input)
-                .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for input".into()))?;
-            guard_tensor("AutogradContext::rmsnorm_backward input", input_tensor)?;
+            // Route through fetch_saved so saved strided views are
+            // materialized — rms_norm_backward reads inputs via raw
+            // pointers that ignore custom_strides/view_offset (Bug #4).
+            let input_tensor = fetch_saved(input)?;
+            guard_tensor("AutogradContext::rmsnorm_backward input", &input_tensor)?;
 
-            let inv_rms_tensor = entry.get_saved(inv_rms).ok_or_else(|| {
-                Error::InvalidOperation("Missing saved tensor for inv_rms".into())
-            })?;
+            let inv_rms_tensor = fetch_saved(inv_rms)?;
 
-            let weight_tensor = weight.as_ref().and_then(|w| entry.get_saved(w));
-            guard_optional_tensor("AutogradContext::rmsnorm_backward weight", weight_tensor)?;
+            let weight_tensor = match weight.as_ref() {
+                Some(w_id) => Some(fetch_saved(w_id)?),
+                None => None,
+            };
+            guard_optional_tensor(
+                "AutogradContext::rmsnorm_backward weight",
+                weight_tensor.as_ref(),
+            )?;
 
             let (grad_input, grad_weight) = crate::norm::rms_norm_backward(
                 output_grad,
-                input_tensor,
-                weight_tensor,
-                inv_rms_tensor,
+                &input_tensor,
+                weight_tensor.as_ref(),
+                &inv_rms_tensor,
                 normalized_shape,
             )?;
 
@@ -3829,20 +3834,27 @@ fn compute_gradients(
             // unmasked, 4D BF16). Decomposed recompute is the fallback for
             // everything else — masks, odd head_dims, non-BF16 dtypes,
             // non-4D tensors. See HANDOFF_2026-04-23.md §4.
-            let query_tensor = entry
-                .get_saved(query)
-                .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for query".into()))?;
-            let key_tensor = entry
-                .get_saved(key)
-                .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for key".into()))?;
-            let value_tensor = entry
-                .get_saved(value)
-                .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for value".into()))?;
-            let mask_tensor = if let Some(m_id) = mask {
-                entry.get_saved(m_id)
+            //
+            // Saved Q/K/V in Klein/Chroma/Wan/FLUX are permute views of the
+            // materialized reshape output (no `.contiguous()` after permute
+            // in the trainer). Route through fetch_saved so their custom
+            // strides are materialized before flame_cudnn_sdpa_bwd_bf16 /
+            // attention_backward_recompute reads them via raw pointers.
+            // (Bug #4 follow-up; without this the SDPA backward at every
+            // block produces ~5%-direction-wrong dq/dk/dv that compounds
+            // multiplicatively across all 25 Klein blocks.)
+            let query_tensor_owned = fetch_saved(query)?;
+            let key_tensor_owned = fetch_saved(key)?;
+            let value_tensor_owned = fetch_saved(value)?;
+            let query_tensor = &query_tensor_owned;
+            let key_tensor = &key_tensor_owned;
+            let value_tensor = &value_tensor_owned;
+            let mask_tensor_owned = if let Some(m_id) = mask {
+                Some(fetch_saved(m_id)?)
             } else {
                 None
             };
+            let mask_tensor = mask_tensor_owned.as_ref();
 
             let q_dims = query_tensor.shape().dims().to_vec();
             let k_dims = key_tensor.shape().dims().to_vec();

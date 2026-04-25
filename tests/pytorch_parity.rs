@@ -1982,12 +1982,15 @@ fn parity_klein_full_single_block_prod_diag() {
     let delta_qkv = lora_delta(&x_normed, &lora_qkv_a, &lora_qkv_b);
     let qkv = qkv_base.add(&delta_qkv).expect("qkv + lora");
 
-    // 3. split_qkv (reshape + permute)
+    // 3. split_qkv (reshape + permute) — matches the trainer EXACTLY:
+    //    klein-trainer's single_block_forward chains narrow → reshape →
+    //    permute with NO `.contiguous()` afterwards, so head_rms_norm
+    //    receives a strided permute view. Match that here so the saved
+    //    input to Op::RMSNorm exercises the strided-saved-input path.
     let split_head = |z: &Tensor| -> Tensor {
         z.reshape(&[B, N, H, HD])
             .and_then(|t| t.permute(&[0, 2, 1, 3]))
-            .and_then(|t| t.contiguous())
-            .expect("split_head reshape/permute/contig")
+            .expect("split_head reshape/permute")
     };
     let q = split_head(&qkv.narrow(2, 0, INNER).expect("narrow q"));
     let k = split_head(&qkv.narrow(2, INNER, INNER).expect("narrow k"));
