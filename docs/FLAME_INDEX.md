@@ -223,6 +223,15 @@ This is a critical area with several implementations. **Use these for inference*
   halfsplit, giving cos_sim ≈ 0.05 backward gradients on Klein
   (orthogonal-direction at correct magnitude — magnitude-only checks
   hid this for sessions). See `src/autograd.rs:2515-2570`.
+- ⚠️ **Interleaved `rope_fused_bf16` autograd-recording fix** (commit
+  fa3291e). Pre-fix: output had `requires_grad: false` hardcoded and no
+  `Op::RoPePrecomputed` recording, severing Q/K LoRA gradient chains in
+  every trainer using interleaved RoPE (Klein, Z-Image, Chroma, Wan,
+  FLUX). Pre-fix Klein and Z-Image LoRAs are corrupt — Q_B and K_B
+  stayed exactly at zero-init while V_B (skips RoPE) trained normally.
+  Halfsplit variant always recorded; only the interleaved variant was
+  missing the recording. Re-train pre-fix LoRAs. See
+  `src/bf16_ops.rs:735-757`.
 
 ---
 

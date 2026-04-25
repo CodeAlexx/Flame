@@ -201,6 +201,38 @@ So:
 The fused inference primitives in `ops::fused_inference::*` also do NOT
 record. They're designed for inference, not training.
 
+#### `rope_fused_bf16` autograd — historical bug
+
+The interleaved variant `bf16_ops::rope_fused_bf16` (used by Klein,
+Z-Image, Chroma, Wan, FLUX) had `output.requires_grad: false` hardcoded
+and never recorded `Op::RoPePrecomputed`. Only the halfsplit variant
+`rope_fused_bf16_halfsplit` (used by LTX-2) recorded.
+
+Symptom: in any LoRA trainer that runs Q/K through interleaved RoPE
+(e.g. Z-Image trainer's Q/K post-LoRA-delta path), `lora_B` for Q and K
+adapters stayed at zero-init across every training step while `lora_B`
+for V (which skips RoPE) trained normally. The asymmetry was the
+diagnostic: identical config, only Q/K stuck.
+
+The fix at `bf16_ops.rs:735-757` propagates `requires_grad` and records
+the op when the input requires grad. The `Op::RoPePrecomputed`
+backward dispatcher was already correct (broadcast cos `[1, N, half]`
+→ interleaved, per-head cos `[BH, N, half]` → halfsplit); the recording
+side was the missing link.
+
+**Pattern to remember:** any new BF16 inference primitive in
+`bf16_ops.rs` / `ops/fused_inference.rs` that's reachable from a trainer's
+forward must propagate `x.requires_grad` and record an autograd op,
+OR fail loud when called inside `AutogradContext::is_recording()`.
+Hardcoding `requires_grad: false` on a forward path that trainers can
+hit is a silent gradient-killer.
+
+**Diagnostic signal:** a specific LoRA target's `lora_B` is *exactly*
+0.0 (not 1e-30, EXACTLY zero) across many training steps while sibling
+adapters in the same block train normally → autograd chain cut, not a
+learning rate or scaling issue. Inspect every op the affected target's
+output flows through; one of them is inference-only.
+
 ### `contiguous()` and friends on non-contig views
 
 `Tensor::contiguous()` on a non-contig view (the typical post-`narrow` /
