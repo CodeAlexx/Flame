@@ -550,7 +550,35 @@ pub fn rope_fused_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor>
         )?;
     }
 
-    out.reshape(&[b, h, n, d])
+    let mut result = out.reshape(&[b, h, n, d])?;
+
+    // Record autograd op so gradients flow through RoPE during training.
+    // Critical for Z-Image trainer's Q/K LoRA adapters: Q and K go through
+    // this RoPE before SDPA; without recording, `result.requires_grad`
+    // stays false and the gradient chain is severed at this point —
+    // Q_B/K_B never receive non-zero gradient, while V (which skips RoPE)
+    // trains normally. The dispatching backward handler in `autograd.rs`
+    // picks fused/Interleaved when the saved cos shape is `[1, N, half]`.
+    if x.requires_grad {
+        result.requires_grad = true;
+        if crate::autograd::AutogradContext::is_recording() {
+            crate::autograd::AutogradContext::record_op(
+                result.id,
+                crate::autograd::Op::RoPePrecomputed {
+                    input: x.id,
+                    cos: cos_flat.id,
+                    sin: sin_flat.id,
+                },
+                vec![
+                    (x.id, x.clone()),
+                    (cos_flat.id, cos_flat.clone()),
+                    (sin_flat.id, sin_flat.clone()),
+                ],
+            );
+        }
+    }
+
+    Ok(result)
 }
 
 /// Interleaved-pairs RoPE with F32 cos/sin tables.
