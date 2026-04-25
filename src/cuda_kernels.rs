@@ -411,6 +411,14 @@ impl CudaKernels {
 
     /// Element-wise addition kernel (rank-safe broadcasting)
     pub fn add(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        // Materialize non-contiguous views before the raw-pointer kernel.
+        // The launch reads `try_as_slice_f32()` from offset 0, ignoring
+        // custom_strides and view_offset — a transposed/permuted/narrowed
+        // view fed in raw produces wrong values.
+        let a_mat_owned;
+        let a = if a.is_contiguous() { a } else { a_mat_owned = a.contiguous()?; &a_mat_owned };
+        let b_mat_owned;
+        let b = if b.is_contiguous() { b } else { b_mat_owned = b.contiguous()?; &b_mat_owned };
         // Normalize via broadcast if shapes differ (NumPy semantics)
         let (a_owned, b_owned);
         let (a_t, b_t) = if a.shape != b.shape {
@@ -465,6 +473,11 @@ impl CudaKernels {
 
     /// Element-wise multiplication kernel (rank-safe broadcasting)
     pub fn mul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        // Materialize non-contiguous views — see add() for rationale.
+        let a_mat_owned;
+        let a = if a.is_contiguous() { a } else { a_mat_owned = a.contiguous()?; &a_mat_owned };
+        let b_mat_owned;
+        let b = if b.is_contiguous() { b } else { b_mat_owned = b.contiguous()?; &b_mat_owned };
         // Normalize via broadcast if shapes differ (NumPy semantics)
         let (a_owned, b_owned);
         let (a_t, b_t) = if a.shape != b.shape {
@@ -2002,6 +2015,11 @@ impl CudaKernels {
                 got: b.shape.clone(),
             });
         }
+        // Materialize non-contiguous views — see add() for rationale.
+        let a_mat_owned;
+        let a = if a.is_contiguous() { a } else { a_mat_owned = a.contiguous()?; &a_mat_owned };
+        let b_mat_owned;
+        let b = if b.is_contiguous() { b } else { b_mat_owned = b.contiguous()?; &b_mat_owned };
         let mut output = Tensor::empty_dtype(a.shape.clone(), DType::F32, a.device.clone())?;
         let n = a.shape.elem_count();
         let kernel = self

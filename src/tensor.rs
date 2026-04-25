@@ -2911,9 +2911,13 @@ extern "C" __global__ void f32_to_bool_kernel(
     /// Fallible deep/device clone. Prefer `clone_result()` in internal code
     /// and the `Clone` trait (`.clone()`) for infallible API.
     pub fn clone_result(&self) -> Result<Tensor> {
-        // Commented out for performance
-        // println!("CLONE DEBUG: Cloning tensor with shape {:?}, dtype {:?}, elem_count: {}",
-        //          self.shape, self.dtype(), self.shape.elem_count());
+        // For non-contiguous tensors (narrow / permute / transpose views),
+        // we MUST materialize via `.contiguous()` first. The dtod_copy
+        // paths below copy parent storage and label the result with the
+        // view's logical shape, scrambling element addressing.
+        if !self.is_contiguous() {
+            return self.contiguous();
+        }
 
         // Clone the storage while preserving dtype
         let storage = match &self.storage {
