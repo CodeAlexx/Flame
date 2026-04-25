@@ -161,17 +161,24 @@ def apply_rope_interleaved(t, pe_cos, pe_sin):
 
 # 1. modulate_pre
 normed = F.layer_norm(x, [D], None, None, 1e-6)
+normed.retain_grad()
 x_normed = normed * (1.0 + scale_mod.unsqueeze(1)) + shift.unsqueeze(1)
+x_normed.retain_grad()
 
 # 2. linear1 fused
 qkv_mlp = F.linear(x_normed, linear1_w)         # bias=None to match Klein
+qkv_mlp.retain_grad()
 qkv_dim = 3 * INNER
 qkv_base = qkv_mlp[..., :qkv_dim]
+qkv_base.retain_grad()
 gate_up = qkv_mlp[..., qkv_dim:]
+gate_up.retain_grad()
 
 # 3. LoRA on QKV slice (narrow → add via lora_delta)
 delta_qkv = lora_delta(x_normed, lora_qkv_a, lora_qkv_b)
+delta_qkv.retain_grad()
 qkv = qkv_base + delta_qkv
+qkv.retain_grad()
 
 # 4. split_qkv — reshape+permute
 def split_head(z):
@@ -192,19 +199,27 @@ k = apply_rope_interleaved(k, pe_cos, pe_sin)
 # 7. SDPA (uses PyTorch's reference impl — internally cuDNN/efficient/math)
 attn = F.scaled_dot_product_attention(q, k, v, is_causal=False)
 attn_out = attn.permute(0, 2, 1, 3).contiguous().reshape(B, N, INNER)
+attn_out.retain_grad()
 
 # 8. swiglu on gate_up
 gate_proj = gate_up[..., :MLP]
+gate_proj.retain_grad()
 up_proj = gate_up[..., MLP:]
-mlp_out = F.silu(gate_proj) * up_proj
+up_proj.retain_grad()
+silu_gate = F.silu(gate_proj)
+silu_gate.retain_grad()
+mlp_out = silu_gate * up_proj
+mlp_out.retain_grad()
 
 # 9. cat
 fused = torch.cat([attn_out, mlp_out], dim=2)
+fused.retain_grad()
 
 # 10. linear2 + LoRA on attn_out slice only
 out_block_base = F.linear(fused, linear2_w)
 delta_out = lora_delta(attn_out, lora_out_a, lora_out_b)
 out_block = out_block_base + delta_out
+out_block.retain_grad()
 
 # 11. gate_residual
 out = x + out_block * gate.unsqueeze(1)
@@ -249,6 +264,23 @@ tensors = {
     "dlora_qkv_b": lora_qkv_b.grad.cpu().contiguous(),
     "dlora_out_a": lora_out_a.grad.cpu().contiguous(),
     "dlora_out_b": lora_out_b.grad.cpu().contiguous(),
+    # Intermediate gradients for suspect bisecting (Bug #4 hunt).
+    # The dx is corrupted (cos≈0.47); these probes split the chain so
+    # the first wrong cos_sim names the op that introduces the error.
+    "dnormed":    normed.grad.cpu().contiguous(),
+    "dx_normed":  x_normed.grad.cpu().contiguous(),
+    "dqkv_mlp":   qkv_mlp.grad.cpu().contiguous(),
+    "dqkv_base":  qkv_base.grad.cpu().contiguous(),
+    "dgate_up":   gate_up.grad.cpu().contiguous(),
+    "ddelta_qkv": delta_qkv.grad.cpu().contiguous(),
+    "dqkv":       qkv.grad.cpu().contiguous(),
+    "dattn_out":  attn_out.grad.cpu().contiguous(),
+    "dgate_proj": gate_proj.grad.cpu().contiguous(),
+    "dup_proj":   up_proj.grad.cpu().contiguous(),
+    "dsilu_gate": silu_gate.grad.cpu().contiguous(),
+    "dmlp_out":   mlp_out.grad.cpu().contiguous(),
+    "dfused":     fused.grad.cpu().contiguous(),
+    "dout_block": out_block.grad.cpu().contiguous(),
 }
 save_file(tensors, str(OUT_PATH))
 print(f"\nWrote {OUT_PATH} "

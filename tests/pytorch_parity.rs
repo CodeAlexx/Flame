@@ -2014,7 +2014,8 @@ fn parity_klein_full_single_block_prod_diag() {
     // 7. swiglu on gate_up
     let gate_proj = gate_up.narrow(2, 0, MLP).expect("narrow gate_proj");
     let up_proj   = gate_up.narrow(2, MLP, MLP).expect("narrow up_proj");
-    let mlp_out = gate_proj.silu().expect("silu").mul(&up_proj).expect("silu*up");
+    let silu_gate = gate_proj.silu().expect("silu");
+    let mlp_out = silu_gate.mul(&up_proj).expect("silu*up");
 
     // 8. cat
     let fused = Tensor::cat(&[&attn_out, &mlp_out], 2).expect("cat attn,mlp");
@@ -2037,8 +2038,31 @@ fn parity_klein_full_single_block_prod_diag() {
     let expected = fix.get("output").unwrap();
     let cos_fwd = cos_sim_f32(&out, expected);
 
+    // Register intermediate IDs before backward so the autograd loop will
+    // clone their gradients before draining. Cleared by take below.
+    {
+        let mut ids = std::collections::HashSet::new();
+        ids.insert(normed.id());
+        ids.insert(x_normed.id());
+        ids.insert(qkv_mlp.id());
+        ids.insert(qkv_base.id());
+        ids.insert(gate_up.id());
+        ids.insert(delta_qkv.id());
+        ids.insert(qkv.id());
+        ids.insert(attn_out.id());
+        ids.insert(gate_proj.id());
+        ids.insert(up_proj.id());
+        ids.insert(silu_gate.id());
+        ids.insert(mlp_out.id());
+        ids.insert(fused.id());
+        ids.insert(out_block.id());
+        flame_core::autograd::AutogradContext::retain_intermediate_grads(ids);
+    }
+
     let loss = out.mul(&go).expect("out*go").sum().expect("sum");
     let grads = loss.backward().expect("backward");
+    let captured =
+        flame_core::autograd::AutogradContext::take_retained_intermediate_grads();
 
     let dx          = grads.get(x.id()).expect("missing dx");
     let dlora_qkv_a = grads.get(lora_qkv_a.id()).expect("missing dlora_qkv_a");
@@ -2051,6 +2075,36 @@ fn parity_klein_full_single_block_prod_diag() {
     let cos_dlora_qkv_b = cos_sim_f32(dlora_qkv_b, fix.get("dlora_qkv_b").unwrap());
     let cos_dlora_out_a = cos_sim_f32(dlora_out_a, fix.get("dlora_out_a").unwrap());
     let cos_dlora_out_b = cos_sim_f32(dlora_out_b, fix.get("dlora_out_b").unwrap());
+
+    // Intermediate-gradient probes for the Bug #4 bisect. The first wrong
+    // cos_sim, walking from `out_block` backwards, names the op where the
+    // corruption enters. PyTorch reference grads come from retain_grad()
+    // calls in the fixture generator.
+    let probe = |id: flame_core::TensorId, key: &str| -> Option<(f64, f32, f32)> {
+        let g = captured.get(&id)?;
+        let exp = fix.get(key)?;
+        let cos = cos_sim_f32(g, exp);
+        let g_f32 = g.to_dtype(flame_core::DType::F32).ok()?.to_vec().ok()?;
+        let exp_f32 = exp.to_dtype(flame_core::DType::F32).ok()?.to_vec().ok()?;
+        let g_norm   = g_f32.iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+        let exp_norm = exp_f32.iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+        Some((cos, g_norm, exp_norm))
+    };
+
+    let p_normed    = probe(normed.id(),    "dnormed");
+    let p_x_normed  = probe(x_normed.id(),  "dx_normed");
+    let p_qkv_mlp   = probe(qkv_mlp.id(),   "dqkv_mlp");
+    let p_qkv_base  = probe(qkv_base.id(),  "dqkv_base");
+    let p_gate_up   = probe(gate_up.id(),   "dgate_up");
+    let p_delta_qkv = probe(delta_qkv.id(), "ddelta_qkv");
+    let p_qkv       = probe(qkv.id(),       "dqkv");
+    let p_attn_out  = probe(attn_out.id(),  "dattn_out");
+    let p_gate_proj = probe(gate_proj.id(), "dgate_proj");
+    let p_up_proj   = probe(up_proj.id(),   "dup_proj");
+    let p_silu_gate = probe(silu_gate.id(), "dsilu_gate");
+    let p_mlp_out   = probe(mlp_out.id(),   "dmlp_out");
+    let p_fused     = probe(fused.id(),     "dfused");
+    let p_out_block = probe(out_block.id(), "dout_block");
 
     let dx_norm = dx.to_dtype(flame_core::DType::F32).unwrap()
         .to_vec().unwrap()
@@ -2068,6 +2122,29 @@ fn parity_klein_full_single_block_prod_diag() {
          dlora_qkv_a={cos_dlora_qkv_a:.4} dlora_qkv_b={cos_dlora_qkv_b:.4} \
          dlora_out_a={cos_dlora_out_a:.4} dlora_out_b={cos_dlora_out_b:.4}"
     );
+    let dump = |label: &str, p: Option<(f64, f32, f32)>| {
+        match p {
+            Some((c, gn, en)) => eprintln!(
+                "  PROBE {label:<11} cos={c:.4}  ||rust||={gn:.3e}  ||py||={en:.3e}"
+            ),
+            None => eprintln!("  PROBE {label:<11} <missing>"),
+        }
+    };
+    dump("dout_block", p_out_block);
+    dump("dfused",     p_fused);
+    dump("dattn_out",  p_attn_out);
+    dump("dmlp_out",   p_mlp_out);
+    dump("dsilu_gate", p_silu_gate);
+    dump("dup_proj",   p_up_proj);
+    dump("dgate_proj", p_gate_proj);
+    dump("dqkv",       p_qkv);
+    dump("dqkv_base",  p_qkv_base);
+    dump("ddelta_qkv", p_delta_qkv);
+    dump("dgate_up",   p_gate_up);
+    dump("dqkv_mlp",   p_qkv_mlp);
+    dump("dx_normed",  p_x_normed);
+    dump("dnormed",    p_normed);
+
     assert!(cos_fwd          > 0.999, "fwd cos_sim {cos_fwd}");
     assert!(cos_dx           > 0.99,  "dx cos_sim {cos_dx}");
     assert!(cos_dlora_qkv_a  > 0.99,  "dlora_qkv_a cos_sim {cos_dlora_qkv_a}");

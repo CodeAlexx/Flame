@@ -82,6 +82,15 @@ pub fn add_inplace_same_dtype(_dst: &mut Tensor, _src: &Tensor) -> Result<()> {
 }
 
 /// Allocate a new tensor equal to `lhs + rhs` in the operands' dtype.
+///
+/// Materializes non-contiguous inputs first. The `add_inplace_same_dtype`
+/// kernel reads `src.storage_ref().device_ptr()` directly — for narrow /
+/// permute views that pointer is the parent's base, not the view's start,
+/// so a raw-pointer launch with `numel = view_shape.elem_count()` reads
+/// the wrong region. Same hazard on `lhs` because `clone_result()` on a
+/// view copies the parent's full storage and labels it with the view's
+/// (smaller) shape. Contiguifying here guarantees both operands are
+/// laid out as the kernel expects. (Bug #4 hunt, 2026-04-25.)
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 pub fn add_same_dtype(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
     if lhs.dtype() != rhs.dtype() {
@@ -89,9 +98,23 @@ pub fn add_same_dtype(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
             "add_same_dtype: operands must share dtype".into(),
         ));
     }
+    let lhs_owned;
+    let lhs_ref = if lhs.is_contiguous() {
+        lhs
+    } else {
+        lhs_owned = lhs.contiguous()?;
+        &lhs_owned
+    };
+    let rhs_owned;
+    let rhs_ref = if rhs.is_contiguous() {
+        rhs
+    } else {
+        rhs_owned = rhs.contiguous()?;
+        &rhs_owned
+    };
     let _guard = allow_clone();
-    let mut out = lhs.clone_result()?;
-    add_inplace_same_dtype(&mut out, rhs)?;
+    let mut out = lhs_ref.clone_result()?;
+    add_inplace_same_dtype(&mut out, rhs_ref)?;
     Ok(out)
 }
 
@@ -191,6 +214,8 @@ pub fn mul_inplace_same_dtype(_dst: &mut Tensor, _src: &Tensor) -> Result<()> {
 }
 
 /// Allocate a new tensor equal to `lhs * rhs` in the operands' dtype.
+///
+/// See `add_same_dtype` for the contiguify rationale.
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 pub fn mul_same_dtype(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
     if lhs.dtype() != rhs.dtype() {
@@ -198,9 +223,23 @@ pub fn mul_same_dtype(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
             "mul_same_dtype: operands must share dtype".into(),
         ));
     }
+    let lhs_owned;
+    let lhs_ref = if lhs.is_contiguous() {
+        lhs
+    } else {
+        lhs_owned = lhs.contiguous()?;
+        &lhs_owned
+    };
+    let rhs_owned;
+    let rhs_ref = if rhs.is_contiguous() {
+        rhs
+    } else {
+        rhs_owned = rhs.contiguous()?;
+        &rhs_owned
+    };
     let _guard = allow_clone();
-    let mut out = lhs.clone_result()?;
-    mul_inplace_same_dtype(&mut out, rhs)?;
+    let mut out = lhs_ref.clone_result()?;
+    mul_inplace_same_dtype(&mut out, rhs_ref)?;
     Ok(out)
 }
 

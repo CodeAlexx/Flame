@@ -48,6 +48,16 @@ static AUTOGRAD_ENABLED: AtomicBool = AtomicBool::new(true);
 lazy_static::lazy_static! {
     /// Global autograd context - thread-safe
     static ref AUTOGRAD_CONTEXT: Mutex<AutogradContextInner> = Mutex::new(AutogradContextInner::new());
+
+    /// Test-only: when `Some`, the listed `TensorId`s have their gradients
+    /// cloned into `RETAINED_INTERMEDIATE_GRADS` during backward so callers
+    /// can probe intermediate gradients despite autograd's drain-on-take
+    /// semantics. Set via `AutogradContext::retain_intermediate_grads`,
+    /// drained via `take_retained_intermediate_grads`. None outside tests.
+    static ref RETAINED_INTERMEDIATE_GRAD_IDS:
+        Mutex<Option<std::collections::HashSet<TensorId>>> = Mutex::new(None);
+    static ref RETAINED_INTERMEDIATE_GRADS:
+        Mutex<HashMap<TensorId, Tensor>> = Mutex::new(HashMap::new());
 }
 
 /// Global activation offload pool. Set once via `set_activation_offload_pool`
@@ -910,6 +920,32 @@ impl AutogradContext {
         }
     }
 
+    /// Test-only: register a set of intermediate tensor IDs whose gradients
+    /// should be cloned out during backward (before the standard `take`-drain
+    /// frees them). After backward, call `take_retained_intermediate_grads`
+    /// to recover them. Used by parity diagnostics that need to inspect
+    /// intermediate gradients without modifying autograd's drain semantics.
+    pub fn retain_intermediate_grads(ids: std::collections::HashSet<TensorId>) {
+        if let Ok(mut slot) = RETAINED_INTERMEDIATE_GRAD_IDS.lock() {
+            *slot = Some(ids);
+        }
+        if let Ok(mut grads) = RETAINED_INTERMEDIATE_GRADS.lock() {
+            grads.clear();
+        }
+    }
+
+    /// Test-only: take the captured intermediate gradients and reset the
+    /// retain-set. Returns a HashMap keyed by `TensorId`.
+    pub fn take_retained_intermediate_grads() -> HashMap<TensorId, Tensor> {
+        if let Ok(mut slot) = RETAINED_INTERMEDIATE_GRAD_IDS.lock() {
+            *slot = None;
+        }
+        match RETAINED_INTERMEDIATE_GRADS.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => HashMap::new(),
+        }
+    }
+
     /// Number of entries currently on the autograd tape.
     pub fn tape_len() -> usize {
         AUTOGRAD_CONTEXT.lock().map(|ctx| ctx.tape.len()).unwrap_or(0)
@@ -1288,8 +1324,19 @@ impl AutogradContext {
 
             let backward_result: Result<()> = (|| {
                 let finite_check = crate::debug_finite::is_enabled();
+                // Snapshot the test-only retain set once (cheap clone of a
+                // small HashSet, only Some during diagnostic runs).
+                let retain_ids: Option<std::collections::HashSet<TensorId>> =
+                    RETAINED_INTERMEDIATE_GRAD_IDS.lock().ok().and_then(|s| s.clone());
                 for entry in tape_entries.iter().rev() {
                     if let Some(output_grad) = gradients.take(entry.output_id) {
+                        if let Some(ref ids) = retain_ids {
+                            if ids.contains(&entry.output_id) {
+                                if let Ok(mut g) = RETAINED_INTERMEDIATE_GRADS.lock() {
+                                    g.insert(entry.output_id, output_grad.clone());
+                                }
+                            }
+                        }
                         let t_node = std::time::Instant::now();
 
                         // FLAME_DEBUG_FINITE: check incoming grad before the
@@ -1808,20 +1855,40 @@ fn compute_gradients(
     // Helper to fetch saved tensors, restoring or recomputing if checkpointed.
     // Fast path: skip the CHECKPOINT_MANAGER mutex when no checkpoints exist
     // (Relaxed atomic load ~1ns vs ~25ns for uncontended mutex lock per op).
+    //
+    // IMPORTANT: materialize non-contiguous saves before returning. Backward
+    // kernels read saved tensors via raw device pointers (tensor_raw_ptr,
+    // storage.try_as_slice_*) that are the parent storage base — they
+    // ignore custom_strides and view_offset. A saved narrow/permute view
+    // would silently alias the wrong storage region. Bug #4 (Klein 4B
+    // 2026-04-25): saved `up_proj`/`gate_proj` (narrow views of `gate_up`,
+    // itself a narrow of `qkv_mlp`) caused Op::Mul/Op::SiLU backward to
+    // read from offset 0 of `qkv_mlp` instead of the view's start.
     let mut fetch_saved = |tid: &TensorId| -> Result<Tensor> {
-        if CHECKPOINT_HAS_ENTRIES.load(std::sync::atomic::Ordering::Relaxed) {
+        let raw = if CHECKPOINT_HAS_ENTRIES.load(std::sync::atomic::Ordering::Relaxed) {
             if let Some(t) = CHECKPOINT_MANAGER
                 .lock()
                 .map_err(|_| Error::Training("checkpoint manager mutex poisoned".into()))?
                 .fetch_saved(*tid, device)?
             {
-                return Ok(t);
+                t
+            } else {
+                entry
+                    .get_saved(tid)
+                    .cloned()
+                    .ok_or_else(|| Error::InvalidOperation("Missing saved tensor".into()))?
             }
+        } else {
+            entry
+                .get_saved(tid)
+                .cloned()
+                .ok_or_else(|| Error::InvalidOperation("Missing saved tensor".into()))?
+        };
+        if raw.is_contiguous() {
+            Ok(raw)
+        } else {
+            raw.contiguous()
         }
-        entry
-            .get_saved(tid)
-            .cloned()
-            .ok_or_else(|| Error::InvalidOperation("Missing saved tensor".into()))
     };
 
     let grads = match &entry.op {

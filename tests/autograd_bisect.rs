@@ -152,7 +152,7 @@ fn test_4_matmul_rmsnorm() -> Result<()> {
 /// If this fails, the RoPe forward/backward layout match is broken.
 #[test]
 fn test_5_rope_interleaved() -> Result<()> {
-    use flame_core::autograd::{AutogradContext, Op, RoPeLayout};
+    use flame_core::autograd::{AutogradContext, Op};
     let device = global_cuda_device();
     let bh = 2usize;
     let n = 8usize;
@@ -180,7 +180,6 @@ fn test_5_rope_interleaved() -> Result<()> {
                     input: x4.id(),
                     cos: cos4.id(),
                     sin: sin4.id(),
-                    layout: RoPeLayout::Interleaved,
                 },
                 vec![
                     (x4.id(), x4.clone()),
