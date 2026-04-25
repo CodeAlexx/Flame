@@ -574,6 +574,15 @@ pub fn group_norm_backward(
     num_groups: usize,
     eps: f32,
 ) -> Result<(Tensor, Option<Tensor>, Option<Tensor>)> {
+    // BF16 fast path recomputes mean/var inside the kernel and ignores the
+    // saved F32 stats — so check it before guarding mean/var (which are F32
+    // by design from group_norm.rs:402-427).
+    if input.dtype() == DType::BF16 && grad_output.dtype() == DType::BF16 {
+        let (dx, grad_weight, grad_bias) =
+            cuda_ops_bf16::group_norm_backward_bf16(input, grad_output, weight, num_groups, eps)?;
+        return Ok((dx, grad_weight, grad_bias));
+    }
+
     guard_tensor("group_norm_backward grad_output", grad_output)?;
     guard_tensor("group_norm_backward input", input)?;
     guard_tensor("group_norm_backward mean", mean)?;
@@ -586,12 +595,6 @@ pub fn group_norm_backward(
     let width = shape[3];
     let spatial_size = height * width;
     let channels_per_group = num_channels / num_groups;
-
-    if input.dtype() == DType::BF16 && grad_output.dtype() == DType::BF16 {
-        let (dx, grad_weight, grad_bias) =
-            cuda_ops_bf16::group_norm_backward_bf16(input, grad_output, weight, num_groups, eps)?;
-        return Ok((dx, grad_weight, grad_bias));
-    }
 
     // Compile backward kernel
     let kernel_code = get_group_norm_backward_kernel();

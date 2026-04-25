@@ -233,6 +233,59 @@ adapters in the same block train normally → autograd chain cut, not a
 learning rate or scaling issue. Inspect every op the affected target's
 output flows through; one of them is inference-only.
 
+#### SDXL trainer autograd sweep (2026-04-25)
+
+When the SDXL trainer was first wired up, `loss.backward()` failed with
+"backward called on tensor that doesn't require grad" — meaning the
+forward had broken the chain somewhere upstream of the loss. Audit
+turned up four flame-core primitives that ran but did not record:
+
+1. **`ops::conv2d::conv2d_forward`** — added `Op::Conv2d` recording at
+   the end of the closure. Wraps the closure result so that
+   `requires_grad` propagates from input/weight/bias.
+2. **`cuda_ops::GpuOps::permute_nchw_to_nhwc`** /
+   **`permute_nhwc_to_nchw`** — added `Op::Permute` recording with the
+   correct dim vectors `[0,2,3,1]` and `[0,3,1,2]`.
+3. **`cuda_ops::GpuOps::upsample2d_nearest`** — added the new
+   `Op::UpsampleNearest2D` variant + recording. The forward kernel was
+   already in place; the backward was a stub that returned zeros.
+4. **`sdxl-trainer::model::linear_fused`** — was routed through the
+   inference-only `fused_linear3d_native`. Rerouted to
+   `linear_autograd` (a tape-recording `matmul + add`).
+
+Beyond recording, the **F32 training-path conv2d backward**
+(`cuda_conv2d::CudaConv2d::conv2d_backward`) had two real bugs that
+fired the moment the dispatcher started using it:
+
+- It assumed F32 inputs and asserted on BF16 storage. The autograd
+  dispatcher now casts to F32 at the call site (the kernel returns F32
+  grads, which `accumulate_parameter_grads` handles).
+- The grad-input matmul had an extra `.transpose()` on the weight
+  reshape — `weight.reshape([oc, ic*kh*kw]).transpose() @ grad_col`
+  produces a dim mismatch on any output where `oc != ic*kh*kw`. Removed
+  the transpose: `grad_col [B*OH*OW, OC] @ weight_2d [OC, IC*KH*KW]` →
+  `grad_input_col [B*OH*OW, IC*KH*KW]`.
+
+And **`autograd_ops_complete::group_norm_backward`** ran its rank-checking
+`guard_tensor` on `mean`/`var` (saved as F32 by design — see
+`group_norm.rs:402-427`) **before** the BF16 fast path that ignores
+them. Reordered: check the BF16 fast path first, only guard mean/var
+on the F32 fallback.
+
+**`upsample2d_nearest_backward`**: the F32 stub at
+`cuda_kernels.rs::upsample2d_nearest_backward` returned a zeroed
+gradient. Replaced with a real NVRTC kernel that mirrors the forward
+mapping (`h_in_idx = h * h_in / h_out`) and uses `atomicAdd` to scatter
+into the input grad. BF16 grad_outputs are cast to F32 inside the
+backward (atomicAdd on BF16 is unsupported on older arches).
+
+**Pattern:** any new training-path kernel that lands in flame-core must
+be exercised by an actual `loss.backward()` call before being marked
+done. Forward parity does not catch broken backward kernels — only
+the smoke binary does (see `sdxl-trainer/src/bin/autograd_smoke.rs`
+for the template: synthesize fake inputs, run forward + MSE +
+backward, count params with grads + nonzero grads).
+
 ### `contiguous()` and friends on non-contig views
 
 `Tensor::contiguous()` on a non-contig view (the typical post-`narrow` /

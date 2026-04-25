@@ -589,6 +589,30 @@ backward. Foundation of the "offload instead of recompute" checkpoint path.
 - `AutogradContext::set_enabled(bool)` — global on/off
 - `Tensor::backward()` — entry point
 
+### Op variants (forward-recording sites + backward dispatchers)
+Each variant has a forward `record_op` site and a backward arm in
+`autograd::backward_op`. When adding a new training-path primitive:
+1. Add the variant to `pub enum Op` (`autograd.rs:~120`).
+2. Add it to the unary-input / binary-input pattern branch in the
+   compact-index id collector (`autograd.rs:~1140-1210`).
+3. Add a string in `op_tag` (`autograd.rs:~4119`).
+4. Wire the forward to propagate `requires_grad` and call `record_op`.
+5. Add a backward arm in `backward_op`.
+
+Recently-added variants:
+- ⭐ `Op::Conv2d` — forward at `ops/conv2d.rs::conv2d_forward`,
+  backward dispatches to `cuda_conv2d::CudaConv2d::conv2d_backward` (F32-only;
+  the dispatcher casts BF16 inputs to F32 at the call site).
+- ⭐ `Op::Permute` — forward at
+  `cuda_ops::GpuOps::permute_nchw_to_nhwc / permute_nhwc_to_nchw` and
+  `Tensor::permute`, backward applies the inverse permutation.
+- ⭐ `Op::UpsampleNearest2D` (added 2026-04-25) — forward at
+  `cuda_ops::GpuOps::upsample2d_nearest`, backward at
+  `cuda_kernels::CudaKernels::upsample2d_nearest_backward` (NVRTC F32
+  atomicAdd kernel; BF16 grad_outputs are cast to F32 internally).
+- ⭐ `Op::RoPePrecomputed` — forward at `bf16_ops::rope_fused_bf16`
+  (added 2026-04-25 — was the Q/K LoRA gradient blockade).
+
 ### `autograd_v4` (feature gated)
 - `autograd_v4::*` — newer experimental engine. Off by default.
 - `autograd_v4::ops::sdpa` — SDPA backward via v4

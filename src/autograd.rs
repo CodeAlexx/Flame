@@ -174,6 +174,14 @@ pub enum Op {
         input: TensorId,
         dims: Vec<usize>,
     },
+    /// Nearest-neighbor 2D upsample. SDXL/SD3/Cascade up-blocks use this.
+    UpsampleNearest2D {
+        input: TensorId,
+        input_h: usize,
+        input_w: usize,
+        output_h: usize,
+        output_w: usize,
+    },
     AddBias {
         input: TensorId,
         bias: TensorId,
@@ -1142,7 +1150,8 @@ impl AutogradContext {
                                 | Op::Sqrt { input }
                                 | Op::Sum { input, .. } | Op::Mean { input, .. }
                                 | Op::Transpose { input } | Op::Reshape { input, .. }
-                                | Op::Permute { input, .. } | Op::SumDim { input, .. }
+                                | Op::Permute { input, .. } | Op::UpsampleNearest2D { input, .. }
+                                | Op::SumDim { input, .. }
                                 | Op::SumDimKeepdim { input, .. } | Op::SumDims { input, .. }
                                 | Op::Repeat { input, .. } | Op::MaxDim { input, .. }
                                 | Op::Clamp { input, .. } | Op::Abs { input }
@@ -2655,11 +2664,31 @@ fn compute_gradients(
                 .get_saved(weight)
                 .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for weight".into()))?;
 
+            // cuda_conv2d::conv2d_backward is F32-only (training-path kernel).
+            // Cast BF16 inputs/grads to F32 here; the resulting F32 grads are
+            // accepted by accumulate_parameter_grads and the per-tensor
+            // gradient store.
+            let go_f32 = if output_grad.dtype() == DType::F32 {
+                output_grad.clone()
+            } else {
+                output_grad.to_dtype(DType::F32)?
+            };
+            let in_f32 = if input_tensor.dtype() == DType::F32 {
+                input_tensor.clone()
+            } else {
+                input_tensor.to_dtype(DType::F32)?
+            };
+            let w_f32 = if weight_tensor.dtype() == DType::F32 {
+                weight_tensor.clone()
+            } else {
+                weight_tensor.to_dtype(DType::F32)?
+            };
+
             let (grad_input, grad_weight, grad_bias) =
                 crate::cuda_conv2d::CudaConv2d::conv2d_backward(
-                    output_grad,
-                    input_tensor,
-                    weight_tensor,
+                    &go_f32,
+                    &in_f32,
+                    &w_f32,
                     (*stride, *stride),
                     (*padding, *padding),
                 )?;
@@ -3046,6 +3075,23 @@ fn compute_gradients(
             // Gradient of permute is inverse permute
             let inverse_dims = inverse_permutation(dims);
             let grad = output_grad.permute(&inverse_dims)?;
+            Ok(smallvec![(*input, ensure_bf16(grad)?)])
+        }
+
+        Op::UpsampleNearest2D {
+            input,
+            input_h,
+            input_w,
+            output_h,
+            output_w,
+        } => {
+            // Backward kernel sums grad_output over the source block of each
+            // input pixel (the inverse of nearest-neighbor "duplicate" forward).
+            let grad = crate::cuda_ops::GpuOps::upsample2d_nearest_backward(
+                output_grad,
+                (*input_h, *input_w),
+                (*output_h, *output_w),
+            )?;
             Ok(smallvec![(*input, ensure_bf16(grad)?)])
         }
 
@@ -4124,6 +4170,7 @@ fn op_tag(op: &Op) -> &'static str {
         Op::Transpose { .. } => "Transpose",
         Op::Reshape { .. } => "Reshape",
         Op::Permute { .. } => "Permute",
+        Op::UpsampleNearest2D { .. } => "UpsampleNearest2D",
         Op::Repeat { .. } => "Repeat",
         Op::Cast { .. } => "Cast",
         Op::Cat { .. } => "Cat",

@@ -977,7 +977,26 @@ impl GpuOps {
     // Upsampling operations
     pub fn upsample2d_nearest(input: &Tensor, output_size: (usize, usize)) -> Result<Tensor> {
         let kernels = Self::get_kernels(&input.device)?;
-        kernels.upsample2d_nearest(input, output_size)
+        let mut out = kernels.upsample2d_nearest(input, output_size)?;
+        if input.requires_grad {
+            out.requires_grad = true;
+            if crate::autograd::AutogradContext::is_recording() {
+                let in_dims = input.shape().dims();
+                let (in_h, in_w) = (in_dims[2], in_dims[3]);
+                crate::autograd::AutogradContext::record_op(
+                    out.id,
+                    crate::autograd::Op::UpsampleNearest2D {
+                        input: input.id,
+                        input_h: in_h,
+                        input_w: in_w,
+                        output_h: output_size.0,
+                        output_w: output_size.1,
+                    },
+                    vec![(input.id, input.alias())],
+                );
+            }
+        }
+        Ok(out)
     }
 
     pub fn upsample2d_bilinear(

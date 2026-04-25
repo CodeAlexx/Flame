@@ -1937,10 +1937,98 @@ impl CudaKernels {
         input_size: (usize, usize),
         output_size: (usize, usize),
     ) -> Result<Tensor> {
-        let _ = (grad_output, input_size, output_size);
-        Err(Error::InvalidOperation(
-            "Upsample2d nearest backward GPU kernel not yet implemented".into(),
-        ))
+        // grad_input[b, c, h_in_idx, w_in_idx] += grad_output[b, c, h, w]
+        // where h_in_idx = h * h_in / h_out (matches the forward kernel mapping
+        // in cuda_kernels_gpu.rs:1995-1996).
+        let (h_in, w_in) = input_size;
+        let (h_out, w_out) = output_size;
+        let dims = grad_output.shape().dims();
+        if dims.len() != 4 {
+            return Err(Error::InvalidOperation(
+                "upsample2d_nearest_backward expects 4D grad_output".into(),
+            ));
+        }
+        let (batch, channels) = (dims[0], dims[1]);
+        if dims[2] != h_out || dims[3] != w_out {
+            return Err(Error::ShapeMismatch {
+                expected: Shape::from_dims(&[batch, channels, h_out, w_out]),
+                got: grad_output.shape().clone(),
+            });
+        }
+
+        // Cast BF16 grad_output to F32 (atomicAdd on bf16 is unsupported on
+        // older arches and our autograd framework converts back via
+        // ensure_bf16 anyway).
+        let go_f32 = if grad_output.dtype() == DType::F32 {
+            grad_output.clone()
+        } else {
+            grad_output.to_dtype(DType::F32)?
+        };
+
+        const KERNEL: &str = r#"
+extern "C" __global__ void upsample2d_nearest_backward_kernel(
+    const float* __restrict__ grad_out,
+    float* __restrict__ grad_in,
+    int batch_channels,
+    int h_in, int w_in,
+    int h_out, int w_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch_channels * h_out * w_out;
+    if (idx >= total) return;
+    int w = idx % w_out;
+    int h = (idx / w_out) % h_out;
+    int bc = idx / (h_out * w_out);
+    int h_in_idx = h * h_in / h_out;
+    int w_in_idx = w * w_in / w_out;
+    int dst = bc * h_in * w_in + h_in_idx * w_in + w_in_idx;
+    atomicAdd(grad_in + dst, grad_out[idx]);
+}"#;
+
+        Self::ensure_kernel(
+            &grad_output.device,
+            "upsample2d_nearest_backward_kernel",
+            KERNEL,
+        )?;
+        let f = grad_output
+            .device
+            .get_func(
+                "upsample2d_nearest_backward_kernel",
+                "upsample2d_nearest_backward_kernel",
+            )
+            .ok_or_else(|| {
+                Error::Cuda("Failed to get upsample2d_nearest_backward_kernel".into())
+            })?;
+
+        let in_numel = batch * channels * h_in * w_in;
+        let grad_in_data = crate::tensor::alloc_zeros_from_pool(&grad_output.device, in_numel)?;
+        let cfg = LaunchConfig::for_num_elems((batch * channels * h_out * w_out) as u32);
+        unsafe {
+            launch_kernel!(
+                f,
+                cfg,
+                go_f32.storage.try_as_slice_f32()?,
+                &grad_in_data,
+                (batch * channels) as i32,
+                h_in as i32,
+                w_in as i32,
+                h_out as i32,
+                w_out as i32
+            )?;
+        }
+
+        Ok(Tensor {
+            storage: crate::tensor_storage::TensorStorage::F32 {
+                data: grad_in_data.into(),
+                numel: in_numel,
+            },
+            shape: Shape::from_dims(&[batch, channels, h_in, w_in]),
+            device: grad_output.device.clone(),
+            id: crate::tensor::TensorId::new(),
+            requires_grad: false,
+            custom_strides: None,
+            view_offset: 0,
+        })
     }
 
     pub fn upsample2d_bilinear_backward(

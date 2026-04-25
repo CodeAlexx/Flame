@@ -441,12 +441,12 @@ impl CudaConv2d {
         let grad_weight =
             grad_weight_2d.reshape(&[out_channels, in_channels, kernel_h, kernel_w])?;
 
-        // Gradient w.r.t. input using col2im
-        // First compute weight^T @ grad_output
-        let weight_t = weight
-            .reshape(&[out_channels, in_channels * kernel_h * kernel_w])?
-            .transpose()?;
-        let grad_input_col = grad_col.matmul(&weight_t)?;
+        // Gradient w.r.t. input using col2im.
+        // grad_input_col[b*oh*ow, ic*kh*kw] = sum_oc grad_col[b*oh*ow, oc] * weight[oc, ic*kh*kw]
+        // i.e. grad_col @ weight_2d (no transpose).
+        let weight_2d = weight
+            .reshape(&[out_channels, in_channels * kernel_h * kernel_w])?;
+        let grad_input_col = grad_col.matmul(&weight_2d)?;
 
         // Now use col2im to get grad_input
         let grad_input_data =
