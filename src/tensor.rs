@@ -404,6 +404,17 @@ extern "C" __global__ void masked_fill_kernel(
     }
 
     /// Return a non-owning view that shares the underlying storage.
+    ///
+    /// IMPORTANT: preserves `custom_strides` and `view_offset`. Earlier
+    /// versions zeroed these, which silently broke save-for-backward of
+    /// strided permute views: `tensor.alias()` of a `[B,H,N,HD]` permute
+    /// of a `[B,N,H,HD]` buffer would label itself as logical-shape
+    /// contiguous with no strides, so a downstream backward kernel that
+    /// did `is_contiguous()` returned true on the alias and read raw
+    /// physical memory in the pre-permute order while interpreting it
+    /// as post-permute shape — gradients land in wrong cells. Caught by
+    /// `parity_klein_attn_chain_prod_diag` showing dscale cos_sim ~-0.1
+    /// against PyTorch reference.
     #[inline]
     pub fn alias(&self) -> Tensor {
         Tensor {
@@ -412,9 +423,8 @@ extern "C" __global__ void masked_fill_kernel(
             device: self.device.clone(),
             id: TensorId::new(),
             requires_grad: self.requires_grad,
-            custom_strides: None,
-            view_offset: 0,
-
+            custom_strides: self.custom_strides.clone(),
+            view_offset: self.view_offset,
         }
     }
 
