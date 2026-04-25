@@ -987,3 +987,1349 @@ fn perf_comparison() {
         );
     }
 }
+
+// ===========================================================================
+// Klein gradient-corruption diagnostic tests (added 2026-04-24).
+//
+// Hunt context: Klein 4B LoRA training produces useless samples; the
+// `klein_finite_diff_test --bisect` diagnostic shows random-sign random-
+// magnitude per-block α (gradient corruption, not attenuation). cuDNN SDPA
+// backward already ruled out by `FLAME_NO_CUDNN_SDPA_BWD=1` test.
+//
+// These three tests narrow which op in the qkv.lora_b backward chain is
+// the culprit by isolating ops at production shape (B=1, H=24, N=1024+,
+// HD=128) — coverage that the existing parity tests at H=8/HD=32 miss.
+// ===========================================================================
+
+/// Toy-shape head_rms_norm via reshape→permute view. Sanity check: if
+/// even this fails, the bug is independent of HD=128 and lives in the
+/// `reshape→permute→rms_norm` chain itself.
+#[test]
+fn parity_klein_head_rms_norm_toy_diag() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let path = fixtures_dir()
+        .join("patterns")
+        .join("klein_ext_head_rms_norm.safetensors");
+    if !path.exists() {
+        eprintln!("SKIP: {path:?} not found");
+        return;
+    }
+    let fix = load_fixture(&path);
+    let x = fix.get("x").unwrap().clone().requires_grad_(true);
+    let scale = fix.get("scale").unwrap().clone().requires_grad_(true);
+
+    flame_core::autograd::AutogradContext::clear();
+
+    let dims = x.shape().dims().to_vec();
+    let (b_d, n_d, d_d) = (dims[0], dims[1], dims[2]);
+    let h_d = 8usize;
+    let hd_d = d_d / h_d;
+
+    let h = x
+        .reshape(&[b_d, n_d, h_d, hd_d])
+        .and_then(|t| t.permute(&[0, 2, 1, 3]))
+        .expect("reshape/permute");
+    let out = flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6)
+        .expect("rms_norm");
+
+    let loss = out.sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+
+    let dx = grads.get(x.id()).expect("missing dx (toy HD=32)");
+    let dscale = grads.get(scale.id()).expect("missing dscale (toy)");
+    eprintln!(
+        "head_rms_norm_toy_diag: ||dx||={:.3e} ||dscale||={:.3e}",
+        dx.to_dtype(flame_core::DType::F32).unwrap()
+            .to_vec().unwrap()
+            .iter().map(|v: &f32| v * v).sum::<f32>().sqrt(),
+        dscale.to_dtype(flame_core::DType::F32).unwrap()
+            .to_vec().unwrap()
+            .iter().map(|v: &f32| v * v).sum::<f32>().sqrt(),
+    );
+}
+
+/// Production-shape head_rms_norm: same `reshape→permute→rms_norm`
+/// chain as the toy test but at Klein 4B's actual per-block shape
+/// (B=1, H=24, N=1024, HD=128).
+#[test]
+fn parity_klein_head_rms_norm_prod_diag() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let path = fixtures_dir()
+        .join("patterns")
+        .join("klein_ext_head_rms_norm_prod.safetensors");
+    if !path.exists() {
+        eprintln!("SKIP: {path:?} not found");
+        return;
+    }
+    let fix = load_fixture(&path);
+    let x = fix.get("x").unwrap().clone().requires_grad_(true);
+    let scale = fix.get("scale").unwrap().clone().requires_grad_(true);
+
+    flame_core::autograd::AutogradContext::clear();
+
+    let dims = x.shape().dims().to_vec();
+    let (b_d, n_d, d_d) = (dims[0], dims[1], dims[2]);
+    let h_d = 24usize;
+    let hd_d = d_d / h_d;
+
+    let h = x
+        .reshape(&[b_d, n_d, h_d, hd_d])
+        .and_then(|t| t.permute(&[0, 2, 1, 3]))
+        .expect("reshape/permute");
+    let out = flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6)
+        .expect("rms_norm");
+
+    let loss = out.sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+
+    let dx = grads.get(x.id()).expect("missing dx (prod HD=128)");
+    let dscale = grads.get(scale.id()).expect("missing dscale (prod)");
+    let cos_dx     = cos_sim_f32(dx,     fix.get("dx").unwrap());
+    let cos_dscale = cos_sim_f32(dscale, fix.get("dscale").unwrap());
+    eprintln!(
+        "head_rms_norm_prod_diag: cos_dx={:.4} cos_dscale={:.4}  \
+         (||dx||={:.3e} ||dscale||={:.3e})",
+        cos_dx,
+        cos_dscale,
+        dx.to_dtype(flame_core::DType::F32).unwrap()
+            .to_vec().unwrap()
+            .iter().map(|v: &f32| v * v).sum::<f32>().sqrt(),
+        dscale.to_dtype(flame_core::DType::F32).unwrap()
+            .to_vec().unwrap()
+            .iter().map(|v: &f32| v * v).sum::<f32>().sqrt(),
+    );
+    assert!(cos_dx     > 0.99, "dx cos_sim {cos_dx}");
+    assert!(cos_dscale > 0.99, "dscale cos_sim {cos_dscale}");
+}
+
+/// Production-shape Interleaved RoPE backward: standalone `apply_rope`
+/// at Klein's post-cat shape (B=1, H=24, N=1536, HD=128). Mirrors
+/// klein-trainer's apply_rope (manual Op::RoPePrecomputed Interleaved
+/// recording around `bf16_ops::rope_fused_bf16`).
+#[test]
+fn parity_klein_apply_rope_prod_diag() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let path = fixtures_dir()
+        .join("patterns")
+        .join("klein_ext_apply_rope_prod.safetensors");
+    if !path.exists() {
+        eprintln!("SKIP: {path:?} not found");
+        return;
+    }
+    let fix = load_fixture(&path);
+    let x = fix.get("x").unwrap().clone().requires_grad_(true);
+    let pe_cos = fix.get("pe_cos").unwrap().clone();
+    let pe_sin = fix.get("pe_sin").unwrap().clone();
+
+    flame_core::autograd::AutogradContext::clear();
+
+    let out = {
+        use flame_core::autograd::{AutogradContext, Op};
+        let mut o = flame_core::bf16_ops::rope_fused_bf16(&x, &pe_cos, &pe_sin)
+            .expect("rope_fused_bf16");
+        if x.requires_grad() {
+            o = o.requires_grad_(true);
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    o.id(),
+                    Op::RoPePrecomputed {
+                        input: x.id(),
+                        cos: pe_cos.id(),
+                        sin: pe_sin.id(),
+                    },
+                    vec![
+                        (x.id(), x.clone()),
+                        (pe_cos.id(), pe_cos.clone()),
+                        (pe_sin.id(), pe_sin.clone()),
+                    ],
+                );
+            }
+        }
+        o
+    };
+
+    let loss = out.sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+
+    let dx = grads.get(x.id()).expect("missing dx (rope prod)");
+    let expected_dx = fix.get("dx").unwrap();
+    let cos_dx = cos_sim_f32(dx, expected_dx);
+    let dx_norm = dx.to_dtype(flame_core::DType::F32).unwrap()
+        .to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let exp_norm = expected_dx.to_dtype(flame_core::DType::F32).unwrap()
+        .to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    eprintln!(
+        "apply_rope_prod_diag: cos_dx={:.4}  ||dx||={:.3e} (expected {:.3e})",
+        cos_dx, dx_norm, exp_norm
+    );
+    assert!(cos_dx > 0.99, "rope dx cos_sim {cos_dx}");
+}
+
+/// Direct rms_norm on 4D input (no reshape, no permute) — control to
+/// verify that rms_norm backward by itself propagates dx. Builds a
+/// 4D BF16 tensor directly from the prod fixture's [B,N,D] payload.
+#[test]
+fn parity_klein_rms_norm_direct_4d_diag() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let path = fixtures_dir()
+        .join("patterns")
+        .join("klein_ext_head_rms_norm_prod.safetensors");
+    if !path.exists() {
+        eprintln!("SKIP: {path:?} not found");
+        return;
+    }
+    let fix = load_fixture(&path);
+    let x_3d = fix.get("x").unwrap().clone();
+    let scale = fix.get("scale").unwrap().clone().requires_grad_(true);
+
+    flame_core::autograd::AutogradContext::clear();
+
+    let dims = x_3d.shape().dims().to_vec();
+    let (b_d, n_d, d_d) = (dims[0], dims[1], dims[2]);
+    let h_d = 24usize;
+    let hd_d = d_d / h_d;
+
+    // Reshape with NO autograd recording, then mark the result as
+    // requires_grad. This bypasses Op::Reshape entirely and tests
+    // ONLY rms_norm's own backward.
+    let x_4d = x_3d
+        .reshape(&[b_d, n_d, h_d, hd_d])
+        .expect("reshape (no-grad)")
+        .requires_grad_(true);
+
+    let out = flame_core::norm::rms_norm(&x_4d, &[hd_d], Some(&scale), 1.0e-6)
+        .expect("rms_norm");
+
+    let loss = out.sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+
+    let dx = grads.get(x_4d.id()).expect("missing dx (4D direct)");
+    let _dscale = grads.get(scale.id()).expect("missing dscale");
+    let dx_norm = dx.to_dtype(flame_core::DType::F32).unwrap()
+        .to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    eprintln!(
+        "rms_norm_direct_4d_diag: ||dx_4d||={:.3e}",
+        dx_norm
+    );
+}
+
+/// Sanity: rms_norm on a CONTIGUOUS input (no permute) at production
+/// shape. Should pass — gives us a control to confirm the bug is in
+/// the reshape→permute view chain, not in rms_norm itself.
+#[test]
+fn parity_klein_rms_norm_contig_prod_diag() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let path = fixtures_dir()
+        .join("patterns")
+        .join("klein_ext_head_rms_norm_prod.safetensors");
+    if !path.exists() {
+        eprintln!("SKIP: {path:?} not found");
+        return;
+    }
+    let fix = load_fixture(&path);
+    // Use the prod fixture's x, but feed it CONTIGUOUSLY to rms_norm.
+    // Reshape it directly to [B, H, N, HD] (no permute) so the input is
+    // already contiguous. We don't care about matching the fixture's
+    // expected output — we just want to verify dx flows back to x.
+    let x = fix.get("x").unwrap().clone().requires_grad_(true);
+    let scale = fix.get("scale").unwrap().clone().requires_grad_(true);
+
+    flame_core::autograd::AutogradContext::clear();
+
+    let dims = x.shape().dims().to_vec();
+    let (b_d, n_d, d_d) = (dims[0], dims[1], dims[2]);
+    let h_d = 24usize;
+    let hd_d = d_d / h_d;
+
+    // Reshape ONLY (no permute) → tensor is still contiguous.
+    let h = x.reshape(&[b_d, n_d, h_d, hd_d]).expect("reshape");
+    let out = flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6)
+        .expect("rms_norm");
+
+    let loss = out.sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+
+    let dx = grads.get(x.id()).expect("missing dx (contig)");
+    let _dscale = grads.get(scale.id()).expect("missing dscale");
+    let dx_norm = dx.to_dtype(flame_core::DType::F32).unwrap()
+        .to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    eprintln!(
+        "rms_norm_contig_prod_diag: ||dx||={:.3e}  (sanity: should be nonzero)",
+        dx_norm
+    );
+}
+
+/// Production-shape FULL ATTN CHAIN: linear → split_qkv → head_rms_norm
+/// (Q,K) → apply_rope (Q,K, Interleaved) → SDPA → permute back →
+/// reshape → linear at H=24, HD=128, N=1024. The existing
+/// `klein_ext_attn_chain` runs at H=8/HD=32; if every sub-op passes
+/// parity at production scale but THIS chain produces wrong gradients
+/// at production scale, the bug is in op COMPOSITION (e.g., a saved-
+/// tensor lifetime issue that only fires when many ops chain).
+///
+/// Run with `--test-threads=1` to avoid the AUTOGRAD_ENABLED race.
+#[test]
+fn parity_klein_attn_chain_prod_diag() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let path = fixtures_dir()
+        .join("patterns")
+        .join("klein_ext_attn_chain_prod.safetensors");
+    if !path.exists() {
+        eprintln!("SKIP: {path:?} not found");
+        return;
+    }
+    let fix = load_fixture(&path);
+    let x = fix.get("x").unwrap().clone().requires_grad_(true);
+    let w_qkv = fix.get("w_qkv").unwrap().clone().requires_grad_(true);
+    let b_qkv = fix.get("b_qkv").unwrap().clone().requires_grad_(true);
+    let q_scale = fix.get("q_scale").unwrap().clone().requires_grad_(true);
+    let k_scale = fix.get("k_scale").unwrap().clone().requires_grad_(true);
+    let w_out = fix.get("w_out").unwrap().clone().requires_grad_(true);
+    let b_out = fix.get("b_out").unwrap().clone().requires_grad_(true);
+    let pe_cos = fix.get("pe_cos").unwrap().clone();
+    let pe_sin = fix.get("pe_sin").unwrap().clone();
+
+    flame_core::autograd::AutogradContext::clear();
+
+    let linear = |x_in: &Tensor, w: &Tensor, b: &Tensor| -> Tensor {
+        let dims = x_in.shape().dims().to_vec();
+        let leading: usize = dims[..dims.len() - 1].iter().product();
+        let in_features = *dims.last().unwrap();
+        let x2d = x_in.reshape(&[leading, in_features]).expect("reshape");
+        let w_t = w.transpose().expect("w_t");
+        let pre = x2d.matmul(&w_t).expect("matmul");
+        let mut out_dims = dims.clone();
+        *out_dims.last_mut().unwrap() = w.shape().dims()[0];
+        let pre_3d = pre.reshape(&out_dims).expect("reshape out");
+        pre_3d.add(b).expect("add bias")
+    };
+
+    let dims = x.shape().dims().to_vec();
+    let (b_d, n_d, d_d) = (dims[0], dims[1], dims[2]);
+    // Production: H=24, HD=128.
+    let h_d = 24usize;
+    let hd_d = d_d / h_d;
+    let inner = d_d;
+
+    let qkv = linear(&x, &w_qkv, &b_qkv);
+    let q_flat = qkv.narrow(2, 0, inner).expect("narrow q");
+    let k_flat = qkv.narrow(2, inner, inner).expect("narrow k");
+    let v_flat = qkv.narrow(2, 2 * inner, inner).expect("narrow v");
+
+    let q = q_flat
+        .reshape(&[b_d, n_d, h_d, hd_d])
+        .and_then(|t| t.permute(&[0, 2, 1, 3]))
+        .expect("q reshape/permute");
+    let k = k_flat
+        .reshape(&[b_d, n_d, h_d, hd_d])
+        .and_then(|t| t.permute(&[0, 2, 1, 3]))
+        .expect("k reshape/permute");
+    let v = v_flat
+        .reshape(&[b_d, n_d, h_d, hd_d])
+        .and_then(|t| t.permute(&[0, 2, 1, 3]))
+        .expect("v reshape/permute");
+
+    let q = flame_core::norm::rms_norm(&q, &[hd_d], Some(&q_scale), 1.0e-6).expect("q rms");
+    let k = flame_core::norm::rms_norm(&k, &[hd_d], Some(&k_scale), 1.0e-6).expect("k rms");
+
+    let rope = |x_in: &Tensor| -> Tensor {
+        use flame_core::autograd::{AutogradContext, Op};
+        let mut o = flame_core::bf16_ops::rope_fused_bf16(x_in, &pe_cos, &pe_sin)
+            .expect("rope_fused_bf16");
+        if x_in.requires_grad() {
+            o = o.requires_grad_(true);
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    o.id(),
+                    Op::RoPePrecomputed {
+                        input: x_in.id(),
+                        cos: pe_cos.id(),
+                        sin: pe_sin.id(),
+                    },
+                    vec![
+                        (x_in.id(), x_in.clone()),
+                        (pe_cos.id(), pe_cos.clone()),
+                        (pe_sin.id(), pe_sin.clone()),
+                    ],
+                );
+            }
+        }
+        o
+    };
+    let q = rope(&q);
+    let k = rope(&k);
+
+    let o = flame_core::sdpa::forward(&q, &k, &v, None).expect("sdpa");
+    let o = o.permute(&[0, 2, 1, 3])
+        .and_then(|t| t.reshape(&[b_d, n_d, d_d]))
+        .expect("permute/reshape back");
+    let out = linear(&o, &w_out, &b_out);
+
+    let expected = fix.get("output").unwrap();
+    let cos_fwd = cos_sim_f32(&out, expected);
+
+    let loss = out.sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+
+    // Bias-only-via-Op::Add doesn't enter `needed_grad_ids` in flame-core
+    // (separate flame-core bug — Op::Add saves nothing). Treat bias
+    // gradients as best-effort: the chaos hunt cares about the chain not
+    // the biases.
+    let dx       = grads.get(x.id()).expect("missing dx");
+    let dw_qkv   = grads.get(w_qkv.id()).expect("missing dw_qkv");
+    let dq_scale = grads.get(q_scale.id()).expect("missing dq_scale");
+    let dk_scale = grads.get(k_scale.id()).expect("missing dk_scale");
+    let dw_out   = grads.get(w_out.id()).expect("missing dw_out");
+
+    let cos_dx       = cos_sim_f32(dx,       fix.get("dx").unwrap());
+    let cos_dw_qkv   = cos_sim_f32(dw_qkv,   fix.get("dw_qkv").unwrap());
+    let cos_dq_scale = cos_sim_f32(dq_scale, fix.get("dq_scale").unwrap());
+    let cos_dk_scale = cos_sim_f32(dk_scale, fix.get("dk_scale").unwrap());
+    let cos_dw_out   = cos_sim_f32(dw_out,   fix.get("dw_out").unwrap());
+    let cos_db_qkv = grads.get(b_qkv.id())
+        .map(|g| cos_sim_f32(g, fix.get("db_qkv").unwrap()))
+        .unwrap_or(f64::NAN);
+    let cos_db_out = grads.get(b_out.id())
+        .map(|g| cos_sim_f32(g, fix.get("db_out").unwrap()))
+        .unwrap_or(f64::NAN);
+
+    eprintln!(
+        "attn_chain_prod_diag: cos_fwd={cos_fwd:.4}  \
+         dx={cos_dx:.4} dw_qkv={cos_dw_qkv:.4} db_qkv={cos_db_qkv:.4} \
+         dq_scale={cos_dq_scale:.4} dk_scale={cos_dk_scale:.4} \
+         dw_out={cos_dw_out:.4} db_out={cos_db_out:.4}"
+    );
+    assert!(cos_fwd       > 0.999, "fwd cos_sim {cos_fwd}");
+    assert!(cos_dx        > 0.99,  "dx  cos_sim {cos_dx}");
+    assert!(cos_dw_qkv    > 0.99,  "dw_qkv cos_sim {cos_dw_qkv}");
+    assert!(cos_dq_scale  > 0.99,  "dq_scale cos_sim {cos_dq_scale}");
+    assert!(cos_dk_scale  > 0.99,  "dk_scale cos_sim {cos_dk_scale}");
+    assert!(cos_dw_out    > 0.99,  "dw_out cos_sim {cos_dw_out}");
+}
+
+/// Same chain as `parity_klein_attn_chain_prod_diag` BUT with SDPA
+/// replaced by `q + k + v`. If THIS test's dq_scale/dk_scale matches
+/// PyTorch but the SDPA version doesn't, the residual bug is in SDPA
+/// backward at production HD=128 (not in the rms_norm + rope + linear
+/// composition).
+#[test]
+fn parity_klein_attn_chain_no_sdpa_prod_diag() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let path = fixtures_dir()
+        .join("patterns")
+        .join("klein_ext_attn_chain_no_sdpa_prod.safetensors");
+    if !path.exists() {
+        eprintln!("SKIP: {path:?} not found");
+        return;
+    }
+    let fix = load_fixture(&path);
+    let x = fix.get("x").unwrap().clone().requires_grad_(true);
+    let w_qkv = fix.get("w_qkv").unwrap().clone().requires_grad_(true);
+    let b_qkv = fix.get("b_qkv").unwrap().clone().requires_grad_(true);
+    let q_scale = fix.get("q_scale").unwrap().clone().requires_grad_(true);
+    let k_scale = fix.get("k_scale").unwrap().clone().requires_grad_(true);
+    let w_out = fix.get("w_out").unwrap().clone().requires_grad_(true);
+    let b_out = fix.get("b_out").unwrap().clone().requires_grad_(true);
+    let pe_cos = fix.get("pe_cos").unwrap().clone();
+    let pe_sin = fix.get("pe_sin").unwrap().clone();
+
+    flame_core::autograd::AutogradContext::clear();
+
+    let linear = |x_in: &Tensor, w: &Tensor, b: &Tensor| -> Tensor {
+        let dims = x_in.shape().dims().to_vec();
+        let leading: usize = dims[..dims.len() - 1].iter().product();
+        let in_features = *dims.last().unwrap();
+        let x2d = x_in.reshape(&[leading, in_features]).expect("reshape");
+        let w_t = w.transpose().expect("w_t");
+        let pre = x2d.matmul(&w_t).expect("matmul");
+        let mut out_dims = dims.clone();
+        *out_dims.last_mut().unwrap() = w.shape().dims()[0];
+        let pre_3d = pre.reshape(&out_dims).expect("reshape out");
+        pre_3d.add(b).expect("add bias")
+    };
+
+    let dims = x.shape().dims().to_vec();
+    let (b_d, n_d, d_d) = (dims[0], dims[1], dims[2]);
+    let h_d = 24usize;
+    let hd_d = d_d / h_d;
+    let inner = d_d;
+
+    let qkv = linear(&x, &w_qkv, &b_qkv);
+    let q_flat = qkv.narrow(2, 0, inner).expect("nq");
+    let k_flat = qkv.narrow(2, inner, inner).expect("nk");
+    let v_flat = qkv.narrow(2, 2 * inner, inner).expect("nv");
+
+    let q = q_flat.reshape(&[b_d, n_d, h_d, hd_d])
+        .and_then(|t| t.permute(&[0, 2, 1, 3])).expect("q");
+    let k = k_flat.reshape(&[b_d, n_d, h_d, hd_d])
+        .and_then(|t| t.permute(&[0, 2, 1, 3])).expect("k");
+    let v = v_flat.reshape(&[b_d, n_d, h_d, hd_d])
+        .and_then(|t| t.permute(&[0, 2, 1, 3])).expect("v");
+
+    let q = flame_core::norm::rms_norm(&q, &[hd_d], Some(&q_scale), 1.0e-6).expect("q rms");
+    let k = flame_core::norm::rms_norm(&k, &[hd_d], Some(&k_scale), 1.0e-6).expect("k rms");
+
+    let rope = |x_in: &Tensor| -> Tensor {
+        use flame_core::autograd::{AutogradContext, Op};
+        let mut o = flame_core::bf16_ops::rope_fused_bf16(x_in, &pe_cos, &pe_sin)
+            .expect("rope");
+        if x_in.requires_grad() {
+            o = o.requires_grad_(true);
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    o.id(),
+                    Op::RoPePrecomputed { input: x_in.id(), cos: pe_cos.id(), sin: pe_sin.id() },
+                    vec![
+                        (x_in.id(), x_in.clone()),
+                        (pe_cos.id(), pe_cos.clone()),
+                        (pe_sin.id(), pe_sin.clone()),
+                    ],
+                );
+            }
+        }
+        o
+    };
+    let q = rope(&q);
+    let k = rope(&k);
+
+    // NO SDPA — pointwise sum across q + k + v.
+    let qk = q.add(&k).expect("q+k");
+    // rope returns a 3D [BH, N, D] tensor on the kernel side; reshape v to match.
+    let qk_dims = qk.shape().dims().to_vec();
+    let v_match = if qk_dims.len() != v.shape().dims().len() {
+        v.reshape(&qk_dims).expect("v reshape match")
+    } else {
+        v.clone()
+    };
+    let o = qk.add(&v_match).expect("qk+v");
+    let o_dims = o.shape().dims().to_vec();
+    let o = if o_dims.len() == 3 {
+        // [BH, N, D] → [B, H, N, HD] for permute back.
+        o.reshape(&[b_d, h_d, n_d, hd_d]).expect("o 4d")
+    } else {
+        o
+    };
+    let o = o.permute(&[0, 2, 1, 3])
+        .and_then(|t| t.reshape(&[b_d, n_d, d_d]))
+        .expect("permute/reshape");
+    let out = linear(&o, &w_out, &b_out);
+
+    let expected = fix.get("output").unwrap();
+    let cos_fwd = cos_sim_f32(&out, expected);
+
+    let loss = out.sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+
+    let dx       = grads.get(x.id()).expect("missing dx");
+    let dw_qkv   = grads.get(w_qkv.id()).expect("missing dw_qkv");
+    let dq_scale = grads.get(q_scale.id()).expect("missing dq_scale");
+    let dk_scale = grads.get(k_scale.id()).expect("missing dk_scale");
+    let dw_out   = grads.get(w_out.id()).expect("missing dw_out");
+
+    let cos_dx       = cos_sim_f32(dx,       fix.get("dx").unwrap());
+    let cos_dw_qkv   = cos_sim_f32(dw_qkv,   fix.get("dw_qkv").unwrap());
+    let cos_dq_scale = cos_sim_f32(dq_scale, fix.get("dq_scale").unwrap());
+    let cos_dk_scale = cos_sim_f32(dk_scale, fix.get("dk_scale").unwrap());
+    let cos_dw_out   = cos_sim_f32(dw_out,   fix.get("dw_out").unwrap());
+
+    eprintln!(
+        "attn_chain_no_sdpa_prod_diag: cos_fwd={cos_fwd:.4}  \
+         dx={cos_dx:.4} dw_qkv={cos_dw_qkv:.4} \
+         dq_scale={cos_dq_scale:.4} dk_scale={cos_dk_scale:.4} \
+         dw_out={cos_dw_out:.4}"
+    );
+    assert!(cos_fwd       > 0.999, "fwd cos_sim {cos_fwd}");
+    assert!(cos_dx        > 0.99,  "dx  cos_sim {cos_dx}");
+    assert!(cos_dw_qkv    > 0.99,  "dw_qkv cos_sim {cos_dw_qkv}");
+    assert!(cos_dq_scale  > 0.99,  "dq_scale cos_sim {cos_dq_scale}");
+    assert!(cos_dk_scale  > 0.99,  "dk_scale cos_sim {cos_dk_scale}");
+    assert!(cos_dw_out    > 0.99,  "dw_out cos_sim {cos_dw_out}");
+}
+
+/// Production-shape LoRA forward_delta backward. Mirrors
+/// flame-diffusion/src/lora.rs::forward_delta exactly:
+///   a is F32 [rank, in], b is F32 [out, rank];
+///   cast both to BF16, transpose+contiguify, double matmul,
+///   scale by alpha/rank.
+///
+/// Klein 4B uses rank=16, in=3072, out=9216 (qkv adapter), alpha=16.
+/// The existing `klein_ext_lora_delta` runs rank=4/D=256;
+/// `klein_ext_lora_f32` runs at toy shape. This is the production pair.
+///
+/// Run with `--test-threads=1`.
+#[test]
+fn parity_klein_lora_delta_prod_diag() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let path = fixtures_dir()
+        .join("patterns")
+        .join("klein_ext_lora_delta_prod.safetensors");
+    if !path.exists() {
+        eprintln!("SKIP: {path:?} not found");
+        return;
+    }
+    let fix = load_fixture(&path);
+    let x = fix.get("x").unwrap().clone().requires_grad_(true);
+    let lora_a = fix.get("lora_a").unwrap().clone().requires_grad_(true);
+    let lora_b = fix.get("lora_b").unwrap().clone().requires_grad_(true);
+
+    flame_core::autograd::AutogradContext::clear();
+
+    let rank = lora_a.shape().dims()[0];
+    let in_f = lora_a.shape().dims()[1];
+    let out_f = lora_b.shape().dims()[0];
+    let alpha = rank as f32;
+    let scale_factor = alpha / rank as f32;
+
+    // forward_delta from flame-diffusion/src/lora.rs (verbatim).
+    let dims = x.shape().dims().to_vec();
+    let leading: usize = dims[..dims.len() - 1].iter().product();
+    let x2d = x.reshape(&[leading, in_f]).expect("reshape");
+    // Cast to BF16 with autograd (Parameters are F32 for optimizer stability).
+    let a_bf16 = lora_a.to_dtype(flame_core::DType::BF16).expect("a cast");
+    let b_bf16 = lora_b.to_dtype(flame_core::DType::BF16).expect("b cast");
+    let a_t = a_bf16.transpose().and_then(|t| t.contiguous()).expect("a_t");
+    let b_t = b_bf16.transpose().and_then(|t| t.contiguous()).expect("b_t");
+    let delta_2d = x2d
+        .matmul(&a_t)
+        .and_then(|t| t.matmul(&b_t))
+        .and_then(|t| t.mul_scalar(scale_factor))
+        .expect("delta");
+    let mut out_dims = dims.clone();
+    *out_dims.last_mut().unwrap() = out_f;
+    let out = delta_2d.reshape(&out_dims).expect("reshape out");
+
+    let expected = fix.get("output").unwrap();
+    let cos_fwd = cos_sim_f32(&out, expected);
+
+    let loss = out.sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+
+    let dx       = grads.get(x.id()).expect("missing dx");
+    let dlora_a  = grads.get(lora_a.id()).expect("missing dlora_a");
+    let dlora_b  = grads.get(lora_b.id()).expect("missing dlora_b");
+
+    let cos_dx      = cos_sim_f32(dx,      fix.get("dx").unwrap());
+    let cos_dlora_a = cos_sim_f32(dlora_a, fix.get("dlora_a").unwrap());
+    let cos_dlora_b = cos_sim_f32(dlora_b, fix.get("dlora_b").unwrap());
+
+    eprintln!(
+        "lora_delta_prod_diag: cos_fwd={cos_fwd:.4}  \
+         dx={cos_dx:.4} dlora_a={cos_dlora_a:.4} dlora_b={cos_dlora_b:.4}"
+    );
+    assert!(cos_fwd      > 0.999, "fwd cos_sim {cos_fwd}");
+    assert!(cos_dx       > 0.99,  "dx  cos_sim {cos_dx}");
+    assert!(cos_dlora_a  > 0.99,  "dlora_a cos_sim {cos_dlora_a}");
+    assert!(cos_dlora_b  > 0.99,  "dlora_b cos_sim {cos_dlora_b}");
+}
+
+// ---------------------------------------------------------------------------
+// Klein single-block ingredient parity tests (post-Bug-#1/#2 fix landscape).
+//
+// Build target: name the residual chaos seen by `klein_finite_diff_test
+// --bisect` after the alias() and rope-layout fixes landed. The
+// `attn_chain_prod_diag` test covers linear→split_qkv→head_rms_norm→rope
+// →SDPA→permute→reshape→linear; the chaos still present in the live
+// trainer must come from one of: modulate_pre (LayerNorm+affine),
+// swiglu activation, gate_residual, or the full single-block composition
+// that wires them together.
+//
+// All three tests inject a *random* upstream gradient `go` so that the
+// backward stresses non-uniform directions — a uniform `ones()` upstream
+// (sum().backward()) misses bugs whose error patterns are mean-zero across
+// the upstream support.
+// ---------------------------------------------------------------------------
+
+/// Modulate-pre at single-block production shape. Mirrors
+/// `klein-trainer/src/model.rs::modulate_pre`:
+///
+/// ```text
+/// normed = layer_norm(x, [D], weight=None, bias=None, eps=1e-6)
+/// out    = normed * (1 + scale.unsqueeze(1).broadcast) + shift.unsqueeze(1).broadcast
+/// ```
+///
+/// Klein doesn't train scale/shift (frozen outputs of a linear projection of
+/// the timestep embedding); the load-bearing gradient is `dx`. We only assert
+/// `cos_fwd` and `cos_dx`. dscale/dshift are intentionally NOT asserted —
+/// flame-core's `Tensor::broadcast_to` doesn't record an autograd op, so the
+/// scale → broadcast → mul edge breaks. That breakage doesn't affect the
+/// trainer because `Op::Mul` backward uses scale_b's *value* (not its
+/// gradient) to compute d(normed) → d(x).
+#[test]
+fn parity_klein_modulate_pre_prod_diag() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let path = fixtures_dir()
+        .join("patterns")
+        .join("klein_ext_modulate_pre_prod.safetensors");
+    if !path.exists() {
+        eprintln!("SKIP: {path:?} not found");
+        return;
+    }
+    let fix = load_fixture(&path);
+    let x = fix.get("x").unwrap().clone().requires_grad_(true);
+    // scale/shift are constants in production: no requires_grad.
+    let scale = fix.get("scale").unwrap().clone();
+    let shift = fix.get("shift").unwrap().clone();
+    let go = fix.get("go").unwrap().clone();
+
+    flame_core::autograd::AutogradContext::clear();
+
+    let dims = x.shape().dims().to_vec();
+    let (b_d, n_d, d_d) = (dims[0], dims[1], dims[2]);
+    let target = flame_core::Shape::from_dims(&[b_d, n_d, d_d]);
+
+    let normed = flame_core::layer_norm::layer_norm(&x, &[d_d], None, None, 1.0e-6)
+        .expect("layer_norm");
+    let scale_b = scale.unsqueeze(1).expect("scale unsqueeze")
+        .broadcast_to(&target).expect("scale broadcast");
+    let shift_b = shift.unsqueeze(1).expect("shift unsqueeze")
+        .broadcast_to(&target).expect("shift broadcast");
+    let out = normed
+        .mul(&scale_b.add_scalar(1.0).expect("scale + 1")).expect("mul")
+        .add(&shift_b).expect("add shift");
+
+    let expected = fix.get("output").unwrap();
+    let cos_fwd = cos_sim_f32(&out, expected);
+
+    // Inject random upstream `go` via (out * go).sum().backward() — equivalent
+    // to out.backward(go) in PyTorch.
+    let loss = out.mul(&go).expect("out*go").sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+
+    let dx = grads.get(x.id()).expect("missing dx");
+    let cos_dx = cos_sim_f32(dx, fix.get("dx").unwrap());
+
+    eprintln!(
+        "modulate_pre_prod_diag: cos_fwd={cos_fwd:.4}  dx={cos_dx:.4}"
+    );
+    assert!(cos_fwd > 0.999, "fwd cos_sim {cos_fwd}");
+    assert!(cos_dx  > 0.99,  "dx cos_sim {cos_dx}");
+}
+
+/// SwiGLU activation at single-block production shape: `silu(gate) * up`.
+/// Failure mode of interest: silu backward or elementwise mul backward
+/// at MLP=12288 width.
+#[test]
+fn parity_klein_swiglu_act_prod_diag() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let path = fixtures_dir()
+        .join("patterns")
+        .join("klein_ext_swiglu_act_prod.safetensors");
+    if !path.exists() {
+        eprintln!("SKIP: {path:?} not found");
+        return;
+    }
+    let fix = load_fixture(&path);
+    let gate = fix.get("gate").unwrap().clone().requires_grad_(true);
+    let up   = fix.get("up").unwrap().clone().requires_grad_(true);
+    let go   = fix.get("go").unwrap().clone();
+
+    flame_core::autograd::AutogradContext::clear();
+
+    let act = gate.silu().expect("silu").mul(&up).expect("silu*up");
+
+    let expected = fix.get("output").unwrap();
+    let cos_fwd = cos_sim_f32(&act, expected);
+
+    let loss = act.mul(&go).expect("act*go").sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+
+    let dgate = grads.get(gate.id()).expect("missing dgate");
+    let dup   = grads.get(up.id()).expect("missing dup");
+
+    let cos_dgate = cos_sim_f32(dgate, fix.get("dgate").unwrap());
+    let cos_dup   = cos_sim_f32(dup,   fix.get("dup").unwrap());
+
+    eprintln!(
+        "swiglu_act_prod_diag: cos_fwd={cos_fwd:.4}  \
+         dgate={cos_dgate:.4} dup={cos_dup:.4}"
+    );
+    assert!(cos_fwd  > 0.999, "fwd cos_sim {cos_fwd}");
+    assert!(cos_dgate > 0.99, "dgate cos_sim {cos_dgate}");
+    assert!(cos_dup   > 0.99, "dup cos_sim {cos_dup}");
+}
+
+/// Gate-residual at single-block production shape:
+/// `x + (update * gate.unsqueeze(1).broadcast)`. Klein doesn't train `gate`
+/// (frozen modulation output); load-bearing gradients are dx (residual
+/// stream) and dupdate (block output before residual fold-in). dgate is
+/// not asserted for the same broadcast-not-recorded reason as
+/// `parity_klein_modulate_pre_prod_diag`.
+#[test]
+fn parity_klein_gate_residual_prod_diag() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let path = fixtures_dir()
+        .join("patterns")
+        .join("klein_ext_gate_residual_prod.safetensors");
+    if !path.exists() {
+        eprintln!("SKIP: {path:?} not found");
+        return;
+    }
+    let fix = load_fixture(&path);
+    let x      = fix.get("x").unwrap().clone().requires_grad_(true);
+    let update = fix.get("update").unwrap().clone().requires_grad_(true);
+    // `gate` is a frozen modulation output in production: no requires_grad.
+    let gate   = fix.get("gate").unwrap().clone();
+    let go     = fix.get("go").unwrap().clone();
+
+    flame_core::autograd::AutogradContext::clear();
+
+    // Route `x` through an identity reshape to break the leaf-bias-of-Op::Add
+    // pattern (otherwise x.id() doesn't enter `needed_grad_ids`). This isn't
+    // a workaround for a bug that affects production — in the trainer, the
+    // gate_residual `x` arg is the previous block's output (intermediate),
+    // so the leaf-bias pattern never arises. The reshape just makes the
+    // *test* mirror the trainer's chain shape.
+    let x_dims: Vec<usize> = x.shape().dims().to_vec();
+    let x_chained = x.reshape(&x_dims).expect("identity reshape on x");
+
+    let target = update.shape().clone();
+    let gate_b = gate.unsqueeze(1).expect("gate unsqueeze")
+        .broadcast_to(&target).expect("gate broadcast");
+    let scaled = update.mul(&gate_b).expect("update*gate");
+    let out = x_chained.add(&scaled).expect("x+scaled");
+
+    let expected = fix.get("output").unwrap();
+    let cos_fwd = cos_sim_f32(&out, expected);
+
+    let loss = out.mul(&go).expect("out*go").sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+
+    let dx      = grads.get(x.id()).expect("missing dx");
+    let dupdate = grads.get(update.id()).expect("missing dupdate");
+
+    let cos_dx      = cos_sim_f32(dx,      fix.get("dx").unwrap());
+    let cos_dupdate = cos_sim_f32(dupdate, fix.get("dupdate").unwrap());
+
+    eprintln!(
+        "gate_residual_prod_diag: cos_fwd={cos_fwd:.4}  \
+         dx={cos_dx:.4} dupdate={cos_dupdate:.4}"
+    );
+    assert!(cos_fwd     > 0.999, "fwd cos_sim {cos_fwd}");
+    assert!(cos_dx      > 0.99,  "dx cos_sim {cos_dx}");
+    assert!(cos_dupdate > 0.99,  "dupdate cos_sim {cos_dupdate}");
+}
+
+/// End-to-end Klein single-block parity at production shape. Composes
+/// every op in `klein-trainer/src/model.rs::single_block_forward`. Failure
+/// mode of interest: a composition-level autograd bug (Tensor::cat backward,
+/// dual-narrow on MLP gate_up, LoRA-via-Op::Add on a narrow slice) that
+/// was invisible to the individual ingredient tests.
+///
+/// **Run with `FLAME_NO_CUDNN_SDPA_BWD=1`** to factor out Bug #3 (located
+/// in cuDNN SDPA bwd at HD=128). With that workaround set, this test
+/// passing means the residual bisect chaos is at the chain-of-blocks
+/// level (BlockOffloader / cross-block AutogradContext), not at single-block.
+#[test]
+fn parity_klein_full_single_block_prod_diag() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let path = fixtures_dir()
+        .join("patterns")
+        .join("klein_ext_full_single_block_prod.safetensors");
+    if !path.exists() {
+        eprintln!("SKIP: {path:?} not found");
+        return;
+    }
+    let fix = load_fixture(&path);
+
+    // Klein single-block production constants (verify against fixture shapes
+    // below — fail fast if the fixture was generated against different dims).
+    const B: usize = 1;
+    const N: usize = 1536;
+    const D: usize = 3072;
+    const H: usize = 24;
+    const HD: usize = 128;
+    const INNER: usize = D;
+    const MLP: usize = 12288;
+    const RANK: usize = 16;
+    const ALPHA: f32 = 16.0;
+
+    let x = fix.get("x").unwrap().clone().requires_grad_(true);
+    assert_eq!(x.shape().dims(), &[B, N, D], "x shape mismatch");
+
+    // Frozen base weights — no requires_grad.
+    let linear1_w = fix.get("linear1_w").unwrap().clone();
+    let linear2_w = fix.get("linear2_w").unwrap().clone();
+    let q_norm_scale = fix.get("q_norm_scale").unwrap().clone();
+    let k_norm_scale = fix.get("k_norm_scale").unwrap().clone();
+    let shift = fix.get("shift").unwrap().clone();
+    let scale = fix.get("scale").unwrap().clone();
+    let gate = fix.get("gate").unwrap().clone();
+    let pe_cos = fix.get("pe_cos").unwrap().clone();
+    let pe_sin = fix.get("pe_sin").unwrap().clone();
+    let go = fix.get("go").unwrap().clone();
+
+    // LoRA parameters (F32).
+    let lora_qkv_a = fix.get("lora_qkv_a").unwrap().clone().requires_grad_(true);
+    let lora_qkv_b = fix.get("lora_qkv_b").unwrap().clone().requires_grad_(true);
+    let lora_out_a = fix.get("lora_out_a").unwrap().clone().requires_grad_(true);
+    let lora_out_b = fix.get("lora_out_b").unwrap().clone().requires_grad_(true);
+
+    flame_core::autograd::AutogradContext::clear();
+
+    let target_3d = flame_core::Shape::from_dims(&[B, N, D]);
+
+    // ---- helpers -----------------------------------------------------------
+
+    // Mirrors klein-trainer/src/model.rs::linear3d. PyTorch convention:
+    // weight is [out, in]; we transpose to [in, out] for matmul.
+    let linear3d = |x_in: &Tensor, w: &Tensor| -> Tensor {
+        let dims = x_in.shape().dims().to_vec();
+        let leading: usize = dims[..dims.len() - 1].iter().product();
+        let in_f = *dims.last().unwrap();
+        let out_f = w.shape().dims()[0];
+        let x2d = x_in.reshape(&[leading, in_f]).expect("reshape x");
+        let w_t = w.transpose().expect("transpose w");
+        let out2d = x2d.matmul(&w_t).expect("matmul");
+        let mut out_dims = dims.clone();
+        *out_dims.last_mut().unwrap() = out_f;
+        out2d.reshape(&out_dims).expect("reshape out")
+    };
+
+    // Mirrors flame-diffusion/src/lora.rs::forward_delta.
+    let lora_delta = |inp: &Tensor, a: &Tensor, b: &Tensor| -> Tensor {
+        let dims = inp.shape().dims().to_vec();
+        let leading: usize = dims[..dims.len() - 1].iter().product();
+        let in_f = *dims.last().unwrap();
+        let out_f = b.shape().dims()[0];
+        let inp2d = inp.reshape(&[leading, in_f]).expect("lora reshape");
+        let a_bf = a.to_dtype(flame_core::DType::BF16).expect("a bf");
+        let b_bf = b.to_dtype(flame_core::DType::BF16).expect("b bf");
+        let a_t = a_bf.transpose().and_then(|t| t.contiguous()).expect("a_t");
+        let b_t = b_bf.transpose().and_then(|t| t.contiguous()).expect("b_t");
+        let scale_factor = ALPHA / RANK as f32;
+        let delta_2d = inp2d
+            .matmul(&a_t).and_then(|t| t.matmul(&b_t))
+            .and_then(|t| t.mul_scalar(scale_factor))
+            .expect("lora matmul chain");
+        let mut out_dims = dims;
+        *out_dims.last_mut().unwrap() = out_f;
+        delta_2d.reshape(&out_dims).expect("lora reshape out")
+    };
+
+    // Manual Op::RoPePrecomputed wrapper — same pattern as
+    // parity_klein_apply_rope_prod_diag.
+    let rope = |x_in: &Tensor| -> Tensor {
+        use flame_core::autograd::{AutogradContext, Op};
+        let mut o = flame_core::bf16_ops::rope_fused_bf16(x_in, &pe_cos, &pe_sin)
+            .expect("rope_fused_bf16");
+        if x_in.requires_grad() {
+            o = o.requires_grad_(true);
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    o.id(),
+                    Op::RoPePrecomputed {
+                        input: x_in.id(),
+                        cos: pe_cos.id(),
+                        sin: pe_sin.id(),
+                    },
+                    vec![
+                        (x_in.id(), x_in.clone()),
+                        (pe_cos.id(), pe_cos.clone()),
+                        (pe_sin.id(), pe_sin.clone()),
+                    ],
+                );
+            }
+        }
+        o
+    };
+
+    // ---- forward (mirrors single_block_forward step-by-step) ---------------
+
+    // 1. modulate_pre
+    let normed = flame_core::layer_norm::layer_norm(&x, &[D], None, None, 1.0e-6)
+        .expect("layer_norm");
+    let scale_b = scale.unsqueeze(1).expect("scale unsqueeze")
+        .broadcast_to(&target_3d).expect("scale broadcast");
+    let shift_b = shift.unsqueeze(1).expect("shift unsqueeze")
+        .broadcast_to(&target_3d).expect("shift broadcast");
+    let x_normed = normed
+        .mul(&scale_b.add_scalar(1.0).expect("scale+1")).expect("mul")
+        .add(&shift_b).expect("add shift");
+
+    // 2. linear1 fused → narrow → LoRA(QKV)
+    let qkv_mlp = linear3d(&x_normed, &linear1_w);
+    let qkv_dim = 3 * INNER;
+    let qkv_base = qkv_mlp.narrow(2, 0, qkv_dim).expect("narrow qkv");
+    let gate_up  = qkv_mlp.narrow(2, qkv_dim, 2 * MLP).expect("narrow gate_up");
+    let delta_qkv = lora_delta(&x_normed, &lora_qkv_a, &lora_qkv_b);
+    let qkv = qkv_base.add(&delta_qkv).expect("qkv + lora");
+
+    // 3. split_qkv (reshape + permute)
+    let split_head = |z: &Tensor| -> Tensor {
+        z.reshape(&[B, N, H, HD])
+            .and_then(|t| t.permute(&[0, 2, 1, 3]))
+            .and_then(|t| t.contiguous())
+            .expect("split_head reshape/permute/contig")
+    };
+    let q = split_head(&qkv.narrow(2, 0, INNER).expect("narrow q"));
+    let k = split_head(&qkv.narrow(2, INNER, INNER).expect("narrow k"));
+    let v = split_head(&qkv.narrow(2, 2 * INNER, INNER).expect("narrow v"));
+
+    // 4. head_rms_norm
+    let q = flame_core::norm::rms_norm(&q, &[HD], Some(&q_norm_scale), 1.0e-6)
+        .expect("q rms_norm");
+    let k = flame_core::norm::rms_norm(&k, &[HD], Some(&k_norm_scale), 1.0e-6)
+        .expect("k rms_norm");
+
+    // 5. RoPE
+    let q = rope(&q);
+    let k = rope(&k);
+
+    // 6. SDPA — auto-routes to forward_train when recording.
+    let attn = flame_core::sdpa::forward(&q, &k, &v, None).expect("sdpa");
+    let attn_out = attn
+        .permute(&[0, 2, 1, 3])
+        .and_then(|t| t.contiguous())
+        .and_then(|t| t.reshape(&[B, N, INNER]))
+        .expect("permute/reshape attn");
+
+    // 7. swiglu on gate_up
+    let gate_proj = gate_up.narrow(2, 0, MLP).expect("narrow gate_proj");
+    let up_proj   = gate_up.narrow(2, MLP, MLP).expect("narrow up_proj");
+    let mlp_out = gate_proj.silu().expect("silu").mul(&up_proj).expect("silu*up");
+
+    // 8. cat
+    let fused = Tensor::cat(&[&attn_out, &mlp_out], 2).expect("cat attn,mlp");
+
+    // 9. linear2 + LoRA on attn_out slice only
+    let out_block_base = linear3d(&fused, &linear2_w);
+    let delta_out = lora_delta(&attn_out, &lora_out_a, &lora_out_b);
+    let out_block = out_block_base.add(&delta_out).expect("linear2 + lora_out");
+
+    // 10. gate_residual
+    let gate_b = gate.unsqueeze(1).expect("gate unsqueeze")
+        .broadcast_to(&target_3d).expect("gate broadcast");
+    let scaled = out_block.mul(&gate_b).expect("out_block * gate");
+    // Route x through identity reshape to break leaf-bias-of-Op::Add pattern,
+    // matching the trainer's chain-of-blocks topology where x is intermediate.
+    let x_dims_v: Vec<usize> = x.shape().dims().to_vec();
+    let x_chained = x.reshape(&x_dims_v).expect("identity reshape on x");
+    let out = x_chained.add(&scaled).expect("x + scaled");
+
+    let expected = fix.get("output").unwrap();
+    let cos_fwd = cos_sim_f32(&out, expected);
+
+    let loss = out.mul(&go).expect("out*go").sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+
+    let dx          = grads.get(x.id()).expect("missing dx");
+    let dlora_qkv_a = grads.get(lora_qkv_a.id()).expect("missing dlora_qkv_a");
+    let dlora_qkv_b = grads.get(lora_qkv_b.id()).expect("missing dlora_qkv_b");
+    let dlora_out_a = grads.get(lora_out_a.id()).expect("missing dlora_out_a");
+    let dlora_out_b = grads.get(lora_out_b.id()).expect("missing dlora_out_b");
+
+    let cos_dx          = cos_sim_f32(dx,          fix.get("dx").unwrap());
+    let cos_dlora_qkv_a = cos_sim_f32(dlora_qkv_a, fix.get("dlora_qkv_a").unwrap());
+    let cos_dlora_qkv_b = cos_sim_f32(dlora_qkv_b, fix.get("dlora_qkv_b").unwrap());
+    let cos_dlora_out_a = cos_sim_f32(dlora_out_a, fix.get("dlora_out_a").unwrap());
+    let cos_dlora_out_b = cos_sim_f32(dlora_out_b, fix.get("dlora_out_b").unwrap());
+
+    let dx_norm = dx.to_dtype(flame_core::DType::F32).unwrap()
+        .to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let exp_dx_norm = fix.get("dx").unwrap()
+        .to_dtype(flame_core::DType::F32).unwrap()
+        .to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let go_norm = go.to_dtype(flame_core::DType::F32).unwrap()
+        .to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    eprintln!(
+        "full_single_block_prod_diag: cos_fwd={cos_fwd:.4}  \
+         dx={cos_dx:.4} (||rust_dx||={dx_norm:.3e} ||py_dx||={exp_dx_norm:.3e} ||go||={go_norm:.3e}) \
+         dlora_qkv_a={cos_dlora_qkv_a:.4} dlora_qkv_b={cos_dlora_qkv_b:.4} \
+         dlora_out_a={cos_dlora_out_a:.4} dlora_out_b={cos_dlora_out_b:.4}"
+    );
+    assert!(cos_fwd          > 0.999, "fwd cos_sim {cos_fwd}");
+    assert!(cos_dx           > 0.99,  "dx cos_sim {cos_dx}");
+    assert!(cos_dlora_qkv_a  > 0.99,  "dlora_qkv_a cos_sim {cos_dlora_qkv_a}");
+    assert!(cos_dlora_qkv_b  > 0.99,  "dlora_qkv_b cos_sim {cos_dlora_qkv_b}");
+    assert!(cos_dlora_out_a  > 0.99,  "dlora_out_a cos_sim {cos_dlora_out_a}");
+    assert!(cos_dlora_out_b  > 0.99,  "dlora_out_b cos_sim {cos_dlora_out_b}");
+}
+
+/// Diagnostic for the dx-failure mode of `parity_klein_full_single_block_prod_diag`.
+/// Does autograd correctly *accumulate* gradients on a leaf tensor that is
+/// used by multiple downstream ops? Klein's single block has x_normed
+/// flowing into BOTH linear3d(linear1) AND lora_delta(qkv); if accumulation
+/// is broken, the dx contribution from one path would be silently dropped.
+///
+/// Reference: PyTorch with two matmul branches summed at the output.
+/// Run with `--test-threads=1`.
+#[test]
+fn parity_multi_use_accumulation_diag() {
+    let device = flame_core::global_cuda_device();
+    flame_core::autograd::AutogradContext::clear();
+
+    // Small but nontrivial: x [B*N, D=256], two random matrices [D, M] each.
+    const BN: usize = 32;
+    const D: usize = 256;
+    const M: usize = 128;
+
+    // Deterministic synthetic inputs: f(i) = sin(i)/D, etc. Using simple
+    // arithmetic instead of randn so the test is self-contained (no Python
+    // fixture dependency).
+    let mut x_data = vec![0.0f32; BN * D];
+    for i in 0..BN * D {
+        x_data[i] = ((i as f32 * 0.137).sin() * 0.05) as f32;
+    }
+    let mut m1_data = vec![0.0f32; D * M];
+    let mut m2_data = vec![0.0f32; D * M];
+    for i in 0..D * M {
+        m1_data[i] = ((i as f32 * 0.211).cos() * 0.05) as f32;
+        m2_data[i] = ((i as f32 * 0.359).sin() * 0.05) as f32;
+    }
+    let mut go_data = vec![0.0f32; BN * M];
+    for i in 0..BN * M {
+        go_data[i] = ((i as f32 * 0.073).sin() * 0.1) as f32;
+    }
+
+    use flame_core::{DType, Shape};
+    let x_f32 = Tensor::from_vec(x_data, Shape::from_dims(&[BN, D]), device.clone()).unwrap();
+    let m1_f32 = Tensor::from_vec(m1_data, Shape::from_dims(&[D, M]), device.clone()).unwrap();
+    let m2_f32 = Tensor::from_vec(m2_data, Shape::from_dims(&[D, M]), device.clone()).unwrap();
+    let go_f32 = Tensor::from_vec(go_data, Shape::from_dims(&[BN, M]), device.clone()).unwrap();
+
+    let x = x_f32.to_dtype(DType::BF16).unwrap().requires_grad_(true);
+    let m1 = m1_f32.to_dtype(DType::BF16).unwrap();
+    let m2 = m2_f32.to_dtype(DType::BF16).unwrap();
+    let go = go_f32.to_dtype(DType::BF16).unwrap();
+
+    // Two downstream uses: y1 = x @ m1, y2 = x @ m2, out = y1 + y2.
+    // d(out)/d(x) should be go @ m1.T + go @ m2.T (accumulated).
+    let y1 = x.matmul(&m1).expect("x @ m1");
+    let y2 = x.matmul(&m2).expect("x @ m2");
+    let out = y1.add(&y2).expect("y1 + y2");
+
+    let loss = out.mul(&go).expect("out * go").sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+    let dx = grads.get(x.id()).expect("missing dx");
+
+    // Reference: dx_ref = go @ m1.T + go @ m2.T computed without autograd.
+    flame_core::autograd::AutogradContext::clear();
+    let m1_t = m1.transpose().and_then(|t| t.contiguous()).unwrap();
+    let m2_t = m2.transpose().and_then(|t| t.contiguous()).unwrap();
+    let dx_a = go.matmul(&m1_t).unwrap();
+    let dx_b = go.matmul(&m2_t).unwrap();
+    let dx_ref = dx_a.add(&dx_b).unwrap();
+
+    let cos = cos_sim_f32(dx, &dx_ref);
+    let dx_norm = dx.to_dtype(DType::F32).unwrap().to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let ref_norm = dx_ref.to_dtype(DType::F32).unwrap().to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let ratio = dx_norm / ref_norm;
+    eprintln!(
+        "multi_use_accumulation_diag: cos_dx={cos:.4} \
+         ||rust_dx||={dx_norm:.3e} ||ref_dx||={ref_norm:.3e} ratio={ratio:.4}"
+    );
+    assert!(cos   > 0.999, "multi-use dx cos_sim {cos}");
+    assert!((ratio - 1.0).abs() < 0.05, "multi-use dx ||ratio|| {ratio}");
+}
+
+/// Step-2 diagnostic: x → LayerNorm → split into TWO downstream branches,
+/// summed at output. Mirrors Klein's `x_normed` having two consumers
+/// (linear1 fused QKV+gate_up AND lora_delta on the QKV slice). If this
+/// fails, the bug is in gradient accumulation when LayerNorm's output is
+/// consumed by multiple downstream ops.
+///
+/// All values built from sin/cos so the test is self-contained (no fixture).
+/// Reference path runs the same graph but with `(out * go).sum().backward()`
+/// expressed as an explicit closed-form via per-branch transposes.
+#[test]
+fn parity_multi_use_after_layernorm_diag() {
+    use flame_core::{DType, Shape};
+
+    let device = flame_core::global_cuda_device();
+    flame_core::autograd::AutogradContext::clear();
+
+    const BN: usize = 32;
+    const D: usize = 256;
+    const M: usize = 128;
+
+    let x_data: Vec<f32> = (0..BN * D)
+        .map(|i| (i as f32 * 0.137).sin() * 0.05)
+        .collect();
+    let m1_data: Vec<f32> = (0..D * M)
+        .map(|i| (i as f32 * 0.211).cos() * 0.05)
+        .collect();
+    let m2_data: Vec<f32> = (0..D * M)
+        .map(|i| (i as f32 * 0.359).sin() * 0.05)
+        .collect();
+    let go_data: Vec<f32> = (0..BN * M)
+        .map(|i| (i as f32 * 0.073).sin() * 0.1)
+        .collect();
+
+    let x_f32 = Tensor::from_vec(x_data, Shape::from_dims(&[BN, D]), device.clone()).unwrap();
+    let m1 = Tensor::from_vec(m1_data, Shape::from_dims(&[D, M]), device.clone())
+        .unwrap().to_dtype(DType::BF16).unwrap();
+    let m2 = Tensor::from_vec(m2_data, Shape::from_dims(&[D, M]), device.clone())
+        .unwrap().to_dtype(DType::BF16).unwrap();
+    let go = Tensor::from_vec(go_data, Shape::from_dims(&[BN, M]), device.clone())
+        .unwrap().to_dtype(DType::BF16).unwrap();
+
+    // Path A — through autograd (Rust):
+    let x = x_f32.to_dtype(DType::BF16).unwrap().requires_grad_(true);
+    let normed = flame_core::layer_norm::layer_norm(&x, &[D], None, None, 1.0e-6)
+        .expect("layer_norm");
+    let y1 = normed.matmul(&m1).expect("normed @ m1");
+    let y2 = normed.matmul(&m2).expect("normed @ m2");
+    let out = y1.add(&y2).expect("y1 + y2");
+    let loss = out.mul(&go).expect("out * go").sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+    let dx = grads.get(x.id()).expect("missing dx").clone();
+
+    // Path B — reference: run same graph again under autograd to get a
+    // *known-good* dx via a single-branch substitute:
+    //   y_combined = normed @ (m1 + m2)
+    //   dx_ref = backward(y_combined.mul(go).sum())
+    // Mathematically y1 + y2 = normed @ (m1 + m2), so dx_ref must equal dx
+    // if the multi-use accumulation is correct.
+    flame_core::autograd::AutogradContext::clear();
+    let m_sum = m1.add(&m2).expect("m1 + m2");
+    let x2 = x_f32.to_dtype(DType::BF16).unwrap().requires_grad_(true);
+    let normed2 = flame_core::layer_norm::layer_norm(&x2, &[D], None, None, 1.0e-6)
+        .expect("layer_norm 2");
+    let y_combined = normed2.matmul(&m_sum).expect("normed2 @ m_sum");
+    let loss2 = y_combined.mul(&go).expect("y_combined * go").sum().expect("sum2");
+    let grads2 = loss2.backward().expect("backward 2");
+    let dx_ref = grads2.get(x2.id()).expect("missing dx_ref");
+
+    let cos = cos_sim_f32(&dx, dx_ref);
+    let dx_norm = dx.to_dtype(DType::F32).unwrap().to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let ref_norm = dx_ref.to_dtype(DType::F32).unwrap().to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let ratio = dx_norm / ref_norm;
+    eprintln!(
+        "multi_use_after_layernorm_diag: cos_dx={cos:.4} \
+         ||two_branch_dx||={dx_norm:.3e} ||single_branch_dx||={ref_norm:.3e} ratio={ratio:.4}"
+    );
+    assert!(cos   > 0.999, "post-LN multi-use cos_sim {cos}");
+    assert!((ratio - 1.0).abs() < 0.05, "post-LN multi-use ratio {ratio}");
+}
+
+/// Step-3 diagnostic: x feeds BOTH a LayerNorm path AND a direct residual
+/// path, the two branches summed at output. Mirrors Klein's pattern of
+/// `out = x_residual + (LN(x) → ... → out_block) * gate`. If this fails,
+/// the bug is in gradient accumulation when the same leaf x flows through
+/// both an Op::LayerNorm AND a non-LN op (Op::Reshape identity, Op::Add
+/// residual fold-in).
+#[test]
+fn parity_multi_use_x_via_ln_and_direct_diag() {
+    use flame_core::{DType, Shape};
+
+    let device = flame_core::global_cuda_device();
+    flame_core::autograd::AutogradContext::clear();
+
+    const BN: usize = 32;
+    const D: usize = 256;
+
+    let x_data: Vec<f32> = (0..BN * D)
+        .map(|i| (i as f32 * 0.137).sin() * 0.05)
+        .collect();
+    let m_data: Vec<f32> = (0..D * D)
+        .map(|i| (i as f32 * 0.211).cos() * 0.05)
+        .collect();
+    let go_data: Vec<f32> = (0..BN * D)
+        .map(|i| (i as f32 * 0.073).sin() * 0.1)
+        .collect();
+
+    let x_f32 = Tensor::from_vec(x_data.clone(), Shape::from_dims(&[BN, D]), device.clone()).unwrap();
+    let m = Tensor::from_vec(m_data, Shape::from_dims(&[D, D]), device.clone())
+        .unwrap().to_dtype(DType::BF16).unwrap();
+    let go = Tensor::from_vec(go_data, Shape::from_dims(&[BN, D]), device.clone())
+        .unwrap().to_dtype(DType::BF16).unwrap();
+
+    // Path A — through autograd:
+    //   y_ln = LN(x) @ m
+    //   y_res = x.reshape(same)              (mirror of klein-trainer's
+    //                                          x_chained = x.reshape(&dims))
+    //   out = y_ln + y_res
+    let x = x_f32.to_dtype(DType::BF16).unwrap().requires_grad_(true);
+    let normed = flame_core::layer_norm::layer_norm(&x, &[D], None, None, 1.0e-6)
+        .expect("layer_norm");
+    let y_ln = normed.matmul(&m).expect("normed @ m");
+    let dims_v: Vec<usize> = x.shape().dims().to_vec();
+    let x_residual = x.reshape(&dims_v).expect("identity reshape on x");
+    let out = y_ln.add(&x_residual).expect("y_ln + x_residual");
+    let loss = out.mul(&go).expect("out * go").sum().expect("sum");
+    let grads = loss.backward().expect("backward");
+    let dx = grads.get(x.id()).expect("missing dx").clone();
+
+    // Reference path — compute the same dx via SEPARATE backwards then sum:
+    //   dx_ln_only  = backward through LN+matmul branch only
+    //   dx_res_only = backward through residual branch only  (= go itself)
+    //   dx_ref = dx_ln_only + dx_res_only
+    //
+    // We split on `.requires_grad_(true)` per branch by running each as its
+    // own clean autograd session.
+    flame_core::autograd::AutogradContext::clear();
+    let x_a = x_f32.to_dtype(DType::BF16).unwrap().requires_grad_(true);
+    let normed_a = flame_core::layer_norm::layer_norm(&x_a, &[D], None, None, 1.0e-6)
+        .expect("layer_norm a");
+    let y_ln_a = normed_a.matmul(&m).expect("normed_a @ m");
+    let loss_a = y_ln_a.mul(&go).expect("y_ln_a * go").sum().expect("sum a");
+    let grads_a = loss_a.backward().expect("backward a");
+    let dx_ln_only = grads_a.get(x_a.id()).expect("missing dx_ln_only").clone();
+
+    flame_core::autograd::AutogradContext::clear();
+    let x_b = x_f32.to_dtype(DType::BF16).unwrap().requires_grad_(true);
+    let dims_b: Vec<usize> = x_b.shape().dims().to_vec();
+    let x_res_b = x_b.reshape(&dims_b).expect("identity reshape on x_b");
+    // Need ANOTHER reshape (or any recorded op) past x_res_b to avoid the
+    // leaf-bias-of-Op::Add pattern when we later .add into a sink. Since
+    // we just want to extract dx via "any op that has go as upstream",
+    // multiply by ones (= go path).
+    let loss_b = x_res_b.mul(&go).expect("x_res_b * go").sum().expect("sum b");
+    let grads_b = loss_b.backward().expect("backward b");
+    let dx_res_only = grads_b.get(x_b.id()).expect("missing dx_res_only").clone();
+
+    let dx_ref = dx_ln_only.add(&dx_res_only).expect("dx_ln + dx_res");
+
+    let cos = cos_sim_f32(&dx, &dx_ref);
+    let dx_norm = dx.to_dtype(DType::F32).unwrap().to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let ref_norm = dx_ref.to_dtype(DType::F32).unwrap().to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let ln_norm = dx_ln_only.to_dtype(DType::F32).unwrap().to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let res_norm = dx_res_only.to_dtype(DType::F32).unwrap().to_vec().unwrap()
+        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let ratio = dx_norm / ref_norm;
+    eprintln!(
+        "multi_use_x_via_ln_and_direct_diag: cos_dx={cos:.4} ratio={ratio:.4}\n\
+         \t||combined_dx||={dx_norm:.3e}  ||ref_dx||={ref_norm:.3e}\n\
+         \t||dx_ln_only||={ln_norm:.3e}  ||dx_res_only||={res_norm:.3e}"
+    );
+    assert!(cos   > 0.999, "x-via-LN-and-direct cos_sim {cos}");
+    assert!((ratio - 1.0).abs() < 0.05, "x-via-LN-and-direct ratio {ratio}");
+}
