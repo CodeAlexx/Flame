@@ -537,3 +537,116 @@ This is the core trade-off: ~2x compute (forward recomputation during backward) 
 | `cuda_alloc_pool.rs` | Caching allocator -- exact-size free lists, eliminates cudaMalloc/cudaFree during backward |
 | `cuda_graph.rs` | CUDA Graph capture/replay for backward (FLAME_CUDA_GRAPH=1) |
 | `adam.rs` | Adam/AdamW optimizer -- FP32 state, reads public BF16 gradients from Parameters |
+
+---
+
+## Saved-tensor stride hazard (Bug #4 family — fixed 2026-04-25)
+
+The historical bug: backward kernels read saved tensors via raw device
+pointers that ignore `custom_strides` and `view_offset`. A saved
+narrow / permute / transpose view → kernel reads parent storage from
+offset 0 → wrong values. Symptoms: `cos_sim ≈ 0.05` direction-wrong
+gradients with magnitude-matched output, hidden by magnitude-only
+checks.
+
+### Single chokepoint: `fetch_saved`
+
+The closure `fetch_saved` defined inside `compute_gradients`
+(`src/autograd.rs:1855-1894`) is the canonical access path for saved
+tensors during backward. It:
+
+1. Pulls the saved tensor (from `entry.saved_tensors` or
+   `CHECKPOINT_MANAGER` if checkpointed).
+2. **Materializes via `.contiguous()` if not already contiguous.**
+
+Every backward op that reads a saved tensor's data via a kernel
+**MUST** route through `fetch_saved` — not direct
+`entry.get_saved(...)`.
+
+### Audit list (current state, all routed through fetch_saved):
+
+- `Op::Mul` ✓ (saved lhs/rhs read by `GpuOps::mul`)
+- `Op::Div` ✓
+- `Op::Sub` (no saved-tensor data reads)
+- `Op::Add` (no saved-tensor data reads)
+- `Op::Square` ✓ (saved input read by `GpuOps::mul`)
+- `Op::ReLU` / `GELU` / `SiLU` / `Sigmoid` / `Tanh` ✓ (fused unary
+  backwards via `tensor_raw_ptr`)
+- `Op::Sqrt` ✓
+- `Op::MatMul` / `Op::BatchMatMul` ✓
+- `Op::Linear` ✓
+- `Op::Conv2d` / `Op::Conv2dNHWC` — uses direct `get_saved` for
+  shape only (the kernel allocates fresh contiguous; no data read
+  from the saved view). **Verify before adding new conv backwards.**
+- `Op::LayerNorm` ✓
+- `Op::RMSNorm` ✓ (commit 4aca427: switched from direct get_saved to
+  fetch_saved)
+- `Op::FlashAttention` ✓ (commit 4aca427: same switch)
+- `Op::SageAttention` — still uses direct `get_saved`; not on Klein
+  hot path, but should be audited if SageAttention training is ever
+  enabled.
+- `Op::Cat` — only reads `dims[*dim]` for slot sizes, no data. Safe.
+- `Op::Slice` — no saved data read.
+- `Op::Permute` / `Op::Transpose` / `Op::Reshape` — no saved data
+  read (output_grad alone suffices).
+- `Op::RoPePrecomputed` ✓
+- `Op::Embedding` / `Op::IndexSelect` — uses direct `get_saved` for
+  indices. Indices are small int tensors typically already contig.
+  Audit if used with strided index inputs.
+- `Op::Maximum` / `Op::Minimum` / `Op::Where` — uses direct
+  `get_saved`. Klein/Z-Image inference doesn't trigger these in
+  backward; audit when used.
+- `Op::MSELoss` / `L1Loss` / `HuberLoss` / `BCELoss` / `NLLLoss` —
+  uses direct `get_saved` for predictions/targets. Tested through
+  `mse_loss_bf16`'s decomposed-form path (sub→square→mean) which
+  exercises Sub/Square/Mean backward — those are stride-safe. The
+  fused loss-op backwards are not on Klein's hot path; audit when
+  used.
+
+### Rule for new backward arms
+
+When adding a new `Op::Foo` backward case:
+- If the backward reads `saved_tensor.data` (via `tensor_raw_ptr`,
+  `try_as_slice_*`, or any kernel input), use `fetch_saved(id)`.
+- If the backward only reads `saved_tensor.shape() / dims() / dtype()`,
+  direct `entry.get_saved(id)` is fine.
+- When in doubt, use `fetch_saved` — the cost is one if-check (and
+  one extra contiguify-and-copy when the input was strided).
+
+### Test-only intermediate-grad probing
+
+For diagnosing where a backward chain corrupts gradients:
+
+```rust
+use flame_core::autograd::AutogradContext;
+use flame_core::TensorId;
+
+let mut ids: HashSet<TensorId> = HashSet::new();
+ids.insert(some_intermediate.id());
+ids.insert(another.id());
+AutogradContext::retain_intermediate_grads(ids);
+
+let grads = loss.backward()?;
+let intermediates = AutogradContext::take_retained_intermediate_grads();
+
+for (id, grad) in intermediates {
+    // compare to PyTorch reference, find first wrong cos_sim
+}
+```
+
+`retain_intermediate_grads` snapshots the gradient AT each tracked id
+right before the standard `take`-drain frees it, into a thread-local
+HashMap returnable via `take_retained_intermediate_grads`. See
+`src/autograd.rs:910-940`.
+
+### Forward-side analogues
+
+Bug #4 was backward-side. Two forward-side analogues exist:
+
+- `Tensor::clone_result` materializes views first
+  (`src/tensor.rs:2913`).
+- `CudaKernels::{add,mul,div}` (method form) materialize views first
+  (`src/cuda_kernels.rs`).
+
+See [`FLAME_CONVENTIONS.md` § Stride hazards](./FLAME_CONVENTIONS.md#stride-hazards-in-kernel-paths)
+for the broader auditing guide.

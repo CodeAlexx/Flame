@@ -124,11 +124,37 @@
 - `.as_mut_device_ptr_bf16(label) -> *mut u16`
 - `.storage_ref() / .storage_mut()`
 
+⚠️ **Stride hazard**: these return the storage's offset-0 pointer
+without honoring `view_offset` or `custom_strides`. Anyone launching
+a kernel that reads via these MUST contiguify non-contig inputs first.
+See [`FLAME_CONVENTIONS.md`](./FLAME_CONVENTIONS.md#stride-hazards-in-kernel-paths)
+for the audited chokepoints (`fetch_saved`, `clone_result`,
+`CudaKernels::{add,mul,div}`, `add_same_dtype`, `mul_same_dtype` —
+all materialize views).
+
+### View materialization
+- `.is_contiguous() -> bool` — `custom_strides.is_none() && view_offset == 0`
+- `.contiguous()` — propagates requires_grad and records identity-reshape
+  for autograd. Routes views through `materialize_view` /
+  `permute_generic` / fast-paths.
+- `.clone_result() -> Result<Tensor>` — fallible deep clone. **Now safe
+  for views** (commit 05f07f9): non-contig inputs are routed through
+  `.contiguous()` first; pre-fix it was duplicating parent storage with
+  the view's smaller logical shape, producing wrong addressing.
+- `.alias() -> Tensor` — non-owning shallow view. Preserves
+  `custom_strides` + `view_offset` (fix in commit 8678680; pre-fix it
+  zeroed both, breaking save-for-backward of strided views).
+
 ### Autograd hooks
 - `.requires_grad / .requires_grad_(bool)`
 - `.backward() / .backward_with_grad()`
 - `.detach()`
 - See [`FLAME_MODULES.md`](./FLAME_MODULES.md) `autograd_v3` section for the active engine.
+- ⭐ **`AutogradContext::retain_intermediate_grads(ids)` /
+  `take_retained_intermediate_grads()`** — test-only API for probing
+  intermediate gradients during backward. Used by
+  `parity_klein_full_single_block_prod_diag` to bisect bug-#4-class
+  hazards. See `src/autograd.rs:910-940`.
 
 ---
 
@@ -190,6 +216,13 @@ This is a critical area with several implementations. **Use these for inference*
   The interleaved-pair (FLUX/Klein/LTX/HunyuanVideo/QwenImage/Chroma) format.
 - `bf16_ops::rope_halfsplit_bf16(x, cos, sin)` — `bf16_ops.rs:656`
   The halfsplit (Z-Image/some Klein variants) format.
+- ⚠️ **`Op::RoPePrecomputed` backward dispatches by `cos` shape**
+  (commit dfe85b8): broadcast cos `[1,_,N,half]` →
+  `rope_fused_bf16` (Interleaved); per-head cos `[BH,N,half]` →
+  `rope_halfsplit_bf16` (Halfsplit). Pre-fix it unconditionally called
+  halfsplit, giving cos_sim ≈ 0.05 backward gradients on Klein
+  (orthogonal-direction at correct magnitude — magnitude-only checks
+  hid this for sessions). See `src/autograd.rs:2515-2570`.
 
 ---
 

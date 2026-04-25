@@ -959,3 +959,95 @@ applies the mask tile-by-tile.
 - Chunking the sampler step (unchanged token count per call).
 The stream kernel is the fix; the threshold dispatcher routes to it
 automatically.
+
+---
+
+## Stride hazards in kernel paths (the Bug #4-6 family)
+
+flame-core has THREE chokepoints for "raw-pointer kernel reads a
+saved/passed tensor" — each must materialize non-contiguous views, or
+the kernel reads the parent storage from offset 0 with the view's
+smaller logical shape and produces wrong values.
+
+### Chokepoint 1: backward saves — `fetch_saved` in `autograd.rs`
+
+The closure `fetch_saved` defined inside `compute_gradients`
+(`src/autograd.rs:1855-1894`) wraps `entry.get_saved` /
+`CHECKPOINT_MANAGER.fetch_saved` and **materializes any non-contiguous
+result**. Backward kernels (rms_norm_backward, sdpa_bwd, mul backward,
+silu backward, etc.) read saved tensors via raw `tensor_raw_ptr` /
+`storage_ref().try_as_slice_*` — those ignore custom_strides /
+view_offset.
+
+**Rule**: backward arms in `compute_gradients` use `fetch_saved` for
+any saved tensor whose data is read by a kernel. **Anti-pattern**:
+direct `entry.get_saved(...)` on a tensor-then-pass-to-kernel —
+bypasses the chokepoint. Only use `entry.get_saved(...)` when you
+need just `shape()` / `dims()` / `dtype()`, never the data.
+
+The ops that USE direct `entry.get_saved` for shape-only purposes are
+fine (Cat backward, Reshape backward, Permute backward — they only
+read shape). Audit any new backward that reads via raw pointer.
+
+### Chokepoint 2: forward `clone_result` — `tensor.rs`
+
+`Tensor::clone_result()` (`src/tensor.rs:2913-2935`) is the canonical
+fallible deep-clone. For non-contiguous inputs it materializes via
+`.contiguous()` first, then duplicates the storage. The materialize
+step uses `materialize_view` / `permute_generic` which walks the
+strided source correctly.
+
+The pre-fix bug: `clone_result` copied `*numel` (parent storage size)
+elements via `dtod_copy(slice_ref(data), new_data)` and labeled the
+output with `self.shape` (the view's smaller shape). For a transposed
+[16,8] view, this stored parent's data in [16,8] row-major order but
+labeled it as [8,16] — `out[i,j]` resolved to `parent[i*16+j]` rather
+than the correct `parent[j*8+i]`.
+
+**Rule**: this is now safe to call on any tensor including views.
+Don't add new `dtod_copy(parent.data, ...)` paths that bypass the
+contiguity check.
+
+### Chokepoint 3: kernel-launch boundaries reading via `try_as_slice_*`
+
+Functions that launch CUDA kernels with `tensor.storage.try_as_slice_f32()?`
+or `try_as_slice_u16()?` read from the storage's offset 0 — ignoring
+`view_offset`. They MUST contiguify non-contiguous inputs first.
+Already done in:
+
+- `src/cuda_kernels.rs:413-490` (`CudaKernels::add`)
+- `src/cuda_kernels.rs:474-540` (`CudaKernels::mul`)
+- `src/cuda_kernels.rs:2010-2030` (`CudaKernels::div`)
+- `src/ops/elt.rs:84-137` (`add_same_dtype`)
+- `src/ops/elt.rs:193-235` (`mul_same_dtype`)
+
+Audit unaudited sites:
+
+```bash
+grep -rn "storage.try_as_slice\|storage_ref().try_as_slice" \
+  /home/alex/EriDiffusion/flame-core/src/ | grep -v test
+```
+
+For each site, ask:
+1. Does the caller guarantee contiguity? (e.g., it's just been
+   produced by a kernel that always emits contig output, or it's a
+   freshly-allocated `Tensor::empty_dtype`.)
+2. If not, add `if !t.is_contiguous() { t = t.contiguous()? }` at
+   the top of the function.
+
+The conv2d / norm / sgd / activation_offload paths mostly fall under
+case 1 (operating on freshly-emitted kernel outputs), but explicit
+audit is cheap insurance.
+
+### What `is_contiguous()` actually checks
+
+```rust
+pub fn is_contiguous(&self) -> bool {
+    self.custom_strides.is_none() && self.view_offset == 0
+}
+```
+
+So `narrow()` at start=0 STILL returns false (because narrow sets
+custom_strides to the parent's strides). Any contiguity check must
+honor this or it'll produce silent garbage on offset-0 narrows.
+
