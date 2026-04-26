@@ -34,6 +34,15 @@ extern "C" int flame_add_bf16_kernel(
     if (meta == nullptr) {
         return 1;
     }
+    // Clear any sticky error left by an upstream API call (e.g. cuBLAS
+    // GEMM's internal capability probing leaves cudaErrorInvalidValue=2
+    // latched on first invocation per process even when GEMM itself
+    // succeeded). Without this clear, our kernel-launch status check
+    // below would mistakenly attribute that sticky error to this launch.
+    // PyTorch handles the same issue via TORCH_CUDA_CHECK_AFTER_LAUNCH
+    // sequencing — kernels there only assert the cudaGetLastError AFTER
+    // their own launch succeeds.
+    (void)cudaGetLastError();
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_void);
     flame::iter::launch_gpu_kernel<2, AddBF16Op>(*meta, AddBF16Op{}, stream);
     cudaError_t err = cudaGetLastError();

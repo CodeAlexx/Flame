@@ -32,6 +32,11 @@ extern "C" int flame_square_bf16_kernel(
         return 1;
     }
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_void);
+    // Drain any sticky cudaError from upstream (e.g. cuBLAS GEMM
+    // capability probe) so cudaGetLastError after our launch only
+    // reflects this kernel's status. Mirrors PyTorch's
+    // TORCH_CUDA_CHECK_AFTER_LAUNCH discipline.
+    (void)cudaGetLastError();
     flame::iter::launch_gpu_kernel<1, SquareBF16Op>(*meta, SquareBF16Op{}, stream);
     cudaError_t err = cudaGetLastError();
     return (err == cudaSuccess) ? 0 : static_cast<int>(err);

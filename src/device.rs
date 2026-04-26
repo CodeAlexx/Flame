@@ -10,6 +10,38 @@ extern "C" {
     fn cudaDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
     fn cudaMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
     fn cudaMemPoolTrimTo(pool: *mut c_void, min_bytes_to_keep: usize) -> i32;
+    fn cudaPeekAtLastError() -> i32;
+    fn cudaGetLastError() -> i32;
+    fn cudaDeviceSynchronize() -> i32;
+}
+
+/// Peek the most recent CUDA runtime error WITHOUT clearing it. Used to
+/// bisect which upstream kernel left a sticky error before a downstream
+/// kernel reports it via cudaGetLastError.
+pub fn cuda_peek_last_error() -> i32 {
+    unsafe { cudaPeekAtLastError() }
+}
+
+/// Synchronous CUDA error probe — synchronizes the device, then consumes
+/// + reports the per-thread last error. Use this as a fence between
+/// forward stages to localize which kernel failed.
+///
+/// Two error sources:
+///  - Async kernel error → returned by cudaDeviceSynchronize, cleared after.
+///  - Latched per-thread error from a launch-time validation failure →
+///    consumed by cudaGetLastError, NOT cleared by cudaDeviceSynchronize.
+///
+/// We check both. Whichever is non-zero gets reported.
+pub fn cuda_probe(tag: &str) -> i32 {
+    let sync_code = unsafe { cudaDeviceSynchronize() };
+    let last_code = unsafe { cudaGetLastError() };
+    if sync_code != 0 || last_code != 0 {
+        eprintln!(
+            "[cuda_probe] {tag}: sync={} last={}",
+            sync_code, last_code
+        );
+    }
+    if sync_code != 0 { sync_code } else { last_code }
 }
 
 /// Trim the CUDA mempool: release cached (freed) GPU memory back to the driver.

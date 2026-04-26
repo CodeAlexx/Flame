@@ -46,6 +46,7 @@ extern "C" int flame_add_scalar_bf16_kernel(
     }
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_void);
     AddScalarBF16Op op{scalar};
+    (void)cudaGetLastError();
     flame::iter::launch_gpu_kernel<1, AddScalarBF16Op>(*meta, op, stream);
     cudaError_t err = cudaGetLastError();
     return (err == cudaSuccess) ? 0 : static_cast<int>(err);
