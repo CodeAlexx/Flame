@@ -475,6 +475,49 @@ cargo's incremental build sometimes misses `.cu` mtime changes.
 
 ## Common gotchas
 
+### cuBLAS leaves `cudaErrorInvalidValue` latched after first GEMM call
+
+cuBLAS GEMM's first invocation per process probes device capabilities
+internally. Some of those probes call CUDA APIs that fail with
+`cudaErrorInvalidValue=2` and **latch it in the per-thread last-error
+queue** even though GEMM itself returns success via `cublasStatus_t`.
+
+The next kernel that calls `cudaGetLastError()` after its launch picks
+up that sticky error and reports it as its own failure. Symptom:
+`flame_<op>_bf16_kernel failed with code 2` on completely valid inputs
+with canonical strides — and the same op against the same shapes works
+fine in isolation (no upstream GEMM).
+
+**Fix discipline (mirrors PyTorch's `TORCH_CUDA_CHECK_AFTER_LAUNCH`):**
+every tensor_iterator-style FFI kernel drains the last-error queue
+right before launch:
+
+```cpp
+extern "C" int flame_<op>_bf16_kernel(const flame::iter::IterMetadata* meta,
+                                       void* stream_void) {
+    // Drain any sticky error left by upstream (e.g. cuBLAS GEMM
+    // capability probe) so cudaGetLastError below reflects only
+    // this launch.
+    (void)cudaGetLastError();
+    flame::iter::launch_gpu_kernel<...>(*meta, ..., stream);
+    cudaError_t err = cudaGetLastError();
+    return (err == cudaSuccess) ? 0 : static_cast<int>(err);
+}
+```
+
+All 26 kernels in `src/cuda/{binary,unary,cmp}/` carry this drain.
+Skipping it is fine for in-isolation correctness but produces flaky
+training failures whenever a matmul precedes the kernel — and FLUX 1
+trainer hit it deterministically on every QKV LoRA delta.
+
+**Bisection helpers** in `flame_core::device`:
+- `cuda_peek_last_error() -> i32` — non-clearing peek.
+- `cuda_probe(tag) -> i32` — synchronizes the device, then consumes +
+  prints the per-thread last error (sync errors have already been
+  consumed by `cudaDeviceSynchronize`'s return value, latched
+  launch-validation errors are consumed by `cudaGetLastError`). Sprinkle
+  between forward stages to localize which kernel left the sticky.
+
 ### "My .cu changes aren't taking effect"
 
 `cargo build` uses cargo's incremental cache, which sometimes misses

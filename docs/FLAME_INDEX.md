@@ -28,6 +28,9 @@
 | ⭐ `CudaDevice` | re-export of `cudarc::driver::CudaDevice` | |
 | ⭐ `global_cuda_device()` | `device.rs:42` | Singleton `Arc<CudaDevice>` for device 0. |
 | `Device, DeviceEnum` | `device.rs:56,152` | Device wrapper enum. |
+| `device::trim_cuda_mempool(min_keep_bytes)` | `device.rs:42` | Release cached freed VRAM back to the driver. Pass 0 to release everything not in use. |
+| `device::cuda_peek_last_error() -> i32` | `device.rs:51` | Non-clearing peek at the per-thread last cudaError_t. |
+| `device::cuda_probe(tag) -> i32` | `device.rs:60` | Sync + read+clear: `cudaDeviceSynchronize` (catches async errors) THEN `cudaGetLastError` (catches latched launch-validation errors). Prints when nonzero, used to bisect which kernel set a sticky error. |
 | `init()` | `lib.rs:268` | Auto-runs at load via `#[ctor::ctor]`. |
 | `Module` trait | `lib.rs:239` | Layer trait: `forward(&self, x) -> Result<Tensor>`. |
 
