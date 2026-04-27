@@ -1111,6 +1111,25 @@ pub fn modulate_pre_fused_bf16(
             "modulate_pre_fused: expected 3D [B,N,dim], got {:?}", x_dims
         )));
     }
+    // If any input requires grad, route through autograd-recording primitives
+    // so backward propagates correctly. The fused kernel has no autograd op
+    // and silently severs gradient at every block's modulation step.
+    let needs_grad = x.requires_grad || shift.requires_grad || scale.requires_grad;
+    if std::env::var("DEBUG_MODULATE_PRE").ok().as_deref() == Some("1") {
+        eprintln!("[modulate_pre] x.rg={} shift.rg={} scale.rg={} needs_grad={} recording={}",
+            x.requires_grad, shift.requires_grad, scale.requires_grad, needs_grad,
+            crate::autograd::AutogradContext::is_recording());
+    }
+    if needs_grad {
+        let dim = x_dims[2];
+        let normed = crate::layer_norm::layer_norm(x, &[dim], None, None, eps)?;
+        // (1 + scale.unsqueeze(1)) * normed + shift.unsqueeze(1)
+        let scale_3d = scale.unsqueeze(1)?;
+        let shift_3d = shift.unsqueeze(1)?;
+        let factor = scale_3d.add_scalar(1.0)?;
+        let scaled = normed.mul(&factor)?;
+        return scaled.add(&shift_3d);
+    }
     if x.is_contiguous() && shift.is_contiguous() && scale.is_contiguous() {
         modulate_pre_fused_bf16_contig(x, shift, scale, eps)
     } else {
@@ -1583,11 +1602,40 @@ pub fn gate_residual_fused_bf16(
             "gate_residual_fused: expected 3D [B,N,dim], got {:?}", dims
         )));
     }
-    if residual.is_contiguous() && gate.is_contiguous() && x.is_contiguous() {
-        gate_residual_fused_bf16_contig(residual, gate, x)
+    let mut result = if residual.is_contiguous() && gate.is_contiguous() && x.is_contiguous() {
+        gate_residual_fused_bf16_contig(residual, gate, x)?
     } else {
-        gate_residual_fused_bf16_strided(residual, gate, x)
+        gate_residual_fused_bf16_strided(residual, gate, x)?
+    };
+    // Record autograd op so gradient flows through the fused gate-residual
+    // during training. Without this, the trainer's per-block residual path
+    // severs the gradient chain and LoRA params receive ~zero gradient,
+    // attenuating identity-learning signal exponentially with depth.
+    let needs_grad = residual.requires_grad || gate.requires_grad || x.requires_grad;
+    if std::env::var("DEBUG_GATE_RESIDUAL").ok().as_deref() == Some("1") {
+        let recording = crate::autograd::AutogradContext::is_recording();
+        eprintln!("[gate_residual] r.rg={} g.rg={} x.rg={} needs_grad={} recording={}",
+            residual.requires_grad, gate.requires_grad, x.requires_grad, needs_grad, recording);
     }
+    if needs_grad {
+        result.requires_grad = true;
+        if crate::autograd::AutogradContext::is_recording() {
+            crate::autograd::AutogradContext::record_op(
+                result.id,
+                crate::autograd::Op::GateResidual {
+                    residual: residual.id,
+                    gate: gate.id,
+                    x: x.id,
+                },
+                vec![
+                    (residual.id, residual.clone()),
+                    (gate.id, gate.clone()),
+                    (x.id, x.clone()),
+                ],
+            );
+        }
+    }
+    Ok(result)
 }
 
 fn gate_residual_fused_bf16_contig(

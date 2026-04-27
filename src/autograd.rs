@@ -344,6 +344,17 @@ pub enum Op {
         cos: TensorId,
         sin: TensorId,
     },
+    /// Fused gate-residual: out = residual + gate.unsqueeze(1) * x
+    /// where residual,x are [B,N,dim] and gate is [B,dim].
+    /// Backward:
+    ///   grad_residual = grad_out
+    ///   grad_x        = grad_out * gate.unsqueeze(1)
+    ///   grad_gate     = (grad_out * x).sum(dim=1)
+    GateResidual {
+        residual: TensorId,
+        gate: TensorId,
+        x: TensorId,
+    },
     /// Level 2 activation offload: runs forward ONCE with autograd enabled,
     /// captures the sub-tape, offloads all saved tensors to CPU via the
     /// ActivationOffloadPool. During backward, pulls saved tensors from CPU
@@ -1206,6 +1217,9 @@ impl AutogradContext {
                                 }
                                 Op::RoPePrecomputed { input, cos, sin } => {
                                     ids.push(*input); ids.push(*cos); ids.push(*sin);
+                                }
+                                Op::GateResidual { residual, gate, x } => {
+                                    ids.push(*residual); ids.push(*gate); ids.push(*x);
                                 }
                             }
                             ids
@@ -2588,6 +2602,49 @@ fn compute_gradients(
                 }
                 Ok(smallvec![(*gate, d_gate_t), (*up, d_up_t)])
             }
+        }
+
+        Op::GateResidual { residual, gate, x } => {
+            if std::env::var("DEBUG_GATE_RESIDUAL").ok().as_deref() == Some("1") {
+                eprintln!("[gate_residual::BACKWARD] hit");
+            }
+            // forward: out = residual + gate.unsqueeze(1) * x
+            //   residual,x ∈ [B,N,dim], gate ∈ [B,dim], out ∈ [B,N,dim]
+            // backward:
+            //   grad_residual = grad_out
+            //   grad_x        = grad_out * gate.unsqueeze(1)
+            //   grad_gate     = (grad_out * x).sum(dim=1)
+            let x_tensor = fetch_saved(x)?;
+            let gate_tensor = fetch_saved(gate)?;
+            let dims = x_tensor.shape().dims().to_vec();
+            let (b, _n, dim) = (dims[0], dims[1], dims[2]);
+
+            // grad_residual = grad_out (identity)
+            let grad_residual = output_grad.clone();
+
+            // grad_x = grad_out * gate.unsqueeze(1) — relies on GpuOps::mul's
+            // broadcast then reduces if shapes drift.
+            let gate_3d = gate_tensor.reshape(&[b, 1, dim])?;
+            let grad_x_full = GpuOps::mul(output_grad, &gate_3d)?;
+            let grad_x = if grad_x_full.shape() != x_tensor.shape() {
+                reduce_grad_for_broadcast(&grad_x_full, x_tensor.shape())?
+            } else {
+                grad_x_full
+            };
+
+            // grad_gate = sum over N of (grad_out * x) → [B, dim]
+            // reduce_grad_for_broadcast doesn't handle this layout
+            // ([B,N,dim] → [B,dim] needs sum on axis 1, not axis 0); do it
+            // explicitly by sum_dim_keepdim then reshape.
+            let grad_gate_full = GpuOps::mul(output_grad, &x_tensor)?;
+            let grad_gate_3d = grad_gate_full.sum_dim_keepdim(1)?;  // [B, 1, dim]
+            let grad_gate = grad_gate_3d.reshape(&[b, dim])?;
+
+            Ok(smallvec![
+                (*residual, ensure_bf16(grad_residual)?),
+                (*gate, ensure_bf16(grad_gate)?),
+                (*x, ensure_bf16(grad_x)?),
+            ])
         }
 
         Op::RoPePrecomputed { input, cos, sin } => {
@@ -4194,6 +4251,7 @@ fn op_tag(op: &Op) -> &'static str {
         Op::SageAttention { .. } => "SageAttention",
         Op::FusedSwiGLU { .. } => "FusedSwiGLU",
         Op::RoPePrecomputed { .. } => "RoPePrecomputed",
+        Op::GateResidual { .. } => "GateResidual",
         Op::Checkpoint { .. } => "Checkpoint",
         Op::CheckpointOffload { .. } => "CheckpointOffload",
     }
