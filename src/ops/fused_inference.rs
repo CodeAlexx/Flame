@@ -415,6 +415,40 @@ pub fn fused_linear3d_native(
         return Err(Error::Cuda(format!("fused_linear3d_native cublasLt error: {ret}")));
     }
 
+    // CRITICAL: this used to be inference-only — `output` was created via
+    // `Tensor::empty_dtype` with no `requires_grad`, no `Op::Linear`
+    // recording. Calling it from a training-context tape silently broke
+    // backward at every linear: gradient stopped at the linear's output
+    // and never reached upstream/weights. Surfaced as ~random LoRA
+    // gradient direction (cos_sim ≈ 0 against PyTorch) in the Z-Image
+    // trainer's per-block grad parity. Fix: when input or weight requires
+    // grad and an autograd tape is recording, set `output.requires_grad`
+    // and record `Op::Linear` — the existing matmul-style backward at
+    // `autograd.rs::Op::Linear` handles it.
+    let need_grad = input.requires_grad || weight.requires_grad
+        || bias.map(|b| b.requires_grad).unwrap_or(false);
+    if need_grad && crate::autograd::AutogradContext::is_recording() {
+        let mut output = output;
+        output.requires_grad = true;
+        let mut saved = vec![
+            (input.id, input.clone()),
+            (weight.id, weight.clone()),
+        ];
+        if let Some(b) = bias {
+            saved.push((b.id, b.clone()));
+        }
+        crate::autograd::AutogradContext::record_op(
+            output.id,
+            crate::autograd::Op::Linear {
+                input: input.id,
+                weight: weight.id,
+                bias: bias.map(|b| b.id),
+            },
+            saved,
+        );
+        return Ok(output);
+    }
+
     Ok(output)
 }
 
