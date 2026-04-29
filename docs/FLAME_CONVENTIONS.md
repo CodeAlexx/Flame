@@ -334,6 +334,25 @@ Most flame-core inference functions use `[B, N, C]` (batch, sequence, channel)
 — same as PyTorch transformer convention. Some legacy training code uses
 `[B, C, N]`. Check the function docs.
 
+### `fused_linear3d_native` is strictly 3D — wrap 2D inputs explicitly
+
+Unlike PyTorch's `nn.Linear` (which broadcasts over arbitrary leading dims),
+`ops::fused_inference::fused_linear3d_native` rejects 2D input with
+`InvalidShape: input must be 3D [B,N,Cin]`. Same for the non-`_native`
+variant. When porting code that does linear ops on `[N, D]` tensors
+(timestep embedders, sinusoidal MLPs, conv-as-matmul collapses), reshape:
+
+```rust
+let n = x.shape().dims()[0];
+let x3d = x.reshape(&[1, n, in_features])?;
+let y = fused_linear3d_native(&x3d, w, bias)?; // [1, n, out_features]
+let y2d = y.reshape(&[n, out_features])?;
+```
+
+Surfaces as a runtime panic deep in the forward pass on the first call site
+that feeds a 2D tensor — easy to mistake for a layout bug. Encountered on
+SenseNova-U1's `extract_feature_gen` and `time_or_scale_embed`.
+
 ### Attention `[B, H, N, D]`
 
 `attention::sdpa(q, k, v, mask)` expects `[B, H, N, D]` where H is heads, N
