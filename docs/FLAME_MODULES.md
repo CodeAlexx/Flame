@@ -165,6 +165,67 @@ thin wrapper around a `flame_*_bf16` C entry in `cuda::ffi`. Eight pub fns:
 
 The corresponding `.cu` files live in `src/cuda/fused_*.cu`.
 
+### ⭐ `ops/grouped_mm.rs` (added 2026-04-29)
+Wrapper around the build-time `flame_grouped_mm_bf16` kernel
+(`src/cuda/grouped_mm.cu`). One `pub fn`:
+- `grouped_mm_bf16(x: &Tensor, w: &Tensor, offsets: &[i32], t_max: usize) -> Result<Tensor>`
+
+Used by Nucleus-Image MoE expert FFN (gate-up + down projections) and
+queued as the dispatch core for LLaDA2.0-Uni's MoE backbone. Offsets are
+host slices, not `&Tensor`, because flame-core's `DType::I32` is
+f32-bytes-relabeled and the kernel reads real `int*`. Wrapper HtoD-copies
+into a temp `CudaSlice<i32>`. See `FLAME_CONVENTIONS.md` for the
+underlying I32-tensor caveat.
+
+### ⭐ `ops/fused_gated_scatter_add.rs` (added 2026-04-29)
+Wrapper around the build-time `flame_fused_gated_scatter_add_bf16` kernel
+(`src/cuda/fused_gated_scatter_add.cu`). One `pub fn`:
+- `fused_gated_scatter_add_bf16(expert_out: &Tensor, gating: &Tensor, indices: &[i32], accum: &mut Tensor) -> Result<()>`
+
+In-place scatter-add: `accum[indices[t]] += expert_out[t] * gating[t]`,
+F32 atomicAdd. The MoE-unpermute counterpart to `grouped_mm`. Same
+host-slice-for-indices convention.
+
+### ⭐ `ops/moe_routing.rs` (added 2026-04-29)
+Host-side **expert-choice** routing for MoE. Each expert independently
+picks its top-C tokens (uniform C across experts), so per-expert offsets
+are constant `[B*C, 2*B*C, ..., E*B*C]` and no radix sort is needed —
+the original Phase 3 plan called for thrust-style sort+cumsum but
+expert-choice routing eliminates it entirely.
+
+- `expert_choice_route(affinity, capacity, route_scale) -> ExpertRoutingPlan`
+- `permute_tokens(x, plan) -> Tensor` — gathers `x_flat[B*S, D]` into
+  expert-major `(E*B*C, D)` order via `Tensor::index_select0`.
+
+The plan struct holds `offsets: Vec<i32>`, `global_token_indices: Vec<i32>`,
+and `gating_flat: Vec<f32>` — each plugs straight into the relevant
+downstream wrapper without further conversion. Top-K runs host-side
+(download → partial sort → upload indices) for now; for batch=1
+inference at S~1024 / E~64 the affinity matrix is ~64K f32 per layer per
+step, sub-millisecond. Swap to a CUDA top-K later only if profiling
+demands.
+
+### ⭐ `ops/nucleus_moe.rs` (added 2026-04-29)
+SwiGLU MoE expert FFN composite — the Phase 4 milestone of the MoE
+kernel plan. One `pub fn`:
+- `nucleus_moe_expert_forward(x_flat, affinity, gate_up_w, down_w, capacity, route_scale) -> Tensor`
+
+Chains all the lower modules: `expert_choice_route` → `permute_tokens` →
+`grouped_mm_bf16(gate_up)` → `Tensor::swiglu` → `grouped_mm_bf16(down)`
+→ `fused_gated_scatter_add_bf16` weighted unpermute → BF16 cast.
+Mirrors `SwiGLUExperts._run_experts_grouped_mm` + the surrounding
+`NucleusMoELayer.forward` logic from `transformer_nucleusmoe_image.py`.
+
+Toy parity test: matches a bit-faithful hand-rolled scalar Rust reference
+within BF16 tolerance (max abs error < 0.10) on
+`(B=1, E=4, S=8, D=64, inter=64, capacity=4)`. Caller still owns the
+router matmul, modulation, and shared-expert addition — those are normal
+Tensor ops, not new infra.
+
+All four modules have `#[cfg(test)]` parity tests against hand-rolled
+scalar Rust references. 7 tests total. First time the underlying
+`grouped_mm.cu` and `fused_gated_scatter_add.cu` kernels actually ran.
+
 ---
 
 ## Attention / SDPA — multiple paths

@@ -494,6 +494,43 @@ cargo's incremental build sometimes misses `.cu` mtime changes.
 
 ## Common gotchas
 
+### `DType::I32` tensors hold f32 bytes, not real i32 bytes
+
+The `TensorStorage::I32 { data: StorageSlice<f32>, .. }` variant uses an
+**f32 buffer** as backing storage. `Tensor::to_dtype(DType::I32)` does not
+convert values — it only relabels the storage type. Consumers that need
+integer values cast back to F32 first via `to_dtype(DType::F32)`, which
+goes through `storage.to_f32()` and preserves the f32 view.
+
+Practical effect: if you have an F32 tensor with values `[1.0, 3.0, 6.0]`
+and call `.to_dtype(DType::I32)`, the underlying GPU buffer still holds
+the f32 bit patterns of `1.0`, `3.0`, `6.0` — i.e. the bytes
+`0x3F800000`, `0x40400000`, `0x40C00000`. Reading those bytes as `int*`
+yields `1065353216`, `1077936128`, `1086324736`, **not** `1`, `3`, `6`.
+
+Most flame-core ops that take I32 indices (e.g. `index_select0`,
+`gather_rows`) compensate by casting back to F32 internally before
+doing the actual gather, which is why the existing convention works
+end-to-end without anyone noticing the bit mismatch.
+
+**This breaks any C/CUDA kernel that takes `const int*` directly.**
+That includes the build-time MoE kernels in `src/cuda/grouped_mm.cu`
+and `src/cuda/fused_gated_scatter_add.cu` — both expect real i32 bytes
+for `offsets`/`indices`.
+
+The wrappers in `ops/grouped_mm.rs` and `ops/fused_gated_scatter_add.rs`
+work around this by accepting `&[i32]` host slices and HtoD-copying into
+a temporary `cudarc::driver::CudaSlice<i32>` (which IS real i32 bytes)
+before launching the kernel. For per-step inference where offsets/indices
+are tiny (E≤1024 experts × per-token routing), the HtoD overhead is
+microseconds and irrelevant against the millisecond-class GEMMs.
+
+If a future caller ever produces i32 indices on the GPU directly (e.g.
+from a GPU-side top-K routing kernel), the right fix is to add an
+unsafe variant that accepts a raw `*const i32` device pointer rather
+than going through a Tensor — adding a "real i32" dtype path is a
+larger change than is warranted for the few sites that need it.
+
 ### cuBLAS leaves `cudaErrorInvalidValue` latched after first GEMM call
 
 cuBLAS GEMM's first invocation per process probes device capabilities

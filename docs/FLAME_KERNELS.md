@@ -312,9 +312,9 @@ no separate add kernel).
 | Symbol | Line | Notes |
 |---|---|---|
 | `grouped_mm_bf16_kernel` | `:120` | Single fused kernel covering all E experts. Grid: `(ceil(N/128), ceil(T_max/128), E)`. Tile: `BM=128 BN=128 BK=32`, warp tile `64x64`, WMMA 16x16x16 BF16→FP32 fragments. 4 warps per block (128 threads). Matches `torch.nn.functional.grouped_mm(x, w, offs=offsets)`. |
-| `flame_grouped_mm_bf16` | `:255` | C entry. Used by `ops::grouped_mm::grouped_mm` and `Tensor::grouped_mm`. |
+| `flame_grouped_mm_bf16` | `:255` | C entry. Wrapped by `ops::grouped_mm::grouped_mm_bf16` (the previous doc reference to `Tensor::grouped_mm` was aspirational — there's no Tensor method, the wrapper takes `(x, w, offsets: &[i32], t_max)`). |
 
-Offset semantics: `offsets: (E,) i32` is **exclusive cumulative end indices** (expert `e` covers rows `[offsets[e-1] .. offsets[e])`, with `offsets[-1] := 0`). This matches PyTorch's `F.grouped_mm`.
+Offset semantics: `offsets` is **exclusive cumulative end indices** of length `E` (expert `e` covers rows `[offsets[e-1] .. offsets[e])`, with `offsets[-1] := 0`). Matches PyTorch's `F.grouped_mm`. The Rust wrapper takes a host `&[i32]` and HtoD-copies into a temp `CudaSlice<i32>`; flame-core's `DType::I32` tensors hold f32-bytes-relabeled and would feed nonsense to the kernel — see `FLAME_CONVENTIONS.md` for the full story.
 
 Phase-1 perf (RTX 3090 Ti, T=32768 K=2048 N=2688 E=64 uniform, BF16):
 - for-loop of 64 cuBLASLt matmuls: ~12 ms → ~30 TFLOPS
@@ -327,7 +327,7 @@ The cuBLASLt-per-expert baseline is already close to tensor-core peak for this s
 | Symbol | Line | Notes |
 |---|---|---|
 | `fused_gated_scatter_add_kernel` | `:30` | `accum[indices[t]] += expert_out[t] * gating[t]` in one kernel. F32 `atomicAdd` because multiple `t`s may collide on the same output row (MoE top-K with K>1). Grid: `(ceil(D/256), T, 1)`, block = 256. `expert_out` is BF16, `gating` and `accum` are F32, `indices` is I32. |
-| `flame_fused_gated_scatter_add_bf16` | `:57` | C entry. Used by `ops::fused_gated_scatter_add` and `Tensor::fused_gated_scatter_add`. |
+| `flame_fused_gated_scatter_add_bf16` | `:57` | C entry. Wrapped by `ops::fused_gated_scatter_add::fused_gated_scatter_add_bf16(expert_out, gating, indices: &[i32], accum)`. (Previous doc reference to `Tensor::fused_gated_scatter_add` was aspirational — no Tensor method exists; the function is a free `pub fn` that mutates `accum` in-place.) Same I32-tensor caveat as `grouped_mm`: indices come in as a host slice, HtoD'd inside. |
 
 Phase-1 perf (RTX 3090 Ti, T=32768 D=2048 N=4096 BF16 → F32 accum):
 - cast BF16→F32 + F32 broadcast-mul (no scatter): 2603 μs

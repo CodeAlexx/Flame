@@ -442,6 +442,28 @@ the `.cu` files in `src/cuda/`.**
 
 ---
 
+## MoE primitives — `ops/{grouped_mm, fused_gated_scatter_add, moe_routing, nucleus_moe}.rs`
+
+Wrappers around the build-time CUDA kernels in `src/cuda/grouped_mm.cu` and
+`src/cuda/fused_gated_scatter_add.cu`, plus host-side routing + a SwiGLU
+MoE forward composite. Used by Nucleus-Image (and queued for LLaDA2.0-Uni).
+
+| Function | Line | What it does |
+|---|---|---|
+| ⭐ `grouped_mm_bf16` | `ops/grouped_mm.rs:42` | Grouped BF16 matmul. `x:(T,K) BF16` × `w:(E,K,N) BF16` → `y:(T,N) BF16` with one expert per `gridDim.z` slot. WMMA tensor-core path, FP32 accumulators, SM80+. Offsets are EXCLUSIVE cumulative end indices passed as `&[i32]` (host slice — see CONVENTIONS for why not `&Tensor`). |
+| ⭐ `fused_gated_scatter_add_bf16` | `ops/fused_gated_scatter_add.rs:35` | MoE unpermute: `accum[indices[t]] += expert_out[t] * gating[t]` in-place. F32 atomicAdd on Ampere+ for the per-row collisions. Indices passed as `&[i32]` host slice. |
+| ⭐ `expert_choice_route` | `ops/moe_routing.rs:65` | `(B, E, S) F32 affinity` + `capacity`, `route_scale` → `ExpertRoutingPlan` (offsets, global_token_indices, gating_flat). Top-C per (batch,expert) host-side, gating renormalised per-token, scaled by `route_scale`. Mirrors `NucleusMoELayer.forward`'s routing block. |
+| ⭐ `permute_tokens` | `ops/moe_routing.rs:204` | `x: (B*S, D)` + plan → `(E*B*C, D)` expert-major, via `Tensor::index_select0`. |
+| ⭐ `nucleus_moe_expert_forward` | `ops/nucleus_moe.rs:51` | Full SwiGLU MoE expert FFN: route + permute + grouped_mm(gate_up) + SwiGLU + grouped_mm(down) + weighted scatter-add. Caller owns router matmul, modulation, and shared-expert addition. |
+
+All five have `#[cfg(test)] mod tests` parity tests against hand-rolled
+scalar Rust references. **First time these CUDA kernels actually ran** —
+the two `.cu` kernels had FFI declarations since pre-history but no Rust
+caller until 2026-04-29. Phase 4 toy parity (D=inter=64, B=1, E=4, S=8,
+C=4) passed within BF16 tolerance.
+
+---
+
 ## CUDA infrastructure
 
 ### `cuda/ffi.rs` — Rust FFI declarations

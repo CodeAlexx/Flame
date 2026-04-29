@@ -13,4 +13,8 @@ pub mod gemm_bf16;
 pub mod reduce;
 pub mod tile;
 pub mod utils;
+pub mod fused_gated_scatter_add;
 pub mod fused_inference;
+pub mod grouped_mm;
+pub mod moe_routing;
+pub mod nucleus_moe;
