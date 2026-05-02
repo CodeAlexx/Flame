@@ -2,6 +2,7 @@ pub mod attn;
 pub mod broadcast;
 pub mod cast;
 pub mod conv2d;
+pub mod deinterleave;
 #[cfg(feature = "bf16_conv")]
 pub mod conv2d_bf16;
 #[cfg(feature = "bf16_conv")]

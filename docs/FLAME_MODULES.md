@@ -165,6 +165,24 @@ thin wrapper around a `flame_*_bf16` C entry in `cuda::ffi`. Eight pub fns:
 
 The corresponding `.cu` files live in `src/cuda/fused_*.cu`.
 
+### ⭐ `ops/deinterleave.rs` (added 2026-05-01)
+NVRTC-compiled `float2`-vectorized deinterleave for the last dim of a
+contiguous F32 tensor. One `pub fn`:
+- `deinterleave_pair_f32(x: &Tensor) -> Result<(Tensor, Tensor)>` — splits
+  `[..., 2K]` F32 into two `[..., K]` halves (even-indexed columns and
+  odd-indexed columns). Self-contained NVRTC source, ~50 LOC.
+
+Why this exists separately: the generic
+`materialize_strided_f32_kernel` path (the one `Tensor::contiguous()`
+takes for arbitrary strided views) coalesces poorly on stride-2 access
+patterns — ~1.35 s per layer for 18 M-element interleaved-SwiGLU
+gathers in MagiHuman. The dedicated kernel reads one `float2` per
+thread (a single 8-byte coalesced load), writes 4 bytes to each output
+buffer. Memory-bound at full bandwidth on a 3090 Ti (~0.5 ms for the
+same workload, ~2700× speedup). Use this for any model whose MLP runs
+the FLUX/Klein/MagiHuman pattern of `linear → split-into-glu/up halves
+on the last dim`.
+
 ### ⭐ `ops/grouped_mm.rs` (added 2026-04-29)
 Wrapper around the build-time `flame_grouped_mm_bf16` kernel
 (`src/cuda/grouped_mm.cu`). One `pub fn`:

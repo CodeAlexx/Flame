@@ -218,7 +218,14 @@ This is a critical area with several implementations. **Use these for inference*
 - ⭐ `bf16_ops::rope_fused_bf16(x, cos, sin)` — `bf16_ops.rs:476`
   The interleaved-pair (FLUX/Klein/LTX/HunyuanVideo/QwenImage/Chroma) format.
 - `bf16_ops::rope_halfsplit_bf16(x, cos, sin)` — `bf16_ops.rs:656`
-  The halfsplit (Z-Image/some Klein variants) format.
+  The halfsplit (Z-Image/some Klein variants/MagiHuman) format.
+- ⚠️ **Both `rope_fused_bf16` and `rope_halfsplit_bf16` rotate the FULL last
+  dim of `x`** — they compute `half = x.shape[-1] / 2` internally. For models
+  that rotate only a prefix of `head_dim` (e.g. MagiHuman: head_dim=128,
+  ROPE_DIM=96, last 32 channels passthrough), wrap with split→rotate→cat.
+  Symptom of misuse: `Shape mismatch: expected [..., D/2_from_x], got
+  [..., ROPE_DIM/2]` from the cos/sin reshape inside the kernel. See
+  `inference-flame/src/models/magihuman_dit.rs::rope_partial_halfsplit`.
 - ⚠️ **`Op::RoPePrecomputed` backward dispatches by `cos` shape**
   (commit dfe85b8): broadcast cos `[1,_,N,half]` →
   `rope_fused_bf16` (Interleaved); per-head cos `[BH,N,half]` →
@@ -258,7 +265,19 @@ This is a critical area with several implementations. **Use these for inference*
 - `cuda_ops_bf16::rms_norm_bf16_to_f32(x, eps)` — `cuda_ops_bf16.rs:296` — F32 output variant
 - ⭐ `ops::fused_inference::fused_rms_norm(x, weight, eps)` — `ops/fused_inference.rs:116`
   Direct call to `flame_fused_rms_norm_bf16` kernel (`src/cuda/fused_rms_norm.cu`).
-  Used by Z-Image NextDiT.
+  Used by Z-Image NextDiT, MagiHuman MM/Shared transformer layers.
+- 💡 **`(weight + 1)` precompute pattern** (Gemma3 / MagiHuman): the kernel
+  computes `out = normed * weight`, but those models want `out = normed *
+  (weight + 1)`. Pre-add 1.0 to the weight at layer-load time and pass the
+  precomputed tensor — saves a per-call `add_scalar(1.0)` kernel launch.
+  For multi-modality variants (per-modality gain), pre-split + pre-add the
+  weights into N contiguous chunks at load time; per-call forward then does
+  N narrows + N fused_rms_norm calls + 1 cat (vs the 14-op cascade of
+  to_dtype + mul + mean_dim + sqrt + div + per-modality narrow + add + mul +
+  cat). MagiHuman: replaced ~14 op cascade taking 5 sec/call with 1 fused
+  kernel taking <1 ms/call (5000× speedup at L≈1086, hidden=5120).
+  See `inference-flame/src/models/magihuman_dit.rs::{precompute_w_plus_1_bf16,
+  mm_rms_norm_multi_fused, mm_rms_norm_single_fused}`.
 
 ### GroupNorm
 - ⭐ `group_norm::group_norm(x, groups, gamma, beta, eps)` — `group_norm.rs:24`
@@ -439,6 +458,12 @@ The "kernel calls that bypass autograd entirely". Used by every FLUX-style block
 
 **All of these go through `crate::cuda::ffi::flame_*_bf16` declarations and
 the `.cu` files in `src/cuda/`.**
+
+### Deinterleave — `ops/deinterleave.rs`
+
+| Function | Line | What it does |
+|---|---|---|
+| ⭐ `deinterleave_pair_f32` | `:67` | NVRTC `float2`-vectorized split of `[..., 2K]` F32 into `[..., K]` even+odd halves; replaces `materialize_strided_*` for stride-2 gathers (interleaved-SwiGLU MLPs) |
 
 ---
 

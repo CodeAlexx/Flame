@@ -56,10 +56,18 @@ ensure / get_func / launch dance.
 | `square_bf16_kernel` | `:73` | Element square. Vectorized. |
 | `softmax_last_dim_bf16_kernel` | `:195` | Older fused softmax (one block per row). The 2026-04 `softmax_lastdim_bf16_kernel` in `bf16_elementwise.rs` is the preferred entry but this still exists and is called by `softmax_last_dim_bf16` pub fn. |
 | `rope_fused_bf16_kernel` | `:343` | **Interleaved-pair RoPE** — `out[2i] = x[2i]*cos[i] - x[2i+1]*sin[i]`. Used by FLUX, Klein, LTX, Hunyuan, QwenImage, Chroma. |
-| `rope_halfsplit_bf16_kernel` | `:376` | Halfsplit RoPE — first/second half rotation. Used by Z-Image, some Klein variants. |
+| `rope_halfsplit_bf16_kernel` | `:376` | Halfsplit RoPE — first/second half rotation. Used by Z-Image, some Klein variants, MagiHuman (via partial-rotation wrapper — see gotcha). |
+
+> **Gotcha (rope_halfsplit_bf16 / rope_fused_bf16, partial rotation):** both kernels rotate the *full* last dim of `x` (compute `half = d / 2` from `x.shape[-1]`). Models that rotate only a prefix of `head_dim` (e.g. MagiHuman: head_dim=128, ROPE_DIM=96, last 32 channels are passthrough) must split→rotate→cat manually: `narrow(3, 0, ROPE_DIM).contiguous() → rope_halfsplit_bf16 → cat with narrow(3, ROPE_DIM, head_dim - ROPE_DIM)`. Symptom if you don't: `Shape mismatch: expected [..., D/2_from_x], got [..., ROPE_DIM/2]` from the cos/sin reshape inside the kernel. See `inference-flame/src/models/magihuman_dit.rs::rope_partial_halfsplit` for the wrapper pattern.
 | `modulate_pre_bf16_kernel` | `:580` | DiT modulate `(1 + scale) * x + shift`. |
 | `gate_residual_bf16_kernel` | `:699` | `out = x + gate * attn_out`. |
 | `swiglu_fused_bf16_kernel` | `:776` | `silu(gate) * up`. |
+
+### `ops/deinterleave.rs` — last-dim pair deinterleave
+
+| Kernel | Line | Purpose / notes |
+|---|---|---|
+| `deinterleave_pair_f32_kernel` | `:25` | **Last-dim deinterleave**, vectorized via `float2` reinterpret_cast. Splits `[..., 2K]` F32 into two `[..., K]` halves (even/odd columns). Used by interleaved-SwiGLU MLPs to skip the stride-2 generic gather (`materialize_strided_f32_kernel` was ~1.35 s for 18 M elements vs ~0.5 ms here on a 3090 Ti) — the host-side path went `reshape→narrow(stride 2)→.contiguous()` and lost on coalescing; this kernel does one vectorized 8-byte read + two 4-byte writes per thread. |
 
 ### `bf16_convert.rs` — BF16↔F32 cast
 
@@ -349,6 +357,8 @@ Phase-1 perf (RTX 3090 Ti, T=32768 I=2688 BF16):
 |---|---|---|
 | `fused_rms_norm_bf16` (kernel) | `:26` | One block per row; sum-of-squares + rsqrt + scale, single kernel. |
 | `flame_fused_rms_norm_bf16` (entry) | `:89` | C entry. Used by `ops::fused_inference::fused_rms_norm`. |
+
+> **Pattern (Gemma3 / MagiHuman `(weight + 1)` formulation):** the kernel computes `out = normed * weight`. For models that use `out = normed * (weight + 1)`, pre-add `1.0` to the weight tensor at layer-load time and pass that as `weight`. Saves one `add_scalar(1.0)` kernel launch per call. MagiHuman MM layers also pre-split `[hidden * 3]` weights into 3 per-modality contiguous chunks at load time so per-call forward can call `fused_rms_norm` 3 times directly (one per modality narrow + cat) instead of running the 6-op cascade. Empirical: replaced ~10 kernel launches at ~5 sec/call with one fused launch at ~1 ms (5000× speedup at L≈1086, hidden=5120).
 
 ### `src/cuda/fused_norm_modulate.cu` — fused RMSNorm + modulate
 
