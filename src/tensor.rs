@@ -929,12 +929,12 @@ extern "C" __global__ void masked_fill_kernel(
             padded_data.resize(cuda_data.len(), 0.0);
             device
                 .htod_copy_into(padded_data, &mut cuda_data)
-                .map_err(|_| Error::CudaDriver)?;
+                .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         } else {
             // Normal case - sizes match
             device
                 .htod_copy_into(data, &mut cuda_data)
-                .map_err(|_| Error::CudaDriver)?;
+                .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         }
         Ok(Self {
             storage: TensorStorage::F32 {
@@ -975,12 +975,12 @@ extern "C" __global__ void masked_fill_kernel(
             padded_data.resize(cuda_data.len(), 0.0);
             device
                 .htod_copy_into(padded_data, &mut cuda_data)
-                .map_err(|_| Error::CudaDriver)?;
+                .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         } else {
             // Normal case - sizes match
             device
                 .htod_copy_into(data, &mut cuda_data)
-                .map_err(|_| Error::CudaDriver)?;
+                .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         }
 
         // Create storage with specified dtype
@@ -2475,7 +2475,7 @@ extern "C" __global__ void f32_to_bool_kernel(
             Ok(slice) => self
                 .device
                 .dtoh_sync_copy(slice)
-                .map_err(|_| Error::CudaDriver),
+                .map_err(|e| Error::CudaDriver(format!("{e:?}"))),
             Err(_) => {
                 #[cfg(feature = "bf16_u16")]
                 {
@@ -2492,7 +2492,7 @@ extern "C" __global__ void f32_to_bool_kernel(
                 let tmp = self.to_dtype(DType::F32)?;
                 tmp.device
                     .dtoh_sync_copy(tmp.storage.try_as_slice_f32()?)
-                    .map_err(|_| Error::CudaDriver)
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))
             }
         }
     }
@@ -2856,7 +2856,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         let cpu_data = self
             .device
             .dtoh_sync_copy(&tmp)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         Ok(cpu_data)
     }
 
@@ -2925,7 +2925,7 @@ extern "C" __global__ void f32_to_bool_kernel(
                 let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
                 self.device
                     .dtod_copy(slice_ref(data), &mut new_data)
-                    .map_err(|_| Error::CudaDriver)?;
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 TensorStorage::F32 {
                     data: wrap_slice(new_data),
                     numel: *numel,
@@ -2935,7 +2935,7 @@ extern "C" __global__ void f32_to_bool_kernel(
                 let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
                 self.device
                     .dtod_copy(slice_ref(data), &mut new_data)
-                    .map_err(|_| Error::CudaDriver)?;
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 TensorStorage::F16 {
                     data: wrap_slice(new_data),
                     numel: *numel,
@@ -2948,7 +2948,7 @@ extern "C" __global__ void f32_to_bool_kernel(
                     let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
                     self.device
                         .dtod_copy(slice_ref(data), &mut new_data)
-                        .map_err(|_| Error::CudaDriver)?;
+                        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                     TensorStorage::BF16 {
                         data: wrap_slice(new_data),
                         numel: *numel,
@@ -2957,10 +2957,10 @@ extern "C" __global__ void f32_to_bool_kernel(
                 #[cfg(feature = "bf16_u16")]
                 {
                     let mut new_data = unsafe { self.device.alloc::<u16>(*numel) }
-                        .map_err(|_| Error::CudaDriver)?;
+                        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                     self.device
                         .dtod_copy(slice_ref(data), &mut new_data)
-                        .map_err(|_| Error::CudaDriver)?;
+                        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                     TensorStorage::BF16 {
                         data: wrap_slice(new_data),
                         numel: *numel,
@@ -2971,7 +2971,7 @@ extern "C" __global__ void f32_to_bool_kernel(
             TensorStorage::BF16Arena { ptr, numel, .. } => {
                 use cudarc::driver::DevicePtrMut;
                 let mut new_data =
-                    unsafe { self.device.alloc::<u16>(*numel) }.map_err(|_| Error::CudaDriver)?;
+                    unsafe { self.device.alloc::<u16>(*numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 let stream = CudaStream::from_raw(self.device.cuda_stream_raw_ptr());
                 bf16_copy_async(
                     (*new_data.device_ptr_mut()) as *mut std::ffi::c_void,
@@ -2988,7 +2988,7 @@ extern "C" __global__ void f32_to_bool_kernel(
             TensorStorage::BF16View { ptr, numel } => {
                 use cudarc::driver::DevicePtrMut;
                 let mut new_data =
-                    unsafe { self.device.alloc::<u16>(*numel) }.map_err(|_| Error::CudaDriver)?;
+                    unsafe { self.device.alloc::<u16>(*numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 let stream = CudaStream::from_raw(self.device.cuda_stream_raw_ptr());
                 bf16_copy_async(
                     (*new_data.device_ptr_mut()) as *mut std::ffi::c_void,
@@ -3003,10 +3003,10 @@ extern "C" __global__ void f32_to_bool_kernel(
             }
             TensorStorage::I8 { data, numel } => {
                 let mut new_data =
-                    unsafe { self.device.alloc::<i8>(*numel) }.map_err(|_| Error::CudaDriver)?;
+                    unsafe { self.device.alloc::<i8>(*numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 self.device
                     .dtod_copy(slice_ref(data), &mut new_data)
-                    .map_err(|_| Error::CudaDriver)?;
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 TensorStorage::I8 {
                     data: wrap_slice(new_data),
                     numel: *numel,
@@ -3016,7 +3016,7 @@ extern "C" __global__ void f32_to_bool_kernel(
                 let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
                 self.device
                     .dtod_copy(slice_ref(data), &mut new_data)
-                    .map_err(|_| Error::CudaDriver)?;
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 TensorStorage::I32 {
                     data: wrap_slice(new_data),
                     numel: *numel,
@@ -3026,7 +3026,7 @@ extern "C" __global__ void f32_to_bool_kernel(
                 let mut new_data = alloc_aligned_f32(&self.device, *numel)?;
                 self.device
                     .dtod_copy(slice_ref(data), &mut new_data)
-                    .map_err(|_| Error::CudaDriver)?;
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 TensorStorage::Bool {
                     data: wrap_slice(new_data),
                     numel: *numel,
@@ -3547,6 +3547,36 @@ extern "C" __global__ void f32_to_bool_kernel(
     }
 
     /// Narrow (slice) a tensor along a dimension - CUDA only implementation
+    /// Like `narrow`, but always returns a tensor with FRESH storage that does
+    /// NOT pin the parent. The result is row-major contiguous and independent
+    /// of `self`'s underlying allocation.
+    ///
+    /// Use this when:
+    /// * You need to drop the parent before the child outlives it (typical in
+    ///   chunked decode loops where the parent is multi-GB and you want each
+    ///   chunk's free()-able memory back before the next allocation).
+    /// * You're accumulating chunks into a `Vec<Tensor>` across iterations —
+    ///   `narrow` would Arc-pin every parent, exhausting GPU memory after a
+    ///   few iterations of large workloads.
+    /// * You need to feed the slice to a kernel that reads via raw pointers
+    ///   without honoring `view_offset` (e.g. older cuBLASLt wrappers).
+    ///
+    /// Cost: one device-to-device copy of `length * stride(dim) * dtype_size`
+    /// bytes vs. the zero-copy `narrow`. For the chunked-decode case (~250 MB
+    /// per chunk on 540p video) this is ~1 ms — negligible vs. eliminating
+    /// allocator fragmentation that would otherwise cause intermittent OOM.
+    ///
+    /// Use `narrow` (the cheaper view) when you don't need ownership.
+    pub fn narrow_owning(&self, dim: usize, start: usize, length: usize) -> Result<Tensor> {
+        let view = self.narrow(dim, start, length)?;
+        // `materialize_view` always allocates a new contiguous tensor and
+        // gathers the view's data into it via a strided copy. Unlike
+        // `.contiguous()`, it does NOT short-circuit when the tensor is
+        // already contiguous (which would just clone the Arc<Storage> and
+        // keep us pinned to the parent — exactly what we're trying to avoid).
+        crate::cuda_ops::GpuOps::materialize_view(&view)
+    }
+
     pub fn narrow(&self, dim: usize, start: usize, length: usize) -> Result<Tensor> {
         let dims = self.shape.dims();
         if dim >= dims.len() {
@@ -3849,7 +3879,7 @@ impl Tensor {
             } => {
                 device
                     .htod_sync_copy_into(data, ensure_unique_slice(device_data)?)
-                    .map_err(|_| Error::CudaDriver)?;
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 Ok(())
             }
             #[cfg(feature = "bf16_u16")]
@@ -3860,7 +3890,7 @@ impl Tensor {
                     .map_err(|e| Error::Cuda(format!("alloc staging: {:?}", e)))?;
                 device
                     .htod_sync_copy_into(data, &mut staging)
-                    .map_err(|_| Error::CudaDriver)?;
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
                 let stream = CudaStream::from_raw(device.cuda_stream_raw_ptr());
                 bf16_copy_async(
@@ -3883,7 +3913,7 @@ impl Tensor {
                 }
                 device
                     .htod_copy_into(f32_data, device_data)
-                    .map_err(|_| Error::CudaDriver)?;
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 Ok(())
             }
             _ => Err(Error::InvalidOperation(
@@ -3961,7 +3991,7 @@ impl Tensor {
                     let mut sub_slice = ensure_unique_slice(data)?.slice_mut(offset..offset + len);
                     device_ref
                         .htod_sync_copy_into(chunk_view, &mut sub_slice)
-                        .map_err(|_| Error::CudaDriver)?;
+                        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 }
                 #[cfg(feature = "bf16_u16")]
                 TensorStorage::BF16Arena { ptr, .. } | TensorStorage::BF16View { ptr, .. } => {
@@ -3970,7 +4000,7 @@ impl Tensor {
                         .map_err(|e| Error::Cuda(format!("alloc staging: {:?}", e)))?;
                     device_ref
                         .htod_sync_copy_into(chunk_view, &mut staging)
-                        .map_err(|_| Error::CudaDriver)?;
+                        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
                     let stream = CudaStream::from_raw(device_ref.cuda_stream_raw_ptr());
                     let dst_ptr = unsafe { ptr.as_ptr().add(offset) };
@@ -3993,7 +4023,7 @@ impl Tensor {
                     let mut sub_slice = data.slice_mut(offset..offset + len);
                     device_ref
                         .htod_sync_copy_into(&f32_chunk, &mut sub_slice)
-                        .map_err(|_| Error::CudaDriver)?;
+                        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 }
                 _ => {
                     return Err(Error::InvalidOperation(

@@ -544,6 +544,23 @@ impl Tensor {
             }
         }
 
+        // Contract: `cat` ALWAYS returns a row-major contiguous tensor. Output
+        // is built from `Tensor::zeros_dtype` (fresh contiguous allocation)
+        // and the per-dtype branches above write into that buffer via DMA;
+        // no path produces a strided view. Callers may rely on this contract
+        // and avoid defensive `.contiguous()` calls. Release-time `assert!`
+        // (not `debug_assert!`) — production builds also depend on this
+        // guarantee (e.g. inference-flame turbo_vaed reshape-after-cat).
+        // Cost is one stride-pattern check, sub-microsecond.
+        assert!(
+            output.is_contiguous(),
+            "cat output not contiguous (contract violation): \
+             shape={:?} custom_strides={:?} view_offset={}",
+            output.shape().dims(),
+            output.custom_strides,
+            output.view_offset,
+        );
+
         Ok(output)
     }
 

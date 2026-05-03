@@ -84,7 +84,11 @@
 - `.unsqueeze(dim)` / `.squeeze(Some(dim))` / `.squeeze_dim(dim)`
 - `.permute(&[dims])` — uses `GpuOps::permute_generic` fallback for non-fast-path orders
 - `.transpose() / .t() / .transpose_dims(d0, d1)`
-- `.narrow(dim, start, len)`
+- `.narrow(dim, start, len)` — zero-copy view; Arc-clones parent storage
+- `.narrow_owning(dim, start, len)` ⭐ — like `narrow` but materializes into
+  fresh contiguous storage via `cuda_ops::GpuOps::materialize_view`. No
+  short-circuit; result is independent of parent. Use in chunked-decode
+  loops where keeping multi-GB parent storage alive would fragment GPU heap
 - `.chunk(num, dim)` — returns `Vec<Tensor>`
 - `.as_strided(shape, strides, offset)` ⭐ — zero-copy view primitive used by
   narrow/chunk and parity tests. No autograd; caller records op.
