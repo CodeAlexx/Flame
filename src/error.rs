@@ -28,8 +28,8 @@ pub enum Error {
     #[error("Invalid operation: {0}")]
     InvalidOperation(String),
 
-    #[error("CUDA driver error")]
-    CudaDriver,
+    #[error("CUDA driver error: {0}")]
+    CudaDriver(String),
 
     #[error("CUBLAS error")]
     CuBlas,

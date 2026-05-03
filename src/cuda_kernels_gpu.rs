@@ -25,7 +25,7 @@ fn alloc_from_pool_and_copy(device: &Arc<CudaDevice>, data: &[i32]) -> Result<Cu
     let mut cuda_data = crate::tensor::alloc_from_pool(device, f32_data.len())?;
     device
         .htod_copy_into(f32_data, &mut cuda_data)
-        .map_err(|_| Error::CudaDriver)?;
+        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
     Ok(cuda_data)
 }
 
@@ -38,7 +38,7 @@ fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(
     let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
     device
         .htod_copy_into(slice.to_vec(), &mut cuda_data)
-        .map_err(|_| Error::CudaDriver)?;
+        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
     Ok(cuda_data)
 }
 
@@ -362,10 +362,10 @@ extern "C" __global__ void sum_dim_keepdim_kernel(
         // Upload dimensions
         let dims_vec: Vec<i32> = tensor.shape().dims().iter().map(|&x| x as i32).collect();
         let dims_gpu =
-            alloc_from_pool_and_copy(&tensor.device, &dims_vec).map_err(|_| Error::CudaDriver)?;
+            alloc_from_pool_and_copy(&tensor.device, &dims_vec).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let mut output_data =
-            unsafe { tensor.device.alloc::<f32>(out_elements) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { tensor.device.alloc::<f32>(out_elements) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(out_elements as u32);
         launch_kernel!(
@@ -440,7 +440,7 @@ extern "C" __global__ void sum_all_kernel(
             .ok_or_else(|| Error::Cuda("Failed to get sum_all_kernel".into()))?;
 
         let output_data = crate::tensor::alloc_zeros_from_pool(&tensor.device, 1)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let n = tensor.shape().elem_count();
         let block_size = 256;
@@ -514,7 +514,7 @@ extern "C" __global__ void sum_all_bf16_kernel(
                 .ok_or_else(|| Error::Cuda("Failed to get sum_all_bf16_kernel".into()))?;
 
             let output_data = crate::tensor::alloc_zeros_from_pool(&tensor.device, 1)
-                .map_err(|_| Error::CudaDriver)?;
+                .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
             let n = tensor.shape().elem_count();
             let block_size = 256;
@@ -618,7 +618,7 @@ extern "C" __global__ void add_kernel(float *out, const float *a, const float *b
 
         // Allocate output data
         let mut output_data =
-            crate::tensor::alloc_from_pool(&a_t.device, numel).map_err(|_| Error::CudaDriver)?;
+            crate::tensor::alloc_from_pool(&a_t.device, numel).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(
@@ -677,7 +677,7 @@ extern "C" __global__ void mul_kernel(float *out, const float *a, const float *b
 
         // Allocate output data
         let mut output_data =
-            crate::tensor::alloc_from_pool(&a_t.device, numel).map_err(|_| Error::CudaDriver)?;
+            crate::tensor::alloc_from_pool(&a_t.device, numel).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(
@@ -718,7 +718,7 @@ extern "C" __global__ void mul_scalar_kernel(float *out, const float *input, flo
 
         // Allocate output data
         let mut output_data =
-            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(
@@ -759,7 +759,7 @@ extern "C" __global__ void add_scalar_kernel(float *out, const float *input, flo
 
         // Allocate output data
         let mut output_data =
-            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(
@@ -801,7 +801,7 @@ extern "C" __global__ void relu_kernel(float *out, const float *input, int numel
 
         // Allocate output data
         let mut output_data =
-            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(
@@ -954,7 +954,7 @@ extern "C" __global__ void gelu_kernel(float *out, const float *input, int numel
 
         // Allocate output data
         let mut output_data =
-            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(
@@ -995,7 +995,7 @@ extern "C" __global__ void silu_kernel(float *out, const float *input, int numel
 
         // Allocate output data
         let mut output_data =
-            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(
@@ -1035,7 +1035,7 @@ extern "C" __global__ void tanh_kernel(float *out, const float *input, int numel
 
         // Allocate output data
         let mut output_data =
-            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(
@@ -1075,7 +1075,7 @@ extern "C" __global__ void sigmoid_kernel(float *out, const float *input, int nu
 
         // Allocate output data
         let mut output_data =
-            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(
@@ -1150,7 +1150,7 @@ extern "C" __global__ void transpose_kernel(
         let rows = dims[0];
         let cols = dims[1];
         let mut output_data =
-            unsafe { tensor.device.alloc::<f32>(rows * cols) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { tensor.device.alloc::<f32>(rows * cols) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let tile_size = 16;
         let grid_x = cols.div_ceil(tile_size);
@@ -1199,7 +1199,7 @@ extern "C" __global__ void leaky_relu_kernel(float *out, const float *input, flo
 
         let numel = tensor.shape.elem_count();
         let mut output_data =
-            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(
@@ -1238,7 +1238,7 @@ extern "C" __global__ void elu_kernel(float *out, const float *input, float alph
 
         let numel = tensor.shape.elem_count();
         let mut output_data =
-            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(
@@ -1294,7 +1294,7 @@ extern "C" __global__ void prelu_kernel(
         let channel_size = numel / shape_dims[0] / num_channels;
 
         let mut output_data =
-            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { tensor.device.alloc::<f32>(numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         unsafe {
@@ -1406,9 +1406,9 @@ extern "C" __global__ void maxpool2d_with_indices_kernel(
         let output_numel = output_shape.elem_count();
 
         let mut output_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         let mut indices_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(output_numel as u32);
         unsafe {
@@ -1502,7 +1502,7 @@ extern "C" __global__ void maxpool2d_backward_with_indices_kernel(
 
         // Allocate and zero-initialize grad_input
         let grad_input = crate::tensor::alloc_zeros_from_pool(&input.device, input_numel)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         // Launch kernel with output elements (we scatter gradients from output to input)
         let cfg = LaunchConfig::for_num_elems(output_numel as u32);
@@ -1609,7 +1609,7 @@ extern "C" __global__ void avgpool2d_kernel(
         let output_numel = output_shape.elem_count();
 
         let mut output_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(output_numel as u32);
         unsafe {
@@ -1755,7 +1755,7 @@ extern "C" __global__ void avgpool2d_backward_kernel(
 
         let input_numel = input.shape.elem_count();
         let mut grad_input = crate::tensor::alloc_from_pool(&input.device, input_numel)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(input_numel as u32);
         unsafe {
@@ -1855,7 +1855,7 @@ extern "C" __global__ void adaptive_maxpool2d_kernel(
         let output_numel = output_shape.elem_count();
 
         let mut output_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(output_numel as u32);
         unsafe {
@@ -1944,7 +1944,7 @@ extern "C" __global__ void adaptive_avgpool2d_kernel(
         let output_numel = output_shape.elem_count();
 
         let mut output_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(output_numel as u32);
         unsafe {
@@ -2021,7 +2021,7 @@ extern "C" __global__ void upsample2d_nearest_kernel(
         let output_numel = output_shape.elem_count();
 
         let mut output_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(output_numel as u32);
         unsafe {
@@ -2127,7 +2127,7 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
         let output_numel = output_shape.elem_count();
 
         let mut output_data = crate::tensor::alloc_from_pool(&input.device, output_numel)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(output_numel as u32);
         unsafe {
@@ -2160,7 +2160,7 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
     ) -> Result<Tensor> {
         let grad_input =
             crate::tensor::alloc_zeros_from_pool(&grad_output.device, input_size.elem_count())
-                .map_err(|_| Error::CudaDriver)?;
+                .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         Ok(create_output_tensor(
             grad_input,
@@ -2177,7 +2177,7 @@ extern "C" __global__ void upsample2d_bilinear_kernel(
     ) -> Result<Tensor> {
         let grad_input =
             crate::tensor::alloc_zeros_from_pool(&grad_output.device, input_size.elem_count())
-                .map_err(|_| Error::CudaDriver)?;
+                .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         Ok(create_output_tensor(
             grad_input,
@@ -2327,20 +2327,20 @@ extern "C" __global__ void broadcast_kernel(
             &input.device,
             &src_shape.iter().map(|&x| x as i32).collect::<Vec<_>>(),
         )
-        .map_err(|_| Error::CudaDriver)?;
+        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         let dst_shape_gpu = alloc_from_pool_and_copy(
             &input.device,
             &dst_shape.iter().map(|&x| x as i32).collect::<Vec<_>>(),
         )
-        .map_err(|_| Error::CudaDriver)?;
+        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         let src_strides_gpu =
-            alloc_from_pool_and_copy(&input.device, &src_strides).map_err(|_| Error::CudaDriver)?;
+            alloc_from_pool_and_copy(&input.device, &src_strides).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         let dst_strides_gpu =
-            alloc_from_pool_and_copy(&input.device, &dst_strides).map_err(|_| Error::CudaDriver)?;
+            alloc_from_pool_and_copy(&input.device, &dst_strides).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let numel = target_shape.elem_count();
         let mut output_data =
-            crate::tensor::alloc_from_pool(&input.device, numel).map_err(|_| Error::CudaDriver)?;
+            crate::tensor::alloc_from_pool(&input.device, numel).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(

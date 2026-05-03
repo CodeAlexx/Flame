@@ -13,7 +13,7 @@ fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(
     let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
     device
         .htod_copy_into(slice.to_vec(), &mut cuda_data)
-        .map_err(|_| Error::CudaDriver)?;
+        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
     Ok(cuda_data)
 }
 
@@ -193,7 +193,7 @@ impl HalfTensor {
                 // Full implementation would use proper f16 CUDA support
                 let f32_data: Vec<f32> = half_data.iter().map(|&x| x.to_f32()).collect();
                 let cuda_data =
-                    alloc_and_copy_to_pool(&device, &f32_data).map_err(|_| Error::CudaDriver)?;
+                    alloc_and_copy_to_pool(&device, &f32_data).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
                 Ok(Self {
                     data: cuda_data,
@@ -209,7 +209,7 @@ impl HalfTensor {
                 // Full implementation would use proper bf16 CUDA support
                 let f32_data: Vec<f32> = half_data.iter().map(|&x| x.to_f32()).collect();
                 let cuda_data =
-                    alloc_and_copy_to_pool(&device, &f32_data).map_err(|_| Error::CudaDriver)?;
+                    alloc_and_copy_to_pool(&device, &f32_data).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
                 Ok(Self {
                     data: cuda_data,
@@ -231,7 +231,7 @@ impl HalfTensor {
         let f32_data = self
             .device
             .dtoh_sync_copy(&self.data)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         Tensor::from_vec(f32_data, self.shape.clone(), self.device.clone())
     }
 }

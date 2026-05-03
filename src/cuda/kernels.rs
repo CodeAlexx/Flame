@@ -9,7 +9,7 @@ use crate::{Result, Error};
 fn alloc_from_pool_and_copy(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<f32>> {
     let f32_data: Vec<f32> = data.iter().map(|&x| f32::from_bits(x as u32)).collect();
     let mut cuda_data = crate::tensor::alloc_from_pool(device, f32_data.len())?;
-    device.htod_copy_into(&f32_data, &mut cuda_data).map_err(|_| Error::CudaDriver)?;
+    device.htod_copy_into(&f32_data, &mut cuda_data).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
     Ok(cuda_data)
 }
 
@@ -18,7 +18,7 @@ fn alloc_from_pool_and_copy(device: &Arc<CudaDevice>, data: &[i32]) -> Result<Cu
 fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(device: &Arc<CudaDevice>, data: T) -> Result<CudaSlice<f32>> {
     let slice = data.as_ref();
     let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
-    device.htod_copy_into(slice, &mut cuda_data).map_err(|_| Error::CudaDriver)?;
+    device.htod_copy_into(slice, &mut cuda_data).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
     Ok(cuda_data)
 }
 
@@ -96,9 +96,9 @@ impl CudaKernels {
         // For now, we'll use a simple CPU implementation
         // In production, we'd compile and load PTX modules
         let mut weights_cpu = self.device.dtoh_sync_copy(weights)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         let gradients_cpu = self.device.dtoh_sync_copy(gradients)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         for i in 0..num_elements {
             weights_cpu[i] -= learning_rate * gradients_cpu[i];
@@ -106,7 +106,7 @@ impl CudaKernels {
 
         // Copy back
         *weights = alloc_from_pool_and_copy(&self.device, &weights_cpu)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         Ok(())
     }
@@ -126,9 +126,9 @@ impl CudaKernels {
 
         // CPU implementation for now
         let a_cpu = self.device.dtoh_sync_copy(a)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         let b_cpu = self.device.dtoh_sync_copy(b)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let mut result = vec![0.0f32; num_elements];
         for i in 0..num_elements {
@@ -136,7 +136,7 @@ impl CudaKernels {
         }
 
         Ok(alloc_from_pool_and_copy(&self.device, &result)
-            .map_err(|_| Error::CudaDriver)?)
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?)
     }
 
     /// Element-wise multiplication
@@ -154,9 +154,9 @@ impl CudaKernels {
 
         // CPU implementation for now
         let a_cpu = self.device.dtoh_sync_copy(a)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         let b_cpu = self.device.dtoh_sync_copy(b)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let mut result = vec![0.0f32; num_elements];
         for i in 0..num_elements {
@@ -164,7 +164,7 @@ impl CudaKernels {
         }
 
         Ok(alloc_from_pool_and_copy(&self.device, &result)
-            .map_err(|_| Error::CudaDriver)?)
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?)
     }
 
     /// Scalar multiplication
@@ -177,7 +177,7 @@ impl CudaKernels {
 
         // CPU implementation for now
         let input_cpu = self.device.dtoh_sync_copy(input)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let mut result = vec![0.0f32; num_elements];
         for i in 0..num_elements {
@@ -185,7 +185,7 @@ impl CudaKernels {
         }
 
         Ok(alloc_from_pool_and_copy(&self.device, &result)
-            .map_err(|_| Error::CudaDriver)?)
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?)
     }
 
     /// ReLU activation
@@ -197,7 +197,7 @@ impl CudaKernels {
 
         // CPU implementation for now
         let input_cpu = self.device.dtoh_sync_copy(input)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let mut result = vec![0.0f32; num_elements];
         for i in 0..num_elements {
@@ -205,7 +205,7 @@ impl CudaKernels {
         }
 
         Ok(alloc_from_pool_and_copy(&self.device, &result)
-            .map_err(|_| Error::CudaDriver)?)
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?)
     }
 
     /// Fill tensor with value
@@ -216,6 +216,6 @@ impl CudaKernels {
     ) -> Result<CudaSlice<f32>> {
         let data = vec![value; num_elements];
         Ok(alloc_from_pool_and_copy(&self.device, &data)
-            .map_err(|_| Error::CudaDriver)?)
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?)
     }
 }

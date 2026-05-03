@@ -2151,10 +2151,10 @@ extern "C" __global__ void upsample2d_nearest_backward_kernel(
 
         let dims_f32: Vec<f32> = dims.iter().map(|&x| x as f32).collect();
         let mut dims_gpu =
-            unsafe { self.device.alloc::<f32>(dims_f32.len()) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { self.device.alloc::<f32>(dims_f32.len()) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         self.device
             .htod_copy_into(dims_f32, &mut dims_gpu)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let dtype = tensor.dtype();
         let out = match dtype {
@@ -2347,13 +2347,13 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         // Upload dims to GPU as i32
         let dims_i32: Vec<i32> = dims.iter().map(|&d| d as i32).collect();
         let mut dims_gpu =
-            unsafe { self.device.alloc::<f32>(dims_i32.len()) }.map_err(|_| Error::CudaDriver)?;
+            unsafe { self.device.alloc::<f32>(dims_i32.len()) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         self.device
             .htod_copy_into(
                 dims_i32.iter().map(|&x| x as f32).collect::<Vec<_>>(),
                 &mut dims_gpu,
             )
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         let dtype = tensor.dtype();
         let out = match dtype {
@@ -2557,17 +2557,17 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         }
         let inv_std: Vec<f32> = std.iter().map(|&v| 1.0f32 / v).collect();
         let mut mean_gpu =
-            crate::tensor::alloc_from_pool(&input.device, c).map_err(|_| Error::CudaDriver)?;
+            crate::tensor::alloc_from_pool(&input.device, c).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         let mut inv_gpu =
-            crate::tensor::alloc_from_pool(&input.device, c).map_err(|_| Error::CudaDriver)?;
+            crate::tensor::alloc_from_pool(&input.device, c).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         input
             .device
             .htod_copy_into(mean.to_vec(), &mut mean_gpu)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         input
             .device
             .htod_copy_into(inv_std, &mut inv_gpu)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         let output_shape = input.shape.clone();
         let total = n * h * w * c;
         let mut out = Tensor::empty_dtype(output_shape, DType::F32, input.device.clone())?;

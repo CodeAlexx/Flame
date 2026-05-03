@@ -106,21 +106,21 @@ pub fn broadcast_to_impl(tensor: &Tensor, target_shape: &[i64]) -> Result<Tensor
                 .map_err(|e| Error::Cuda(format!("broadcast_to: alloc out_shape failed: {:?}", e)))?;
             device
                 .htod_copy_into(out_dims_i64.clone(), &mut d_out_shape)
-                .map_err(|_| Error::CudaDriver)?;
+                .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
             let mut d_in_strides = unsafe { device.alloc::<i64>(ndim) }.map_err(|e| {
                 Error::Cuda(format!("broadcast_to: alloc in_strides failed: {:?}", e))
             })?;
             device
                 .htod_copy_into(in_strides.clone(), &mut d_in_strides)
-                .map_err(|_| Error::CudaDriver)?;
+                .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
             let mut d_out_strides = unsafe { device.alloc::<i64>(ndim) }.map_err(|e| {
                 Error::Cuda(format!("broadcast_to: alloc out_strides failed: {:?}", e))
             })?;
             device
                 .htod_copy_into(out_strides.clone(), &mut d_out_strides)
-                .map_err(|_| Error::CudaDriver)?;
+                .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
             let stream = device.cuda_stream_raw_ptr();
             unsafe {

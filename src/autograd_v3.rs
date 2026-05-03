@@ -463,7 +463,7 @@ extern "C" __global__ void relu_backward_kernel(
 
         let numel = input.shape().elem_count();
         let grad_in = crate::tensor::alloc_from_pool(&input.device, numel)
-            .map_err(|_| crate::Error::CudaDriver)?;
+            .map_err(|e| crate::Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
         launch_kernel!(

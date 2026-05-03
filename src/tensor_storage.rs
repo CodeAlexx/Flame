@@ -544,7 +544,7 @@ impl TensorStorage {
         match self {
             TensorStorage::BF16 { data, .. } => device
                 .dtoh_sync_copy(slice_ref(data))
-                .map_err(|_| Error::CudaDriver),
+                .map_err(|e| Error::CudaDriver(format!("{e:?}"))),
             TensorStorage::BF16Arena {
                 ptr,
                 numel,
@@ -564,7 +564,7 @@ impl TensorStorage {
                 )?;
                 arena_device
                     .dtoh_sync_copy(&staging)
-                    .map_err(|_| Error::CudaDriver)
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))
             }
             TensorStorage::BF16View { ptr, numel } => {
                 use cudarc::driver::DevicePtrMut;
@@ -581,7 +581,7 @@ impl TensorStorage {
                 )?;
                 device
                     .dtoh_sync_copy(&staging)
-                    .map_err(|_| Error::CudaDriver)
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))
             }
             _ => Err(Error::InvalidOperation(
                 "to_vec_bf16: tensor storage is not BF16".into(),

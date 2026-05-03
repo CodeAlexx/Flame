@@ -129,7 +129,7 @@ fn acquire_sdpa_workspace(
         .map_err(|_| Error::InvalidInput("sdpa workspace exceeds usize".into()))?;
     let buffer = device
         .alloc_zeros::<u8>(len)
-        .map_err(|_| Error::CudaDriver)?;
+        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
     let mut registry = sdpa_workspace_registry().lock().map_err(workspace_poison)?;
     registry.insert(

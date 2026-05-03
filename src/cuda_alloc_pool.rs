@@ -367,7 +367,7 @@ pub fn pool_alloc_f32(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
     if pool_disabled() || size == 0 {
         return device
             .alloc_zeros::<f32>(size)
-            .map_err(|_| crate::Error::CudaDriver);
+            .map_err(|e| crate::Error::CudaDriver(format!("{e:?}")));
     }
 
     let pool = global_pool();
@@ -385,15 +385,15 @@ pub fn pool_alloc_f32(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
     // Cache miss — fresh allocation at exact requested size.
     device
         .alloc_zeros::<f32>(size)
-        .map_err(|_| {
+        .map_err(|e| {
             // On OOM, try clearing the cache and retrying once.
             pool.clear_cache();
-            crate::Error::CudaDriver
+            crate::Error::CudaDriver(format!("alloc_zeros::<f32>({size}) (1st try): {e:?}"))
         })
         .or_else(|_| {
             device
                 .alloc_zeros::<f32>(size)
-                .map_err(|_| crate::Error::CudaDriver)
+                .map_err(|e| crate::Error::CudaDriver(format!("alloc_zeros::<f32>({size}) (after pool.clear_cache): {e:?}")))
         })
 }
 
@@ -434,7 +434,7 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
         return unsafe {
             device
                 .alloc::<u16>(size)
-                .map_err(|_| crate::Error::CudaDriver)
+                .map_err(|e| crate::Error::CudaDriver(format!("{e:?}")))
         };
     }
 
@@ -453,7 +453,7 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
     let result = unsafe {
         device
             .alloc::<u16>(size)
-            .map_err(|_| crate::Error::CudaDriver)
+            .map_err(|e| crate::Error::CudaDriver(format!("{e:?}")))
     };
 
     result.or_else(|_| {
@@ -461,7 +461,7 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
         unsafe {
             device
                 .alloc::<u16>(size)
-                .map_err(|_| crate::Error::CudaDriver)
+                .map_err(|e| crate::Error::CudaDriver(format!("{e:?}")))
         }
     })
 }

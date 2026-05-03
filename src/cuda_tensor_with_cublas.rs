@@ -7,7 +7,7 @@ use std::sync::Arc;
 fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(device: &Arc<CudaDevice>, data: T) -> Result<CudaSlice<f32>> {
     let slice = data.as_ref();
     let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
-    device.htod_copy_into(slice, &mut cuda_data).map_err(|_| Error::CudaDriver)?;
+    device.htod_copy_into(slice, &mut cuda_data).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
     Ok(cuda_data)
 }
 
@@ -24,7 +24,7 @@ impl CudaTensor {
     pub fn zeros(shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
         let size = shape.elem_count();
         let data = crate::tensor::alloc_zeros_from_pool(&device, size)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         Ok(Self { data, shape, device })
     }
 
@@ -37,7 +37,7 @@ impl CudaTensor {
             });
         }
         let data = alloc_and_copy_to_pool(&device, &data)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         Ok(Self { data, shape, device })
     }
 
@@ -144,7 +144,7 @@ impl CudaTensor {
             
             // Copy self to output
             self.device.dtod_copy(&self.data(), &mut output.data())
-                .map_err(|_| Error::CudaDriver)?;
+                .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
             
             // Add other to output
             unsafe {
@@ -173,7 +173,7 @@ impl CudaTensor {
     /// Copy to CPU for inspection
     pub fn to_vec(&self) -> Result<Vec<f32>> {
         Ok(self.device.dtoh_sync_copy(&self.data())
-            .map_err(|_| Error::CudaDriver)?)
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?)
     }
 
     /// Get a single value (for loss printing)

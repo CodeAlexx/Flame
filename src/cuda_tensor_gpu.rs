@@ -18,7 +18,7 @@ impl CudaTensor {
         let size = shape.elem_count();
         let data = device
             .alloc_zeros::<f32>(size)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         Ok(Self {
             data,
             shape,
@@ -33,7 +33,7 @@ impl CudaTensor {
         let ones = vec![1.0f32; size];
         let data = device
             .htod_sync_copy(&ones[..])
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         Ok(Self {
             data,
             shape,
@@ -51,7 +51,7 @@ impl CudaTensor {
         }
         let data = device
             .htod_sync_copy(&data)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         Ok(Self {
             data,
             shape,
@@ -383,7 +383,7 @@ impl CudaTensor {
     pub fn to_vec(&self) -> Result<Vec<f32>> {
         self.device
             .dtoh_sync_copy(&self.data)
-            .map_err(|_| Error::CudaDriver)
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))
     }
 
     /// Get a single value (for loss printing)
@@ -401,7 +401,7 @@ impl CudaTensor {
         let mut output = CudaTensor::zeros(self.shape.clone(), self.device.clone())?;
         self.device
             .dtod_copy(&self.data, &mut output.data)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         Ok(output)
     }
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 fn alloc_from_pool_and_copy(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<f32>> {
     let f32_data: Vec<f32> = data.iter().map(|&x| f32::from_bits(x as u32)).collect();
     let mut cuda_data = crate::tensor::alloc_from_pool(device, f32_data.len())?;
-    device.htod_copy_into(&f32_data, &mut cuda_data).map_err(|_| Error::CudaDriver)?;
+    device.htod_copy_into(&f32_data, &mut cuda_data).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
     Ok(cuda_data)
 }
 
@@ -15,7 +15,7 @@ fn alloc_from_pool_and_copy(device: &Arc<CudaDevice>, data: &[i32]) -> Result<Cu
 fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(device: &Arc<CudaDevice>, data: T) -> Result<CudaSlice<f32>> {
     let slice = data.as_ref();
     let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
-    device.htod_copy_into(slice, &mut cuda_data).map_err(|_| Error::CudaDriver)?;
+    device.htod_copy_into(slice, &mut cuda_data).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
     Ok(cuda_data)
 }
 
@@ -32,7 +32,7 @@ impl CudaTensor {
     pub fn zeros(shape: Shape, device: Arc<CudaDevice>) -> Result<Self> {
         let size = shape.elem_count();
         let data = crate::tensor::alloc_zeros_from_pool(&device, size)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         Ok(Self { data, shape, device })
     }
 
@@ -45,7 +45,7 @@ impl CudaTensor {
             });
         }
         let data = alloc_and_copy_to_pool(&device, &data)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         Ok(Self { data, shape, device })
     }
 
@@ -76,9 +76,9 @@ impl CudaTensor {
 
         // Download to CPU
         let mut weight_data = self.device.dtoh_sync_copy(&self.data())
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         let grad_data = gradient.device.dtoh_sync_copy(&gradient.data())
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         // Update on CPU
         for i in 0..weight_data.len() {
@@ -87,7 +87,7 @@ impl CudaTensor {
 
         // Upload back to GPU - create new slice
         self.data = alloc_from_pool_and_copy(&self.device, &weight_data)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         Ok(())
     }
@@ -113,9 +113,9 @@ impl CudaTensor {
 
         // Download to host for matmul (debug path; not used in active GPU ops)
         let a_data = self.device.dtoh_sync_copy(&self.data())
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         let b_data = other.device.dtoh_sync_copy(&other.data())
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         // CPU matmul
         let mut c_data = vec![0.0f32; m * n];
@@ -141,7 +141,7 @@ impl CudaTensor {
     /// Copy to CPU for inspection
     pub fn to_vec(&self) -> Result<Vec<f32>> {
         Ok(self.device.dtoh_sync_copy(&self.data())
-            .map_err(|_| Error::CudaDriver)?)
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?)
     }
 
     /// Get a single value (for loss printing)

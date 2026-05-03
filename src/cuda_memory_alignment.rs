@@ -142,7 +142,7 @@ pub fn alloc_aligned<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZero
             eprintln!("CUDA allocation failed with size {}: {:?}", size, e);
             // DO NOT try power-of-2! That makes it WORSE!
             // Just fail cleanly so we know the real problem
-            Err(Error::CudaDriver)
+            Err(Error::CudaDriver(format!("alloc_zeros::<T>({size}): {e:?}")))
         }
     }
 }

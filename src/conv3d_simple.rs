@@ -15,7 +15,7 @@ use cudarc::driver::{LaunchAsync, LaunchConfig, CudaSlice};
 fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(device: &Arc<CudaDevice>, data: T) -> Result<CudaSlice<f32>> {
     let slice = data.as_ref();
     let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
-    device.htod_copy_into(slice.to_vec(), &mut cuda_data).map_err(|_| Error::CudaDriver)?;
+    device.htod_copy_into(slice.to_vec(), &mut cuda_data).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
     Ok(cuda_data)
 }
 
@@ -255,7 +255,7 @@ extern "C" __global__ void conv3d_forward_v2(
 
         let output_numel = output_shape.elem_count();
         let mut output_data = crate::tensor::alloc_from_pool(&self.device, output_numel)
-            .map_err(|_| crate::Error::CudaDriver)?;
+            .map_err(|e| crate::Error::CudaDriver(format!("{e:?}")))?;
 
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(output_numel as u32);
 
@@ -432,7 +432,7 @@ extern "C" __global__ void batchnorm3d_forward(
         let spatial_size = dims[2] * dims[3] * dims[4];
         let numel = input.shape().elem_count();
         let mut output_data = crate::tensor::alloc_from_pool(&self.device, numel)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         
         // Use running stats if available, otherwise compute batch stats
         let (batch_mean, batch_var);

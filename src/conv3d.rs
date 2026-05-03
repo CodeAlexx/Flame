@@ -140,7 +140,7 @@ impl Conv3d {
         // Allocate output data
         let output_numel = output_shape.elem_count();
         let mut output_data = crate::tensor::alloc_from_pool(&self.device, output_numel)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         
         // Compile and load kernel
         let kernel_code = get_conv3d_kernel_code();
@@ -226,7 +226,7 @@ impl Conv3d {
         
         // Allocate new output data
         let mut output_data = crate::tensor::alloc_from_pool(&self.device, total_elems)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         
         let cfg = LaunchConfig::for_num_elems(total_elems as u32);
         
@@ -468,7 +468,7 @@ impl BatchNorm3d {
         
         // Allocate output data
         let mut output_data = crate::tensor::alloc_from_pool(&self.device, total_elems)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         
         let cfg = LaunchConfig::for_num_elems(total_elems as u32);
         

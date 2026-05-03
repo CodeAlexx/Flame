@@ -15,10 +15,10 @@ use crate::cuda_conv2d_kernels::CONV2D_KERNELS;
 fn copy_i32_to_gpu(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<f32>> {
     let f32_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
     let mut gpu_data =
-        unsafe { device.alloc::<f32>(f32_data.len()) }.map_err(|_| Error::CudaDriver)?;
+        unsafe { device.alloc::<f32>(f32_data.len()) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
     device
         .htod_copy_into(f32_data, &mut gpu_data)
-        .map_err(|_| Error::CudaDriver)?;
+        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
     Ok(gpu_data)
 }
 

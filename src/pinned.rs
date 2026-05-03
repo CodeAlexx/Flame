@@ -344,7 +344,7 @@ where
         }
         let slice = device
             .alloc_zeros::<T>(len)
-            .map_err(|_| Error::CudaDriver)?;
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         Ok(Self { device, slice, len })
     }
 

@@ -151,7 +151,7 @@ impl Device {
 
     /// Synchronize the device
     pub fn synchronize(&self) -> Result<()> {
-        self.inner.synchronize().map_err(|_| Error::CudaDriver)
+        self.inner.synchronize().map_err(|e| Error::CudaDriver(format!("{e:?}")))
     }
 
     /// Set random seed for the device

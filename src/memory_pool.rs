@@ -111,9 +111,9 @@ impl DeviceMemoryPool {
                 // If power-of-2 allocation fails, try aligned size
                 self.device
                     .alloc_zeros::<f32>(aligned_size)
-                    .map_err(|_| Error::CudaDriver)?
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?
             }
-            Err(_e) => return Err(Error::CudaDriver),
+            Err(e) => return Err(Error::CudaDriver(format!("alloc_zeros::<f32>({pool_size}): {e:?}"))),
         };
 
         let block = MemoryBlock {
@@ -153,7 +153,7 @@ impl DeviceMemoryPool {
     /// Force GPU synchronization and memory cleanup
     pub fn force_cleanup(&self) -> Result<()> {
         // Synchronize the device to ensure all operations complete
-        self.device.synchronize().map_err(|_| Error::CudaDriver)?;
+        self.device.synchronize().map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
         // Note: cuMemAdvise is not available in cudarc, but the synchronize
         // above should help ensure memory operations complete
