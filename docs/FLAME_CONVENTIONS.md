@@ -181,8 +181,9 @@ force a recompile.
 | Inference, 2D transpose | `bf16_elementwise::transpose2d_bf16` |
 | Inference, DiT patchify/unpatchify | `bf16_elementwise::patchify_bf16 / unpatchify_bf16` |
 | Inference, RMSNorm/LayerNorm | `cuda_ops_bf16::rms_norm_bf16 / layer_norm_bf16` |
+| Inference, RMSNorm `(weight+1)` formulation | `ops::fused_inference::fused_rms_norm` with weight pre-added 1.0 at load time (Gemma3, MagiHuman, Z-Image NextDiT) — see FLAME_INDEX.md RMSNorm section |
 | Inference, attention | `attention::sdpa` |
-| Inference, RoPE | `bf16_ops::rope_fused_bf16` (interleaved-pair) or `bf16_ops::rope_halfsplit_bf16` (Z-Image format) |
+| Inference, RoPE | `bf16_ops::rope_fused_bf16` (interleaved-pair) or `bf16_ops::rope_halfsplit_bf16` (Z-Image, MagiHuman halfsplit format). Both rotate the FULL last dim — wrap with split→rotate→cat for partial-rotation models like MagiHuman (head_dim=128, ROPE_DIM=96). |
 | Inference, FFN gate-residual | `bf16_ops::gate_residual_fused_bf16` and `bf16_ops::swiglu_fused_bf16` |
 | Training F32 tensor add | falls through to `cuda_ops::GpuOps::add` |
 | Need autograd | use the `Tensor::*` methods (they record on the tape); the bare `*_iter` functions DO NOT record |
