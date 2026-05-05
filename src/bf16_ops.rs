@@ -1843,11 +1843,27 @@ pub fn swiglu_fused_bf16(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     debug_assert_eq!(gate.dtype(), DType::BF16);
     debug_assert_eq!(up.dtype(), DType::BF16);
     debug_assert_eq!(gate.shape(), up.shape());
-    if gate.is_contiguous() && up.is_contiguous() {
-        swiglu_fused_bf16_contig(gate, up)
+    let mut out = if gate.is_contiguous() && up.is_contiguous() {
+        swiglu_fused_bf16_contig(gate, up)?
     } else {
-        swiglu_fused_bf16_strided(gate, up)
+        swiglu_fused_bf16_strided(gate, up)?
+    };
+    // Record autograd op so gradients flow through SwiGLU during training.
+    // Without this, MLP-up (`mlp.0` in Klein/Z-Image/etc.) LoRA adapters
+    // never receive gradient because backward terminates at the kernel
+    // boundary. `Op::FusedSwiGLU` backward (autograd.rs:2535) is the same
+    // dispatch used by `Tensor::swiglu`, so composition works identically.
+    if gate.requires_grad || up.requires_grad {
+        out.requires_grad = true;
+        if crate::autograd::AutogradContext::is_recording() {
+            crate::autograd::AutogradContext::record_op(
+                out.id,
+                crate::autograd::Op::FusedSwiGLU { gate: gate.id, up: up.id },
+                vec![(gate.id, gate.clone()), (up.id, up.clone())],
+            );
+        }
     }
+    Ok(out)
 }
 
 fn swiglu_fused_bf16_contig(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
@@ -2045,6 +2061,21 @@ pub fn attn_split_txt_img_bf16(
             "attn_split_txt_img_bf16: N_total={} != N_txt({}) + N_img({})",
             n_total, n_txt, n_img
         )));
+    }
+    // Training-time path: same reasoning as qkv_split_permute_bf16. Fall
+    // back to a composition of `narrow + permute + reshape` so each step
+    // records its own autograd op and gradient flows back through SDPA
+    // to the QKV LoRA adapters. The fused kernel below severs the chain.
+    if attn_out.requires_grad && crate::autograd::AutogradContext::is_recording() {
+        let txt = attn_out
+            .narrow(2, 0, n_txt)?
+            .permute(&[0, 2, 1, 3])?
+            .reshape(&[b, n_txt, h * d])?;
+        let img = attn_out
+            .narrow(2, n_txt, n_img)?
+            .permute(&[0, 2, 1, 3])?
+            .reshape(&[b, n_img, h * d])?;
+        return Ok((txt, img));
     }
 
     let txt_numel = b * n_txt * h * d;
@@ -2473,13 +2504,31 @@ pub fn qkv_split_permute_bf16(
             "qkv_split_permute_bf16: expected 3D [B,N,3*H*D], got {:?}", dims
         )));
     }
-    let (_b, _n, c) = (dims[0], dims[1], dims[2]);
+    let (b, n, c) = (dims[0], dims[1], dims[2]);
     let hd = heads * head_dim;
     if c != 3 * hd {
         return Err(Error::InvalidOperation(format!(
             "qkv_split_permute_bf16: last dim {c} != 3 * H*D = 3*{heads}*{head_dim} = {}",
             3 * hd
         )));
+    }
+    // Training-time path: the fused kernels output `requires_grad=false` and
+    // record no autograd op, which severs the gradient chain to Q/K/V LoRA
+    // adapters in Klein/Z-Image/Flux/etc. When autograd is recording and the
+    // input requires grad, fall back to a composition of primitives — each
+    // of `narrow`, `reshape`, `permute` records its own autograd op so
+    // backward flows through to the QKV input.
+    if qkv.requires_grad && crate::autograd::AutogradContext::is_recording() {
+        let q = qkv.narrow(2, 0, hd)?
+            .reshape(&[b, n, heads, head_dim])?
+            .permute(&[0, 2, 1, 3])?;
+        let k = qkv.narrow(2, hd, hd)?
+            .reshape(&[b, n, heads, head_dim])?
+            .permute(&[0, 2, 1, 3])?;
+        let v = qkv.narrow(2, 2 * hd, hd)?
+            .reshape(&[b, n, heads, head_dim])?
+            .permute(&[0, 2, 1, 3])?;
+        return Ok((q, k, v));
     }
     if qkv.is_contiguous() {
         qkv_split_permute_bf16_contig(qkv, heads, head_dim)

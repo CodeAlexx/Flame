@@ -293,11 +293,15 @@ extern "C" __global__ void layer_norm_backward(
         float x_centered = input[global_idx] - mean_val;
         grad_input[global_idx] = rstd_val * grad_out + grad_mean + 2.0f * grad_var * x_centered / norm_size;
         
-        // Accumulate weight and bias gradients
-        if (idx == 0 && grad_weight != nullptr) {
+        // Accumulate weight and bias gradients (every batch element contributes via atomicAdd).
+        // BUG FIX: previously gated `if (idx == 0)` which meant only batch[0] contributed —
+        // silently broke training with batch>1 + affine. NVRTC kernel here is currently
+        // dead code (training routes through `cuda_ops_bf16::fc_layer_norm_backward_bf16`
+        // which is correct), but fixed here so revival doesn't reintroduce the bug.
+        if (grad_weight != nullptr) {
             atomicAdd(&grad_weight[i], grad_output[global_idx] * (input[global_idx] - mean_val) * rstd_val);
         }
-        if (idx == 0 && grad_bias != nullptr) {
+        if (grad_bias != nullptr) {
             atomicAdd(&grad_bias[i], grad_output[global_idx]);
         }
     }

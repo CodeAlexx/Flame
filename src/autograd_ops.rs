@@ -153,17 +153,27 @@ impl BackwardOps {
         Ok(grad)
     }
 
-    /// Backward for matrix multiplication
+    /// Backward for matrix multiplication.
+    ///
+    /// **CRITICAL**: `transpose()` returns a strided view, not a fresh tensor.
+    /// flame's BF16 matmul backward reads the saved tensors **as if contiguous**
+    /// (CONVENTIONS doc + reproduced by Z-Image's `block_forward_standalone`
+    /// comment block). Without `.contiguous()` after `transpose()`, the grad
+    /// matmuls read strided memory through contiguous-stride math → grad_lhs
+    /// and grad_rhs are silently garbled. This was the convergence killer for
+    /// every LoRA trainer in the OneTrainer-rs port (ERNIE / Klein / Z-Image
+    /// / Flux / SDXL all bottomed out at low loss but never imprinted
+    /// identity — gradient direction was wrong, not magnitude).
     pub fn matmul_backward(grad_output: &Tensor, lhs: &Tensor, rhs: &Tensor) -> Result<(Tensor, Tensor)> {
         if grad_output.dtype() != DType::BF16 || lhs.dtype() != DType::BF16 || rhs.dtype() != DType::BF16 {
             return Err(crate::Error::InvalidInput(
                 "BackwardOps::matmul_backward expects BF16 tensors".into(),
             ));
         }
-        let rhs_t = rhs.transpose()?;
+        let rhs_t = rhs.transpose()?.contiguous()?;
         let grad_lhs = grad_output.matmul(&rhs_t)?;
 
-        let lhs_t = lhs.transpose()?;
+        let lhs_t = lhs.transpose()?.contiguous()?;
         let grad_rhs = lhs_t.matmul(grad_output)?;
 
         if grad_lhs.dtype() != DType::BF16 {
