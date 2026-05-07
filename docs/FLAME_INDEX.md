@@ -710,10 +710,12 @@ Recently-added variants:
 
 ## Optimizers
 
-- `adam::AdamW` — re-exported as `nn::AdamW`. Standard AdamW with BF16 master / F32 moments; `set_lr()` supports runtime schedulers.
+- `adam::AdamW` — re-exported as `nn::AdamW`. Standard AdamW with BF16 master / F32 moments; `set_lr()` supports runtime schedulers. Single-tensor fused CUDA kernel per param (`adam_fused_bf16_kernel` etc., `adam.rs:54-225`). DECOUPLED weight decay. Multi-tensor variant (Apex-style) is **not** shipped — see Fusion Sprint Phase 4 backlog.
 - `sgd::*` — basic SGD
 - `parameter::Parameter` — re-exported as `Var` and `Parameter`. Wraps a `Tensor` with `requires_grad=true`.
 - `nn::Optimizer` trait — `lib.rs:258` — `step()` + `zero_grad()`
+- ⭐ `ops::grad_norm::global_l2_norm(grads)` — `ops/grad_norm.rs:48`. Device-resident global L2 norm of a slice of gradient tensors. Returns 1-element FP32 device tensor; caller decides when (if ever) to `.item()`. Mixed-dtype (BF16 + FP32) supported, casts internally.
+- ⭐ `ops::grad_norm::global_l2_norm_with_scale(grads, max_norm, eps)` — `ops/grad_norm.rs:79`. Same but also returns the clip-scale factor as a 1-element device tensor. One D2H sync at the end if logging needed.
 
 ---
 

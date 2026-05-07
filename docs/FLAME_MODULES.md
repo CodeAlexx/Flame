@@ -567,6 +567,27 @@ are compiled once on first call and loaded into the `adam_fused` module:
 Basic SGD with momentum + weight decay. F32 implementation with an inline
 NVRTC kernel.
 
+### `ops/grad_norm.rs`
+Async global gradient L2 norm + clip-scale (Fusion Sprint Phase 5). Replaces
+the per-tensor `g.square().mean().to_vec()?[0]` loop in EriDiffusion-v2 trainers
+(N D2H syncs/step on Klein 9B LoRA = 200+ stalls) with one D2H sync at the
+end. Two helpers:
+
+- `global_l2_norm(grads: &[&Tensor]) -> Result<Tensor>` — returns a 1-element
+  FP32 device tensor (the global L2 norm). Per-tensor `square().sum()` is
+  one launch each, all async; the fold-over is N-1 small device-side adds;
+  final `sqrt` stays on device. Empty slice short-circuits to a zero scalar.
+  BF16 grads cast to FP32 internally.
+- `global_l2_norm_with_scale(grads, max_norm, eps) -> Result<(Tensor, Tensor)>` —
+  norm + `min(max_norm/(norm+eps), 1.0)` clip scale, both as 1-element FP32
+  device tensors. Caller does at most one `.item()` for logging.
+
+Parity tested vs PyTorch oracle on 200 LoRA-shape tensors — see
+`tests/grad_norm_parity.rs` (6 tests, atol=1e-4 vs PyTorch FP32; BF16
+round-trip atol=1e-4). Apex's two-stage `multi_tensor_l2norm_kernel.cu`
+single-launch pattern is the natural follow-up — for now we trade one
+launch per tensor for "no new CUDA kernel needed".
+
 ### `parameter.rs`
 `Parameter` (a `Tensor` wrapper with `requires_grad=true`) — re-exported as
 both `Var` and `Parameter`.
@@ -717,6 +738,25 @@ The other modules (`activation`, `algorithms`, `linear`, `matmul`,
 ### `tests/*` and `bin/*`
 Test modules and standalone test/debug binaries. See `bin/` for runnable
 sanity checks.
+
+#### Parity test infrastructure (Fusion Sprint Phase 0)
+
+- `tests/parity_helpers/mod.rs` — shared comparator. Public API:
+  `compare_tensor(got, expected, atol, rtol)`,
+  `compare_bf16(got, expected)`,
+  `compare_fp32_reduction(got, expected)`,
+  `assert_parity_bf16(name, got, expected)`,
+  `sha256_file(path)`. See FLAME_CONVENTIONS.md "PyTorch Parity Tests"
+  for tolerance defaults and policy.
+- `tests/parity_smoke.rs` — 4-test smoke that pins fixture SHA256,
+  asserts add parity, asserts the comparator catches a known mismatch,
+  and asserts FP32-reduction tol is tight (not silently widened to BF16).
+- `tests/pytorch_parity.rs` — broad per-op parity suite (unary, binary,
+  scalar, comparison, sdpa, matmul). Predates the Fusion Sprint; uses
+  its own helpers (`cos_sim_f32`, `assert_cos_sim`). New phases SHOULD
+  use `parity_helpers::compare_bf16` instead.
+- `tests/pytorch_fixtures/` — generated `.safetensors` fixtures.
+  `smoke/add_4x8_bf16.safetensors` is pinned by SHA256 in `parity_smoke.rs`.
 
 ---
 

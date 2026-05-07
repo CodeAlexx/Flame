@@ -1069,6 +1069,35 @@ lr·m̂/(√v̂+ε) / p -= lr·wd·p` shape is load-bearing. Folding `wd` into
 is zero) and unlearns them at uniform `lr·sign(p)` per step. That bug
 destroyed Klein 4B LoRA_A training in April 2026 — do not reintroduce it.
 
+### Multi-tensor reductions: launch all, sync once
+
+Trainers MUST NOT compute global L2 norm with the per-tensor
+`.to_vec()?[0]` pattern — that forces N D2H syncs per step. Klein 9B LoRA
+hits ~200 syncs each iteration that way. Use
+`flame_core::ops::grad_norm::global_l2_norm` (or `_with_scale`) which
+returns a 1-element FP32 device tensor; the caller chooses when (if ever)
+to `.item()` it for host-side logging.
+
+Pattern:
+
+```rust
+let grad_refs: Vec<&Tensor> = params
+    .iter()
+    .filter_map(|p| grads.get(p.id()))
+    .collect();
+let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?
+    .item()? as f32;     // ← exactly one D2H sync per step
+let scale = if total_norm > clip {clip / total_norm} else {1.0};
+for p in &params { /* mul_scalar(scale) and set_grad */ }
+```
+
+The 8 EriDiffusion-v2 `train_*.rs` binaries all use this pattern as of
+the Fusion Sprint Phase 5 migration. New trainers must adopt it from
+inception. Apex-style single-launch multi-tensor reduction
+(`csrc/multi_tensor_l2norm_kernel.cu`) would shave more launch overhead
+but is not yet ported — the win there is incremental on top of the
+"one D2H sync" rule.
+
 ---
 
 ## Conv3d — cuDNN-first dispatch, im2vol as fallback (2026-04)
@@ -1236,3 +1265,45 @@ So `narrow()` at start=0 STILL returns false (because narrow sets
 custom_strides to the parent's strides). Any contiguity check must
 honor this or it'll produce silent garbage on offset-0 narrows.
 
+
+---
+
+## PyTorch Parity Tests
+
+**Source of truth**: PyTorch (BSD-3) is the oracle. Fixtures are produced
+by `scripts/generate_pytorch_fixtures.py` and live under
+`tests/pytorch_fixtures/<category>/<op>/<shape_name>.safetensors`.
+Every fixture stores `input*` + `output` tensors generated with PyTorch's
+op on the same device/dtype the Rust test will use.
+
+**Smoke test entry point**: `tests/parity_smoke.rs` (Fusion Sprint Phase 0).
+SHA256-pins the smoke fixture so silent regeneration / corruption is caught
+at test load.
+
+**Comparator**: `tests/parity_helpers/mod.rs::compare_tensor`
+(promotes both tensors to FP32 host-side, then per-element atol/rtol).
+On mismatch, prints the top-K largest absolute deltas with their flat
+indices — never just "FAILED".
+
+**Tolerance defaults** (from `parity_helpers`):
+
+| Path | atol | rtol | Used for |
+|-----:|:----:|:----:|----------|
+| BF16 element-wise | 1e-2 | 1e-2 | unary/binary ops, fused norms, fused softmax, attention output |
+| FP32 reductions   | 1e-5 | 1e-5 | norm stats, optimizer moments, grad clip, loss reductions |
+
+**Helpers**:
+- `parity_helpers::compare_bf16(got, expected)` — applies BF16 defaults.
+- `parity_helpers::compare_fp32_reduction(got, expected)` — applies FP32 defaults.
+- `parity_helpers::assert_parity_bf16(name, got, expected)` — assert + pretty-print on fail.
+- `parity_helpers::sha256_file(path)` — pin a fixture's bytes.
+
+**Rule**: every new fused kernel ships with a parity fixture. PRs that
+add `flame-core/cuda/*.cu` MUST include a paired Python generator under
+`scripts/generate_*_fixture.py` and a `tests/parity_*.rs` Rust test
+that loads the fixture and calls `compare_bf16` (or `compare_fp32_reduction`
+for reduction outputs). No exceptions.
+
+**Anti-pattern**: comparing flame-core against itself. The comparator is
+designed for `(got: flame_core, expected: pytorch_fixture)`. Never wire
+it to a flame-core-vs-flame-core regression test — that's a tautology.
