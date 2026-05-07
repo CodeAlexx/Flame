@@ -142,11 +142,12 @@ pub fn cudnn_conv2d_bf16(
 
 ### `adam.rs` — fused Adam / AdamW step
 
-Four NVRTC kernels, concatenated into a single translation unit, compiled
+Six NVRTC kernels, concatenated into a single translation unit, compiled
 once on first call, loaded into the `adam_fused` module. All kernels are
 single-pass: read `(param, grad, m, v)`, write `(param, m, v)` in place,
-no temporaries. All implement decoupled weight decay (AdamW). Launch
-config: `block=256, grid=(n+255)/256`.
+no temporaries. All implement decoupled weight decay (AdamW).
+
+**Per-tensor variants** (launch config `block=256, grid=(n+255)/256`):
 
 | Kernel | Param / Grad dtype | Purpose |
 |---|---|---|
@@ -154,6 +155,24 @@ config: `block=256, grid=(n+255)/256`.
 | `adam_fused_f32grad_kernel` | BF16 param, F32 grad, F32 m/v | BF16-param with F32 grad (default path — `Parameter::set_grad` casts grads to F32). |
 | `adam_fused_f32param_f32grad_kernel` | F32 param, F32 grad, F32 m/v | F32-param fast path (biases, F32 embeddings, F32 LoRA alphas). |
 | `adam_fused_f32param_bf16grad_kernel` | F32 param, BF16 grad, F32 m/v | F32-param with BF16 grad for callers that bypass `Parameter::set_grad`. |
+
+**Multi-tensor variants** (launch config `block=256, grid=n_tensors`,
+"one block per tensor + grid-strided loop within the block"):
+
+| Kernel | Param / Grad dtype | Purpose |
+|---|---|---|
+| `adam_fused_multi_bf16_f32grad_kernel` | BF16 param, F32 grad, F32 m/v | Default LoRA path. One launch covers every parameter via a 5-region packed pointer/size buffer (`[params \| grads \| ms \| vs \| sizes]`) staged via a single H2D copy. Buffer is held by `fused::MultiTensorMetaCache` (one per `Adam` instance) so the alloc cost is paid once at first step, not per step. |
+| `adam_fused_multi_bf16_bf16grad_kernel` | BF16 param, BF16 grad, F32 m/v | Same launch shape as above, BF16 grad reads. |
+
+`Adam::step` auto-selects the multi-tensor path iff every param is BF16
+and every grad is F32. Otherwise it falls through to the per-tensor loop.
+`FLAME_ADAM_NO_MULTI_TENSOR=1` forces the fallback for A/B comparison.
+
+Bit-exact parity is gated by `tests/adam_multi_tensor_parity.rs`: the
+multi-tensor kernel and the per-tensor kernel produce identical bytes
+on a 50-tensor 1-step toy and stay within BF16 atol across 100 steps.
+The multi-tensor variant only changes launch shape — kernel math is
+identical including the DECOUPLED-WD ordering receipt.
 
 ### `cuda_kernel_sources.rs` — shared kernel source constants (NVRTC)
 

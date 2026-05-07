@@ -710,7 +710,11 @@ Recently-added variants:
 
 ## Optimizers
 
-- `adam::AdamW` — re-exported as `nn::AdamW`. Standard AdamW with BF16 master / F32 moments; `set_lr()` supports runtime schedulers. Single-tensor fused CUDA kernel per param (`adam_fused_bf16_kernel` etc., `adam.rs:54-225`). DECOUPLED weight decay. Multi-tensor variant (Apex-style) is **not** shipped — see Fusion Sprint Phase 4 backlog.
+- `adam::AdamW` — re-exported as `nn::AdamW`. Standard AdamW with BF16 master / F32 moments; `set_lr()` supports runtime schedulers. DECOUPLED weight decay. Two fused-kernel paths:
+  - Single-tensor kernels (`adam_fused_bf16_kernel` etc., `adam.rs:54-225`) — fallback for F32 params, mixed-dtype slices, or when `FLAME_ADAM_NO_MULTI_TENSOR=1`.
+  - Multi-tensor kernel (`adam_fused_multi_bf16_f32grad_kernel`, `adam.rs:225-345`) — auto-selected when **all** params are BF16 and **all** grads are F32 (the dominant LoRA training case). One kernel launch covers every parameter. Backed by a cached device-side metadata buffer (`fused::MultiTensorMetaCache`).
+- `adam::adam_fused_multi_tensor_step` (re-exported, `adam.rs:413`) — direct launcher for parity-test access. Production code uses `Adam::step` / `AdamW::step` instead.
+- `adam::MultiTensorMetaCache` (re-exported, `adam.rs:347`) — cache type held by `Adam` for reuse across steps. Reallocates when n changes.
 - `sgd::*` — basic SGD
 - `parameter::Parameter` — re-exported as `Var` and `Parameter`. Wraps a `Tensor` with `requires_grad=true`.
 - `nn::Optimizer` trait — `lib.rs:258` — `step()` + `zero_grad()`

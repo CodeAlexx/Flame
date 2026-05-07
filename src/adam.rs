@@ -33,6 +33,15 @@
 use crate::{parameter::Parameter, DType, Error, Result, Tensor, TensorId};
 use std::collections::{hash_map::Entry, HashMap};
 
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+// Re-exports for parity-test access. These are low-level launcher entry
+// points for the fused Adam kernels — production code should use
+// `Adam::step` / `AdamW::step` instead, which select the right path.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub use fused::{adam_fused_multi_tensor_step, adam_fused_step, MultiTensorMetaCache};
+
 // ---------------------------------------------------------------------------
 // Fused Adam CUDA kernels (inline PTX, compiled on first use)
 // ---------------------------------------------------------------------------
@@ -221,6 +230,125 @@ extern "C" __global__ void adam_fused_f32param_bf16grad_kernel(
 }
 "#;
 
+// Multi-tensor fused Adam (Fusion Sprint Phase 4 follow-up).
+//
+// Reference: NVIDIA Apex `csrc/multi_tensor_adam.cu` (BSD-3) and
+// `csrc/multi_tensor_apply.cuh`. Apex's harness chunks tensors into ~110-per-launch
+// blocks via a constant-memory metadata struct. We use a simpler "1 block per
+// tensor + grid-strided loop within the block" model:
+//
+//   - gridDim.x = n_tensors
+//   - blockDim.x = 256
+//   - Each block handles its tensor's full element range via stride-256 walk.
+//
+// Pointer arrays + size array live on device — populated once per step from
+// the host with a single H2D copy of `5 * n_tensors * 8` bytes (~8 KB for
+// 200 LoRA tensors). The 5 arrays are packed contiguously into one allocation.
+//
+// This collapses N kernel launches (one per param) into 1, saving ~5 μs of
+// launch overhead per param. For Klein 9B LoRA (~200 LoRA tensors per step)
+// that's ~1 ms/step of pure overhead. Modest E2E impact (<0.2% on a 2 s step)
+// but the helper is the right architecture going forward and matches the
+// "multi-tensor reductions" rule in FLAME_CONVENTIONS.md.
+//
+// Same DECOUPLED-WD math as the single-tensor kernel — see the receipt at
+// the top of the BF16 source above.
+const CUDA_ADAM_FUSED_MULTI_BF16: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void adam_fused_multi_bf16_f32grad_kernel(
+    __nv_bfloat16** const __restrict__ params,
+    const float**     const __restrict__ grads,
+    float**           const __restrict__ ms,
+    float**           const __restrict__ vs,
+    const long long*  __restrict__ sizes,
+    int n_tensors,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    float bias_correction1,
+    float bias_correction2
+) {
+    int t = blockIdx.x;
+    if (t >= n_tensors) return;
+
+    long long n = sizes[t];
+    __nv_bfloat16* p = params[t];
+    const float*   g = grads[t];
+    float*         m = ms[t];
+    float*         v = vs[t];
+
+    int tid    = threadIdx.x;
+    int stride = blockDim.x;
+
+    for (long long i = (long long)tid; i < n; i += (long long)stride) {
+        float gv = g[i];
+        float pv = __bfloat162float(p[i]);
+
+        float mi = beta1 * m[i] + (1.0f - beta1) * gv;
+        float vi = beta2 * v[i] + (1.0f - beta2) * gv * gv;
+        m[i] = mi;
+        v[i] = vi;
+
+        float m_hat = mi / bias_correction1;
+        float v_hat = vi / bias_correction2;
+        pv -= lr * m_hat / (sqrtf(v_hat) + eps);
+        if (weight_decay > 0.0f) {
+            pv -= lr * weight_decay * pv;
+        }
+        p[i] = __float2bfloat16(pv);
+    }
+}
+
+extern "C" __global__ void adam_fused_multi_bf16_bf16grad_kernel(
+    __nv_bfloat16**         const __restrict__ params,
+    const __nv_bfloat16**   const __restrict__ grads,
+    float**                 const __restrict__ ms,
+    float**                 const __restrict__ vs,
+    const long long*        __restrict__ sizes,
+    int n_tensors,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    float bias_correction1,
+    float bias_correction2
+) {
+    int t = blockIdx.x;
+    if (t >= n_tensors) return;
+
+    long long n = sizes[t];
+    __nv_bfloat16*       p = params[t];
+    const __nv_bfloat16* g = grads[t];
+    float*               m = ms[t];
+    float*               v = vs[t];
+
+    int tid    = threadIdx.x;
+    int stride = blockDim.x;
+
+    for (long long i = (long long)tid; i < n; i += (long long)stride) {
+        float gv = __bfloat162float(g[i]);
+        float pv = __bfloat162float(p[i]);
+
+        float mi = beta1 * m[i] + (1.0f - beta1) * gv;
+        float vi = beta2 * v[i] + (1.0f - beta2) * gv * gv;
+        m[i] = mi;
+        v[i] = vi;
+
+        float m_hat = mi / bias_correction1;
+        float v_hat = vi / bias_correction2;
+        pv -= lr * m_hat / (sqrtf(v_hat) + eps);
+        if (weight_decay > 0.0f) {
+            pv -= lr * weight_decay * pv;
+        }
+        p[i] = __float2bfloat16(pv);
+    }
+}
+"#;
+
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 mod fused {
     use super::*;
@@ -239,17 +367,18 @@ mod fused {
             return Ok(());
         }
 
-        // Cold path: combine all four kernel sources into a single translation
-        // unit and compile once. `<cuda_bf16.h>` has its own include guard, so
-        // the repeated include across the bf16-touching source constants is a
-        // no-op. Option A from the Phase 2 plan: one NVRTC compile, one
-        // `load_ptx`, one `MODULE_NAME` — `get_func` is O(1) regardless of
-        // which dtype combo hits at step time.
+        // Cold path: combine all single- and multi-tensor kernel sources into
+        // a single translation unit and compile once. `<cuda_bf16.h>` has its
+        // own include guard, so the repeated include across the bf16-touching
+        // source constants is a no-op. Option A from the Phase 2 plan: one
+        // NVRTC compile, one `load_ptx`, one `MODULE_NAME` — `get_func` is
+        // O(1) regardless of which dtype combo hits at step time.
         let combined = format!(
-            "{}\n{}\n{}",
+            "{}\n{}\n{}\n{}",
             CUDA_ADAM_FUSED_BF16,
             CUDA_ADAM_FUSED_F32PARAM_F32GRAD,
             CUDA_ADAM_FUSED_F32PARAM_BF16GRAD,
+            CUDA_ADAM_FUSED_MULTI_BF16,
         );
 
         let include_dir = std::env::var("CUDA_INCLUDE_DIR")
@@ -268,6 +397,8 @@ mod fused {
                     "adam_fused_f32grad_kernel",
                     "adam_fused_f32param_f32grad_kernel",
                     "adam_fused_f32param_bf16grad_kernel",
+                    "adam_fused_multi_bf16_f32grad_kernel",
+                    "adam_fused_multi_bf16_bf16grad_kernel",
                 ],
             )
             .map_err(|e| Error::Cuda(format!("load adam_fused: {:?}", e)))?;
@@ -461,6 +592,145 @@ mod fused {
         }
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Multi-tensor fused Adam (one kernel launch covers many parameters).
+    // -----------------------------------------------------------------------
+
+    /// Cache of the device-resident metadata buffer used by the multi-tensor
+    /// launcher. Held by `Adam` so we don't pay an alloc + free + sync per
+    /// step. Capacity grows monotonically as the param count grows.
+    pub struct MultiTensorMetaCache {
+        buf: Option<cudarc::driver::CudaSlice<u64>>,
+        capacity_n: usize,
+    }
+
+    impl MultiTensorMetaCache {
+        pub const fn new() -> Self {
+            Self { buf: None, capacity_n: 0 }
+        }
+
+        fn ensure(&mut self, dev: &Arc<CudaDevice>, n: usize) -> Result<()> {
+            // cudarc 0.11 `htod_sync_copy_into` asserts src.len() == dst.len(),
+            // so the cached buffer must be EXACTLY 5*n u64 slots — not "at
+            // least". Re-allocate when n changes. For LoRA training where the
+            // param count is fixed throughout, this is a one-time alloc on
+            // step 0 and a no-op thereafter.
+            let needed = 5 * n;
+            if self.capacity_n == n && self.buf.is_some() {
+                return Ok(());
+            }
+            let new_buf = dev
+                .alloc_zeros::<u64>(needed)
+                .map_err(|e| Error::Cuda(format!("multi_tensor meta alloc: {e:?}")))?;
+            self.buf = Some(new_buf);
+            self.capacity_n = n;
+            Ok(())
+        }
+    }
+
+    /// Launch fused multi-tensor AdamW update from a pre-built packed
+    /// pointer + size buffer.
+    ///
+    /// `packed` must be exactly `5 * n` u64 entries laid out as five
+    /// region-contiguous slabs: `[params(n) | grads(n) | ms(n) | vs(n) | sizes(n)]`.
+    /// All `params` and `m`/`v` storages must be BF16/F32/F32 respectively;
+    /// all `grads` must share a single dtype (BF16 or F32) selected by
+    /// `grad_is_bf16`. The caller (typically `Adam::step`) is responsible
+    /// for that pre-classification and for extracting the raw device
+    /// pointers under whatever borrowing discipline the parameter storage
+    /// requires.
+    ///
+    /// `cache` is held by the calling `Adam` instance so the device-side
+    /// metadata buffer is allocated once and reused — without it, allocating
+    /// a fresh buffer per step (plus the implicit cudaFree on drop) would
+    /// erase the launch-overhead savings this kernel exists to capture.
+    pub fn adam_fused_multi_tensor_step(
+        cache: &mut MultiTensorMetaCache,
+        device: &Arc<CudaDevice>,
+        n: usize,
+        grad_is_bf16: bool,
+        packed: &[u64],
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bias_correction1: f32,
+        bias_correction2: f32,
+    ) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(
+            packed.len(),
+            5 * n,
+            "adam_fused_multi_tensor_step: packed buffer must be 5*n u64 entries"
+        );
+        ensure_adam_kernels(device)?;
+
+        // Reuse / grow the device-side metadata buffer. cudarc 0.11
+        // `htod_sync_copy_into` asserts equal lengths, so the cache holds
+        // exactly `5 * n` slots and we re-allocate when n changes (a
+        // one-time alloc on step 0 in steady-state training).
+        cache.ensure(device, n)?;
+        let dev_buf = cache
+            .buf
+            .as_mut()
+            .expect("MultiTensorMetaCache::ensure post-condition: buf is Some");
+
+        device
+            .htod_sync_copy_into(packed, dev_buf)
+            .map_err(|e| Error::Cuda(format!("adam_mt h2d: {e:?}")))?;
+
+        // Compute device pointers for each region in the packed layout.
+        let base = *dev_buf.device_ptr();
+        let stride_bytes = (n * std::mem::size_of::<u64>()) as u64;
+        let params_arr_ptr = base;
+        let grads_arr_ptr = base + stride_bytes;
+        let ms_arr_ptr = base + 2 * stride_bytes;
+        let vs_arr_ptr = base + 3 * stride_bytes;
+        let sizes_arr_ptr = base + 4 * stride_bytes;
+
+        let kernel_name = if grad_is_bf16 {
+            "adam_fused_multi_bf16_bf16grad_kernel"
+        } else {
+            "adam_fused_multi_bf16_f32grad_kernel"
+        };
+        let f = device
+            .get_func(MODULE_NAME, kernel_name)
+            .ok_or_else(|| Error::Cuda(format!("missing kernel: {kernel_name}")))?;
+
+        let n_tensors_i32 = n as i32;
+        let block = 256u32;
+        let grid = n as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut k_params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(13);
+        k_params.push(&params_arr_ptr  as *const u64 as *mut std::ffi::c_void);
+        k_params.push(&grads_arr_ptr   as *const u64 as *mut std::ffi::c_void);
+        k_params.push(&ms_arr_ptr      as *const u64 as *mut std::ffi::c_void);
+        k_params.push(&vs_arr_ptr      as *const u64 as *mut std::ffi::c_void);
+        k_params.push(&sizes_arr_ptr   as *const u64 as *mut std::ffi::c_void);
+        k_params.push(&n_tensors_i32   as *const i32 as *mut std::ffi::c_void);
+        k_params.push(&lr              as *const f32 as *mut std::ffi::c_void);
+        k_params.push(&beta1           as *const f32 as *mut std::ffi::c_void);
+        k_params.push(&beta2           as *const f32 as *mut std::ffi::c_void);
+        k_params.push(&eps             as *const f32 as *mut std::ffi::c_void);
+        k_params.push(&weight_decay    as *const f32 as *mut std::ffi::c_void);
+        k_params.push(&bias_correction1 as *const f32 as *mut std::ffi::c_void);
+        k_params.push(&bias_correction2 as *const f32 as *mut std::ffi::c_void);
+
+        unsafe {
+            f.launch(cfg, &mut k_params)
+                .map_err(|e| Error::Cuda(format!("adam_fused_multi launch: {e:?}")))?;
+        }
+        Ok(())
+    }
 }
 
 /// Adam optimizer with momentum and adaptive learning rates
@@ -481,6 +751,12 @@ pub struct Adam {
     v: HashMap<TensorId, Tensor>,
     /// Weight decay coefficient
     weight_decay: f32,
+    /// Cached device-side metadata buffer for the multi-tensor fused-Adam
+    /// launcher. Allocated lazily on the first multi-tensor-eligible step
+    /// (all-BF16 params + all-F32 grads). Survives across steps so we don't
+    /// pay an alloc + cudaFree-sync per step.
+    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+    multi_tensor_meta: fused::MultiTensorMetaCache,
 }
 
 impl Adam {
@@ -495,6 +771,8 @@ impl Adam {
             m: HashMap::new(),
             v: HashMap::new(),
             weight_decay,
+            #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+            multi_tensor_meta: fused::MultiTensorMetaCache::new(),
         }
     }
 
@@ -515,6 +793,123 @@ impl Adam {
         let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
         let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
 
+        // ----------------------------------------------------------------
+        // Multi-tensor fast path (Fusion Sprint Phase 4 follow-up).
+        //
+        // Eligible iff: every parameter is BF16, every grad is present and
+        // F32. This is the dominant LoRA training case (Parameter::set_grad
+        // casts incoming grads to F32, so BF16 params consistently see F32
+        // grads). Collapses N kernel launches to 1, saving ~5 μs of launch
+        // overhead per parameter.
+        //
+        // Numerically equivalent to the per-param fused path: same kernel
+        // math, same DECOUPLED-WD receipt, identical step ordering. Verified
+        // by the toy-MLP parity test in `tests/adam_multi_tensor_parity.rs`.
+        // ----------------------------------------------------------------
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        {
+            let n = parameters.len();
+            // Env override: `FLAME_ADAM_NO_MULTI_TENSOR=1` forces the per-param
+            // fallback for A/B comparison. Production runs leave this unset.
+            let multi_disabled = std::env::var("FLAME_ADAM_NO_MULTI_TENSOR")
+                .ok()
+                .as_deref()
+                .map(|v| matches!(v, "1" | "true" | "TRUE"))
+                .unwrap_or(false);
+            let all_bf16_with_f32_grad = !multi_disabled
+                && n > 0
+                && parameters.iter().all(|p| {
+                    p.dtype().ok() == Some(DType::BF16)
+                        && p.grad().map_or(false, |g| g.dtype() == DType::F32)
+                });
+
+            if all_bf16_with_f32_grad {
+                // Lazy m/v init for any new param. Same shape + F32 dtype
+                // contract as the per-param path so a switch between the
+                // multi-tensor and per-param paths leaves state consistent.
+                for param in parameters {
+                    let id = param.id();
+                    if !self.m.contains_key(&id) {
+                        let g = param.grad().unwrap();
+                        self.m.insert(id, g.zeros_like_with_dtype(DType::F32)?);
+                    }
+                    if !self.v.contains_key(&id) {
+                        let g = param.grad().unwrap();
+                        self.v.insert(id, g.zeros_like_with_dtype(DType::F32)?);
+                    }
+                }
+
+                // Build the 5-region packed pointer + size buffer. Region
+                // ordering must match the kernel's slab layout — see
+                // `CUDA_ADAM_FUSED_MULTI_BF16` and `adam_fused_multi_tensor_step`.
+                let mut packed: Vec<u64> = Vec::with_capacity(5 * n);
+
+                // Region 0: BF16 param data pointers.
+                for param in parameters {
+                    let p_ptr: u64 = param.with_data_mut(|t| {
+                        Ok(t.as_mut_device_ptr_bf16("adam_mt:p")? as u64)
+                    })?;
+                    packed.push(p_ptr);
+                }
+                // Region 1: F32 grad pointers.
+                for param in parameters {
+                    let g = param
+                        .grad()
+                        .expect("grad presence checked in classifier above");
+                    let s = g.as_slice_f32("adam_mt:g")?;
+                    packed.push(*s.device_ptr());
+                }
+                // Region 2: F32 m pointers. HashMap::get_mut once per id.
+                for param in parameters {
+                    let m_t = self
+                        .m
+                        .get_mut(&param.id())
+                        .expect("m initialized in lazy-init pass above");
+                    let s = m_t.as_mut_slice_f32("adam_mt:m")?;
+                    packed.push(*s.device_ptr_mut());
+                }
+                // Region 3: F32 v pointers.
+                for param in parameters {
+                    let v_t = self
+                        .v
+                        .get_mut(&param.id())
+                        .expect("v initialized in lazy-init pass above");
+                    let s = v_t.as_mut_slice_f32("adam_mt:v")?;
+                    packed.push(*s.device_ptr_mut());
+                }
+                // Region 4: per-tensor element counts (i64, stored as u64).
+                for param in parameters {
+                    packed.push(param.shape().elem_count() as u64);
+                }
+
+                let device = parameters[0]
+                    .grad()
+                    .expect("grad presence checked")
+                    .device
+                    .clone();
+
+                fused::adam_fused_multi_tensor_step(
+                    &mut self.multi_tensor_meta,
+                    &device,
+                    n,
+                    false, // grad_is_bf16: F32 grads in this branch
+                    &packed,
+                    self.lr,
+                    self.beta1,
+                    self.beta2,
+                    self.eps,
+                    self.weight_decay,
+                    bias_correction1,
+                    bias_correction2,
+                )?;
+                return Ok(());
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Per-param fallback. Exercises mixed-dtype slices, F32 params, or
+        // any case the multi-tensor classifier rejected.
+        // ----------------------------------------------------------------
         for param in parameters {
             if let Some(grad) = param.grad() {
                 let param_id = param.id();
@@ -672,6 +1067,39 @@ impl AdamW {
     pub fn zero_grad(&self, parameters: &[Parameter]) {
         self.adam.zero_grad(parameters)
     }
+
+    // ── Checkpoint accessors ────────────────────────────────────────────
+    // Used by trainers that save/restore full optimizer state across runs.
+    // The TensorId-keyed m/v maps must be re-keyed by the caller using the
+    // current run's Parameter ids (TensorIds are per-run unique, not stable
+    // on reload).
+
+    pub fn t(&self) -> u32 { self.adam.t }
+    pub fn lr(&self) -> f32 { self.adam.lr }
+    pub fn beta1(&self) -> f32 { self.adam.beta1 }
+    pub fn beta2(&self) -> f32 { self.adam.beta2 }
+    pub fn eps(&self) -> f32 { self.adam.eps }
+    pub fn weight_decay(&self) -> f32 { self.adam.weight_decay }
+
+    /// Read m and v for a given parameter, if state has been initialized
+    /// (i.e. the parameter has had at least one step).
+    pub fn state_for(&self, param: &Parameter) -> Option<(Tensor, Tensor)> {
+        let id = param.id();
+        let m = self.adam.m.get(&id)?.clone();
+        let v = self.adam.v.get(&id)?.clone();
+        Some((m, v))
+    }
+
+    /// Inject m/v state for a parameter and set the global step counter.
+    /// Use after rebuilding the model on resume — TensorIds will be fresh,
+    /// so the caller pairs each Parameter with its saved (m, v) by name.
+    pub fn set_state(&mut self, param: &Parameter, m: Tensor, v: Tensor) {
+        let id = param.id();
+        self.adam.m.insert(id, m);
+        self.adam.v.insert(id, v);
+    }
+
+    pub fn set_t(&mut self, t: u32) { self.adam.t = t; }
 }
 
 impl Default for AdamW {

@@ -558,10 +558,28 @@ This reduces the global tape from ~2700 to ~50 entries for Klein 4B.
 Canonical Adam: `src/adam.rs` (fused BF16 and F32 CUDA kernels). Canonical SGD: `src/sgd/mod.rs`.
 All param dtypes except BF16 and F32 return an error — no silent fallback.
 BF16 master weights use F32 moments; F32 params use F32 moments. Re-exported as
-`nn::AdamW`. Includes `set_lr()` for step-wise schedulers. Four NVRTC kernels
-are compiled once on first call and loaded into the `adam_fused` module:
-`adam_fused_bf16_kernel`, `adam_fused_f32grad_kernel` (BF16 param + F32 grad),
-`adam_fused_f32param_f32grad_kernel`, and `adam_fused_f32param_bf16grad_kernel`.
+`nn::AdamW`. Includes `set_lr()` for step-wise schedulers.
+
+Six NVRTC kernels are compiled once on first call and loaded into the
+`adam_fused` module:
+
+  - **Single-tensor**: `adam_fused_bf16_kernel`, `adam_fused_f32grad_kernel`
+    (BF16 param + F32 grad), `adam_fused_f32param_f32grad_kernel`,
+    `adam_fused_f32param_bf16grad_kernel`. One launch per parameter.
+  - **Multi-tensor** (Fusion Sprint Phase 4 follow-up):
+    `adam_fused_multi_bf16_f32grad_kernel` and
+    `adam_fused_multi_bf16_bf16grad_kernel`. One launch covers every
+    parameter via a device-resident metadata buffer
+    (`fused::MultiTensorMetaCache`). `Adam::step` auto-selects this path
+    when every param is BF16 and every grad is F32 (the dominant LoRA
+    case); set `FLAME_ADAM_NO_MULTI_TENSOR=1` to force the per-param
+    fallback.
+
+Bit-exact parity: `tests/adam_multi_tensor_parity.rs` asserts the
+multi-tensor kernel and the per-tensor kernel produce identical bytes
+on a 50-tensor 1-step toy + drift-free agreement across 100 steps. They
+share the same kernel math; the multi-tensor variant only changes the
+launch shape.
 
 ### `sgd/mod.rs`
 Basic SGD with momentum + weight decay. F32 implementation with an inline
