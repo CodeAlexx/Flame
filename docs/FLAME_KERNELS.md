@@ -62,6 +62,7 @@ ensure / get_func / launch dance.
 | `modulate_pre_bf16_kernel` | `:580` | DiT modulate `(1 + scale) * x + shift`. |
 | `gate_residual_bf16_kernel` | `:699` | `out = x + gate * attn_out`. |
 | `swiglu_fused_bf16_kernel` | `:776` | `silu(gate) * up`. |
+| `bf16_stoch_round_kernel` | end-of-file (~`:2700`) | **Stochastic-round F32→BF16**. One thread/element. Reads `src[i]` (F32) + `rng[i]` (u32); keeps high-16 bits, increments by 1 with probability `(src[i] & 0xFFFF) / 2^16` driven by the low-16 of `rng[i]`. Launched via `lc(n)` (1 thread/element). Standalone kernel — used for ad-hoc cast paths (e.g. final F32-master → BF16 store at save time). AdamW's BF16 stochastic-round path uses the inline-hash variants `adam_fused_bf16_f32grad_stoch_kernel` / `adam_fused_multi_bf16_f32grad_stoch_kernel` instead of round-tripping through this kernel. CPU reference in `bf16_convert::stochastic_round_to_bf16_cpu`. |
 
 ### `ops/deinterleave.rs` — last-dim pair deinterleave
 
@@ -163,6 +164,8 @@ no temporaries. All implement decoupled weight decay (AdamW).
 |---|---|---|
 | `adam_fused_multi_bf16_f32grad_kernel` | BF16 param, F32 grad, F32 m/v | Default LoRA path. One launch covers every parameter via a 5-region packed pointer/size buffer (`[params \| grads \| ms \| vs \| sizes]`) staged via a single H2D copy. Buffer is held by `fused::MultiTensorMetaCache` (one per `Adam` instance) so the alloc cost is paid once at first step, not per step. |
 | `adam_fused_multi_bf16_bf16grad_kernel` | BF16 param, BF16 grad, F32 m/v | Same launch shape as above, BF16 grad reads. |
+| `adam_fused_bf16_f32grad_stoch_kernel` (added 2026-05-08) | BF16 param, F32 grad, F32 m/v | Single-tensor variant of the BF16-param + F32-grad fused step **with stochastic rounding** at the F32 → BF16 store. Per-element entropy from splitmix64 keyed on `(seed, idx)` where `seed` is supplied by the caller (typically the optimizer step counter). Same Adam math as `adam_fused_bf16_kernel` modulo the rounding. Selected by `Adam::step` when `Adam::set_stochastic_round(true)` was called and the param is BF16 + grad is F32. |
+| `adam_fused_multi_bf16_f32grad_stoch_kernel` (added 2026-05-08) | BF16 param, F32 grad, F32 m/v | Multi-tensor variant of `*_stoch_kernel` above. Same 5-region packed buffer harness as `adam_fused_multi_bf16_f32grad_kernel`; tensor index is mixed into the seed to avoid lock-step rounding decisions across params at the same elementwise idx. |
 
 `Adam::step` auto-selects the multi-tensor path iff every param is BF16
 and every grad is F32. Otherwise it falls through to the per-tensor loop.
@@ -192,6 +195,23 @@ Two notable broadcast kernels:
 
 The full set of F32 NVRTC kernels in `cuda_kernels.rs` and
 `cuda_kernels_gpu.rs` (~100+) are training-only — see those files directly.
+
+### `tensor_ops_extended.rs` — index_assign (TREAD scatter-back)
+
+Two NVRTC kernels (one per dtype) that implement the
+`Tensor::index_assign(dim, indices, values)` op. Output shape == self
+shape; for each output element the kernel decomposes the flat index into
+per-axis coords using `self_strides`, looks up `inverse_mask[coord_dim]`
+(precomputed on host: `inverse_mask[k] = pos in indices` or `-1`), and
+copies from `values` (at `(coords with axis-dim = pos)`) when masked,
+else from `self` at the same flat index.
+
+| Kernel | Symbol | Notes |
+|---|---|---|
+| `index_assign_f32_kernel` | `:1597` (const), `:1666` (launch in `index_assign_f32`) | F32 path. Single thread per output element. `total = self.elem_count`. |
+| `index_assign_bf16_kernel` | `:1622` (const), `:1755` (launch in `index_assign_bf16`) | BF16 path (`u16` reads/writes). Inputs forced through `clone_result()` to materialize arena/view BF16 → owning storage. |
+
+Used by `eridiffusion-core/training/features/tread.rs::TreadStep::scatter_routed`.
 
 ---
 

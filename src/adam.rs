@@ -349,6 +349,137 @@ extern "C" __global__ void adam_fused_multi_bf16_bf16grad_kernel(
 }
 "#;
 
+// Stochastic-rounding variants of the BF16 + F32-grad kernels (single +
+// multi-tensor). Behaviorally identical to the round-to-nearest variants
+// above, except the final F32 → BF16 store applies the same lower-16-bit
+// hash-based stochastic rounding as the standalone
+// `bf16_ops::bf16_stoch_round_kernel`. CPU reference:
+// `bf16_convert::stochastic_round_to_bf16_cpu`.
+//
+// Per-element entropy is derived inside the kernel from `(seed, idx)` via
+// splitmix64, so the caller only needs to pass a u64 seed (typically the
+// step counter). For the multi-tensor kernel the seed is additionally mixed
+// with the tensor index so two parameters at the same elementwise index do
+// not stochastically round in lock-step.
+//
+// Stochastic rounding eliminates the systematic accumulator stalling that
+// can occur in long-horizon BF16 training: when the post-Adam update for an
+// element has magnitude smaller than `0.5 * ulp(BF16)`, round-to-nearest
+// pins the result back to the same BF16 bucket every step and the live
+// param never moves; stochastic rounding moves it with probability
+// proportional to the F32 fractional remainder.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+const CUDA_ADAM_FUSED_BF16_STOCH: &str = r#"
+#include <cuda_bf16.h>
+
+__device__ inline unsigned short adam_stoch_round_f32_to_bf16(
+    float p,
+    unsigned long long seed,
+    long long idx
+) {
+    unsigned int bits  = __float_as_uint(p);
+    unsigned int lower = bits & 0xFFFFu;
+    unsigned int upper = bits >> 16;
+    // splitmix64 keyed on seed XOR (idx + golden ratio).
+    unsigned long long s = seed ^ ((unsigned long long)idx + 0x9E3779B97F4A7C15ULL);
+    s = (s ^ (s >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    s = (s ^ (s >> 27)) * 0x94D049BB133111EBULL;
+    s = s ^ (s >> 31);
+    unsigned int r = (unsigned int)(s & 0xFFFFu);
+    if (r < lower) upper = (upper + 1u) & 0xFFFFu;
+    return (unsigned short)upper;
+}
+
+extern "C" __global__ void adam_fused_bf16_f32grad_stoch_kernel(
+    __nv_bfloat16* __restrict__ param,
+    const float*   __restrict__ grad,
+    float*         __restrict__ m,
+    float*         __restrict__ v,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    float bias_correction1,
+    float bias_correction2,
+    long long n,
+    unsigned long long seed
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float g = grad[idx];
+    float p = __bfloat162float(param[idx]);
+
+    float mi = beta1 * m[idx] + (1.0f - beta1) * g;
+    float vi = beta2 * v[idx] + (1.0f - beta2) * g * g;
+    m[idx] = mi;
+    v[idx] = vi;
+
+    float m_hat = mi / bias_correction1;
+    float v_hat = vi / bias_correction2;
+    p -= lr * m_hat / (sqrtf(v_hat) + eps);
+    if (weight_decay > 0.0f) {
+        p -= lr * weight_decay * p;
+    }
+
+    unsigned short bf = adam_stoch_round_f32_to_bf16(p, seed, idx);
+    ((unsigned short*)param)[idx] = bf;
+}
+
+extern "C" __global__ void adam_fused_multi_bf16_f32grad_stoch_kernel(
+    __nv_bfloat16** const __restrict__ params,
+    const float**     const __restrict__ grads,
+    float**           const __restrict__ ms,
+    float**           const __restrict__ vs,
+    const long long*  __restrict__ sizes,
+    int n_tensors,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    float bias_correction1,
+    float bias_correction2,
+    unsigned long long seed
+) {
+    int t = blockIdx.x;
+    if (t >= n_tensors) return;
+    long long n = sizes[t];
+    __nv_bfloat16* p = params[t];
+    const float*   g = grads[t];
+    float*         m = ms[t];
+    float*         v = vs[t];
+
+    int tid    = threadIdx.x;
+    int stride = blockDim.x;
+
+    // Mix tensor index into the seed so two tensors do not stochastically
+    // round in lock-step at the same elementwise idx.
+    unsigned long long t_seed = seed ^ ((unsigned long long)t * 0x100000001B3ULL);
+
+    for (long long i = (long long)tid; i < n; i += (long long)stride) {
+        float gv = g[i];
+        float pv = __bfloat162float(p[i]);
+
+        float mi = beta1 * m[i] + (1.0f - beta1) * gv;
+        float vi = beta2 * v[i] + (1.0f - beta2) * gv * gv;
+        m[i] = mi;
+        v[i] = vi;
+
+        float m_hat = mi / bias_correction1;
+        float v_hat = vi / bias_correction2;
+        pv -= lr * m_hat / (sqrtf(v_hat) + eps);
+        if (weight_decay > 0.0f) {
+            pv -= lr * weight_decay * pv;
+        }
+
+        unsigned short bf = adam_stoch_round_f32_to_bf16(pv, t_seed, i);
+        ((unsigned short*)p)[i] = bf;
+    }
+}
+"#;
+
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 mod fused {
     use super::*;
@@ -374,11 +505,12 @@ mod fused {
         // NVRTC compile, one `load_ptx`, one `MODULE_NAME` — `get_func` is
         // O(1) regardless of which dtype combo hits at step time.
         let combined = format!(
-            "{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}",
             CUDA_ADAM_FUSED_BF16,
             CUDA_ADAM_FUSED_F32PARAM_F32GRAD,
             CUDA_ADAM_FUSED_F32PARAM_BF16GRAD,
             CUDA_ADAM_FUSED_MULTI_BF16,
+            CUDA_ADAM_FUSED_BF16_STOCH,
         );
 
         let include_dir = std::env::var("CUDA_INCLUDE_DIR")
@@ -399,6 +531,8 @@ mod fused {
                     "adam_fused_f32param_bf16grad_kernel",
                     "adam_fused_multi_bf16_f32grad_kernel",
                     "adam_fused_multi_bf16_bf16grad_kernel",
+                    "adam_fused_bf16_f32grad_stoch_kernel",
+                    "adam_fused_multi_bf16_f32grad_stoch_kernel",
                 ],
             )
             .map_err(|e| Error::Cuda(format!("load adam_fused: {:?}", e)))?;
@@ -421,6 +555,7 @@ mod fused {
         weight_decay: f32,
         bias_correction1: f32,
         bias_correction2: f32,
+        stoch_seed: Option<u64>,
     ) -> Result<()> {
         // Validate dtypes once at entry
         debug_assert_eq!(param.dtype(), DType::BF16);
@@ -436,8 +571,16 @@ mod fused {
         ensure_adam_kernels(&device)?;
 
         let grad_is_bf16 = grad.dtype() == DType::BF16;
+        // Stochastic-rounding BF16 store is supported only for the F32-grad
+        // path (the BF16-grad kernel pipeline is currently unreachable via
+        // the public Parameter API which casts grads to F32). When stoch is
+        // requested with a BF16 grad we silently fall back to round-to-nearest;
+        // it is a no-op in practice.
+        let stoch_active = stoch_seed.is_some() && !grad_is_bf16;
         let kernel_name = if grad_is_bf16 {
             "adam_fused_bf16_kernel"
+        } else if stoch_active {
+            "adam_fused_bf16_f32grad_stoch_kernel"
         } else {
             "adam_fused_f32grad_kernel"
         };
@@ -473,7 +616,8 @@ mod fused {
             shared_mem_bytes: 0,
         };
 
-        let mut params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(12);
+        let seed_u64: u64 = stoch_seed.unwrap_or(0);
+        let mut params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(13);
         params.push(&param_ptr as *const u64 as *mut std::ffi::c_void);
         params.push(&grad_ptr as *const u64 as *mut std::ffi::c_void);
         params.push(&m_ptr as *const u64 as *mut std::ffi::c_void);
@@ -486,6 +630,9 @@ mod fused {
         params.push(&bias_correction1 as *const f32 as *mut std::ffi::c_void);
         params.push(&bias_correction2 as *const f32 as *mut std::ffi::c_void);
         params.push(&n_i64 as *const i64 as *mut std::ffi::c_void);
+        if stoch_active {
+            params.push(&seed_u64 as *const u64 as *mut std::ffi::c_void);
+        }
 
         unsafe {
             f.launch(cfg, &mut params)
@@ -658,6 +805,7 @@ mod fused {
         weight_decay: f32,
         bias_correction1: f32,
         bias_correction2: f32,
+        stoch_seed: Option<u64>,
     ) -> Result<()> {
         if n == 0 {
             return Ok(());
@@ -692,8 +840,14 @@ mod fused {
         let vs_arr_ptr = base + 3 * stride_bytes;
         let sizes_arr_ptr = base + 4 * stride_bytes;
 
+        // Stoch round only available for the F32-grad variant; falls back
+        // silently to round-to-nearest for BF16 grads (an unreachable branch
+        // via the public Parameter API).
+        let stoch_active = stoch_seed.is_some() && !grad_is_bf16;
         let kernel_name = if grad_is_bf16 {
             "adam_fused_multi_bf16_bf16grad_kernel"
+        } else if stoch_active {
+            "adam_fused_multi_bf16_f32grad_stoch_kernel"
         } else {
             "adam_fused_multi_bf16_f32grad_kernel"
         };
@@ -710,7 +864,8 @@ mod fused {
             shared_mem_bytes: 0,
         };
 
-        let mut k_params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(13);
+        let seed_u64: u64 = stoch_seed.unwrap_or(0);
+        let mut k_params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(14);
         k_params.push(&params_arr_ptr  as *const u64 as *mut std::ffi::c_void);
         k_params.push(&grads_arr_ptr   as *const u64 as *mut std::ffi::c_void);
         k_params.push(&ms_arr_ptr      as *const u64 as *mut std::ffi::c_void);
@@ -724,6 +879,9 @@ mod fused {
         k_params.push(&weight_decay    as *const f32 as *mut std::ffi::c_void);
         k_params.push(&bias_correction1 as *const f32 as *mut std::ffi::c_void);
         k_params.push(&bias_correction2 as *const f32 as *mut std::ffi::c_void);
+        if stoch_active {
+            k_params.push(&seed_u64 as *const u64 as *mut std::ffi::c_void);
+        }
 
         unsafe {
             f.launch(cfg, &mut k_params)
@@ -751,6 +909,14 @@ pub struct Adam {
     v: HashMap<TensorId, Tensor>,
     /// Weight decay coefficient
     weight_decay: f32,
+    /// When `true`, the F32 → BF16 store at the end of each fused BF16-param
+    /// step uses lower-16-bit hash-based stochastic rounding instead of
+    /// round-to-nearest. Default `false` (byte-identical to prior behavior).
+    /// Per-step entropy is derived from the step counter `t` so a run with a
+    /// fixed top-level seed is reproducible across reruns.
+    /// Affects only the F32-grad path; BF16-grad fallbacks (currently
+    /// unreachable) keep round-to-nearest.
+    stochastic_round: bool,
     /// Cached device-side metadata buffer for the multi-tensor fused-Adam
     /// launcher. Allocated lazily on the first multi-tensor-eligible step
     /// (all-BF16 params + all-F32 grads). Survives across steps so we don't
@@ -771,6 +937,7 @@ impl Adam {
             m: HashMap::new(),
             v: HashMap::new(),
             weight_decay,
+            stochastic_round: false,
             #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
             multi_tensor_meta: fused::MultiTensorMetaCache::new(),
         }
@@ -779,6 +946,34 @@ impl Adam {
     /// Update the learning rate used for subsequent optimizer steps.
     pub fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
+    }
+
+    /// Toggle stochastic rounding on the BF16 param store. See
+    /// [`Adam::stochastic_round`] field doc for semantics.
+    pub fn set_stochastic_round(&mut self, on: bool) {
+        self.stochastic_round = on;
+    }
+
+    /// Whether stochastic rounding is currently enabled for BF16 stores.
+    pub fn is_stochastic_round(&self) -> bool {
+        self.stochastic_round
+    }
+
+    /// Per-step seed for the stochastic-round kernel. Derived from the step
+    /// counter so the schedule is reproducible across reruns. The hash mixes
+    /// `t` with a large odd constant to avoid degenerate seeds at low step.
+    fn stoch_seed(&self) -> Option<u64> {
+        if self.stochastic_round {
+            let t = self.t as u64;
+            // splitmix64 finalizer keyed on the step count.
+            let mut s = t.wrapping_add(0x9E3779B97F4A7C15);
+            s = (s ^ (s >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            s = (s ^ (s >> 27)).wrapping_mul(0x94D049BB133111EB);
+            s = s ^ (s >> 31);
+            Some(s)
+        } else {
+            None
+        }
     }
 
     /// Perform a single optimization step.
@@ -888,6 +1083,7 @@ impl Adam {
                     .device
                     .clone();
 
+                let seed = self.stoch_seed();
                 fused::adam_fused_multi_tensor_step(
                     &mut self.multi_tensor_meta,
                     &device,
@@ -901,6 +1097,7 @@ impl Adam {
                     self.weight_decay,
                     bias_correction1,
                     bias_correction2,
+                    seed,
                 )?;
                 return Ok(());
             }
@@ -928,6 +1125,11 @@ impl Adam {
                         entry.insert(grad.zeros_like_with_dtype(state_dtype)?);
                     }
 
+                    // Compute the per-step stoch seed BEFORE the &mut borrow
+                    // of self.m / self.v below; the seed is a &self read of
+                    // self.stochastic_round + self.t and would otherwise
+                    // collide with the mutable map borrows.
+                    let seed = self.stoch_seed();
                     let m = self
                         .m
                         .get_mut(&param_id)
@@ -936,7 +1138,6 @@ impl Adam {
                         .v
                         .get_mut(&param_id)
                         .ok_or_else(|| Error::Training("optimizer v state missing".into()))?;
-
                     // Single fused kernel: param, m, v updated in-place
                     param.with_data_mut(|param_tensor| {
                         fused::adam_fused_step(
@@ -951,6 +1152,7 @@ impl Adam {
                             self.weight_decay,
                             bias_correction1,
                             bias_correction2,
+                            seed,
                         )
                     })?;
                     continue;
@@ -1058,6 +1260,22 @@ impl AdamW {
     /// Update the learning rate used for subsequent optimizer steps.
     pub fn set_lr(&mut self, lr: f32) {
         self.adam.set_lr(lr);
+    }
+
+    /// Toggle stochastic rounding on the F32 → BF16 store at the end of
+    /// each fused BF16-param step. Default off (round-to-nearest, byte-
+    /// identical to prior commits). When on, per-element rounding is driven
+    /// by a step-counter-derived seed mixed with `(tensor_idx, elem_idx)`,
+    /// matching the standalone `bf16_ops::stochastic_round_f32_to_bf16`
+    /// kernel's CPU reference. Long horizon BF16-param training accumulates
+    /// small grads correctly under stochastic rounding instead of stalling.
+    pub fn set_stochastic_round(&mut self, on: bool) {
+        self.adam.set_stochastic_round(on);
+    }
+
+    /// Whether stochastic BF16 rounding is currently on.
+    pub fn is_stochastic_round(&self) -> bool {
+        self.adam.is_stochastic_round()
     }
 
     pub fn step(&mut self, parameters: &[Parameter]) -> Result<()> {

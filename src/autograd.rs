@@ -60,17 +60,37 @@ lazy_static::lazy_static! {
         Mutex<HashMap<TensorId, Tensor>> = Mutex::new(HashMap::new());
 }
 
-/// Global activation offload pool. Set once via `set_activation_offload_pool`
-/// at training setup, then used by `checkpoint_offload` during forward and
-/// by `Op::CheckpointOffload` backward to push/pull activations.
-static ACTIVATION_POOL: std::sync::OnceLock<Arc<Mutex<ActivationOffloadPool>>> = std::sync::OnceLock::new();
+/// Global activation offload pool. Set via `set_activation_offload_pool`
+/// at training setup; can be torn down via `clear_activation_offload_pool`
+/// when the trainer wants to free the pool's GPU staging buffers (e.g.
+/// to free memory for an inline VAE decode at high resolution before
+/// resuming training).
+static ACTIVATION_POOL: std::sync::RwLock<Option<Arc<Mutex<ActivationOffloadPool>>>> =
+    std::sync::RwLock::new(None);
 
 /// Install the activation offload pool for checkpoint_offload to use.
-/// Call once at training setup. Returns Err if already set.
+/// Call at training setup. Replaces any previously-installed pool (the
+/// previous pool's Arc is dropped, releasing its pinned host memory + GPU
+/// staging buffers when the last reference goes away).
 pub fn set_activation_offload_pool(pool: Arc<Mutex<ActivationOffloadPool>>) -> Result<()> {
-    ACTIVATION_POOL.set(pool).map_err(|_| {
-        Error::InvalidOperation("Activation offload pool already set".into())
-    })
+    let mut g = ACTIVATION_POOL
+        .write()
+        .map_err(|_| Error::InvalidOperation("activation pool RwLock poisoned".into()))?;
+    *g = Some(pool);
+    Ok(())
+}
+
+/// Drop the global activation offload pool, releasing its pinned host
+/// memory and GPU staging buffers. Subsequent `checkpoint_offload` calls
+/// fall back to plain recompute checkpoint until a new pool is installed
+/// via `set_activation_offload_pool`.
+///
+/// Used by trainers that need to free the pool's GPU memory for an
+/// inline high-resolution sample/decode that would otherwise OOM.
+pub fn clear_activation_offload_pool() {
+    if let Ok(mut g) = ACTIVATION_POOL.write() {
+        *g = None;
+    }
 }
 
 /// Operation types for autograd
@@ -219,6 +239,16 @@ pub enum Op {
     IndexSelect {
         input: TensorId,
         indices: TensorId,
+        dim: usize,
+    },
+    /// Replace slices at `indices` along `dim` of `input` with the
+    /// corresponding slices from `values`. Backward: grad w.r.t. input is
+    /// upstream with indexed rows zeroed; grad w.r.t. values is index_select
+    /// of upstream at `indices`.
+    IndexAssign {
+        input: TensorId,
+        indices: TensorId,
+        values: TensorId,
         dim: usize,
     },
     Cat {
@@ -1193,6 +1223,9 @@ impl AutogradContext {
                                 Op::Embedding { weight, indices } | Op::IndexSelect { input: weight, indices, .. } => {
                                     ids.push(*weight); ids.push(*indices);
                                 }
+                                Op::IndexAssign { input, indices, values, .. } => {
+                                    ids.push(*input); ids.push(*indices); ids.push(*values);
+                                }
                                 Op::Cat { inputs, .. } => { ids.extend(inputs.iter()); }
                                 Op::Split { input, .. } | Op::Slice { input, .. } => { ids.push(*input); }
                                 Op::Where { cond, t, f } => { ids.push(*cond); ids.push(*t); ids.push(*f); }
@@ -1683,9 +1716,9 @@ impl AutogradContext {
     where
         F: Fn() -> Result<Tensor> + Send + Sync + 'static,
     {
-        // No pool → fall back to standard checkpoint.
-        let pool_arc = match ACTIVATION_POOL.get() {
-            Some(p) => Arc::clone(p),
+        // No pool installed (or torn down) → fall back to standard checkpoint.
+        let pool_arc = match ACTIVATION_POOL.read().ok().and_then(|g| g.as_ref().cloned()) {
+            Some(p) => p,
             None => return Self::checkpoint(inputs, f),
         };
 
@@ -2460,7 +2493,7 @@ fn compute_gradients(
         Op::CheckpointOffload { input, sub_tape } => {
             // Level 2: NO recompute. Walk the stored sub-tape, pulling
             // offloaded saved tensors from CPU as needed.
-            let pool_arc = ACTIVATION_POOL.get()
+            let pool_arc = ACTIVATION_POOL.read().ok().and_then(|g| g.as_ref().cloned())
                 .ok_or_else(|| Error::Training(
                     "CheckpointOffload backward: no offload pool set".into()
                 ))?;
@@ -3453,6 +3486,58 @@ fn compute_gradients(
             Ok(smallvec![(*input, grad_input)])
         }
 
+        Op::IndexAssign {
+            input,
+            indices,
+            values,
+            dim,
+        } => {
+            // Backward:
+            //   grad_input  = output_grad with slices at `indices` zeroed
+            //                 (the assignment overwrites those rows, so they
+            //                 don't propagate back to `input`).
+            //   grad_values = index_select(output_grad, dim, indices) — only
+            //                 the indexed rows of upstream affect `values`.
+            let input_tensor = entry
+                .get_saved(input)
+                .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for input".into()))?;
+            let indices_tensor = entry.get_saved(indices).ok_or_else(|| {
+                Error::InvalidOperation("Missing saved tensor for indices".into())
+            })?;
+            let values_tensor = entry
+                .get_saved(values)
+                .ok_or_else(|| Error::InvalidOperation("Missing saved tensor for values".into()))?;
+
+            // grad_values: gather upstream rows at `indices` along `dim`
+            let grad_values_raw = output_grad.index_select(*dim, indices_tensor)?;
+            let grad_values = if values_tensor.dtype() == grad_values_raw.dtype() {
+                grad_values_raw
+            } else {
+                grad_values_raw.to_dtype_no_grad(values_tensor.dtype())?
+            };
+
+            // grad_input: zero the indexed rows in upstream. Build a
+            // values_zero tensor matching the gathered shape and re-use
+            // index_assign to overwrite. Use no_grad path to avoid recording.
+            let zeros_for_assign = Tensor::zeros_dtype(
+                grad_values.shape().clone(),
+                output_grad.dtype(),
+                output_grad.device().clone(),
+            )?;
+            let grad_input_full = output_grad.index_assign_no_grad(
+                *dim,
+                indices_tensor,
+                &zeros_for_assign,
+            )?;
+            let grad_input = if input_tensor.dtype() == grad_input_full.dtype() {
+                grad_input_full
+            } else {
+                grad_input_full.to_dtype_no_grad(input_tensor.dtype())?
+            };
+
+            Ok(smallvec![(*input, grad_input), (*values, grad_values)])
+        }
+
         Op::Cat { inputs, dim } => {
             // Split gradient back to original tensors
             let mut grads: GradVec = SmallVec::new();
@@ -4242,6 +4327,7 @@ fn op_tag(op: &Op) -> &'static str {
         Op::GroupNorm { .. } => "GroupNorm",
         Op::Embedding { .. } => "Embedding",
         Op::IndexSelect { .. } => "IndexSelect",
+        Op::IndexAssign { .. } => "IndexAssign",
         Op::MSELoss { .. } => "MSELoss",
         Op::L1Loss { .. } => "L1Loss",
         Op::HuberLoss { .. } => "HuberLoss",

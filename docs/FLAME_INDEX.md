@@ -96,6 +96,23 @@
 - `.expand(&[usize])` — broadcast view
 - `.flatten / .flatten_to_2d`
 
+### Indexing — gather / scatter / assign
+- `.index_select(dim, &indices)` — `tensor_ops_extended.rs:568`. Gather rows
+  along `dim`. BF16 fast path via `cuda_ops_bf16::index_select_bf16_into`,
+  F32 via `GpuOps::index_select` + `INDEX_SELECT_KERNEL`. Backward via
+  `Op::IndexSelect` (uses `cuda_kernels::scatter_add` to splat upstream).
+- ⭐ `.index_assign(dim, &indices, &values)` — `tensor_ops_extended.rs:680`.
+  Returns a NEW tensor where slices at `indices` along `dim` are replaced
+  by the corresponding slices of `values`; non-indexed positions are
+  copied from `self`. F32 + BF16 paths via NVRTC kernels
+  `index_assign_f32_kernel` / `index_assign_bf16_kernel`. Backward
+  `Op::IndexAssign`: grad_input = upstream with indexed rows zeroed
+  (computed by re-applying `index_assign_no_grad` with zero values),
+  grad_values = `index_select(upstream, dim, indices)`. Used by TREAD's
+  scatter-back step in `eridiffusion-core/training/features/tread.rs`.
+- `.index_assign_no_grad(dim, &indices, &values)` — forward-only variant
+  used internally by autograd (`tensor_ops_extended.rs:706`).
+
 ### Math (most go through GpuOps or BF16 paths)
 - `.add(&Tensor) / .sub / .mul / .div / .maximum / .minimum` — BF16 routes through the TensorIterator pipeline (`tensor_iterator::ops::binary::*_bf16_iter`); F32 routes through `GpuOps`
 - `.add_scalar(f32) / .mul_scalar / .sub_scalar / .div_scalar / .mul_scalar_inplace` — BF16 through `tensor_iterator::ops::binary::{add,mul}_scalar_bf16_iter`
@@ -424,10 +441,20 @@ dispatch registry in `tensor_iterator/dispatch.rs`.
 - ⭐ `swiglu_fused_bf16(gate, up)` — `:1156` — `silu(gate) * up`.
 - `attn_split_txt_img_bf16(...)` — `:1246` — attention output text/image split.
 - `qkv_split_permute_bf16(...)` — `:1642` — QKV split + permute.
+- `stochastic_round_f32_to_bf16(src, rng)` — `bf16_ops.rs:~2700` — unbiased
+  F32→BF16 rounding driven by per-element u32 RNG. Matches the CPU reference
+  `bf16_convert::stochastic_round_to_bf16_cpu`. Standalone kernel — useful for
+  ad-hoc post-processing (e.g. cast F32 master → BF16 storage at save time).
+  The AdamW BF16 update path uses dedicated fused kernels (`adam_fused_bf16_f32grad_stoch_kernel`,
+  `adam_fused_multi_bf16_f32grad_stoch_kernel`) that re-implement the same
+  lower-16-bit hash logic inline so the AdamW kernel does not need a
+  separate temp F32 → BF16 round-trip.
 
 ### `bf16_convert.rs` — BF16↔F32 cast
 - `bf16_u16_to_f32(...)` — `:54` — vectorized via `__nv_bfloat162` (2-element/thread)
 - `f32_to_bf16_u16(...)` — `:70`
+- `stochastic_round_to_bf16_cpu(f, rng_u32)` — `:~125` — CPU reference for
+  unbiased F32→BF16 rounding (GPU path is `bf16_ops::stochastic_round_f32_to_bf16`).
 - (The Rust call site is `ops::cast::cast_bf16_to_f32 / cast_f32_to_bf16`.)
 
 ### `bf16_normal.rs` — Gaussian noise generator
@@ -713,7 +740,11 @@ Recently-added variants:
 - `adam::AdamW` — re-exported as `nn::AdamW`. Standard AdamW with BF16 master / F32 moments; `set_lr()` supports runtime schedulers. DECOUPLED weight decay. Two fused-kernel paths:
   - Single-tensor kernels (`adam_fused_bf16_kernel` etc., `adam.rs:54-225`) — fallback for F32 params, mixed-dtype slices, or when `FLAME_ADAM_NO_MULTI_TENSOR=1`.
   - Multi-tensor kernel (`adam_fused_multi_bf16_f32grad_kernel`, `adam.rs:225-345`) — auto-selected when **all** params are BF16 and **all** grads are F32 (the dominant LoRA training case). One kernel launch covers every parameter. Backed by a cached device-side metadata buffer (`fused::MultiTensorMetaCache`).
-- `adam::adam_fused_multi_tensor_step` (re-exported, `adam.rs:413`) — direct launcher for parity-test access. Production code uses `Adam::step` / `AdamW::step` instead.
+  - **Stochastic-round variants** (added 2026-05-08): `adam_fused_bf16_f32grad_stoch_kernel` + `adam_fused_multi_bf16_f32grad_stoch_kernel`. Identical math to the round-to-nearest variants except the final F32 → BF16 store applies lower-16-bit hash-driven stochastic rounding seeded from the step counter. Toggled via `Adam::set_stochastic_round(true)` / `AdamW::set_stochastic_round(true)`. Off by default (byte-identical to prior). Only fires for BF16-storage params; F32-storage trainers (e.g. EDv2 Klein, which keeps LoRA params in F32 and casts to BF16 only at forward time) take the F32-param fused path and never hit this kernel.
+- `adam::adam_fused_multi_tensor_step` (re-exported, `adam.rs:413`) — direct launcher for parity-test access. Signature gained a trailing `stoch_seed: Option<u64>` argument 2026-05-08; `None` preserves prior behavior. Production code uses `Adam::step` / `AdamW::step` instead.
+- `adam::adam_fused_step` (re-exported, `adam.rs:546`) — single-tensor variant; same `stoch_seed: Option<u64>` addition.
+- `adam::Adam::set_stochastic_round(bool)` / `Adam::is_stochastic_round() -> bool` — toggle and read of the stochastic-round flag (added 2026-05-08).
+- `adam::AdamW::set_stochastic_round(bool)` / `AdamW::is_stochastic_round() -> bool` — same on AdamW (forwards to Adam).
 - `adam::MultiTensorMetaCache` (re-exported, `adam.rs:347`) — cache type held by `Adam` for reuse across steps. Reallocates when n changes.
 - `sgd::*` — basic SGD
 - `parameter::Parameter` — re-exported as `Var` and `Parameter`. Wraps a `Tensor` with `requires_grad=true`.

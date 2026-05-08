@@ -651,6 +651,184 @@ impl Tensor {
         Ok(output)
     }
 
+    /// Replace slices along `dim` of `self` at `indices` with the
+    /// corresponding slices from `values`. Returns a NEW tensor with the
+    /// same shape as `self`. Non-indexed positions are copied from `self`,
+    /// indexed positions are copied from `values`.
+    ///
+    /// Constraints:
+    /// - `indices` must be 1-D with `len(indices) == values.shape[dim]`.
+    /// - `values.shape` must match `self.shape` everywhere except `dim`,
+    ///   where it equals `len(indices)`.
+    /// - `self.dtype()` must equal `values.dtype()` (BF16 or F32).
+    ///
+    /// Autograd: gradient w.r.t. `self` masks out the indexed rows of
+    /// upstream (they were overwritten); gradient w.r.t. `values` is
+    /// `index_select(upstream, dim, indices)`.
+    ///
+    /// Used by TREAD's scatter-back step (`features::tread::TreadStep`).
+    pub fn index_assign(
+        &self,
+        dim: usize,
+        indices: &Tensor,
+        values: &Tensor,
+    ) -> Result<Tensor> {
+        let mut output = self.index_assign_no_grad(dim, indices, values)?;
+
+        if self.requires_grad || values.requires_grad {
+            output.requires_grad = true;
+            if AutogradContext::is_recording() {
+                AutogradContext::record_op(
+                    output.id,
+                    Op::IndexAssign {
+                        input: self.id,
+                        indices: indices.id(),
+                        values: values.id(),
+                        dim,
+                    },
+                    vec![
+                        (self.id, self.alias()),
+                        (indices.id(), indices.alias()),
+                        (values.id(), values.alias()),
+                    ],
+                );
+            }
+        }
+        Ok(output)
+    }
+
+    /// Forward-only variant of [`Tensor::index_assign`]. Used internally by
+    /// the backward pass to construct gradients without re-recording.
+    pub fn index_assign_no_grad(
+        &self,
+        dim: usize,
+        indices: &Tensor,
+        values: &Tensor,
+    ) -> Result<Tensor> {
+        let self_dims = self.shape().dims();
+        if dim >= self_dims.len() {
+            return Err(Error::InvalidOperation(format!(
+                "index_assign: dim {} out of bounds for tensor with {} dims",
+                dim,
+                self_dims.len()
+            )));
+        }
+        let idx_shape = indices.shape().dims();
+        if idx_shape.len() != 1 {
+            return Err(Error::InvalidOperation(format!(
+                "index_assign: indices must be 1-D, got shape {:?}",
+                idx_shape
+            )));
+        }
+        let n_idx = indices.shape().elem_count();
+
+        let val_dims = values.shape().dims();
+        if val_dims.len() != self_dims.len() {
+            return Err(Error::InvalidOperation(format!(
+                "index_assign: rank mismatch self={:?} values={:?}",
+                self_dims, val_dims
+            )));
+        }
+        for (d, (a, b)) in self_dims.iter().zip(val_dims.iter()).enumerate() {
+            let expected = if d == dim { n_idx } else { *a };
+            if *b != expected {
+                return Err(Error::InvalidOperation(format!(
+                    "index_assign: values shape {:?} incompatible with self {:?} along dim {} (expected {} got {})",
+                    val_dims, self_dims, d, expected, b
+                )));
+            }
+        }
+        if self.dtype() != values.dtype() {
+            return Err(Error::InvalidOperation(format!(
+                "index_assign: dtype mismatch self={:?} values={:?}",
+                self.dtype(),
+                values.dtype()
+            )));
+        }
+        if !Arc::ptr_eq(self.device(), values.device())
+            || !Arc::ptr_eq(self.device(), indices.device())
+        {
+            return Err(Error::InvalidOperation(
+                "index_assign: tensors must reside on the same device".into(),
+            ));
+        }
+
+        // Build `inverse_mask` on host: for each k in [0, dim_size), record
+        // the position in `indices` (or -1 if k is not in `indices`). This
+        // lets the kernel decide src per element with O(1) lookup.
+        let dim_size = self_dims[dim];
+        let indices_f32 = indices.to_dtype(DType::F32)?;
+        let host_idx: Vec<f32> = indices_f32.to_vec()?;
+        let mut inverse_mask = vec![-1_i32; dim_size];
+        for (pos, &fi) in host_idx.iter().enumerate() {
+            let i = fi as i64;
+            if i < 0 || i >= dim_size as i64 {
+                return Err(Error::InvalidOperation(format!(
+                    "index_assign: index {} out of bounds for dim_size {}",
+                    i, dim_size
+                )));
+            }
+            inverse_mask[i as usize] = pos as i32;
+        }
+
+        // Compute strides for self (output) and values.
+        let ndim = self_dims.len();
+        let mut self_strides = vec![1_i32; ndim];
+        for i in (0..ndim - 1).rev() {
+            self_strides[i] = self_strides[i + 1] * self_dims[i + 1] as i32;
+        }
+        let mut val_strides = vec![1_i32; ndim];
+        for i in (0..ndim - 1).rev() {
+            val_strides[i] = val_strides[i + 1] * val_dims[i + 1] as i32;
+        }
+
+        let self_dims_i32: Vec<i32> = self_dims.iter().map(|&x| x as i32).collect();
+
+        let total_elem = self.shape().elem_count();
+        let total_i32: i32 = total_elem
+            .try_into()
+            .map_err(|_| Error::InvalidOperation("index_assign: tensor too large".into()))?;
+
+        let device = self.device().clone();
+
+        let dtype = self.dtype();
+        let output = match dtype {
+            DType::F32 => index_assign_f32(
+                self,
+                values,
+                &inverse_mask,
+                &self_dims_i32,
+                &self_strides,
+                &val_strides,
+                dim as i32,
+                total_i32,
+                ndim as i32,
+                &device,
+            )?,
+            #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+            DType::BF16 => index_assign_bf16(
+                self,
+                values,
+                &inverse_mask,
+                &self_dims_i32,
+                &self_strides,
+                &val_strides,
+                dim as i32,
+                total_i32,
+                ndim as i32,
+                &device,
+            )?,
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "index_assign: dtype {:?} not yet supported (F32, BF16 only)",
+                    other
+                )));
+            }
+        };
+
+        Ok(output)
+    }
+
     /// Expand tensor to a new shape (broadcasting)
     pub fn expand(&self, new_shape: &[usize]) -> Result<Tensor> {
         let shape = self.shape().dims();
@@ -1327,3 +1505,367 @@ fn broadcast_shapes(shape1: &[usize], shape2: &[usize]) -> Result<Vec<usize>> {
 }
 
 // Note: softmax, unsqueeze, full_like, and gelu are already implemented in tensor.rs
+
+// ─── index_assign: NVRTC kernel + dispatcher ───────────────────────────────
+//
+// Replaces slices of `self` along `dim` at the positions given by `indices`
+// with the corresponding slices from `values`. Backs `Tensor::index_assign`
+// (forward + autograd-internal `*_no_grad`). Used by TREAD's scatter step.
+//
+// Strategy: precompute on the host an `inverse_mask[k] = pos in indices`
+// (or -1) of length `dim_size`; the kernel then does a single O(1) lookup
+// per output element to decide whether to copy from `self` or `values`.
+//
+// Two NVRTC modules: `index_assign_f32_kernel` (training path) and
+// `index_assign_bf16_kernel` (inference / mixed-precision path).
+const INDEX_ASSIGN_F32_KERNEL_NAME: &str = "index_assign_f32_kernel";
+const INDEX_ASSIGN_BF16_KERNEL_NAME: &str = "index_assign_bf16_kernel";
+
+const INDEX_ASSIGN_F32_KERNEL_SRC: &str = r#"
+extern "C" __global__ void index_assign_f32_kernel(
+    const float* __restrict__ self_in,
+    const float* __restrict__ values_in,
+    const int* __restrict__ inverse_mask,
+    const int* __restrict__ self_dims,
+    const int* __restrict__ self_strides,
+    const int* __restrict__ val_strides,
+    float* __restrict__ out,
+    int ndim,
+    int dim,
+    int total)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    // Decompose `idx` into per-axis coords (output is dense / contiguous,
+    // matching self_strides since output shape == self shape).
+    int rem = idx;
+    int coord_dim = 0;
+    int val_offset = 0;
+    for (int d = 0; d < ndim; ++d) {
+        int s = self_strides[d];
+        int c;
+        if (s > 0) {
+            c = rem / s;
+            rem = rem - c * s;
+        } else {
+            c = 0;
+        }
+        if (d == dim) {
+            coord_dim = c;
+        } else {
+            val_offset += c * val_strides[d];
+        }
+    }
+
+    int pos = inverse_mask[coord_dim];
+    if (pos >= 0) {
+        // Indexed → copy from values, with values' axis-`dim` coord = pos.
+        val_offset += pos * val_strides[dim];
+        out[idx] = values_in[val_offset];
+    } else {
+        // Non-indexed → copy from self.
+        out[idx] = self_in[idx];
+    }
+}
+"#;
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+const INDEX_ASSIGN_BF16_KERNEL_SRC: &str = r#"
+extern "C" __global__ void index_assign_bf16_kernel(
+    const unsigned short* __restrict__ self_in,
+    const unsigned short* __restrict__ values_in,
+    const int* __restrict__ inverse_mask,
+    const int* __restrict__ self_dims,
+    const int* __restrict__ self_strides,
+    const int* __restrict__ val_strides,
+    unsigned short* __restrict__ out,
+    int ndim,
+    int dim,
+    int total)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int rem = idx;
+    int coord_dim = 0;
+    int val_offset = 0;
+    for (int d = 0; d < ndim; ++d) {
+        int s = self_strides[d];
+        int c;
+        if (s > 0) {
+            c = rem / s;
+            rem = rem - c * s;
+        } else {
+            c = 0;
+        }
+        if (d == dim) {
+            coord_dim = c;
+        } else {
+            val_offset += c * val_strides[d];
+        }
+    }
+
+    int pos = inverse_mask[coord_dim];
+    if (pos >= 0) {
+        val_offset += pos * val_strides[dim];
+        out[idx] = values_in[val_offset];
+    } else {
+        out[idx] = self_in[idx];
+    }
+}
+"#;
+
+#[allow(clippy::too_many_arguments)]
+fn index_assign_f32(
+    self_t: &Tensor,
+    values: &Tensor,
+    inverse_mask: &[i32],
+    self_dims_i32: &[i32],
+    self_strides: &[i32],
+    val_strides: &[i32],
+    dim: i32,
+    total: i32,
+    ndim: i32,
+    device: &Arc<CudaDevice>,
+) -> Result<Tensor> {
+    use cudarc::driver::{LaunchAsync, LaunchConfig};
+
+    // Materialize non-contiguous inputs.
+    let self_owned;
+    let self_t = if self_t.is_contiguous() {
+        self_t
+    } else {
+        self_owned = self_t.contiguous()?;
+        &self_owned
+    };
+    let val_owned;
+    let values = if values.is_contiguous() {
+        values
+    } else {
+        val_owned = values.contiguous()?;
+        &val_owned
+    };
+
+    crate::cuda_kernels::CudaKernels::ensure_kernel(
+        device,
+        INDEX_ASSIGN_F32_KERNEL_NAME,
+        INDEX_ASSIGN_F32_KERNEL_SRC,
+    )?;
+    let func = device
+        .get_func(INDEX_ASSIGN_F32_KERNEL_NAME, INDEX_ASSIGN_F32_KERNEL_NAME)
+        .ok_or_else(|| Error::Cuda(format!("Failed to load {}", INDEX_ASSIGN_F32_KERNEL_NAME)))?;
+
+    let d_inv = device
+        .htod_copy(inverse_mask.to_vec())
+        .map_err(|e| Error::Cuda(format!("htod inverse_mask: {:?}", e)))?;
+    let d_dims = device
+        .htod_copy(self_dims_i32.to_vec())
+        .map_err(|e| Error::Cuda(format!("htod self_dims: {:?}", e)))?;
+    let d_self_strides = device
+        .htod_copy(self_strides.to_vec())
+        .map_err(|e| Error::Cuda(format!("htod self_strides: {:?}", e)))?;
+    let d_val_strides = device
+        .htod_copy(val_strides.to_vec())
+        .map_err(|e| Error::Cuda(format!("htod val_strides: {:?}", e)))?;
+
+    let mut output = Tensor::empty_dtype(self_t.shape().clone(), DType::F32, device.clone())?;
+
+    let threads: u32 = 256;
+    let grid: u32 = ((total as u32) + threads - 1) / threads;
+    let cfg = LaunchConfig {
+        grid_dim: (grid.max(1), 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                self_t.storage.try_as_slice_f32()?,
+                values.storage.try_as_slice_f32()?,
+                &d_inv,
+                &d_dims,
+                &d_self_strides,
+                &d_val_strides,
+                output.storage_mut().try_as_mut_slice_f32()?,
+                ndim,
+                dim,
+                total,
+            ),
+        )
+        .map_err(|e| Error::Cuda(format!("launch index_assign_f32: {:?}", e)))?;
+    }
+
+    Ok(output)
+}
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+#[allow(clippy::too_many_arguments)]
+fn index_assign_bf16(
+    self_t: &Tensor,
+    values: &Tensor,
+    inverse_mask: &[i32],
+    self_dims_i32: &[i32],
+    self_strides: &[i32],
+    val_strides: &[i32],
+    dim: i32,
+    total: i32,
+    ndim: i32,
+    device: &Arc<CudaDevice>,
+) -> Result<Tensor> {
+    use cudarc::driver::{LaunchAsync, LaunchConfig};
+
+    // BF16 path needs OWNING (not arena/view) storage to bind a u16 slice
+    // for the kernel. clone_result materializes arena/view → owning AND
+    // resolves non-contiguous strides via contiguous() in one shot.
+    let self_owned = self_t.clone_result()?;
+    let self_t = &self_owned;
+    let val_owned = values.clone_result()?;
+    let values = &val_owned;
+
+    crate::cuda_kernels::CudaKernels::ensure_kernel(
+        device,
+        INDEX_ASSIGN_BF16_KERNEL_NAME,
+        INDEX_ASSIGN_BF16_KERNEL_SRC,
+    )?;
+    let func = device
+        .get_func(INDEX_ASSIGN_BF16_KERNEL_NAME, INDEX_ASSIGN_BF16_KERNEL_NAME)
+        .ok_or_else(|| Error::Cuda(format!("Failed to load {}", INDEX_ASSIGN_BF16_KERNEL_NAME)))?;
+
+    let d_inv = device
+        .htod_copy(inverse_mask.to_vec())
+        .map_err(|e| Error::Cuda(format!("htod inverse_mask: {:?}", e)))?;
+    let d_dims = device
+        .htod_copy(self_dims_i32.to_vec())
+        .map_err(|e| Error::Cuda(format!("htod self_dims: {:?}", e)))?;
+    let d_self_strides = device
+        .htod_copy(self_strides.to_vec())
+        .map_err(|e| Error::Cuda(format!("htod self_strides: {:?}", e)))?;
+    let d_val_strides = device
+        .htod_copy(val_strides.to_vec())
+        .map_err(|e| Error::Cuda(format!("htod val_strides: {:?}", e)))?;
+
+    let mut output = Tensor::empty_dtype(self_t.shape().clone(), DType::BF16, device.clone())?;
+
+    let threads: u32 = 256;
+    let grid: u32 = ((total as u32) + threads - 1) / threads;
+    let cfg = LaunchConfig {
+        grid_dim: (grid.max(1), 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                self_t.storage.try_as_slice_u16()?,
+                values.storage.try_as_slice_u16()?,
+                &d_inv,
+                &d_dims,
+                &d_self_strides,
+                &d_val_strides,
+                output.storage_mut().try_as_mut_slice_u16()?,
+                ndim,
+                dim,
+                total,
+            ),
+        )
+        .map_err(|e| Error::Cuda(format!("launch index_assign_bf16: {:?}", e)))?;
+    }
+
+    Ok(output)
+}
+
+#[cfg(test)]
+mod index_assign_tests {
+    use super::*;
+    use cudarc::driver::CudaDevice;
+
+    fn dev() -> Arc<CudaDevice> {
+        CudaDevice::new(0).expect("device 0")
+    }
+
+    #[test]
+    fn index_assign_identity_recovers_self() {
+        let device = dev();
+        // [B=2, T=4, D=3]
+        let total = 2 * 4 * 3;
+        let data: Vec<f32> = (0..total).map(|i| i as f32).collect();
+        let self_t =
+            Tensor::from_vec(data.clone(), Shape::from_dims(&[2, 4, 3]), device.clone()).unwrap();
+        // Indices = all positions; values = self → output should equal self.
+        let idx_data: Vec<f32> = vec![0.0, 1.0, 2.0, 3.0];
+        let idx_f32 =
+            Tensor::from_vec(idx_data, Shape::from_dims(&[4]), device.clone()).unwrap();
+        let idx = idx_f32.to_dtype(DType::I32).unwrap();
+        let out = self_t.index_assign(1, &idx, &self_t).unwrap();
+        let out_v = out.to_vec().unwrap();
+        assert_eq!(out_v, data);
+    }
+
+    #[test]
+    fn index_assign_round_trip_via_index_select() {
+        let device = dev();
+        let total = 2 * 4 * 3;
+        let data: Vec<f32> = (0..total).map(|i| i as f32).collect();
+        let self_t =
+            Tensor::from_vec(data.clone(), Shape::from_dims(&[2, 4, 3]), device.clone()).unwrap();
+        // Pick indices = [0, 2]
+        let idx_data: Vec<f32> = vec![0.0, 2.0];
+        let idx_f32 =
+            Tensor::from_vec(idx_data, Shape::from_dims(&[2]), device.clone()).unwrap();
+        let idx = idx_f32.to_dtype(DType::I32).unwrap();
+
+        let gathered = self_t.index_select(1, &idx).unwrap();
+        let scattered = self_t.index_assign(1, &idx, &gathered).unwrap();
+        // Should equal self_t exactly: we put back what we took.
+        let s_v = scattered.to_vec().unwrap();
+        assert_eq!(s_v, data);
+    }
+
+    #[test]
+    fn index_assign_writes_only_indexed_rows() {
+        let device = dev();
+        // [T=4, D=2]
+        let self_data: Vec<f32> = vec![10.0, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 41.0];
+        let self_t =
+            Tensor::from_vec(self_data, Shape::from_dims(&[4, 2]), device.clone()).unwrap();
+        // values shape [2, 2] → put rows at indices 1, 3
+        let val_data: Vec<f32> = vec![99.0, 98.0, 97.0, 96.0];
+        let val_t =
+            Tensor::from_vec(val_data, Shape::from_dims(&[2, 2]), device.clone()).unwrap();
+        let idx_f32 =
+            Tensor::from_vec(vec![1.0, 3.0], Shape::from_dims(&[2]), device.clone()).unwrap();
+        let idx = idx_f32.to_dtype(DType::I32).unwrap();
+        let out = self_t.index_assign(0, &idx, &val_t).unwrap();
+        let v = out.to_vec().unwrap();
+        // Row 0: 10, 11 (untouched). Row 1: 99, 98. Row 2: 30, 31 (untouched). Row 3: 97, 96.
+        assert_eq!(v, vec![10.0, 11.0, 99.0, 98.0, 30.0, 31.0, 97.0, 96.0]);
+        // Shape preserved.
+        assert_eq!(out.shape().dims(), &[4, 2]);
+    }
+
+    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+    #[test]
+    fn index_assign_bf16_round_trip() {
+        let device = dev();
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let self_t = Tensor::from_vec(data.clone(), Shape::from_dims(&[2, 4, 3]), device.clone())
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let idx_f32 =
+            Tensor::from_vec(vec![1.0, 3.0], Shape::from_dims(&[2]), device.clone()).unwrap();
+        let idx = idx_f32.to_dtype(DType::I32).unwrap();
+        let gathered = self_t.index_select(1, &idx).unwrap();
+        let scattered = self_t.index_assign(1, &idx, &gathered).unwrap();
+        // Compare in F32 (BF16 → F32 → vec).
+        let s_v = scattered.to_dtype(DType::F32).unwrap().to_vec().unwrap();
+        // BF16 round-trip is lossy on arbitrary floats, but our values are
+        // small ints (0..24) which are exactly representable in BF16.
+        assert_eq!(s_v, data);
+    }
+}

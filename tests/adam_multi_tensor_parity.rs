@@ -140,6 +140,7 @@ fn multi_tensor_matches_per_tensor_one_step_bit_exact() {
         &packed,
         lr, beta1, beta2, eps, wd,
         bc1, bc2,
+        None, // stoch_seed: round-to-nearest path, parity test
     )
     .expect("multi-tensor launch");
 
@@ -160,6 +161,7 @@ fn multi_tensor_matches_per_tensor_one_step_bit_exact() {
             &mut v_b[i],
             lr, beta1, beta2, eps, wd,
             bc1, bc2,
+            None,
         )
         .expect("per-tensor launch");
     }
@@ -230,6 +232,7 @@ fn multi_tensor_matches_per_tensor_100_steps() {
         adam_fused_multi_tensor_step(
             &mut cache, &dev, n, false, &packed,
             lr, beta1, beta2, eps, wd, bc1, bc2,
+            None,
         )
         .unwrap();
     }
@@ -244,6 +247,7 @@ fn multi_tensor_matches_per_tensor_100_steps() {
             adam_fused_step(
                 &mut p_b[i], &g_b[i], &mut m_b[i], &mut v_b[i],
                 lr, beta1, beta2, eps, wd, bc1, bc2,
+                None,
             )
             .unwrap();
         }

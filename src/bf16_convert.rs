@@ -112,3 +112,101 @@ pub fn f32_to_bf16_u16(
     }
     Ok(())
 }
+
+/// CPU reference for stochastic rounding F32 → BF16.
+///
+/// Bias-free rounding: keep the high 16 bits (the BF16 representation under
+/// truncation) and increment by 1 with probability `lower / 2^16`, where
+/// `lower` is the dropped low-16 of the F32 mantissa+exponent. Over many
+/// samples the mean of the rounded value equals the input — meaning small
+/// gradients accumulate correctly across BF16 parameter updates rather than
+/// silently being absorbed by RNE-rounding.
+///
+/// `rng_u32` should be a fresh uniform-random 32-bit value per element.
+/// Matches the GPU kernel `bf16_stoch_round_kernel` defined in `bf16_ops.rs`.
+#[inline]
+pub fn stochastic_round_to_bf16_cpu(f: f32, rng_u32: u32) -> u16 {
+    let bits = f.to_bits();
+    let lower = bits & 0xFFFF;
+    let upper = (bits >> 16) as u16;
+    if (rng_u32 & 0xFFFF) < lower {
+        upper.wrapping_add(1)
+    } else {
+        upper
+    }
+}
+
+#[cfg(test)]
+mod stoch_tests {
+    use super::*;
+
+    #[test]
+    fn rng_low_rounds_up_when_lower_nonzero() {
+        // Probability of rounding UP is `lower / 2^16`. With RNG=0 we always
+        // satisfy `(rng & 0xFFFF) < lower` whenever `lower > 0`, i.e. always
+        // round up. (When `lower == 0` we keep the RNE value, which is also
+        // the truncated value.)
+        let f = 1.0_f32 + 1e-5; // small but nonzero low-16 bits
+        let bits = f.to_bits();
+        let lower = bits & 0xFFFF;
+        let upper = (bits >> 16) as u16;
+        assert!(lower > 0, "test value should have nonzero low-16 bits");
+        assert_eq!(
+            stochastic_round_to_bf16_cpu(f, 0),
+            upper.wrapping_add(1)
+        );
+    }
+
+    #[test]
+    fn rng_high_truncates() {
+        // RNG=0xFFFF means `(rng & 0xFFFF) = 0xFFFF`. Since `lower < 0x10000`
+        // the predicate `0xFFFF < lower` is FALSE for any value of `lower` →
+        // we keep `upper` (truncate).
+        let f = 1.0_f32 + 1.0e-3;
+        let bits = f.to_bits();
+        let upper = (bits >> 16) as u16;
+        assert_eq!(stochastic_round_to_bf16_cpu(f, 0xFFFF), upper);
+    }
+
+    #[test]
+    fn integer_powers_of_two_dont_change() {
+        // Powers of two have all-zero low 16 bits → always truncate.
+        for x in [1.0_f32, 2.0, 0.5, 4.0, 0.25, 1024.0] {
+            let bits = x.to_bits();
+            let upper = (bits >> 16) as u16;
+            for r in [0u32, 1, 0xDEAD_BEEF, 0xFFFF, 0xFFFF_FFFF] {
+                assert_eq!(
+                    stochastic_round_to_bf16_cpu(x, r),
+                    upper,
+                    "x={} r={:#x}",
+                    x,
+                    r
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unbiased_mean_over_random_rng() {
+        // 1000 samples of stochastic rounding should reconstruct the input
+        // value to within 1 BF16 ULP at the input's magnitude.
+        let f = 1.234567_f32;
+        let mut rng_state: u32 = 0x1234_5678;
+        let mut sum_f32 = 0.0_f64;
+        let n = 1000;
+        for _ in 0..n {
+            rng_state = rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let bits = (stochastic_round_to_bf16_cpu(f, rng_state) as u32) << 16;
+            sum_f32 += f32::from_bits(bits) as f64;
+        }
+        let mean = (sum_f32 / n as f64) as f32;
+        // BF16 ULP at value 1.234 is roughly 1/256 ≈ 4e-3. Allow 1e-2 slack
+        // for the LCG's mediocre uniformity over 1000 samples.
+        assert!(
+            (mean - f).abs() < 1e-2,
+            "stochastic rounding biased: input={} mean={}",
+            f,
+            mean
+        );
+    }
+}

@@ -2686,3 +2686,193 @@ fn qkv_split_permute_bf16_strided(
     }
     Ok((q, k, v))
 }
+
+// ─── Stochastic-round F32 → BF16 (Phase 3 / EDv2 multi-feature rollout) ─────
+//
+// Standard practice for serious BF16 training: when adding a tiny gradient
+// update to a BF16 weight, RNE-rounding silently absorbs sub-ULP increments
+// → small gradients never accumulate. Stochastic rounding is unbiased, so
+// over many steps the mean of the rounded weight matches the true F32 value.
+//
+// CPU reference implementation lives in `bf16_convert::stochastic_round_to_bf16_cpu`.
+// This kernel matches that reference: keep the upper 16 bits of `src[i]`,
+// increment by 1 with probability `(src[i] & 0xFFFF) / 2^16` driven by
+// `rng[i] & 0xFFFF`.
+
+const CUDA_BF16_STOCH_ROUND: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void bf16_stoch_round_kernel(const float* __restrict__ src,
+                             const unsigned int* __restrict__ rng,
+                             unsigned short* __restrict__ dst,
+                             long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int bits  = __float_as_uint(src[i]);
+    unsigned int lower = bits & 0xFFFFu;
+    unsigned int upper = bits >> 16;
+    unsigned int r     = rng[i] & 0xFFFFu;
+    if (r < lower) upper = (upper + 1u) & 0xFFFFu;
+    dst[i] = (unsigned short)upper;
+}
+"#;
+
+/// Stochastic-round an F32 tensor into a fresh BF16 tensor of identical shape.
+///
+/// `rng` must be a CUDA u32 slice of length ≥ `src.shape().elem_count()`,
+/// each element a uniform random 32-bit value (lower 16 bits drive the
+/// rounding decision per element).
+///
+/// Output is BF16 (u16 storage) with `requires_grad = false`. **Not yet
+/// wired into the optimizer.** Phase 3 ships the kernel + wrapper; the
+/// optimizer integration is a follow-up.
+///
+/// CPU reference: [`crate::bf16_convert::stochastic_round_to_bf16_cpu`].
+pub fn stochastic_round_f32_to_bf16(
+    src: &Tensor,
+    rng: &cudarc::driver::CudaSlice<u32>,
+) -> Result<Tensor> {
+    use cudarc::driver::DeviceSlice;
+    if src.dtype() != DType::F32 {
+        return Err(Error::InvalidOperation(format!(
+            "stochastic_round_f32_to_bf16 requires F32 source, got {:?}",
+            src.dtype()
+        )));
+    }
+    let n = src.shape().elem_count();
+    if rng.len() < n {
+        return Err(Error::InvalidInput(format!(
+            "stochastic_round_f32_to_bf16: rng buffer len={} < n={}",
+            rng.len(),
+            n
+        )));
+    }
+
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&src.device, n)?;
+    let mut out = Tensor {
+        storage: TensorStorage::BF16 {
+            data: data.into(),
+            numel: n,
+        },
+        shape: src.shape().clone(),
+        device: src.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+    };
+
+    ensure(&src.device, "bf16_stoch_round_kernel", CUDA_BF16_STOCH_ROUND)?;
+    let f = src
+        .device
+        .get_func("bf16_stoch_round_kernel", "bf16_stoch_round_kernel")
+        .ok_or_else(|| Error::Cuda("bf16_stoch_round_kernel missing".into()))?;
+
+    let xs = src.as_slice_f32("stochastic_round_f32_to_bf16.src")?;
+    let ys = match &mut out.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
+    let ys = ensure_unique_slice(ys)?;
+    unsafe {
+        f.launch(lc(n), (xs, rng, ys, n as i64))?;
+    }
+    let _ = Shape::from_dims; // keep import if pruned later
+    Ok(out)
+}
+
+#[cfg(test)]
+mod stoch_round_tests {
+    use super::*;
+    use crate::bf16_convert::stochastic_round_to_bf16_cpu;
+    use crate::global_cuda_device;
+    use cudarc::driver::CudaDevice;
+
+    #[test]
+    fn stochastic_round_matches_cpu_reference() {
+        // Generate 1000 (f32, rng_u32) pairs, run on GPU, compare bit-for-bit
+        // against the CPU reference. Distribution check: for a fixed input
+        // value the average of many GPU-rounded outputs should reconstruct
+        // the input to within 1e-2.
+        let device = global_cuda_device();
+
+        let mut srcs: Vec<f32> = Vec::with_capacity(1000);
+        let mut rngs: Vec<u32> = Vec::with_capacity(1000);
+        // LCG for deterministic test inputs.
+        let mut state: u32 = 0xC0DECAFE;
+        for i in 0..1000 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            // Spread test values over a few orders of magnitude.
+            let exp_bias = (i % 10) as i32;
+            let mantissa = (state as f32 / u32::MAX as f32) - 0.5;
+            let val = mantissa * (1u32 << exp_bias.max(0)) as f32;
+            srcs.push(val);
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            rngs.push(state);
+        }
+
+        // Expected u16s from the CPU reference.
+        let cpu: Vec<u16> = srcs
+            .iter()
+            .zip(rngs.iter())
+            .map(|(&f, &r)| stochastic_round_to_bf16_cpu(f, r))
+            .collect();
+
+        // Upload inputs and run.
+        let src_t = Tensor::from_vec(
+            srcs.clone(),
+            Shape::from_dims(&[srcs.len()]),
+            device.clone(),
+        )
+        .unwrap();
+        let dev: std::sync::Arc<CudaDevice> = device.clone();
+        let rng_dev = dev.htod_copy(rngs.clone()).unwrap();
+
+        let gpu = stochastic_round_f32_to_bf16(&src_t, &rng_dev).unwrap();
+        let gpu_f32 = gpu.to_dtype(crate::DType::F32).unwrap();
+        let gpu_vals = gpu_f32.to_vec().unwrap();
+
+        // Convert each CPU u16 back to F32 the same way BF16 → F32 does (high
+        // 16 bits) for comparison.
+        for (i, &u) in cpu.iter().enumerate() {
+            let bits = (u as u32) << 16;
+            let cpu_val = f32::from_bits(bits);
+            let gpu_val = gpu_vals[i];
+            // Either a bit-exact match, or `gpu_val` is the next BF16
+            // representable value above/below cpu_val (in case the kernel
+            // rounded the borderline differently — should not happen here,
+            // but the assertion is generous to the sign of the rounding step).
+            assert_eq!(
+                gpu_val, cpu_val,
+                "i={}: src={} rng={:#x} cpu_u16={:#x} cpu_f32={} gpu_f32={}",
+                i, srcs[i], rngs[i], u, cpu_val, gpu_val
+            );
+        }
+    }
+
+    #[test]
+    fn stochastic_round_unbiased_for_fixed_input() {
+        // For 4096 RNG draws of a single value, the mean of GPU-rounded
+        // outputs should match the input to within 1 BF16 ULP at that
+        // magnitude (~4e-3 for value ~1.0).
+        let device = global_cuda_device();
+        let val: f32 = 1.234567;
+        let n = 4096;
+        let srcs = vec![val; n];
+        let mut state: u32 = 0xC0FFEE;
+        let mut rngs = Vec::with_capacity(n);
+        for _ in 0..n {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            rngs.push(state);
+        }
+
+        let src_t = Tensor::from_vec(srcs, Shape::from_dims(&[n]), device.clone()).unwrap();
+        let rng_dev = device.htod_copy(rngs).unwrap();
+        let gpu = stochastic_round_f32_to_bf16(&src_t, &rng_dev).unwrap();
+        let gpu_vals = gpu.to_dtype(crate::DType::F32).unwrap().to_vec().unwrap();
+
+        let mean: f64 = gpu_vals.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+        let err = (mean as f32 - val).abs();
+        assert!(err < 1e-2, "biased: input={} mean={} err={}", val, mean, err);
+    }
+}

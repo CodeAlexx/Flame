@@ -65,8 +65,27 @@ pub fn save_tensors(
 ) -> Result<()> {
     match format {
         SerializationFormat::Binary => save_tensors_binary(tensors, path),
-        SerializationFormat::SafeTensors => save_tensors_safetensors(tensors, path),
+        SerializationFormat::SafeTensors => save_tensors_safetensors(tensors, path, None),
     }
+}
+
+/// SafeTensors-only save with extra header metadata (string→string).
+/// Embedded under the standard `__metadata__` header key (per safetensors
+/// spec). Loaders that ignore the key see a normal weights file.
+pub fn save_tensors_with_metadata(
+    tensors: &HashMap<String, Tensor>,
+    extra_metadata: &HashMap<String, String>,
+    path: &Path,
+) -> Result<()> {
+    save_tensors_safetensors(tensors, path, Some(extra_metadata))
+}
+
+/// SafeTensors-only load that also returns the `__metadata__` map.
+pub fn load_tensors_with_metadata(
+    path: &Path,
+    device: Arc<CudaDevice>,
+) -> Result<(HashMap<String, Tensor>, HashMap<String, String>)> {
+    load_tensors_safetensors_with_metadata(path, device)
 }
 
 /// Load multiple tensors from a file
@@ -323,7 +342,7 @@ fn load_tensors_binary(path: &Path, device: Arc<CudaDevice>) -> Result<HashMap<S
 fn save_tensor_safetensors(tensor: &Tensor, path: &Path) -> Result<()> {
     let mut tensors = HashMap::new();
     tensors.insert("tensor".to_string(), tensor);
-    save_tensors_safetensors(&tensors, path)
+    save_tensors_safetensors(&tensors, path, None)
 }
 
 fn load_tensor_safetensors(path: &Path, device: Arc<CudaDevice>) -> Result<Tensor> {
@@ -337,6 +356,7 @@ fn load_tensor_safetensors(path: &Path, device: Arc<CudaDevice>) -> Result<Tenso
 fn save_tensors_safetensors<T: AsRef<Tensor>>(
     tensors: &HashMap<String, T>,
     path: &Path,
+    extra_metadata: Option<&HashMap<String, String>>,
 ) -> Result<()> {
     use serde_json::{json, Value};
 
@@ -346,6 +366,15 @@ fn save_tensors_safetensors<T: AsRef<Tensor>>(
 
     // Create metadata
     let mut metadata = serde_json::Map::new();
+    if let Some(extra) = extra_metadata {
+        if !extra.is_empty() {
+            let mut m = serde_json::Map::new();
+            for (k, v) in extra {
+                m.insert(k.clone(), Value::String(v.clone()));
+            }
+            metadata.insert("__metadata__".into(), Value::Object(m));
+        }
+    }
     let mut offset = 0u64;
 
     // Collect tensor info
@@ -400,6 +429,14 @@ fn load_tensors_safetensors(
     path: &Path,
     device: Arc<CudaDevice>,
 ) -> Result<HashMap<String, Tensor>> {
+    let (tensors, _meta) = load_tensors_safetensors_with_metadata(path, device)?;
+    Ok(tensors)
+}
+
+fn load_tensors_safetensors_with_metadata(
+    path: &Path,
+    device: Arc<CudaDevice>,
+) -> Result<(HashMap<String, Tensor>, HashMap<String, String>)> {
     use serde_json::Value;
 
     let file = File::open(path).map_err(|e| Error::Io(format!("Failed to open file: {:?}", e)))?;
@@ -424,6 +461,18 @@ fn load_tensors_safetensors(
     let metadata_obj = metadata
         .as_object()
         .ok_or_else(|| Error::InvalidInput("Invalid metadata format".to_string()))?;
+
+    // Pull out the safetensors-standard `__metadata__` (string→string) entry,
+    // if present, before tensor entries are walked.
+    let extra_metadata: HashMap<String, String> = metadata_obj
+        .get("__metadata__")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Read all remaining data
     let mut all_data = Vec::new();
@@ -545,7 +594,7 @@ fn load_tensors_safetensors(
         tensors.insert(name.clone(), tensor);
     }
 
-    Ok(tensors)
+    Ok((tensors, extra_metadata))
 }
 
 // Convenience methods for Tensor
