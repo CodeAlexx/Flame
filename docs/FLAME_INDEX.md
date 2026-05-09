@@ -71,6 +71,10 @@
 - `Tensor::from_f32_to_bf16(data, shape, device)` — convenience
 - `Tensor::from_slice / from_data` — variants
 - `Tensor::rand_like / zeros_like` — match shape
+- `Tensor::eye(n, device)` — `n×n` F32 identity — `tensor_ops_extended.rs:1131`
+- `Tensor::eye_dtype(n, dtype, device)` — typed identity (BF16/F16/F32) —
+  `tensor_ops_extended.rs:1138`. Used by OFT-Neumann series
+  `R = I + 2Q + 2Q^2 + ...` in the LyCORIS family.
 
 ### Shape / metadata
 - `.shape() -> &Shape`
@@ -172,7 +176,14 @@ all materialize views).
 ### Autograd hooks
 - `.requires_grad / .requires_grad_(bool)`
 - `.backward() / .backward_with_grad()`
-- `.detach()`
+- `.detach() -> Result<Tensor>` — deep-copy storage, fresh `TensorId`,
+  `requires_grad=false`, no `record_op`. Breaks the autograd tape; backward
+  through the original does NOT flow into the detached copy. Used by DoRA
+  (norm of `W_orig + ΔW` is detached per the paper). `tensor.rs:3052`.
+- `.detach_leaf() -> Tensor` — Arc-bump (zero copy), fresh `TensorId`,
+  `requires_grad=true`. Equivalent to PyTorch `detach_variable`; used by
+  gradient checkpointing to make a leaf for a local recompute graph.
+  `tensor.rs:3068`.
 - See [`FLAME_MODULES.md`](./FLAME_MODULES.md) `autograd_v3` section for the active engine.
 - ⭐ **`AutogradContext::retain_intermediate_grads(ids)` /
   `take_retained_intermediate_grads()`** — test-only API for probing
@@ -433,7 +444,7 @@ dispatch registry in `tensor_iterator/dispatch.rs`.
 - `silu_bf16(x)` — `:322` — same role for `silu_bf16_iter`.
 - `softmax_last_dim_bf16(x)` — `:264` — older fused softmax (one block per row).
 - ⭐ `rope_fused_bf16(x, cos, sin)` — `:476` — interleaved-pair RoPE.
-- ⭐ `rope_fused_bf16_f32pe(x, cos, sin)` — `:567` — RoPE with F32 positional embeddings.
+- ⭐ `rope_fused_bf16_f32pe(x, cos, sin)` — `:595` — RoPE with F32 positional embeddings. Records `Op::RoPePrecomputed` (saves BF16-cast cos/sin for backward dispatcher); see `feedback_rope_fused_autograd.md`.
 - `rope_halfsplit_bf16(x, cos, sin)` — `:656` — halfsplit RoPE.
 - `modulate_pre_fused_bf16(...)` — `:895` — DiT shift+scale modulation.
 - `modulate_pre_split_apply_bf16(...)` — `:961` — B.3 split+apply variant.

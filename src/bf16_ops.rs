@@ -673,7 +673,44 @@ pub fn rope_fused_bf16_f32pe(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<T
         )?;
     }
 
-    out.reshape(&[b, h, n, d])
+    let mut result = out.reshape(&[b, h, n, d])?;
+
+    // Record autograd op so gradients flow through RoPE during training.
+    // CRITICAL: this F32-PE variant was previously inference-only — every
+    // FLUX trainer using it (train_flux models/flux.rs:431 in EDv2) had
+    // its Q/K LoRA gradient chain severed at the RoPE boundary across
+    // all 19 double + 38 single Flux blocks. Same bug pattern as the
+    // already-fixed `rope_fused_bf16` and `rope_halfsplit_bf16` paths;
+    // see `feedback_rope_fused_autograd.md`.
+    //
+    // The shared `Op::RoPePrecomputed` backward at autograd.rs:2683 calls
+    // `rope_fused_bf16` with the saved cos/sin, which expects BF16
+    // tables. We therefore cast the F32 tables to BF16 ONLY for the saved
+    // tape entries — the forward math still uses the F32 tables (the
+    // whole point of this variant) and gradient direction precision is
+    // not the bottleneck for LoRA training.
+    if x.requires_grad {
+        result.requires_grad = true;
+        if crate::autograd::AutogradContext::is_recording() {
+            let cos_bf16 = cos_flat.to_dtype_no_grad(DType::BF16)?;
+            let sin_bf16 = sin_flat.to_dtype_no_grad(DType::BF16)?;
+            crate::autograd::AutogradContext::record_op(
+                result.id,
+                crate::autograd::Op::RoPePrecomputed {
+                    input: x.id,
+                    cos: cos_bf16.id,
+                    sin: sin_bf16.id,
+                },
+                vec![
+                    (x.id, x.clone()),
+                    (cos_bf16.id, cos_bf16.clone()),
+                    (sin_bf16.id, sin_bf16.clone()),
+                ],
+            );
+        }
+    }
+
+    Ok(result)
 }
 
 /// Half-split RoPE (HuggingFace rotate_half convention).

@@ -1127,13 +1127,23 @@ impl Tensor {
         Self::full(shape, 1.0, device)
     }
 
-    /// Create identity matrix
+    /// Create identity matrix (F32).
+    ///
+    /// For arbitrary dtype (BF16/F16/F32), use [`Tensor::eye_dtype`].
     pub fn eye(n: usize, device: Arc<CudaDevice>) -> Result<Tensor> {
+        Self::eye_dtype(n, DType::F32, device)
+    }
+
+    /// Create identity matrix with explicit dtype.
+    ///
+    /// Used by OFT-Neumann (LyCORIS): `R = I + 2Q + 2Q^2 + ...` where the
+    /// identity must match the parameter dtype (BF16 trainers).
+    pub fn eye_dtype(n: usize, dtype: DType, device: Arc<CudaDevice>) -> Result<Tensor> {
         let mut data = vec![0.0f32; n * n];
         for i in 0..n {
             data[i * n + i] = 1.0;
         }
-        Tensor::from_slice(&data, Shape::from_dims(&[n, n]), device)
+        Tensor::from_slice_dtype(&data, Shape::from_dims(&[n, n]), device, dtype)
     }
 
     /// Create range tensor
