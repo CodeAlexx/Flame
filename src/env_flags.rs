@@ -93,3 +93,15 @@ pub fn cuda_graph_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     flag_enabled("FLAME_CUDA_GRAPH", &CACHED)
 }
+
+/// `FLAME_ASSERT_GRAD_FLOW=1` — panic when `diagnostics::assert_grad_flow`
+/// finds any parameter whose gradient is missing or zero after backward.
+/// When unset, the helper returns its report without panicking, so the
+/// trainer may log at warn/info level.  Designed to catch the recurring
+/// "BF16 fused inference op missing autograd registration" bug class
+/// before it wastes a 3000-step training run.
+#[inline]
+pub fn assert_grad_flow_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    flag_enabled("FLAME_ASSERT_GRAD_FLOW", &CACHED)
+}
