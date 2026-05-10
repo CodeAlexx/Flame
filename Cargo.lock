@@ -239,6 +239,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eri-safetensors"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "safetensors",
+ "serde_json",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -297,6 +306,7 @@ dependencies = [
  "cuda-runtime-sys",
  "cudarc",
  "env_logger",
+ "eri-safetensors",
  "half",
  "image",
  "lazy_static",
@@ -876,6 +886,16 @@ name = "ryu"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
+
+[[package]]
+name = "safetensors"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44560c11236a6130a46ce36c836a62936dc81ebf8c36a37947423571be0e55b6"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "serde"

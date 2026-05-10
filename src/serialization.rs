@@ -433,38 +433,25 @@ fn load_tensors_safetensors(
     Ok(tensors)
 }
 
-fn load_tensors_safetensors_with_metadata(
-    path: &Path,
-    device: Arc<CudaDevice>,
-) -> Result<(HashMap<String, Tensor>, HashMap<String, String>)> {
-    use serde_json::Value;
-
-    let file = File::open(path).map_err(|e| Error::Io(format!("Failed to open file: {:?}", e)))?;
-    let mut reader = BufReader::new(file);
-
-    // Read header size
+/// Re-read just the `__metadata__` (string→string) safetensors entry.
+///
+/// `eri_safetensors::MmapFile` indexes only data tensors and skips the
+/// `__metadata__` key. When the loader needs that entry (e.g. for trainer
+/// resume to read `train_dtype`, `seed`, etc.), we re-open the file just
+/// to slice the header. Cheap: the header is at most 100 MB and the
+/// kernel page cache already has it warm from the mmap probe.
+fn read_safetensors_extra_metadata(path: &Path) -> Result<HashMap<String, String>> {
+    let mut file = File::open(path).map_err(|e| Error::Io(format!("open: {e}")))?;
     let mut header_size_bytes = [0u8; 8];
-    reader
-        .read_exact(&mut header_size_bytes)
+    file.read_exact(&mut header_size_bytes)
         .map_err(|e| Error::Io(e.to_string()))?;
     let header_size = u64::from_le_bytes(header_size_bytes) as usize;
-
-    // Read metadata
-    let mut metadata_bytes = vec![0u8; header_size];
-    reader
-        .read_exact(&mut metadata_bytes)
+    let mut header_bytes = vec![0u8; header_size];
+    file.read_exact(&mut header_bytes)
         .map_err(|e| Error::Io(e.to_string()))?;
-
-    let metadata: Value = serde_json::from_slice(&metadata_bytes)
-        .map_err(|e| Error::Io(format!("Failed to parse metadata: {:?}", e)))?;
-
-    let metadata_obj = metadata
-        .as_object()
-        .ok_or_else(|| Error::InvalidInput("Invalid metadata format".to_string()))?;
-
-    // Pull out the safetensors-standard `__metadata__` (string→string) entry,
-    // if present, before tensor entries are walked.
-    let extra_metadata: HashMap<String, String> = metadata_obj
+    let metadata: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| Error::Io(format!("parse header: {e}")))?;
+    Ok(metadata
         .get("__metadata__")
         .and_then(|v| v.as_object())
         .map(|m| {
@@ -472,62 +459,59 @@ fn load_tensors_safetensors_with_metadata(
                 .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default())
+}
 
-    // Read all remaining data
-    let mut all_data = Vec::new();
-    reader
-        .read_to_end(&mut all_data)
+/// Re-read the full safetensors header object (so the FP8 scale-lookup
+/// path can resolve `*_scale` / `*.scale_weight` companion entries).
+fn read_safetensors_full_header(path: &Path) -> Result<serde_json::Value> {
+    let mut file = File::open(path).map_err(|e| Error::Io(format!("open: {e}")))?;
+    let mut header_size_bytes = [0u8; 8];
+    file.read_exact(&mut header_size_bytes)
         .map_err(|e| Error::Io(e.to_string()))?;
+    let header_size = u64::from_le_bytes(header_size_bytes) as usize;
+    let mut header_bytes = vec![0u8; header_size];
+    file.read_exact(&mut header_bytes)
+        .map_err(|e| Error::Io(e.to_string()))?;
+    serde_json::from_slice(&header_bytes).map_err(|e| Error::Io(format!("parse header: {e}")))
+}
 
+/// Decode all (or filtered) tensors out of a mmap'd safetensors file into
+/// device memory. Shared between `load_tensors_safetensors_with_metadata`
+/// (filter = always-true) and `load_file_filtered` (caller-supplied filter).
+///
+/// Each tensor's bytes come from the mmap region (paged in on access);
+/// after the device copy the page can be dropped by the OS.
+///
+/// `header_for_scales` is the parsed safetensors header — only required
+/// for the FP8 path which needs to resolve `*_scale` / `*.scale_weight`
+/// companion entries.
+fn decode_tensors_from_mmap(
+    mmap: &eri_safetensors::MmapFile,
+    header_for_scales: Option<&serde_json::Value>,
+    device: &Arc<CudaDevice>,
+    mut filter: impl FnMut(&str) -> bool,
+) -> Result<HashMap<String, Tensor>> {
     let mut tensors = HashMap::new();
-
-    for (name, info) in metadata_obj {
-        // Skip the __metadata__ key (safetensors global metadata, not a tensor)
-        if name == "__metadata__" {
+    for (name, info) in &mmap.tensors {
+        if !filter(name) {
             continue;
         }
-        let shape = info["shape"]
-            .as_array()
-            .ok_or_else(|| Error::InvalidInput("Missing shape".to_string()))?
-            .iter()
-            .map(|v| {
-                v.as_u64()
-                    .ok_or_else(|| Error::InvalidInput("invalid shape entry".into()))
-                    .map(|u| u as usize)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let offsets = info["data_offsets"]
-            .as_array()
-            .ok_or_else(|| Error::InvalidInput("Missing data_offsets".to_string()))?;
-        let start = offsets
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| Error::InvalidInput("invalid start offset".into()))?
-            as usize;
-        let end = offsets
-            .get(1)
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| Error::InvalidInput("invalid end offset".into()))?
-            as usize;
-
-        // Detect dtype from metadata
-        let dtype_str = info["dtype"]
-            .as_str()
-            .unwrap_or("F32");
-
         // Skip unsupported dtypes (I64, I32, BOOL, etc.)
-        if !matches!(dtype_str, "F32" | "BF16" | "F16" | "F8_E4M3") {
+        if !matches!(info.dtype.as_str(), "F32" | "BF16" | "F16" | "F8_E4M3") {
             continue;
         }
+        let bytes = mmap
+            .tensor_bytes(name)
+            .ok_or_else(|| Error::InvalidInput(format!("mmap missing tensor '{name}'")))?;
+        let shape = info.shape.clone();
 
-        let tensor = match dtype_str {
+        let tensor = match info.dtype.as_str() {
             "BF16" => {
                 // BF16: 2 bytes per element — load raw u16 directly into BF16 tensor (no f32 intermediate)
-                let num_elems = (end - start) / 2;
+                let num_elems = bytes.len() / 2;
                 let mut bf16_u16 = vec![0u16; num_elems];
-                for (value, chunk) in bf16_u16.iter_mut().zip(all_data[start..end].chunks_exact(2)) {
+                for (value, chunk) in bf16_u16.iter_mut().zip(bytes.chunks_exact(2)) {
                     *value = u16::from_le_bytes([chunk[0], chunk[1]]);
                 }
                 let s = Shape::from_dims(&shape);
@@ -540,41 +524,50 @@ fn load_tensors_safetensors_with_metadata(
                 // Two naming conventions in the wild:
                 //   LTX-2:         `foo.weight_scale` (suffix on the key)
                 //   Comfy-scaled:  `foo.scale_weight` (replaces `.weight` with `.scale_weight`)
-                let read_scale = |s_start: usize| -> f32 {
-                    f32::from_le_bytes([
-                        all_data[s_start], all_data[s_start+1],
-                        all_data[s_start+2], all_data[s_start+3],
-                    ])
-                };
-                let lookup_scale = |key: &str| -> Option<f32> {
-                    let info = metadata.get(key)?;
-                    let off = info["data_offsets"].as_array()?;
-                    let s_start = off[0].as_u64()? as usize;
-                    Some(read_scale(s_start))
-                };
-                let scale = lookup_scale(&format!("{name}_scale"))
-                    .or_else(|| {
+                let scale = if let Some(header) = header_for_scales {
+                    let lookup_scale = |key: &str| -> Option<f32> {
+                        let info = header.get(key)?;
+                        let off = info["data_offsets"].as_array()?;
+                        let s_start = off[0].as_u64()? as usize;
+                        // Scale is stored as a single F32 in the file's data
+                        // segment; mmap exposes it via tensor_bytes() too if
+                        // we look it up by name. Simpler: re-mmap-slice into
+                        // the data region using the same MmapFile.
+                        let bytes = mmap.tensor_bytes(key)?;
+                        if bytes.len() >= 4 {
+                            let _ = s_start; // header offset isn't needed when we have tensor_bytes
+                            Some(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                        } else {
+                            None
+                        }
+                    };
+                    lookup_scale(&format!("{name}_scale")).or_else(|| {
                         name.strip_suffix(".weight")
                             .and_then(|base| lookup_scale(&format!("{base}.scale_weight")))
                     })
-                    .unwrap_or(1.0);
-                let num_elems = end - start;
+                } else {
+                    None
+                }
+                .unwrap_or(1.0);
+                let num_elems = bytes.len();
                 let mut bf16_u16 = vec![0u16; num_elems];
-                for (value, &byte) in bf16_u16.iter_mut().zip(all_data[start..end].iter()) {
+                for (value, &byte) in bf16_u16.iter_mut().zip(bytes.iter()) {
                     let f = fp8_e4m3_to_f32(byte) * scale;
                     *value = half::bf16::from_f32(f).to_bits();
                 }
                 let mut tensor = Tensor::zeros_dtype(
-                    Shape::from_dims(&shape), DType::BF16, device.clone(),
+                    Shape::from_dims(&shape),
+                    DType::BF16,
+                    device.clone(),
                 )?;
                 tensor.copy_from_bf16_slice(&bf16_u16)?;
                 tensor
             }
             "F16" => {
                 // F16: 2 bytes per element — convert to F32 then upload
-                let num_elems = (end - start) / 2;
+                let num_elems = bytes.len() / 2;
                 let mut f32_data = vec![0.0f32; num_elems];
-                for (value, chunk) in f32_data.iter_mut().zip(all_data[start..end].chunks_exact(2)) {
+                for (value, chunk) in f32_data.iter_mut().zip(bytes.chunks_exact(2)) {
                     let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                     *value = half::f16::from_bits(bits).to_f32();
                 }
@@ -582,17 +575,48 @@ fn load_tensors_safetensors_with_metadata(
             }
             _ => {
                 // F32: 4 bytes per element
-                let num_floats = (end - start) / 4;
+                let num_floats = bytes.len() / 4;
                 let mut data = vec![0.0f32; num_floats];
-                for (value, chunk) in data.iter_mut().zip(all_data[start..end].chunks_exact(4)) {
-                    let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                    *value = f32::from_le_bytes(bytes);
+                for (value, chunk) in data.iter_mut().zip(bytes.chunks_exact(4)) {
+                    *value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 }
                 Tensor::from_vec(data, Shape::from_dims(&shape), device.clone())?
             }
         };
         tensors.insert(name.clone(), tensor);
     }
+    Ok(tensors)
+}
+
+fn load_tensors_safetensors_with_metadata(
+    path: &Path,
+    device: Arc<CudaDevice>,
+) -> Result<(HashMap<String, Tensor>, HashMap<String, String>)> {
+    // Pre-2026-05-10 this path used `read_to_end` — the entire safetensors
+    // file (often 10–20+ GB for diffusion DiTs) was pulled into the heap
+    // before per-tensor copy. Migrated to `eri-safetensors`'s MAP_NORESERVE
+    // mmap: pages are paged in on-demand and freed by the OS without swap.
+    // The data segment is never materialized as a single heap allocation.
+    use eri_safetensors::MmapFile;
+
+    let mmap = MmapFile::open_path(path).map_err(|e| {
+        Error::Io(format!(
+            "eri-safetensors mmap open '{}': {e}",
+            path.display()
+        ))
+    })?;
+
+    // Re-parse the header for `__metadata__` (mmap layer indexes data
+    // tensors only). Cheap: header is at most 100 MB and the kernel has
+    // already pulled it into the page cache via the mmap probe.
+    let extra_metadata = read_safetensors_extra_metadata(path).unwrap_or_default();
+    let metadata_obj_for_scale = read_safetensors_full_header(path).ok();
+
+    // Allocate tensors using mmap'd byte slices. No bulk heap copy — each
+    // tensor copies its own slice into device memory, and the mmap is
+    // dropped at function exit.
+    let tensors =
+        decode_tensors_from_mmap(&mmap, metadata_obj_for_scale.as_ref(), &device, |_| true)?;
 
     Ok((tensors, extra_metadata))
 }
@@ -626,6 +650,9 @@ pub fn load_file<P: AsRef<Path>>(
 ///
 /// Uses memory-mapping — only the selected tensors' bytes are paged in from
 /// disk. The full file is NOT read into RAM, so this works for 40GB+ files.
+///
+/// Backed by `eri-safetensors`'s MAP_NORESERVE mmap (same path as
+/// `load_tensors_safetensors_with_metadata` post-2026-05-10).
 pub fn load_file_filtered<P, F>(
     path: P,
     device: &Arc<CudaDevice>,
@@ -635,118 +662,17 @@ where
     P: AsRef<Path>,
     F: Fn(&str) -> bool,
 {
-    use serde_json::Value;
-
-    let file = File::open(path.as_ref())
-        .map_err(|e| Error::Io(format!("Failed to open file: {:?}", e)))?;
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| Error::Io(format!("Failed to mmap: {:?}", e)))?;
-
-    if mmap.len() < 8 {
-        return Err(Error::Io("File too small for safetensors".into()));
-    }
-
-    // Parse header
-    let header_size = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
-    let header_end = 8 + header_size;
-    let data_start = header_end; // tensor data begins right after header
-
-    let metadata: Value = serde_json::from_slice(&mmap[8..header_end])
-        .map_err(|e| Error::Io(format!("Failed to parse metadata: {:?}", e)))?;
-    let metadata_obj = metadata.as_object()
-        .ok_or_else(|| Error::InvalidInput("Invalid metadata format".to_string()))?;
-
-    let mut tensors = HashMap::new();
-
-    for (name, info) in metadata_obj {
-        if name == "__metadata__" || !filter(name) {
-            continue;
-        }
-
-        let shape = info["shape"].as_array()
-            .ok_or_else(|| Error::InvalidInput("Missing shape".to_string()))?
-            .iter()
-            .map(|v| v.as_u64().ok_or_else(|| Error::InvalidInput("invalid shape".into())).map(|u| u as usize))
-            .collect::<Result<Vec<_>>>()?;
-
-        let offsets = info["data_offsets"].as_array()
-            .ok_or_else(|| Error::InvalidInput("Missing data_offsets".to_string()))?;
-        let start = data_start + offsets.first().and_then(|v| v.as_u64())
-            .ok_or_else(|| Error::InvalidInput("invalid start".into()))? as usize;
-        let end = data_start + offsets.get(1).and_then(|v| v.as_u64())
-            .ok_or_else(|| Error::InvalidInput("invalid end".into()))? as usize;
-
-        let dtype_str = info["dtype"].as_str().unwrap_or("F32");
-        if !matches!(dtype_str, "F32" | "BF16" | "F16" | "F8_E4M3") {
-            continue;
-        }
-
-        let data = &mmap[start..end];
-
-        let tensor = match dtype_str {
-            "BF16" => {
-                let num_elems = data.len() / 2;
-                let mut bf16_u16 = vec![0u16; num_elems];
-                for (value, chunk) in bf16_u16.iter_mut().zip(data.chunks_exact(2)) {
-                    *value = u16::from_le_bytes([chunk[0], chunk[1]]);
-                }
-                let mut tensor = Tensor::zeros_dtype(
-                    Shape::from_dims(&shape), DType::BF16, device.clone(),
-                )?;
-                tensor.copy_from_bf16_slice(&bf16_u16)?;
-                tensor
-            }
-            "F8_E4M3" => {
-                // FP8 E4M3: 1 byte per element. Dequant: value * weight_scale → BF16.
-                // Two naming conventions (see load_tensors for details).
-                let lookup_scale = |key: &str| -> Option<f32> {
-                    let si = metadata_obj.get(key)?;
-                    let off = si["data_offsets"].as_array()?;
-                    let s_start = data_start + off[0].as_u64()? as usize;
-                    Some(f32::from_le_bytes([
-                        mmap[s_start], mmap[s_start+1], mmap[s_start+2], mmap[s_start+3],
-                    ]))
-                };
-                let scale = lookup_scale(&format!("{name}_scale"))
-                    .or_else(|| {
-                        name.strip_suffix(".weight")
-                            .and_then(|base| lookup_scale(&format!("{base}.scale_weight")))
-                    })
-                    .unwrap_or(1.0);
-                let num_elems = data.len();
-                let mut bf16_u16 = vec![0u16; num_elems];
-                for (value, &byte) in bf16_u16.iter_mut().zip(data.iter()) {
-                    let f = fp8_e4m3_to_f32(byte) * scale;
-                    *value = half::bf16::from_f32(f).to_bits();
-                }
-                let mut tensor = Tensor::zeros_dtype(
-                    Shape::from_dims(&shape), DType::BF16, device.clone(),
-                )?;
-                tensor.copy_from_bf16_slice(&bf16_u16)?;
-                tensor
-            }
-            "F16" => {
-                let num_elems = data.len() / 2;
-                let mut f32_data = vec![0.0f32; num_elems];
-                for (value, chunk) in f32_data.iter_mut().zip(data.chunks_exact(2)) {
-                    let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                    *value = half::f16::from_bits(bits).to_f32();
-                }
-                Tensor::from_vec(f32_data, Shape::from_dims(&shape), device.clone())?
-            }
-            _ => {
-                let num_floats = data.len() / 4;
-                let mut f32_data = vec![0.0f32; num_floats];
-                for (value, chunk) in f32_data.iter_mut().zip(data.chunks_exact(4)) {
-                    *value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                }
-                Tensor::from_vec(f32_data, Shape::from_dims(&shape), device.clone())?
-            }
-        };
-        tensors.insert(name.clone(), tensor);
-    }
-
-    Ok(tensors)
+    let mmap = eri_safetensors::MmapFile::open_path(path.as_ref()).map_err(|e| {
+        Error::Io(format!(
+            "eri-safetensors mmap open '{}': {e}",
+            path.as_ref().display()
+        ))
+    })?;
+    // FP8 scale lookup needs the parsed safetensors header (the mmap layer
+    // skips `__metadata__` and only indexes data tensors). Re-read the
+    // header bytes once — they're already paged in by the mmap probe.
+    let header_for_scales = read_safetensors_full_header(path.as_ref()).ok();
+    decode_tensors_from_mmap(&mmap, header_for_scales.as_ref(), device, filter)
 }
 
 /// Save a safetensors file (convenience function)  

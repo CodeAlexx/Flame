@@ -361,10 +361,21 @@ fn forward_inner(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> S
                 dims
             )));
         }
+        // Each dim must equal the matching target OR be 1 (PyTorch
+        // broadcasting). The materialized BF16 fallback path expands a
+        // singleton via `broadcast_to(target_dims)` before reshape (see
+        // `forward_bf16_fallback` mask_prepared block), so a `[B,1,1,K]`
+        // padding mask broadcasts cleanly through. The cuDNN-flash path
+        // is gated on `mask.is_none()`, so no concern there. The
+        // streaming path (`cuda_ops_bf16::sdpa_stream_bf16`) is only
+        // reached for shapes > 2 G elements and the masked broadcast
+        // case at that scale is not exercised by any current trainer;
+        // if a future caller hits it we'll need a streaming-path
+        // materialization too.
         if !(dims[0] == bq || dims[0] == 1)
             || !(dims[1] == hq || dims[1] == 1)
-            || dims[2] != q_len
-            || dims[3] != k_len
+            || !(dims[2] == q_len || dims[2] == 1)
+            || !(dims[3] == k_len || dims[3] == 1)
         {
             return Err(Error::InvalidInput(format!(
                 "mask dims {:?} not broadcastable to [B,H,Q,K] = [{},{},{},{}]",
