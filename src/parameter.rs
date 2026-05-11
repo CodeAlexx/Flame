@@ -71,13 +71,42 @@ impl Parameter {
         Ok(data_lock.dtype())
     }
 
-    /// Set the parameter data directly
+    /// Set the parameter data directly.
+    ///
+    /// Pinning self.id across in-place updates: optimizers like Adafactor /
+    /// Lion / Prodigy / StableAdamW / RAdamScheduleFree compute updates as
+    /// new Tensors (via cast/detach) and write them back with set_data. Each
+    /// such Tensor has a fresh TensorId. Without this overwrite step,
+    /// `Parameter.id` (cached at `new()`) drifts out of sync with the inner
+    /// storage's id — every downstream `param.id()` query returns a stale
+    /// value that never matches the next forward's recorded op outputs, so
+    /// backward stores grads under the new (post-set_data) id and
+    /// `grads.get(param.id())` returns None forever. The optimizer then
+    /// silently no-ops every subsequent step.
+    ///
+    /// Fix: rewrite the incoming tensor's id to match `self.id` BEFORE
+    /// storing. Parameter.id stays fixed; the next forward records ops with
+    /// this same id; grads land at this id; AdamW-style state (m, v) keyed
+    /// by param.id stays valid across steps. Verified end-to-end with
+    /// Adafactor / RAdamScheduleFree on z-image and u1 trainers.
     pub fn set_data(&self, tensor: Tensor) -> Result<()> {
         let mut data_lock = self
             .data
             .lock()
             .map_err(|_| Error::Training("parameter data mutex poisoned".into()))?;
-        *data_lock = tensor;
+        let mut t = tensor;
+        // Pin self.id across in-place updates (see top of impl block for why).
+        t.id = self.id;
+        // ALSO pin requires_grad. Optimizers like Adafactor / Lion / Prodigy
+        // / StableAdamW / RAdamScheduleFree write back via
+        // `set_data(cast_back.detach()?)` — `detach()` strips requires_grad
+        // before reaching us. If the stored tensor ends up with
+        // requires_grad=false, the next forward's `param.tensor().to_dtype(...)`
+        // skips the autograd Cast record (see `tensor.rs::to_dtype`), so
+        // backward can't reach this parameter at all. Without this line, every
+        // non-AdamW optimizer silently no-ops from step 1 onward.
+        t.requires_grad = self.requires_grad;
+        *data_lock = t;
         Ok(())
     }
 
