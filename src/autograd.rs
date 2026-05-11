@@ -1602,13 +1602,23 @@ impl AutogradContext {
                 eprintln!("╚══════════════════════════════════════════════════════════\n");
             }
 
-            // Re-enable autograd (tape was already drained at the top)
+            // Re-enable autograd (tape was already drained at the top).
+            // Also drop the checkpoint closure cache here: each forward
+            // inserts one Arc<dyn Fn> per checkpoint() call, capturing per-
+            // block state (weights, RoPE tables, KV pair, LoRA adapters,
+            // saved tensors). Backward consumes them via `checkpoint_fns
+            // .get(...)` but doesn't remove them — so without this clear,
+            // `checkpoint_fns` grows by ~N-layers per training step and
+            // pins megabytes of GPU storage per entry. Trainers using
+            // gradient checkpointing on streamed weights (sensenova_u1,
+            // anima, etc.) OOM after ~30-100 steps from this alone.
             {
                 let mut ctx = AUTOGRAD_CONTEXT
                     .lock()
                     .map_err(|_| Error::Training("autograd context mutex poisoned".into()))?;
                 ctx.enabled = prev_enabled;
                 AUTOGRAD_ENABLED.store(prev_enabled, Ordering::Relaxed);
+                ctx.checkpoint_fns.clear();
             }
 
             gradients
