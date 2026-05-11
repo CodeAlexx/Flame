@@ -291,9 +291,21 @@ This is a critical area with several implementations. **Use these for inference*
 - `cuda_ops_bf16::layer_norm_backward_bf16` — backward (training)
 
 ### RMSNorm
+- ⭐ `norm::rms_norm(x, normalized_shape, weight, eps)` — `norm.rs:1100`
+  **Training-safe public entry.** Records `Op::RMSNorm` (NVRTC kernels
+  `RMS_NORM_FWD_KERNEL_BF16` + `RMS_NORM_BWD_KERNEL_BF16` at `norm.rs:1213` /
+  `:1258`). Forward and backward both F32-accumulate internally over BF16
+  storage. Bit-exact backward against the in-trainer primitive F32 chain
+  (cos = 1.000000, mag_ratio = 1.000000 on Z-Image [1,4096,2560] +
+  [1,24,4096,128] shapes) — see
+  `tests/rms_norm_vs_primitive_zimage.rs`. EDv2 Z-Image's
+  `primitive_rms_norm` wrapper now delegates here; the older "BF16 fused
+  backward drifts ~1.25× per layer" issue was fixed in commit `bcc37a7`
+  and pinned by the parity test.
 - ⭐ `cuda_ops_bf16::rms_norm_bf16(x, weight, eps)` — `cuda_ops_bf16.rs:263`
-  The main entry. Wraps `fc_rms_norm_bf16` (cuda_ops.cu). Has the
+  Inference-only entry. Wraps `fc_rms_norm_bf16` (cuda_ops.cu). Has the
   block-per-row + parallel reduction kernel as of 2026-04 (was 1-thread-per-row scalar).
+  Does NOT record autograd — use `norm::rms_norm` from trainers.
 - `cuda_ops_bf16::rms_norm_bf16_to_f32(x, eps)` — `cuda_ops_bf16.rs:296` — F32 output variant
 - ⭐ `ops::fused_inference::fused_rms_norm(x, weight, eps)` — `ops/fused_inference.rs:116`
   Direct call to `flame_fused_rms_norm_bf16` kernel (`src/cuda/fused_rms_norm.cu`).
