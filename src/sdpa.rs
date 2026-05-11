@@ -957,12 +957,12 @@ fn forward_bf16_fallback(
 
     let total = t0.elapsed().as_millis();
     if do_tile {
-        log::info!(
+        log::debug!(
             "[SDPA] tiled total={}ms (BH={} Q={} K={} d={} q_tile={} num_tiles={})",
             total, bh, q_len, k_len, d_q, q_tile, num_tiles
         );
     } else {
-        log::info!(
+        log::debug!(
             "[SDPA] reshape={}ms total={}ms (BH={} Q={} K={} d={})",
             t_reshape, total, bh, q_len, k_len, d_q
         );
