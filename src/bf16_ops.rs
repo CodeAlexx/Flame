@@ -1808,6 +1808,53 @@ fn gate_residual_fused_bf16_strided(
 
 const CUDA_SWIGLU_FUSED: &str = r#"
 #include <cuda_bf16.h>
+
+// 2026-05-12 perf: vectorized BF16 SwiGLU via __nv_bfloat162 pair loads.
+// Each thread processes 2 contiguous BF16 elements with one 4-byte load
+// per input. Scalar fallback for the tail when total % 2 != 0.
+//
+// Math is still per-element F32 (silu = x / (1 + exp(-x))) to preserve
+// BF16-storage / F32-accumulation contract from the legacy kernel.
+extern "C" __global__
+void swiglu_fused_bf16_vec2_kernel(
+    const __nv_bfloat16* __restrict__ GATE,
+    const __nv_bfloat16* __restrict__ UP,
+    __nv_bfloat16* __restrict__ Y,
+    long total)
+{
+    const long n_pairs = total / 2;
+    const __nv_bfloat162* GATE2 = reinterpret_cast<const __nv_bfloat162*>(GATE);
+    const __nv_bfloat162* UP2   = reinterpret_cast<const __nv_bfloat162*>(UP);
+    __nv_bfloat162* Y2          = reinterpret_cast<__nv_bfloat162*>(Y);
+
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const long stride = (long)blockDim.x * (long)gridDim.x;
+    for (; idx < n_pairs; idx += stride) {
+        __nv_bfloat162 g2 = GATE2[idx];
+        __nv_bfloat162 u2 = UP2[idx];
+        float g_lo = __bfloat162float(__low2bfloat16(g2));
+        float g_hi = __bfloat162float(__high2bfloat16(g2));
+        float u_lo = __bfloat162float(__low2bfloat16(u2));
+        float u_hi = __bfloat162float(__high2bfloat16(u2));
+        float silu_lo = g_lo / (1.0f + expf(-g_lo));
+        float silu_hi = g_hi / (1.0f + expf(-g_hi));
+        __nv_bfloat16 y_lo = __float2bfloat16(silu_lo * u_lo);
+        __nv_bfloat16 y_hi = __float2bfloat16(silu_hi * u_hi);
+        Y2[idx] = __halves2bfloat162(y_lo, y_hi);
+    }
+
+    // Scalar tail for odd `total`. Only the very last thread does this.
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        const long tail_start = n_pairs * 2;
+        for (long t = tail_start; t < total; ++t) {
+            float g = __bfloat162float(GATE[t]);
+            float u = __bfloat162float(UP[t]);
+            float s = g / (1.0f + expf(-g));
+            Y[t] = __float2bfloat16(s * u);
+        }
+    }
+}
+
 extern "C" __global__
 void swiglu_fused_bf16_kernel(
     const __nv_bfloat16* __restrict__ GATE,  // [total]
@@ -1918,10 +1965,19 @@ fn swiglu_fused_bf16_contig(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 
     };
 
-    ensure(&gate.device, "swiglu_fused_bf16_kernel", CUDA_SWIGLU_FUSED)?;
+    // 2026-05-12 perf: prefer the vec2 kernel (one __nv_bfloat162 load per
+    // thread per input, 4-byte transactions) when total elements are even.
+    // CUDA pool buffers are 256-byte aligned so 2-element alignment holds.
+    // Env override FLAME_SWIGLU_LEGACY=1 forces the scalar kernel.
+    let use_vec2 = total >= 2
+        && total % 2 == 0
+        && std::env::var("FLAME_SWIGLU_LEGACY").map(|v| v == "0").unwrap_or(true);
+
+    let kernel_name = if use_vec2 { "swiglu_fused_bf16_vec2_kernel" } else { "swiglu_fused_bf16_kernel" };
+    ensure(&gate.device, kernel_name, CUDA_SWIGLU_FUSED)?;
     let f = gate.device
-        .get_func("swiglu_fused_bf16_kernel", "swiglu_fused_bf16_kernel")
-        .ok_or_else(|| Error::Cuda("swiglu_fused_bf16_kernel missing".into()))?;
+        .get_func(kernel_name, kernel_name)
+        .ok_or_else(|| Error::Cuda(format!("{kernel_name} missing")))?;
 
     let gs = match &gate.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
     let us = match &up.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
@@ -1929,7 +1985,9 @@ fn swiglu_fused_bf16_contig(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     let ys = ensure_unique_slice(ys)?;
 
     unsafe {
-        f.launch(lc(total), (slice_ref(gs), slice_ref(us), ys, total as i64))?;
+        // Launch config: vec2 path divides work by 2 (one pair per thread).
+        let work_count = if use_vec2 { (total + 1) / 2 } else { total };
+        f.launch(lc(work_count), (slice_ref(gs), slice_ref(us), ys, total as i64))?;
     }
     Ok(out)
 }

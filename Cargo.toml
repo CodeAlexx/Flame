@@ -136,6 +136,11 @@ harness = false
 name = "permute_bench"
 harness = false
 
+# SwiGLU current-kernel bandwidth measurement (2026-05-12). Read-only.
+[[bench]]
+name = "swiglu_bench"
+harness = false
+
 # Add session 4 — first binary, same 5%-within gate.
 [[bench]]
 name = "add_iter_alloc"
