@@ -137,7 +137,15 @@
 - `.sum_dim / .sum_dim_keepdim / .mean_dim / .max_dim`
 
 ### Cast
-- `.to_dtype(DType)` — generic cast
+- `.to_dtype(DType)` — generic cast. `tensor.rs:752`. As of 2026-05-12
+  (commit `1332019`) has direct-call fast paths for the two hot cases:
+  BF16→F32 and F32→BF16 (both contiguous source). The fast path allocates
+  the output buffer directly and dispatches a single `bf16_convert` kernel
+  via `bf16_to_f32_u16` / `f32_to_bf16_u16`, skipping the legacy
+  F32-staging round-trip (`alloc_aligned_f32` + `storage.to_f32` +
+  `dtod_copy` + optional second conversion = 2–3 kernels + 2–3 allocs).
+  ~16–34× faster on production cast shapes. All other dtype combinations
+  still hit the staging path.
 - via `ops::cast::{cast_bf16_to_f32, cast_f32_to_bf16}` — explicit fast paths
 
 ### Materialize / read back
@@ -285,27 +293,42 @@ This is a critical area with several implementations. **Use these for inference*
 - `layer_norm::layer_norm_into(...)` — `layer_norm.rs:426` — output-into variant
 - `layer_norm::LayerNorm` (struct) — `layer_norm.rs:37`
 - `layer_norm::LayerNormConfig` — `layer_norm.rs:20`
-- ⭐ `cuda_ops_bf16::layer_norm_bf16(x, gamma, beta, eps)` — `cuda_ops_bf16.rs:316`
+- ⭐ `cuda_ops_bf16::layer_norm_bf16(x, gamma, beta, eps)` — `cuda_ops_bf16.rs:316`. Forward dispatches to `layer_norm_forward_bf16_vec_kernel` when `norm_size % 4 == 0` (2026-05-12, commit `774d675`); `FLAME_LAYER_NORM_FWD_LEGACY=1` forces the smem-tree path. Backward dispatches to `layer_norm_backward_bf16_vec_kernel` + the cross-row `layer_norm_grad_weight_bias_bf16_vec_kernel` (commit `4d46832`); `FLAME_LAYER_NORM_LEGACY=1` forces the legacy scalar path.
   Direct BF16 call (used by FLUX `linear_norm_no_affine` helper).
 - `cuda_ops_bf16::layer_norm_bf16_with_stats / layer_norm_bf16_into_with_stats` — variants returning mean/rstd for backward
 - `cuda_ops_bf16::layer_norm_backward_bf16` — backward (training)
 
 ### RMSNorm
 - ⭐ `norm::rms_norm(x, normalized_shape, weight, eps)` — `norm.rs:1100`
-  **Training-safe public entry.** Records `Op::RMSNorm` (NVRTC kernels
-  `RMS_NORM_FWD_KERNEL_BF16` + `RMS_NORM_BWD_KERNEL_BF16` at `norm.rs:1213` /
-  `:1258`). Forward and backward both F32-accumulate internally over BF16
-  storage. Bit-exact backward against the in-trainer primitive F32 chain
-  (cos = 1.000000, mag_ratio = 1.000000 on Z-Image [1,4096,2560] +
-  [1,24,4096,128] shapes) — see
-  `tests/rms_norm_vs_primitive_zimage.rs`. EDv2 Z-Image's
-  `primitive_rms_norm` wrapper now delegates here; the older "BF16 fused
-  backward drifts ~1.25× per layer" issue was fixed in commit `bcc37a7`
-  and pinned by the parity test.
-- ⭐ `cuda_ops_bf16::rms_norm_bf16(x, weight, eps)` — `cuda_ops_bf16.rs:263`
-  Inference-only entry. Wraps `fc_rms_norm_bf16` (cuda_ops.cu). Has the
-  block-per-row + parallel reduction kernel as of 2026-04 (was 1-thread-per-row scalar).
-  Does NOT record autograd — use `norm::rms_norm` from trainers.
+  **Canonical RMSNorm entry for both training and inference.** Records
+  `Op::RMSNorm`. As of 2026-05-12 (commit `2ebc2d1`) dispatches three new
+  vectorized NVRTC kernels when `norm_size % 4 == 0` (all production shapes
+  qualify):
+    - `RMS_NORM_FWD_KERNEL_BF16_VEC` at `:1368` — block per row, 256 threads,
+      `bf16x4` loads, warp-shuffle reduction. 13.5–16.1× faster than legacy.
+    - `RMS_NORM_BWD_KERNEL_BF16_VEC` at `:1522` — same shape, writes
+      `grad_input` only. 9.5–14.8× faster.
+    - `RMS_NORM_GRAD_WEIGHT_KERNEL_BF16` at `:1644` — cross-row dgamma kernel
+      (`COLS_PER_BLOCK=64`, `ROWS_PER_BLOCK=512`). ~500× fewer atomicAdds.
+  Legacy scalar kernels (`RMS_NORM_FWD_KERNEL_BF16` / `_BWD_KERNEL_BF16`)
+  remain for the `norm_size % 4 != 0` fallback. `FLAME_RMS_NORM_LEGACY=1`
+  forces scalar for A/B benchmarking. Bit-exact backward against the
+  primitive F32 chain (cos = 1.000000 on Z-Image shapes) — see
+  `tests/rms_norm_vs_primitive_zimage.rs`. EDv2 Z-Image's `primitive_rms_norm`
+  wrapper delegates here.
+- `rms_norm_backward_for_bench(grad_out, input, weight, inv_rms, batch_size, norm_size)` — `norm.rs:856`
+  ⚠️ **Bench-only escape hatch.** `#[doc(hidden)]`, hidden from API
+  consumers. Calls `rms_norm_backward` directly without the autograd
+  machinery. Used by `benches/rms_norm_vec.rs` to time the backward kernel
+  in isolation. Do NOT use in production code.
+- ⭐ `cuda_ops_bf16::rms_norm_bf16(x, weight, eps)` — `cuda_ops_bf16.rs:241`
+  Inference entry. As of 2026-05-12 (commit `d729ede`) **delegates to
+  `norm::rms_norm`** so inference picks up the same vec kernel speedup
+  without a second rewrite (closed a 2× gap vs PyTorch on the inference
+  path). Does NOT record autograd (caller's `x` doesn't require grad in
+  inference). The older `fc_rms_norm_bf16` smem-tree kernel in
+  `cuda/cuda_ops.cu` remains as the fallback inside `norm::` for shapes
+  where `norm_size % 4 != 0`.
 - `cuda_ops_bf16::rms_norm_bf16_to_f32(x, eps)` — `cuda_ops_bf16.rs:296` — F32 output variant
 - ⭐ `ops::fused_inference::fused_rms_norm(x, weight, eps)` — `ops/fused_inference.rs:116`
   Direct call to `flame_fused_rms_norm_bf16` kernel (`src/cuda/fused_rms_norm.cu`).
@@ -328,7 +351,12 @@ This is a critical area with several implementations. **Use these for inference*
   Functional. Used by SDXL UNet, Klein VAE, LDM VAE, LTX-2 audio VAE, LTX-2 upsampler.
 - `group_norm::GroupNorm` (struct) — `group_norm.rs:674`
 - `cuda_ops_bf16::group_norm_bf16(x, gamma, beta, groups, eps)` — `cuda_ops_bf16.rs:619`
-  ⚠️ NHWC layout only — see CONVENTIONS for the layout trap.
+  ⚠️ NHWC layout only — see CONVENTIONS for the layout trap. Stats kernel
+  dispatches to `group_norm_compute_stats_bf16_vec_kernel` (vec=4 +
+  warp-shuffle) when `spatial_size % 4 == 0` (2026-05-12, commit `f3b75bb`);
+  `FLAME_GROUP_NORM_STATS_LEGACY=1` forces the smem-tree path. The apply
+  kernel is unchanged. Backward still has the auditor-flagged 1-thread
+  bug — separate fix.
 - `cuda_ops_bf16::group_norm_bf16_with_stats` — for backward
 - `cuda_ops_bf16::group_norm_backward_bf16` — training
 
@@ -475,10 +503,17 @@ dispatch registry in `tensor_iterator/dispatch.rs`.
 
 ### `bf16_convert.rs` — BF16↔F32 cast
 - `bf16_u16_to_f32(...)` — `:54` — vectorized via `__nv_bfloat162` (2-element/thread)
-- `f32_to_bf16_u16(...)` — `:70`
+- `f32_to_bf16_u16(...)` — `:100` — wraps the `f32_to_bf16` NVRTC kernel; takes
+  raw `dst: u64` so callers (e.g. `Tensor::to_dtype` fast path) can write into
+  a pre-allocated BF16 buffer without going through `TensorStorage`.
+- ⭐ `bf16_to_f32_u16(...)` — `:119` — direct BF16→F32 cast helper added
+  2026-05-12 for the `Tensor::to_dtype` BF16→F32 fast path. Takes raw `src: u64`
+  + `dst: &mut CudaSlice<f32>`. Eliminates the F32-staging round-trip that
+  `to_dtype` did via `storage.to_f32 + dtod_copy + optional f32_to_bf16` —
+  collapses 2–3 kernel launches into one.
 - `stochastic_round_to_bf16_cpu(f, rng_u32)` — `:~125` — CPU reference for
   unbiased F32→BF16 rounding (GPU path is `bf16_ops::stochastic_round_f32_to_bf16`).
-- (The Rust call site is `ops::cast::cast_bf16_to_f32 / cast_f32_to_bf16`.)
+- (The high-level Rust call site is `ops::cast::cast_bf16_to_f32 / cast_f32_to_bf16`.)
 
 ### `bf16_normal.rs` — Gaussian noise generator
 - `normal_bf16(...)` — Box-Muller in BF16 directly
@@ -761,10 +796,12 @@ Recently-added variants:
 ## Optimizers
 
 - `adam::AdamW` — re-exported as `nn::AdamW`. Standard AdamW with BF16 master / F32 moments; `set_lr()` supports runtime schedulers. DECOUPLED weight decay. Two fused-kernel paths:
-  - Single-tensor kernels (`adam_fused_bf16_kernel` etc., `adam.rs:54-225`) — fallback for F32 params, mixed-dtype slices, or when `FLAME_ADAM_NO_MULTI_TENSOR=1`.
-  - Multi-tensor kernel (`adam_fused_multi_bf16_f32grad_kernel`, `adam.rs:225-345`) — auto-selected when **all** params are BF16 and **all** grads are F32 (the dominant LoRA training case). One kernel launch covers every parameter. Backed by a cached device-side metadata buffer (`fused::MultiTensorMetaCache`).
-  - **Stochastic-round variants** (added 2026-05-08): `adam_fused_bf16_f32grad_stoch_kernel` + `adam_fused_multi_bf16_f32grad_stoch_kernel`. Identical math to the round-to-nearest variants except the final F32 → BF16 store applies lower-16-bit hash-driven stochastic rounding seeded from the step counter. Toggled via `Adam::set_stochastic_round(true)` / `AdamW::set_stochastic_round(true)`. Off by default (byte-identical to prior). Only fires for BF16-storage params; F32-storage trainers (e.g. EDv2 Klein, which keeps LoRA params in F32 and casts to BF16 only at forward time) take the F32-param fused path and never hit this kernel.
-- `adam::adam_fused_multi_tensor_step` (re-exported, `adam.rs:413`) — direct launcher for parity-test access. Signature gained a trailing `stoch_seed: Option<u64>` argument 2026-05-08; `None` preserves prior behavior. Production code uses `Adam::step` / `AdamW::step` instead.
+  - Single-tensor kernels (`adam_fused_bf16_kernel` etc., `adam.rs:54-225`) — fallback for mixed-dtype slices or when `FLAME_ADAM_NO_MULTI_TENSOR=1`.
+  - Multi-tensor BF16 kernel (`adam_fused_multi_bf16_f32grad_kernel`, `adam.rs:259+`) — auto-selected when **all** params are BF16 and **all** grads are F32 (Klein 9B / dominant LoRA case). One kernel launch covers every parameter. Backed by a cached device-side metadata buffer (`fused::MultiTensorMetaCache`).
+  - Multi-tensor F32 kernel (`adam_fused_multi_f32param_f32grad_kernel`, `adam.rs:305-359`) — added Phase 1 of the 2026-05-12 launch-storm refactor. Auto-selected when **all** params are F32 and **all** grads are F32 (zimage LoRA / no-quant trainers). Same packed-buffer pattern as BF16 path, no casts, no stoch. Bit-identical to per-tensor `adam_fused_f32param_f32grad_kernel`.
+  - **Stochastic-round variants** (added 2026-05-08): `adam_fused_bf16_f32grad_stoch_kernel` + `adam_fused_multi_bf16_f32grad_stoch_kernel`. Identical math to the round-to-nearest variants except the final F32 → BF16 store applies lower-16-bit hash-driven stochastic rounding seeded from the step counter. Toggled via `Adam::set_stochastic_round(true)` / `AdamW::set_stochastic_round(true)`. Off by default (byte-identical to prior). Only fires for BF16-storage params; F32-storage trainers automatically take the new F32-param multi-tensor path.
+- `adam::adam_fused_multi_tensor_step` (re-exported, `adam.rs:858`) — direct launcher for parity-test access. Signature is `(cache, device, n, param_is_bf16: bool, grad_is_bf16: bool, packed, …, stoch_seed: Option<u64>)`. The `param_is_bf16` discriminator (added Phase 1, 2026-05-12) routes between BF16 and F32 multi-tensor kernels; `(F32, BF16)` combo returns Err — caller must route to per-param fallback. Production code uses `Adam::step` / `AdamW::step` instead.
+- `adam::adam_fused_step_f32` (re-exported, `adam.rs:707`) — single-tensor F32 variant. Used as the parity baseline for the F32 multi-tensor kernel and the fallback for `(F32 param, BF16 grad)` combos.
 - `adam::adam_fused_step` (re-exported, `adam.rs:546`) — single-tensor variant; same `stoch_seed: Option<u64>` addition.
 - `adam::Adam::set_stochastic_round(bool)` / `Adam::is_stochastic_round() -> bool` — toggle and read of the stochastic-round flag (added 2026-05-08).
 - `adam::AdamW::set_stochastic_round(bool)` / `AdamW::is_stochastic_round() -> bool` — same on AdamW (forwards to Adam).
@@ -772,8 +809,10 @@ Recently-added variants:
 - `sgd::*` — basic SGD
 - `parameter::Parameter` — re-exported as `Var` and `Parameter`. Wraps a `Tensor` with `requires_grad=true`.
 - `nn::Optimizer` trait — `lib.rs:258` — `step()` + `zero_grad()`
-- ⭐ `ops::grad_norm::global_l2_norm(grads)` — `ops/grad_norm.rs:48`. Device-resident global L2 norm of a slice of gradient tensors. Returns 1-element FP32 device tensor; caller decides when (if ever) to `.item()`. Mixed-dtype (BF16 + FP32) supported, casts internally.
-- ⭐ `ops::grad_norm::global_l2_norm_with_scale(grads, max_norm, eps)` — `ops/grad_norm.rs:79`. Same but also returns the clip-scale factor as a 1-element device tensor. One D2H sync at the end if logging needed.
+- ⭐ `ops::grad_norm::global_l2_norm(grads)` — `ops/grad_norm.rs:62`. Device-resident global L2 norm of a slice of gradient tensors. Returns 1-element FP32 device tensor; caller decides when (if ever) to `.item()`. Mixed-dtype (BF16 + FP32) supported, casts internally. **Phase 3 multi-tensor fast path (2026-05-12):** when every grad is F32 + contiguous, dispatches to `multi_tensor_l2_norm_sq_f32` (3 launches total instead of 2N+(N-1)+1). Falls through to legacy per-tensor fold otherwise. Env override: `FLAME_MT_L2NORM=0` forces legacy.
+- ⭐ `ops::grad_norm::global_l2_norm_with_scale(grads, max_norm, eps)` — `ops/grad_norm.rs:103`. Same but also returns the clip-scale factor as a 1-element device tensor. One D2H sync at the end if logging needed.
+- `ops::multi_tensor::multi_tensor_l2_norm_sq_f32(cache, &[&Tensor]) -> Tensor` — `ops/multi_tensor.rs`. Two-stage Apex-style reduction kernel. Stage 1 = block-per-tensor sum-of-squares in shared memory → partials[N]. Stage 2 = single-block reduction across partials → F32[1]. F32 grads + contiguous required; legacy fallback in caller handles BF16. Parity ≤ 1e-5 abs / 1e-6 rel vs legacy fold (parallel-tree reordering, not bit-exact).
+- `ops::multi_tensor::MultiTensorMetaCache` — `ops/multi_tensor.rs`. Process-wide cache for the L2 norm packed buffer + per-tensor partials buffer. Held behind a `Mutex` in `ops::grad_norm` (`MT_L2_CACHE`). Reallocates when n_tensors changes (one-time on step 0 in steady training). Note: this is a **separate** cache from `adam::MultiTensorMetaCache` — region layouts differ.
 
 ---
 

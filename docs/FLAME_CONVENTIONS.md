@@ -632,6 +632,71 @@ the `.cu` functor under `src/cuda/unary/`.
 
 This bit me during the elementwise perf work.
 
+### `tensor.to_dtype()` has BF16↔F32 fast paths (`!requires_grad` only)
+
+As of 2026-05-12 (commit `1332019` + bugfix `ef0faff`),
+`Tensor::to_dtype` has direct-call fast paths for the two hot cast
+cases (both contiguous source, **and source does NOT require grad**):
+- **BF16 → F32**: allocate F32 output, dispatch
+  `bf16_convert::bf16_to_f32_u16` directly.
+- **F32 → BF16**: allocate BF16 output, dispatch
+  `bf16_convert::f32_to_bf16_u16` directly.
+
+The fast paths skip the F32-staging round-trip the legacy code did
+(`alloc_aligned_f32` + `storage.to_f32` + `dtod_copy` + optional
+`f32_to_bf16` = 2–3 kernels + 2–3 allocs per cast). All other dtype
+combinations (F32→F64, BF16↔F16, etc.) still go through the staging
+path — those callers are cold enough that the redundancy is acceptable.
+
+**Autograd guard:** the fast paths return a fresh tensor with
+`requires_grad: false` hardcoded — they bypass `Op::Cast` recording.
+Without the `!self.requires_grad` gate (the bugfix), any cast inside a
+training forward erases the grad marker, the loss ends up
+not-requires-grad, and `loss.backward()` fails. The current dispatch
+checks `requires_grad` first: tensors that don't need grad get the
+17–34× cast speedup; tensors that need grad fall through to the legacy
+path (`Tensor::cast` records `Op::Cast` correctly).
+
+If you're adding a new dtype to `DType`, mirror the BF16↔F32 pattern in
+`tensor.rs:773` AND preserve the `!requires_grad` guard — the legacy
+path is the autograd-aware path.
+
+### RMSNorm has one canonical path — `norm::rms_norm`
+
+Until 2026-05-12 there were two RMSNorm forward paths:
+1. `norm::rms_norm` — training entry, `Op::RMSNorm` autograd record.
+2. `cuda_ops_bf16::rms_norm_bf16` → `fc_rms_norm_bf16` — inference-only entry.
+
+Commit `d729ede` collapsed them: `cuda_ops_bf16::rms_norm_bf16` is now a thin
+wrapper that calls `norm::rms_norm`. Both paths share the same dispatch into
+the new `rms_norm_forward_bf16_vec` kernel (13–16× faster than the legacy
+scalar path on production shapes). The `fc_rms_norm_bf16` `.cu` kernel
+remains as the fallback inside `norm::` when `norm_size % 4 != 0` — but if
+you're optimizing the BF16 RMSNorm hot path, **edit `norm.rs`, not
+`cuda/cuda_ops.cu`**. Inference and training now move together.
+
+### Vec-kernel env overrides (A/B benchmarking the new vec paths)
+
+The 2026-05-12 perf attack added vectorized BF16 kernels alongside the
+legacy paths, with env switches to force the legacy for A/B comparisons.
+Production trainers should NOT set these — the vec dispatch is on by
+default. Use them only when benching or hunting a numerical regression:
+
+| Env var | What it forces | Source |
+|---|---|---|
+| `FLAME_RMS_NORM_LEGACY=1` | Scalar 1-thread-per-row RMSNorm fwd + bwd | `src/norm.rs` |
+| `FLAME_LAYER_NORM_FWD_LEGACY=1` | Smem-tree LayerNorm forward | `cuda/cuda_ops.cu` |
+| `FLAME_LAYER_NORM_LEGACY=1` | Scalar LayerNorm backward (no cross-row kernel) | `cuda/src/flame_norm_bf16.cu` |
+| `FLAME_PERMUTE_LEGACY=1` | Scalar grid-strided `permute0213` / `permute021` | `cuda/permute0213.cu` |
+| `FLAME_SWIGLU_LEGACY=1` | Scalar `swiglu_fused_bf16_kernel` (no vec2 pair loads) | `src/bf16_ops.rs` |
+| `FLAME_SLICE_COPY_LEGACY=1` | Generic strided slice kernel (no `cudaMemcpyAsync` fast path) | `cuda/bf16_slice_index.cu` |
+| `FLAME_GROUP_NORM_STATS_LEGACY=1` | Smem-tree GroupNorm stats kernel | `cuda/cuda_ops.cu` |
+
+All vec kernels require their dispatch precondition (typically a length
+divisibility — `norm_size % 4 == 0`, `C % 4 == 0`, `spatial % 4 == 0`,
+etc.); shapes that don't qualify fall through to the legacy kernel
+automatically. The env vars are an additional manual override.
+
 ### SM_86 shared-memory budget — opt in to 100 KB
 
 RTX 3090 / 3090 Ti are `sm_86`. The per-thread-block static shared memory
@@ -958,8 +1023,8 @@ FlameSwap is deleted. All block offloading uses `BlockOffloader` with
 | Add a BF16 elementwise op | `src/bf16_elementwise.rs` (flat path) + `src/bf16_ops.rs` (single-arg) |
 | Add a build-time `.cu` file | Create file → add to `build.rs` `cuda_sources.push(...)` → declare in `src/cuda/ffi.rs` or `src/cuda_ops_ffi.rs` |
 | Change the SDPA kernel | `src/cuda/flash_attention_fwd.cu` (wmma path) |
-| Change RMSNorm | `cuda/cuda_ops.cu::rms_norm_kernel` (the live one) |
-| Change LayerNorm | `cuda/cuda_ops.cu::layer_norm_forward_bf16_kernel` |
+| Change RMSNorm | `src/norm.rs` NVRTC kernels (`RMS_NORM_FWD_KERNEL_BF16_VEC` / `_BWD_KERNEL_BF16_VEC` / `RMS_NORM_GRAD_WEIGHT_KERNEL_BF16` — vec=4 path, both training + inference). `cuda/cuda_ops.cu::rms_norm_kernel` is now the legacy `norm_size % 4 != 0` fallback. |
+| Change LayerNorm | Forward: `cuda/cuda_ops.cu::layer_norm_forward_bf16_vec_kernel` (legacy smem-tree fallback in same file). Backward: `cuda/src/flame_norm_bf16.cu::layer_norm_backward_bf16_vec_kernel` + `layer_norm_grad_weight_bias_bf16_vec_kernel`. |
 | Change cuBLASLt linear | `src/cuda/fused_linear3d.cu` |
 | Add a new diffusion model | `inference-flame/src/models/your_model.rs` — flame-core just provides primitives |
 | Save/load safetensors | `serialization::load_file_filtered / save_file` |
@@ -1093,10 +1158,73 @@ for p in &params { /* mul_scalar(scale) and set_grad */ }
 
 The 8 EriDiffusion-v2 `train_*.rs` binaries all use this pattern as of
 the Fusion Sprint Phase 5 migration. New trainers must adopt it from
-inception. Apex-style single-launch multi-tensor reduction
-(`csrc/multi_tensor_l2norm_kernel.cu`) would shave more launch overhead
-but is not yet ported — the win there is incremental on top of the
-"one D2H sync" rule.
+inception.
+
+**Phase 3 (2026-05-12, launch-storm refactor):** `global_l2_norm` now
+has an Apex-style multi-tensor fast path. When every grad is F32 +
+contiguous, it dispatches to
+`ops::multi_tensor::multi_tensor_l2_norm_sq_f32` — two-stage reduction
+kernel, 3 launches total instead of 2N+(N-1)+1. Verified on zimage
+rank=8 LoRA: `sum_kernel` + `add_kernel` per step dropped from 561+561
+to 1.3+1.3. Env override `FLAME_MT_L2NORM=0` falls back to the legacy
+per-tensor fold. BF16 grads still go through the legacy path
+(F32-only fast path; BF16 falls through with on-the-fly cast).
+
+### Multi-tensor primitives: foreach-style is the right pattern
+
+When a trainer or library function iterates "do op X on each of N
+parameters / gradients", `flame-core` already has the infrastructure to
+collapse N launches into 1. Two locations to check first:
+
+- `adam::adam_fused_multi_tensor_step` (in `adam.rs:858`) — used by
+  Adam optimizer. The new `param_is_bf16: bool` discriminator (Phase 1,
+  2026-05-12) routes between BF16 and F32 multi-tensor kernels.
+- `ops::multi_tensor` (new module, Phase 3, 2026-05-12) — generalized
+  packed-buffer + kernel-loader pattern. Currently has L2 norm; future
+  expansion documented in
+  `EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md`.
+
+The packed-buffer pattern: build `Vec<u64>` of pointers + sizes (extract
+each pointer via `g.as_mut_slice_f32(...).device_ptr_mut()` or
+`g.as_mut_device_ptr_bf16(...)`), drop the `&mut` borrow per iteration
+(the u64 doesn't carry a Rust lifetime), single H2D copy of the packed
+buffer, one kernel launch with grid = n_tensors. See
+`adam.rs:1093-1230` and `ops/multi_tensor.rs::multi_tensor_l2_norm_sq_f32`
+for the canonical implementation.
+
+### cudarc launch path: context-pin skips `cuCtxSetCurrent` (Phase 4, 2026-05-12)
+
+The workspace uses a vendored cudarc 0.11.9 (at `../cudarc-pinctx`,
+wired via `[patch.crates-io] cudarc = { path = "../cudarc-pinctx" }`
+in flame-core/Cargo.toml AND EriDiffusion-v2/Cargo.toml). The single
+patch: `src/driver/safe/threading.rs` caches the per-thread bound CUDA
+context in a thread-local. `bind_to_thread()` short-circuits when the
+requested context is already current on this thread.
+
+Upstream cudarc 0.11.9 calls `bind_to_thread()` from every safe launch
+and every alloc/free. Each call is a `cuCtxSetCurrent` driver call
+(~106 ns). On zimage training that was 91,637 redundant calls per step
+(~9 ms/step of pure CPU stall). After the patch: 0 calls per step
+(absent from top-15 driver APIs), driver_api/step dropped from 200,472
+to 88,903 (−55.7%).
+
+Implications for new code:
+
+- Don't add `Device::bind_to_thread()` calls in flame-core — they were
+  redundant before the patch and remain a no-op after. cudarc's safe
+  wrappers already do this.
+- If you add a new thread that uses CUDA (currently none in flame-core
+  or EriDiffusion-v2), call `bind_to_thread()` once on the new thread.
+  Subsequent calls hit the fast path.
+- Multi-device usage still works correctly — the thread-local cache
+  flips between contexts on each switch. Single-device single-thread
+  training (the universal case) hits the fast path on every call after
+  the first.
+
+If you ever clone the workspace fresh, `../cudarc-pinctx` must exist as
+a sibling of `flame-core/` and `EriDiffusion-v2/`. See
+[CodeAlexx/cudarc-pinctx](https://github.com/CodeAlexx/cudarc-pinctx)
+for the upstream parity diff and full setup.
 
 ---
 

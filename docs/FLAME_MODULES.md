@@ -316,8 +316,19 @@ struct. Used by SDXL UNet, Klein VAE, LDM VAE, LTX-2 audio VAE, LTX-2
 upsampler. ⚠️ Note: `cuda_ops_bf16::group_norm_bf16` (the lower-level entry)
 takes NHWC layout, not NCHW.
 
-### `norm.rs`
-Older norm wrappers (BatchNorm, etc.) — training-only.
+### ⭐ `norm.rs`
+**Canonical RMSNorm entry for both training and inference** (2026-05-12).
+`norm::rms_norm(x, normalized_shape, weight, eps)` records `Op::RMSNorm`
+and dispatches three vectorized NVRTC kernels (`rms_norm_forward_bf16_vec`,
+`rms_norm_backward_bf16_vec`, `rms_norm_grad_weight_bf16_vec`) when
+`norm_size % 4 == 0`, with the original scalar kernels as a `% 4 != 0`
+fallback. `cuda_ops_bf16::rms_norm_bf16` (the inference entry) delegates
+here as of commit `d729ede`, so both paths share the 13–16× forward and
+9–15× backward speedup. `FLAME_RMS_NORM_LEGACY=1` forces the scalar path
+for A/B benchmarking. Also exposes a `#[doc(hidden)]`
+`rms_norm_backward_for_bench` escape hatch used by `benches/rms_norm_vec.rs`.
+The module also retains older norm wrappers (BatchNorm, etc.) used by the
+training path.
 
 ---
 
@@ -393,9 +404,11 @@ functions for conv2d and SDPA, and the NHWC↔NCHW layout converters.
 ### ⭐ `cuda_ops_bf16.rs`
 The big BF16 ops surface (~70 pub fns). This is where the live kernels are
 exposed: `relu_bf16`, `gelu_bf16`, `silu_bf16`, `axpby_inplace_bf16`,
-`rms_norm_bf16` (the live RMSNorm entry), `rms_norm_bf16_to_f32`,
-`layer_norm_bf16` (live), `layer_norm_bf16_with_stats`,
-`group_norm_bf16` (NHWC), `gemm_bf16`, `slice_axis_bf16`, `broadcast_to_bf16`,
+`rms_norm_bf16` (delegates to `norm::rms_norm` as of 2026-05-12 — see
+the `norm.rs` paragraph), `rms_norm_bf16_to_f32`, `layer_norm_bf16` (vec
+forward + vec backward + cross-row dgamma/dbeta kernels as of 2026-05-12),
+`layer_norm_bf16_with_stats`, `group_norm_bf16` (NHWC, vec stats as of
+2026-05-12), `gemm_bf16`, `slice_axis_bf16`, `broadcast_to_bf16`,
 `repeat_axis_bf16`, `index_select_bf16_into`, `conv2d_bf16` (auto-tunes
 cuDNN), `sdpa_stream_bf16` (chunked SDPA), and the autotune stat accessors.
 
@@ -566,45 +579,86 @@ Six NVRTC kernels are compiled once on first call and loaded into the
   - **Single-tensor**: `adam_fused_bf16_kernel`, `adam_fused_f32grad_kernel`
     (BF16 param + F32 grad), `adam_fused_f32param_f32grad_kernel`,
     `adam_fused_f32param_bf16grad_kernel`. One launch per parameter.
-  - **Multi-tensor** (Fusion Sprint Phase 4 follow-up):
-    `adam_fused_multi_bf16_f32grad_kernel` and
-    `adam_fused_multi_bf16_bf16grad_kernel`. One launch covers every
-    parameter via a device-resident metadata buffer
-    (`fused::MultiTensorMetaCache`). `Adam::step` auto-selects this path
-    when every param is BF16 and every grad is F32 (the dominant LoRA
-    case); set `FLAME_ADAM_NO_MULTI_TENSOR=1` to force the per-param
-    fallback.
+  - **Multi-tensor** (Fusion Sprint Phase 4 follow-up + launch-storm
+    Phase 1 2026-05-12):
+    `adam_fused_multi_bf16_f32grad_kernel`,
+    `adam_fused_multi_bf16_bf16grad_kernel`, and
+    `adam_fused_multi_f32param_f32grad_kernel` (Phase 1, 2026-05-12).
+    One launch covers every parameter via a device-resident metadata
+    buffer (`fused::MultiTensorMetaCache`). `Adam::step` auto-selects
+    this path when every param shares a dtype (BF16 or F32) and every
+    grad is F32 — covers both Klein 9B (BF16 params) and zimage
+    (F32 LoRA params) cases. Set `FLAME_ADAM_NO_MULTI_TENSOR=1` to
+    force the per-param fallback. The `adam_fused_multi_tensor_step`
+    dispatcher takes `param_is_bf16: bool` + `grad_is_bf16: bool` to
+    route between kernel variants.
 
 Bit-exact parity: `tests/adam_multi_tensor_parity.rs` asserts the
-multi-tensor kernel and the per-tensor kernel produce identical bytes
-on a 50-tensor 1-step toy + drift-free agreement across 100 steps. They
-share the same kernel math; the multi-tensor variant only changes the
-launch shape.
+multi-tensor kernels and their per-tensor counterparts produce
+identical bytes on 50-tensor 1-step toys (BF16 and F32 separately) +
+drift-free agreement across 100 steps. The F32 path is bit-identical
+(no float reassociation, same kernel math, same accumulation order);
+the BF16 path matches within BF16 atol across 100 steps. The
+multi-tensor variant only changes launch shape — kernel math is
+identical including the DECOUPLED-WD ordering receipt.
 
 ### `sgd/mod.rs`
 Basic SGD with momentum + weight decay. F32 implementation with an inline
 NVRTC kernel.
 
 ### `ops/grad_norm.rs`
-Async global gradient L2 norm + clip-scale (Fusion Sprint Phase 5). Replaces
-the per-tensor `g.square().mean().to_vec()?[0]` loop in EriDiffusion-v2 trainers
-(N D2H syncs/step on Klein 9B LoRA = 200+ stalls) with one D2H sync at the
-end. Two helpers:
+Async global gradient L2 norm + clip-scale. Replaces the per-tensor
+`g.square().mean().to_vec()?[0]` loop in EriDiffusion-v2 trainers
+(N D2H syncs/step on Klein 9B LoRA = 200+ stalls) with at most one D2H
+sync at the end. Two helpers:
 
-- `global_l2_norm(grads: &[&Tensor]) -> Result<Tensor>` — returns a 1-element
-  FP32 device tensor (the global L2 norm). Per-tensor `square().sum()` is
-  one launch each, all async; the fold-over is N-1 small device-side adds;
-  final `sqrt` stays on device. Empty slice short-circuits to a zero scalar.
-  BF16 grads cast to FP32 internally.
+- `global_l2_norm(grads: &[&Tensor]) -> Result<Tensor>` — returns a
+  1-element FP32 device tensor (the global L2 norm). **Phase 3 fast
+  path (2026-05-12):** when every grad is F32 + contiguous, dispatches
+  to `ops::multi_tensor::multi_tensor_l2_norm_sq_f32` (Apex-style
+  2-stage reduction = 3 launches total). Otherwise falls through to the
+  legacy per-tensor `square().sum()` + serial fold-add. Env override
+  `FLAME_MT_L2NORM=0` forces the legacy path. Empty slice short-circuits
+  to a zero scalar. BF16 grads still go through the legacy path with
+  on-the-fly F32 cast.
 - `global_l2_norm_with_scale(grads, max_norm, eps) -> Result<(Tensor, Tensor)>` —
-  norm + `min(max_norm/(norm+eps), 1.0)` clip scale, both as 1-element FP32
-  device tensors. Caller does at most one `.item()` for logging.
+  norm + `min(max_norm/(norm+eps), 1.0)` clip scale, both as 1-element
+  FP32 device tensors. Caller does at most one `.item()` for logging.
 
-Parity tested vs PyTorch oracle on 200 LoRA-shape tensors — see
-`tests/grad_norm_parity.rs` (6 tests, atol=1e-4 vs PyTorch FP32; BF16
-round-trip atol=1e-4). Apex's two-stage `multi_tensor_l2norm_kernel.cu`
-single-launch pattern is the natural follow-up — for now we trade one
-launch per tensor for "no new CUDA kernel needed".
+Parity tested vs PyTorch oracle on 200 LoRA-shape tensors —
+`tests/grad_norm_parity.rs` (6 tests, atol=1e-4). Multi-tensor parity
+in `tests/multi_tensor_l2_norm_parity.rs`: F32 fast path matches legacy
+within abs ≤ 1e-5 / rel ≤ 1e-6 (parallel-tree vs serial-fold reduction
+order). The process-wide `MT_L2_CACHE: Mutex<MultiTensorMetaCache>`
+amortizes the device-side metadata + partials buffer across steps —
+one-time alloc on step 0.
+
+### `ops/multi_tensor.rs` (added 2026-05-12, Phase 3 of launch-storm refactor)
+Foreach-style multi-tensor primitives that collapse per-parameter
+launch storms in the trainer hot path. Adam already has its own
+multi-tensor packed-buffer launcher in `adam::adam_fused_multi_tensor_step`;
+this module generalizes the pattern for other op families.
+
+Current entries:
+
+- `MultiTensorMetaCache` — device-side packed-buffer + per-tensor
+  partials cache. Reallocates when n_tensors changes. **Separate** from
+  `adam::MultiTensorMetaCache` (different region layouts).
+- `multi_tensor_l2_norm_sq_f32(cache, grads) -> Tensor` — F32-only
+  sum-of-squares across a tensor list, returned as a 1-element F32
+  device tensor. Two NVRTC kernels: stage 1 (block-per-tensor → partial
+  sums) and stage 2 (single-block reduction → scalar). Used by
+  `ops::grad_norm::global_l2_norm` fast path.
+
+The packed-buffer layout for L2 norm is `[ptrs(n) | sizes(n)]` (2n u64
+entries). Each kernel is compiled once on first use, loaded into a
+`MT_L2_NORM_MODULE` cudarc module, looked up by name on subsequent
+launches.
+
+Future expansion: multi-tensor scale-by-scalar (Phase 2, deferred — see
+`EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md`), and
+other foreach-pattern targets (grad clip, fp16-master scatter, etc.)
+as they prove valuable in profiles.
 
 ### `parameter.rs`
 `Parameter` (a `Tensor` wrapper with `requires_grad=true`) — re-exported as

@@ -40,7 +40,7 @@ ensure / get_func / launch dance.
 | `transpose2d_bf16_kernel` | `:252` | 2D BF16 transpose. Used by Klein/Mistral pre-transpose. |
 | `cmp_bf16_kernel` | `:269` | Comparison ops returning u8 (ge/gt/le/lt/ne). |
 | `abs_bf16_kernel` | `:559` | BF16 abs via sign-bit clear (`x & 0x7FFF`). Replaces `square().sqrt()` decomposition that was 8.4× slower. |
-| `softmax_lastdim_bf16_kernel` | `:472` | **Fused last-dim softmax** — 2-pass online softmax (Milakov & Gimelshein) with warp-shuffle reductions. Single block per row, no scratch tensor. 1.5× PyTorch (kernel is 147μs, rest is pool overhead). |
+| `softmax_lastdim_bf16_kernel` | `:472` | **Fused last-dim softmax** — 2-pass online softmax (Milakov & Gimelshein) with warp-shuffle reductions. Single block per row, no scratch tensor. 1.5× PyTorch (kernel is 147μs, rest is pool overhead). Launcher `softmax_lastdim_bf16` (`:152`) sizes `block_size` to the nearest multiple of 32 that covers `cols` (32/64/128/256, capped at 256) instead of the legacy fixed-128 — saves launch overhead for head_dim=64 rows (2026-05-12). Tail threads still no-op via `if (tid < cols)` so correctness holds. |
 | `patchify_bf16_kernel` | `:789` | DiT patchify (raster → 2x2 patches → seq). |
 | `unpatchify_bf16_kernel` | `:828` | Inverse. |
 
@@ -57,6 +57,7 @@ ensure / get_func / launch dance.
 | `softmax_last_dim_bf16_kernel` | `:195` | Older fused softmax (one block per row). The 2026-04 `softmax_lastdim_bf16_kernel` in `bf16_elementwise.rs` is the preferred entry but this still exists and is called by `softmax_last_dim_bf16` pub fn. |
 | `rope_fused_bf16_kernel` | `:343` | **Interleaved-pair RoPE** — `out[2i] = x[2i]*cos[i] - x[2i+1]*sin[i]`. Used by FLUX, Klein, LTX, Hunyuan, QwenImage, Chroma. |
 | `rope_halfsplit_bf16_kernel` | `:376` | Halfsplit RoPE — first/second half rotation. Used by Z-Image, some Klein variants, MagiHuman (via partial-rotation wrapper — see gotcha). |
+| `swiglu_fused_bf16_vec2_kernel` | `:1819` | **Vectorized SwiGLU** — `__nv_bfloat162` pair loads, 2 elements/thread, F32 sigmoid. Selected by `swiglu_fused_bf16` when `total % 2 == 0` (CUDA pool buffers are 256-byte aligned so 2-elem alignment holds). Scalar tail handled by thread (0,0) when `total` is odd. `FLAME_SWIGLU_LEGACY=1` forces the scalar `swiglu_fused_bf16_kernel`. Added 2026-05-12. |
 
 > **Gotcha (rope_halfsplit_bf16 / rope_fused_bf16, partial rotation):** both kernels rotate the *full* last dim of `x` (compute `half = d / 2` from `x.shape[-1]`). Models that rotate only a prefix of `head_dim` (e.g. MagiHuman: head_dim=128, ROPE_DIM=96, last 32 channels are passthrough) must split→rotate→cat manually: `narrow(3, 0, ROPE_DIM).contiguous() → rope_halfsplit_bf16 → cat with narrow(3, ROPE_DIM, head_dim - ROPE_DIM)`. Symptom if you don't: `Shape mismatch: expected [..., D/2_from_x], got [..., ROPE_DIM/2]` from the cos/sin reshape inside the kernel. See `inference-flame/src/models/magihuman_dit.rs::rope_partial_halfsplit` for the wrapper pattern.
 | `modulate_pre_bf16_kernel` | `:580` | DiT modulate `(1 + scale) * x + shift`. |
@@ -76,6 +77,12 @@ ensure / get_func / launch dance.
 |---|---|---|
 | `bf16_to_f32` | `:14` | `__bfloat1622float2` — 2 elements/thread vectorized. |
 | `f32_to_bf16` | `:33` | `__floats2bfloat162_rn` — 2 elements/thread. |
+
+Public Rust wrappers `f32_to_bf16_u16` (`:100`) and `bf16_to_f32_u16` (`:119`)
+take raw device pointers as `u64` / `&mut CudaSlice<f32>` so `Tensor::to_dtype`
+can call the NVRTC kernel directly without going through the F32-staging
+storage roundtrip. Both call `lc_pairs(n)` so each thread handles 2 elements.
+See the `to_dtype` fast-path landmine in CONVENTIONS for the dispatch logic.
 
 ### `bf16_normal.rs` / `bf16_factories.rs` / `bf16_clamp.rs` — RNG / factories
 
@@ -162,20 +169,64 @@ no temporaries. All implement decoupled weight decay (AdamW).
 
 | Kernel | Param / Grad dtype | Purpose |
 |---|---|---|
-| `adam_fused_multi_bf16_f32grad_kernel` | BF16 param, F32 grad, F32 m/v | Default LoRA path. One launch covers every parameter via a 5-region packed pointer/size buffer (`[params \| grads \| ms \| vs \| sizes]`) staged via a single H2D copy. Buffer is held by `fused::MultiTensorMetaCache` (one per `Adam` instance) so the alloc cost is paid once at first step, not per step. |
+| `adam_fused_multi_bf16_f32grad_kernel` | BF16 param, F32 grad, F32 m/v | Klein 9B / BF16-param LoRA path. One launch covers every parameter via a 5-region packed pointer/size buffer (`[params \| grads \| ms \| vs \| sizes]`) staged via a single H2D copy. Buffer is held by `fused::MultiTensorMetaCache` (one per `Adam` instance) so the alloc cost is paid once at first step, not per step. |
 | `adam_fused_multi_bf16_bf16grad_kernel` | BF16 param, BF16 grad, F32 m/v | Same launch shape as above, BF16 grad reads. |
+| `adam_fused_multi_f32param_f32grad_kernel` (added 2026-05-12, Phase 1) | F32 param, F32 grad, F32 m/v | Zimage / no-quant LoRA path. Same 5-region packed-buffer pattern as the BF16 multi-tensor kernels, no BF16↔F32 casts (params + grads + m + v all F32). Bit-identical per-element math to `adam_fused_f32param_f32grad_kernel`. Auto-selected by `Adam::step` when all params are F32 + all grads are F32. |
 | `adam_fused_bf16_f32grad_stoch_kernel` (added 2026-05-08) | BF16 param, F32 grad, F32 m/v | Single-tensor variant of the BF16-param + F32-grad fused step **with stochastic rounding** at the F32 → BF16 store. Per-element entropy from splitmix64 keyed on `(seed, idx)` where `seed` is supplied by the caller (typically the optimizer step counter). Same Adam math as `adam_fused_bf16_kernel` modulo the rounding. Selected by `Adam::step` when `Adam::set_stochastic_round(true)` was called and the param is BF16 + grad is F32. |
 | `adam_fused_multi_bf16_f32grad_stoch_kernel` (added 2026-05-08) | BF16 param, F32 grad, F32 m/v | Multi-tensor variant of `*_stoch_kernel` above. Same 5-region packed buffer harness as `adam_fused_multi_bf16_f32grad_kernel`; tensor index is mixed into the seed to avoid lock-step rounding decisions across params at the same elementwise idx. |
 
-`Adam::step` auto-selects the multi-tensor path iff every param is BF16
-and every grad is F32. Otherwise it falls through to the per-tensor loop.
-`FLAME_ADAM_NO_MULTI_TENSOR=1` forces the fallback for A/B comparison.
+`Adam::step` auto-selects multi-tensor when all params share a dtype
+(BF16 or F32) and all grads are F32. The classifier returns
+`Some(param_is_bf16)` for that case and routes to the appropriate
+multi-tensor kernel via the `param_is_bf16: bool` discriminator on
+`adam_fused_multi_tensor_step`. Otherwise it falls through to the
+per-tensor loop. `FLAME_ADAM_NO_MULTI_TENSOR=1` forces the fallback.
 
-Bit-exact parity is gated by `tests/adam_multi_tensor_parity.rs`: the
-multi-tensor kernel and the per-tensor kernel produce identical bytes
-on a 50-tensor 1-step toy and stay within BF16 atol across 100 steps.
-The multi-tensor variant only changes launch shape — kernel math is
-identical including the DECOUPLED-WD ordering receipt.
+Bit-exact parity is gated by `tests/adam_multi_tensor_parity.rs`: each
+of the BF16 and F32 multi-tensor kernels matches its per-tensor
+counterpart byte-for-byte on a 50-tensor 1-step toy. The F32 path stays
+within 1e-7 relative tolerance across 100 sequential steps (same kernel
+math, same accumulation order; tiny tolerance covers any future float
+reassociation). BF16 stays within BF16 atol/rtol across 100 steps.
+Multi-tensor only changes launch shape — kernel math is identical
+including the DECOUPLED-WD ordering receipt.
+
+### `ops/multi_tensor.rs` — foreach-style primitives (Phase 3, 2026-05-12)
+
+| Kernel | Purpose |
+|---|---|
+| `multi_tensor_l2_norm_sq_stage1_f32_kernel` | Stage 1 of the multi-tensor L2 norm. One block per tensor, block-wide tree reduction in shared memory, writes per-tensor partial sum-of-squares to `partials[N]`. Used by `flame_core::ops::grad_norm::global_l2_norm` when every grad is F32 + contiguous. |
+| `multi_tensor_l2_norm_sq_stage2_kernel` | Stage 2: single-block reduction across `partials[N]` → `out[1]`. `N` can exceed `blockDim` (256); loop strides until exhausted. |
+
+The 2-stage pattern replaces `2N + (N-1) + 1 = 2N` legacy launches (per-
+tensor `square().sum()` + serial fold-add + sqrt) with 3 launches.
+Parity is tolerance-bound, not bit-identical, because parallel-tree
+reduction sums in a different order than serial fold-add. Tests in
+`tests/multi_tensor_l2_norm_parity.rs` document the ≤ 1e-5 absolute /
+≤ 1e-6 relative bound. Env override `FLAME_MT_L2NORM=0` falls back to
+legacy.
+
+The shared `MultiTensorMetaCache` (`ops/multi_tensor.rs`) is separate
+from `adam::MultiTensorMetaCache` — different region layouts (L2 norm
+needs partials buffer + 2 pointer/size regions; Adam needs 5 regions).
+Held behind a process-wide `Mutex` in `ops::grad_norm`.
+
+### `norm.rs` — RMSNorm NVRTC kernels (training + inference)
+
+Live RMSNorm path for both `norm::rms_norm` (training entry) and
+`cuda_ops_bf16::rms_norm_bf16` (inference — delegates to `norm::rms_norm` as
+of commit `d729ede`, 2026-05-12). Three NVRTC kernels, all 2026-05-12:
+
+| Kernel | Source const / line | Purpose / notes |
+|---|---|---|
+| `rms_norm_forward_bf16_vec` | `RMS_NORM_FWD_KERNEL_BF16_VEC` (`:1368`) | **Vectorized forward.** Block per row, 256 threads/block, `bf16x4` (8-byte aligned) loads, warp-shuffle intra-warp reduction, smem inter-warp aggregation (`n_warps` floats). Replaces the legacy 1-thread-per-row scalar kernel. 13.5–16.1× faster on zimage/klein/chroma forward; 3.5× on qknorm (small `norm_size=128`). Requires `norm_size % 4 == 0`. |
+| `rms_norm_backward_bf16_vec` | `RMS_NORM_BWD_KERNEL_BF16_VEC` (`:1522`) | Same 256-threads + vec=4 pattern; writes `grad_input` only. `grad_weight` moved to the separate cross-row reduction below. 9.5–14.8× faster than legacy. |
+| `rms_norm_grad_weight_bf16_vec` | `RMS_NORM_GRAD_WEIGHT_KERNEL_BF16` (`:1644`) | Cross-row `grad_weight` reduction. Tile `COLS_PER_BLOCK=64` × `ROWS_PER_BLOCK=512`. Grid `(ceil(norm_size/64), ceil(batch_size/512), 1)`, block `(64, 1, 1)`. ~500× fewer atomicAdds than inline accumulation (qknorm: 12.6M atomics → ~25k). Fires only in the vec path; legacy kernel still accumulates inline. |
+
+Dispatch in `rms_norm_forward_bf16` (`:735`) and `rms_norm_backward_bf16`
+(`:957`): vec when `norm_size % 4 == 0` (production shapes 2560/3072/4096/128
+all qualify). `FLAME_RMS_NORM_LEGACY=1` forces the scalar fallback for A/B
+benchmarking. Bench: `cargo bench --features cuda --bench rms_norm_vec`.
 
 ### `cuda_kernel_sources.rs` — shared kernel source constants (NVRTC)
 
@@ -549,9 +600,11 @@ This is the largest single `.cu` file. All the `fc_*` BF16 op entries live here.
 | `silu_kernel` | `:128` | Vectorized BF16 SiLU. **Two implementations** of silu exist — this `fc_silu_bf16` is one, and `bf16_ops::silu_bf16` is the other. `Tensor::silu` calls the latter. |
 | `gelu_kernel` | `:147` | Vectorized BF16 GELU. Same caveat. |
 | `axpby_kernel` | `:169` | `y = a*x + b*y` |
-| `rms_norm_kernel` | `:253` | **Block-per-row + parallel reduction RMSNorm**. Was 1-thread-per-row scalar before 2026-04. Wraps `fc_rms_norm_bf16` C entry. |
-| `layer_norm_forward_bf16_kernel` | `:295` | LayerNorm forward (with optional gamma/beta). |
-| `group_norm_compute_stats_bf16_kernel` | `:361` | GroupNorm 1st pass (mean/var per group). |
+| `rms_norm_kernel` | `:253` | **Block-per-row + parallel reduction RMSNorm**. Was 1-thread-per-row scalar before 2026-04. Wraps `fc_rms_norm_bf16` C entry. Legacy path — `cuda_ops_bf16::rms_norm_bf16` now delegates to `norm::rms_norm` (see commit `d729ede`), so this kernel is only reached when `norm_size % 4 != 0`. |
+| `layer_norm_forward_bf16_kernel` | `:295` | LayerNorm forward (with optional gamma/beta) — legacy smem-tree reduction path. |
+| `layer_norm_forward_bf16_vec_kernel` | `:298` | **Vectorized LayerNorm forward** (2026-05-12). 256 threads/block (8 warps), `bf16x4_ln` 8-byte loads, single combined mean+variance pass via warp-shuffle + 2-slot smem (`2 * n_warps` floats). Selected by `fc_layer_norm_bf16` (`:825`) when `norm_size % 4 == 0`. `FLAME_LAYER_NORM_FWD_LEGACY=1` forces the smem-tree path. 1.10–1.36× faster than legacy on flux/zimage/klein production shapes (legacy was already parallel — this is a vec+shuffle upgrade, not a 1-thread fix). |
+| `group_norm_compute_stats_bf16_kernel` | `:361` | GroupNorm 1st pass (mean/var per group) — legacy smem-tree. |
+| `group_norm_compute_stats_bf16_vec_kernel` | `:476` | **Vectorized GroupNorm stats** (2026-05-12). One block per `(n, group)`, vec=4 `bf16x4_gn` loads along the contiguous spatial axis, warp-shuffle intra-warp + smem inter-warp reduction. Selected by `fc_group_norm_bf16` (`:967`) when `spatial_size % 4 == 0` (VAE blocks always satisfy). `FLAME_GROUP_NORM_STATS_LEGACY=1` forces the legacy path. 1.44–2.28× faster end-to-end on VAE shapes (larger spatial sizes win more — bandwidth-bound). The apply kernel `group_norm_forward_bf16_kernel` was unchanged (already coalesced; backward still has the 1-thread-per-group bug). |
 | `group_norm_forward_bf16_kernel` | `:418` | GroupNorm 2nd pass (apply). |
 | `rms_norm_bf16_to_f32_kernel` | `:468` | RMSNorm with F32 output (for mixed-precision callers). |
 | `fc_relu_bf16 / fc_gelu_bf16 / fc_silu_bf16` | `:206-214` | C entries |
@@ -606,9 +659,17 @@ from Rust; included in the `gemm_bf16_cublaslt.cu` translation unit).
 
 | Symbol | Line | Notes |
 |---|---|---|
-| `slice_copy_kernel` | `:49` | Strided slice copy. |
+| `slice_copy_kernel` | `:49` | Strided slice copy. Generic up-to-8-D div/mod unravel per output element — ALU-bound (~225 GB/s) and pure waste when the result is a contiguous chunk. |
 | `index_select_kernel` | `:76` | Gather along axis 0. |
 | `fc_bf16_slice / fc_bf16_index_select` | `:140, :196` | C entries. |
+
+**Leading-axis fast path** (2026-05-12, `fc_bf16_slice` `:190`): when `axis == 0`
+AND input is fully row-major contiguous, the slice is a single contiguous chunk
+of the input. Dispatch one `cudaMemcpyAsync(dst, src + start*inner, len*inner*2)`
+instead of the generic kernel — hits ~800–850 GB/s (82–89% of RTX 3090 Ti peak
+HBM), 3.4–4.0× faster than the legacy kernel on production shapes. Auditor
+flagged 440–3206 calls/step depending on pipeline. `FLAME_SLICE_COPY_LEGACY=1`
+forces the kernel for A/B benchmarking.
 
 ### `cuda/upsample_nearest.cu`
 
@@ -642,8 +703,10 @@ dtype-dispatch wrapper in `src/cuda_kernels.rs:1810`), which is what
 
 | Symbol | Line | Notes |
 |---|---|---|
-| `permute0213_kernel` | `:15` | `[B, N, H, D] → [B, H, N, D]` — the attention reshape permute. |
-| `permute021_kernel` | `:81` | `[B, M, N] → [B, N, M]`. |
+| `permute0213_kernel` | `:16` | `[B, N, H, D] → [B, H, N, D]` — legacy scalar grid-strided fallback. |
+| `permute0213_vec4_bf16_kernel` | `:66` | **Vectorized + 4D-grid permute0213** (2026-05-12). `bf16x4` 8-byte loads/stores along the `c` axis (head_dim). 4D grid `(ceil(C/4/TX), ceil(A/TY), N*B)` with block `(min(C_VEC, 32), min(A, 32), 1)` — no per-element divmod since `n` and `b` are decoded from `blockIdx.z` once. Selected by `launch_permute0213_bf16` (`:118`) when `C % 4 == 0` (production head_dims 64/128/256 all qualify). `FLAME_PERMUTE_LEGACY=1` forces the legacy kernel. Beats stock PyTorch by 1.5–1.8× on a 3090 Ti for standalone permutes (PyTorch only exceeds when the permute fuses into a cuBLAS matmul prelude). |
+| `permute021_kernel` | `:143` | `[N, A, B] → [N, B, A]` — legacy scalar grid-strided. ~135 GB/s on attention shapes (1/8 of peak — within-warp coalesced on `b` but across-warp scatters across `a`-rows separated by stride `B`). |
+| `permute021_tiled_kernel<Scalar>` | `:174` | **Tiled-transpose permute021** (2026-05-12, F32 + BF16 via template). 32×32 smem tile with `tile[32][33]` bank-conflict padding. Phase 1: coalesced read `input[n, a0+ty, b0+tx] → tile[ty][tx]` (warp varies in `b`, stride 1). Phase 2: coalesced write `output[n, b0+ty, a0+tx] = tile[tx][ty]` (warp varies in `a`, stride 1 in output). Selected by `launch_permute021_{f32,bf16}` when `A >= 16 AND B >= 16`. `FLAME_PERMUTE_LEGACY=1` forces the legacy. |
 
 ### `cuda/sdpa_stream_bf16.cu` — chunked SDPA (legacy)
 
@@ -725,9 +788,11 @@ Older streaming attention scaffolding.
 
 | Symbol | Line | Notes |
 |---|---|---|
-| `layer_norm_backward_kernel` | `:26` | LayerNorm backward (training). |
-| `group_norm_backward_kernel` | `:82` | GroupNorm backward. |
-| `fc_layer_norm_backward_bf16` | `:172` | C entry. |
+| `layer_norm_backward_kernel` | `:26` | LayerNorm backward (training) — legacy 1-thread-per-row scalar (same shape as the RMSNorm legacy that was just rewritten). 4 sequential passes per thread: mean, var, sum1+sum2, then dx + inline atomicAdd into both `dgamma[i]` and `dbeta[i]` per element per row (zimage [4096, 2560] = 10.5M atomicAdds × 2 targets per call). |
+| `layer_norm_backward_bf16_vec_kernel` | `:40` | **Vectorized LayerNorm backward** (2026-05-12). 256 threads/block, `bf16x4_t` 8-byte loads, warp-shuffle + smem inter-warp reductions. 3-pass: (1) parallel mean+sum_sq, (2) `sum1=sum(dy*g)` and `sum2=sum(dy*g*xn)`, (3) vectorized `dx` write only. dgamma/dbeta deferred to the cross-row kernel below. Mean/var recomputed inline (no API change to plumb from forward). |
+| `layer_norm_grad_weight_bias_bf16_vec_kernel` | `:189` | **Cross-row dgamma/dbeta reduction** (2026-05-12). Tile `COLS_PER_BLOCK=64` × `ROWS_PER_BLOCK=128`. Each block: 64 threads collaboratively reduce each row's mean/var (2-warp warp-shuffle + smem broadcast via `s_mean`/`s_inv_std`), then accumulate F32 dgamma/dbeta in a single atomicAdd per `(col, row_tile)` per target. ~500× fewer atomicAdds than the inline path. Per-row mean/var is still recomputed across col_tiles (future fix: precompute into `[batch_size]` scratch). |
+| `group_norm_backward_kernel` | `:82` | GroupNorm backward — still the 1-thread-per-group legacy path (auditor flagged 20–50× available; same fix pattern as RMSNorm bwd, deferred). |
+| `fc_layer_norm_backward_bf16` | `:172` | C entry. Dispatches to vec kernel pair when `norm_size % 4 == 0` (`:451`). `FLAME_LAYER_NORM_LEGACY=1` forces the scalar path. Measured 1.8–3.4× faster than legacy on production shapes (smaller multipliers than rms_norm_bwd because LN has two atomicAdd targets vs RMSNorm's one). |
 | `fc_group_norm_backward_bf16` | `:203` | C entry. |
 
 ### `cuda/src/flame_conv2d_stub.cu` — extra conv2d helpers
