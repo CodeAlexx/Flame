@@ -745,10 +745,23 @@ fn rms_norm_forward_bf16(
     debug_assert_eq!(input.storage.dtype(), DType::BF16);
 
     let device = input.device();
-    CudaKernels::ensure_kernel(device, "rms_norm_forward_bf16", RMS_NORM_FWD_KERNEL_BF16)?;
+
+    // 2026-05-12 perf: dispatch to the vectorized (4-wide, 256-thread) kernel
+    // when norm_size is divisible by 4. Production shapes (Z-Image hidden=2560,
+    // head_dim=128, klein=4096, chroma=3072) all qualify. Fallback to the
+    // legacy single-thread-per-row scalar kernel only for odd geometries.
+    // Env override `FLAME_RMS_NORM_LEGACY=1` forces the scalar path for A/B
+    // benchmarking; keep this gate until the vec path has been validated in
+    // training, then drop the gate.
+    let use_vec = norm_size % 4 == 0
+        && std::env::var("FLAME_RMS_NORM_LEGACY").map(|v| v == "0").unwrap_or(true);
+
+    let kernel_src = if use_vec { RMS_NORM_FWD_KERNEL_BF16_VEC } else { RMS_NORM_FWD_KERNEL_BF16 };
+    let kernel_name = if use_vec { "rms_norm_forward_bf16_vec" } else { "rms_norm_forward_bf16" };
+    CudaKernels::ensure_kernel(device, kernel_name, kernel_src)?;
     let f = device
-        .get_func("rms_norm_forward_bf16", "rms_norm_forward_bf16")
-        .ok_or_else(|| Error::Cuda("Failed to get rms_norm_forward_bf16 kernel".into()))?;
+        .get_func(kernel_name, kernel_name)
+        .ok_or_else(|| Error::Cuda(format!("Failed to get {kernel_name} kernel")))?;
 
     let output_data = unsafe { device.alloc::<u16>(input.shape().elem_count()) }
         .map_err(|e| Error::Cuda(format!("rms_norm forward alloc failed: {e:?}")))?;
@@ -756,10 +769,20 @@ fn rms_norm_forward_bf16(
 
     use cudarc::driver::DevicePtr;
 
-    let cfg = LaunchConfig {
-        grid_dim: (batch_size as u32, 1, 1),
-        block_dim: (1, 1, 1),
-        shared_mem_bytes: 0,
+    let cfg = if use_vec {
+        // 256 threads per block, one block per row. Shared memory holds
+        // n_warps=8 floats for the inter-warp reduction in the kernel.
+        LaunchConfig {
+            grid_dim: (batch_size as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 8 * std::mem::size_of::<f32>() as u32,
+        }
+    } else {
+        LaunchConfig {
+            grid_dim: (batch_size as u32, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        }
     };
 
     match weight {
@@ -824,6 +847,21 @@ fn rms_norm_forward_bf16(
         output,
         inv_rms: inv_rms_data,
     })
+}
+
+/// Bench-only escape hatch — call `rms_norm_backward` directly without
+/// going through the autograd machinery. **Do not use in production code.**
+/// Used by `benches/rms_norm_vec.rs` to time the backward kernel in isolation.
+#[doc(hidden)]
+pub fn rms_norm_backward_for_bench(
+    grad_out: &Tensor,
+    input: &Tensor,
+    weight: Option<&Tensor>,
+    inv_rms: &Tensor,
+    _batch_size: usize,
+    norm_size: usize,
+) -> Result<(Tensor, Option<Tensor>)> {
+    rms_norm_backward(grad_out, input, weight, inv_rms, &[norm_size])
 }
 
 pub(crate) fn rms_norm_backward(
@@ -928,10 +966,19 @@ fn rms_norm_backward_bf16(
     use cudarc::driver::DevicePtr;
 
     let device = input.device();
-    CudaKernels::ensure_kernel(device, "rms_norm_backward_bf16", RMS_NORM_BWD_KERNEL_BF16)?;
+
+    // 2026-05-12 perf: dispatch to the vectorized backward when norm_size is
+    // divisible by 4 (all production shapes qualify). Env override
+    // `FLAME_RMS_NORM_LEGACY=1` forces the scalar path (mirrors forward dispatch).
+    let use_vec = norm_size % 4 == 0
+        && std::env::var("FLAME_RMS_NORM_LEGACY").map(|v| v == "0").unwrap_or(true);
+
+    let kernel_src = if use_vec { RMS_NORM_BWD_KERNEL_BF16_VEC } else { RMS_NORM_BWD_KERNEL_BF16 };
+    let kernel_name = if use_vec { "rms_norm_backward_bf16_vec" } else { "rms_norm_backward_bf16" };
+    CudaKernels::ensure_kernel(device, kernel_name, kernel_src)?;
     let f = device
-        .get_func("rms_norm_backward_bf16", "rms_norm_backward_bf16")
-        .ok_or_else(|| Error::Cuda("Failed to get rms_norm_backward_bf16 kernel".into()))?;
+        .get_func(kernel_name, kernel_name)
+        .ok_or_else(|| Error::Cuda(format!("Failed to get {kernel_name} kernel")))?;
 
     let grad_input_data = unsafe { device.alloc::<u16>(input.shape().elem_count()) }
         .map_err(|e| Error::Cuda(format!("rms_norm backward alloc failed: {e:?}")))?;
@@ -941,10 +988,18 @@ fn rms_norm_backward_bf16(
         None
     };
 
-    let cfg = LaunchConfig {
-        grid_dim: (batch_size as u32, 1, 1),
-        block_dim: (1, 1, 1),
-        shared_mem_bytes: 0,
+    let cfg = if use_vec {
+        LaunchConfig {
+            grid_dim: (batch_size as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 8 * std::mem::size_of::<f32>() as u32,
+        }
+    } else {
+        LaunchConfig {
+            grid_dim: (batch_size as u32, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        }
     };
 
     let grad_out_ptr = grad_out.as_device_ptr_bf16("rms_norm_backward_bf16:grad_out")? as u64;
@@ -959,6 +1014,11 @@ fn rms_norm_backward_bf16(
                 ));
             }
             let weight_ptr = w.as_device_ptr_bf16("rms_norm_backward_bf16:weight")? as u64;
+            // Snapshot the gw device pointer so we can pass it to TWO kernels
+            // (vec backward writes grad_input only; grad_weight kernel does
+            // cross-row reduction). `&mut CudaSlice` would be consumed by the
+            // first launch_kernel! macro.
+            let gw_ptr: u64 = *gw.device_ptr();
             launch_kernel!(
                 f,
                 cfg,
@@ -966,12 +1026,50 @@ fn rms_norm_backward_bf16(
                 input_ptr,
                 weight_ptr,
                 grad_input_ptr,
-                gw,
+                gw_ptr,
                 inv_rms.storage.try_as_slice_f32()?,
                 batch_size as i32,
                 norm_size as i32,
                 1i32
             );
+
+            // 2026-05-12 perf: second kernel for grad_weight cross-row reduction.
+            // The vec backward above writes only `grad_input` (the inline
+            // atomicAdd path was removed). This kernel does the
+            // batch_size-row reduction with ~500× fewer atomicAdds via tiling.
+            // Only fires in the vec path; the legacy scalar kernel still
+            // accumulates grad_weight inline.
+            if use_vec {
+                CudaKernels::ensure_kernel(
+                    device,
+                    "rms_norm_grad_weight_bf16_vec",
+                    RMS_NORM_GRAD_WEIGHT_KERNEL_BF16,
+                )?;
+                let gw_func = device
+                    .get_func("rms_norm_grad_weight_bf16_vec", "rms_norm_grad_weight_bf16_vec")
+                    .ok_or_else(|| Error::Cuda(
+                        "Failed to get rms_norm_grad_weight_bf16_vec kernel".into()))?;
+
+                const COLS_PER_BLOCK: u32 = 64;
+                const ROWS_PER_BLOCK: u32 = 512;
+                let cols_blocks = ((norm_size as u32) + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK;
+                let rows_blocks = ((batch_size as u32) + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+                let gw_cfg = LaunchConfig {
+                    grid_dim: (cols_blocks, rows_blocks, 1),
+                    block_dim: (COLS_PER_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                launch_kernel!(
+                    gw_func,
+                    gw_cfg,
+                    grad_out_ptr,
+                    input_ptr,
+                    inv_rms.storage.try_as_slice_f32()?,
+                    gw_ptr,
+                    batch_size as i32,
+                    norm_size as i32
+                );
+            }
         }
         _ => {
             let null_weight = device.null::<u16>()?;
@@ -1255,6 +1353,105 @@ extern "C" __global__ void rms_norm_forward_bf16(
 }
 "#;
 
+/// Vectorized RMSNorm forward (BF16) — parallel reduction within a block.
+///
+/// 2026-05-12 perf: replaces the legacy single-thread-per-row scalar loop.
+/// Uses 256 threads per block, vec_size=4 BF16 loads (8-byte aligned),
+/// per-thread F32 partial sum_sq, warp-shuffle intra-warp reduction, and a
+/// single shared-memory slot for inter-warp reduction. Mirrors the design of
+/// PyTorch `aten/src/ATen/native/cuda/layer_norm_kernel.cu::vectorized_layer_norm_kernel_impl`
+/// stripped to RMSNorm (no mean, no beta).
+///
+/// Caller MUST verify `norm_size % 4 == 0` before launching (production
+/// shapes 2560 and 128 are both multiples of 4); otherwise dispatch to the
+/// legacy scalar kernel above.
+pub const RMS_NORM_FWD_KERNEL_BF16_VEC: &str = r#"
+#include <cuda_bf16.h>
+
+struct __align__(8) bf16x4 {
+    __nv_bfloat16 v[4];
+};
+
+extern "C" __global__ void rms_norm_forward_bf16_vec(
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ weight,
+    float* __restrict__ inv_rms_out,
+    int batch_size,
+    int norm_size,
+    float eps,
+    int has_weight
+) {
+    const int VEC = 4;
+    const int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    const int n_vec = norm_size / VEC;
+    const int tid = threadIdx.x;
+    const int n_threads = blockDim.x;
+
+    const bf16x4* X = reinterpret_cast<const bf16x4*>(input + row * norm_size);
+    bf16x4* Y = reinterpret_cast<bf16x4*>(output + row * norm_size);
+    const bf16x4* W = (has_weight && weight != nullptr)
+        ? reinterpret_cast<const bf16x4*>(weight) : nullptr;
+
+    // Pass 1: per-thread partial sum_sq with vectorized loads.
+    float sum_sq = 0.0f;
+    for (int i = tid; i < n_vec; i += n_threads) {
+        bf16x4 d = X[i];
+        _Pragma("unroll")
+        for (int k = 0; k < VEC; ++k) {
+            float v = __bfloat162float(d.v[k]);
+            sum_sq += v * v;
+        }
+    }
+
+    // Intra-warp reduction (no smem).
+    for (int off = 16; off > 0; off >>= 1) {
+        sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, off);
+    }
+
+    // Inter-warp reduction via shared memory.
+    extern __shared__ float smem[];  // sized to (n_warps) floats from launch
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int n_warps = (n_threads + 31) >> 5;
+
+    if (lane == 0) smem[warp_id] = sum_sq;
+    __syncthreads();
+
+    // Warp 0 reduces the per-warp partials.
+    if (warp_id == 0) {
+        float v = (lane < n_warps) ? smem[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_xor_sync(0xffffffff, v, off);
+        }
+        if (lane == 0) smem[0] = v;
+    }
+    __syncthreads();
+
+    const float total_sum_sq = smem[0];
+    const float mean_sq = total_sum_sq / (float)norm_size;
+    const float inv_rms = rsqrtf(mean_sq + eps);
+    if (tid == 0) inv_rms_out[row] = inv_rms;
+
+    // Pass 2: vectorized normalize + write.
+    for (int i = tid; i < n_vec; i += n_threads) {
+        bf16x4 d = X[i];
+        bf16x4 w_val;
+        if (W != nullptr) w_val = W[i];
+        bf16x4 out;
+        _Pragma("unroll")
+        for (int k = 0; k < VEC; ++k) {
+            float v = __bfloat162float(d.v[k]) * inv_rms;
+            if (W != nullptr) v *= __bfloat162float(w_val.v[k]);
+            out.v[k] = __float2bfloat16_rn(v);
+        }
+        Y[i] = out;
+    }
+}
+"#;
+
 pub const RMS_NORM_BWD_KERNEL_BF16: &str = r#"
 #include <cuda_bf16.h>
 
@@ -1307,6 +1504,170 @@ extern "C" __global__ void rms_norm_backward_bf16(
             atomicAdd(&grad_weight[i], contrib);
         }
     }
+}
+"#;
+
+/// Vectorized RMSNorm backward (BF16) — parallel reduction within a block.
+///
+/// 2026-05-12 perf: replaces the legacy single-thread-per-row scalar loop.
+/// Same parallel pattern as the vec forward (256 threads/block, vec_size=4,
+/// warp-shuffle + smem inter-warp reduction for the `dot` partial). The
+/// `grad_weight` atomicAdds remain — different blocks (rows) update the same
+/// element, so cross-block accumulation requires either atomics or a
+/// separate cross-row reduction kernel. Within a block, threads stride by
+/// `n_threads` so two threads in the same block never touch the same
+/// `grad_weight[idx]` (no intra-block atomic contention).
+///
+/// Caller MUST verify `norm_size % 4 == 0` before launching.
+pub const RMS_NORM_BWD_KERNEL_BF16_VEC: &str = r#"
+#include <cuda_bf16.h>
+
+struct __align__(8) bf16x4 {
+    __nv_bfloat16 v[4];
+};
+
+extern "C" __global__ void rms_norm_backward_bf16_vec(
+    const __nv_bfloat16* __restrict__ grad_out,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ grad_input,
+    float* __restrict__ grad_weight,
+    const float* __restrict__ inv_rms,
+    int batch_size,
+    int norm_size,
+    int has_weight
+) {
+    const int VEC = 4;
+    const int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    const int n_vec = norm_size / VEC;
+    const int tid = threadIdx.x;
+    const int n_threads = blockDim.x;
+
+    const bf16x4* GO = reinterpret_cast<const bf16x4*>(grad_out + row * norm_size);
+    const bf16x4* X  = reinterpret_cast<const bf16x4*>(input    + row * norm_size);
+    bf16x4*       GI = reinterpret_cast<bf16x4*>(grad_input + row * norm_size);
+    const bf16x4* W  = (has_weight && weight != nullptr)
+        ? reinterpret_cast<const bf16x4*>(weight) : nullptr;
+
+    const float inv = inv_rms[row];
+    const float inv_cubed = inv * inv * inv;
+
+    // Pass 1: per-thread partial dot = sum_i (go[i] * w[i] * x[i]).
+    float dot = 0.0f;
+    for (int i = tid; i < n_vec; i += n_threads) {
+        bf16x4 g = GO[i];
+        bf16x4 d = X[i];
+        bf16x4 wv;
+        if (W != nullptr) wv = W[i];
+        _Pragma("unroll")
+        for (int k = 0; k < VEC; ++k) {
+            float go_v = __bfloat162float(g.v[k]);
+            float x_v  = __bfloat162float(d.v[k]);
+            float w_v  = (W != nullptr) ? __bfloat162float(wv.v[k]) : 1.0f;
+            dot += (go_v * w_v) * x_v;
+        }
+    }
+
+    // Intra-warp reduction (no smem).
+    for (int off = 16; off > 0; off >>= 1) {
+        dot += __shfl_xor_sync(0xffffffff, dot, off);
+    }
+
+    // Inter-warp reduction via shared memory.
+    extern __shared__ float smem[];  // sized to (n_warps) floats from launch
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int n_warps = (n_threads + 31) >> 5;
+
+    if (lane == 0) smem[warp_id] = dot;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float v = (lane < n_warps) ? smem[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_xor_sync(0xffffffff, v, off);
+        }
+        if (lane == 0) smem[0] = v;
+    }
+    __syncthreads();
+
+    const float total_dot = smem[0];
+    const float coeff = inv_cubed * total_dot / (float)norm_size;
+
+    // Pass 2: vectorized grad_input write only. The `grad_weight` accumulation
+    // is moved to a separate cross-row reduction kernel (`rms_norm_grad_weight_bf16_vec`)
+    // — accumulating it here would require batch_size × norm_size atomicAdds
+    // (10M+ on production shapes), brutally cross-block-serialized. The
+    // separate kernel reduces atomic volume by ~500× by tiling rows per block
+    // and emitting one atomicAdd per column per row-tile.
+    for (int i = tid; i < n_vec; i += n_threads) {
+        bf16x4 g = GO[i];
+        bf16x4 d = X[i];
+        bf16x4 wv;
+        if (W != nullptr) wv = W[i];
+        bf16x4 out;
+        _Pragma("unroll")
+        for (int k = 0; k < VEC; ++k) {
+            float go_v = __bfloat162float(g.v[k]);
+            float x_v  = __bfloat162float(d.v[k]);
+            float w_v  = (W != nullptr) ? __bfloat162float(wv.v[k]) : 1.0f;
+            float scaled = go_v * w_v;
+            float grad_x = inv * scaled - x_v * coeff;
+            out.v[k] = __float2bfloat16_rn(grad_x);
+        }
+        GI[i] = out;
+    }
+}
+"#;
+
+/// Cross-row reduction kernel for `grad_weight` (BF16 RMSNorm backward).
+///
+/// 2026-05-12 perf: separates `grad_weight` accumulation from the per-row
+/// backward (`rms_norm_backward_bf16_vec`). Mathematics:
+///   grad_weight[j] = sum_r (grad_out[r,j] * input[r,j] * inv_rms[r])
+///
+/// Tiling: each block handles `COLS_PER_BLOCK=64` consecutive columns and a
+/// `ROWS_PER_BLOCK=512` row chunk. Each thread owns ONE column and loops
+/// over the chunk's rows accumulating in F32. At end, one atomicAdd per
+/// column per row-chunk (vs 1 atomicAdd per element per row in the legacy
+/// inline path — ~500× fewer atomic ops on production shapes).
+///
+/// Coalescing: consecutive threadIdx.x access consecutive `[*, col]`
+/// addresses across rows; row stride = `norm_size`, so within one row the
+/// 64 threads of a block read 64 consecutive BF16 = 128 bytes (one cache
+/// line). Reads are fully coalesced.
+pub const RMS_NORM_GRAD_WEIGHT_KERNEL_BF16: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void rms_norm_grad_weight_bf16_vec(
+    const __nv_bfloat16* __restrict__ grad_out,
+    const __nv_bfloat16* __restrict__ input,
+    const float*         __restrict__ inv_rms,
+    float*               __restrict__ grad_weight,
+    int batch_size,
+    int norm_size
+) {
+    const int COLS_PER_BLOCK = 64;
+    const int ROWS_PER_BLOCK = 512;
+
+    const int col = blockIdx.x * COLS_PER_BLOCK + threadIdx.x;
+    if (col >= norm_size) return;
+
+    const int row_start = blockIdx.y * ROWS_PER_BLOCK;
+    int row_end = row_start + ROWS_PER_BLOCK;
+    if (row_end > batch_size) row_end = batch_size;
+
+    float acc = 0.0f;
+    for (int r = row_start; r < row_end; ++r) {
+        const int idx = r * norm_size + col;
+        float go  = __bfloat162float(grad_out[idx]);
+        float x   = __bfloat162float(input[idx]);
+        float inv = inv_rms[r];
+        acc += go * x * inv;
+    }
+    atomicAdd(&grad_weight[col], acc);
 }
 "#;
 
