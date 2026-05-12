@@ -428,6 +428,41 @@ extern "C" __global__ void masked_fill_kernel(
         }
     }
 
+    /// Reconstruct a `Tensor` from its component parts. The caller supplies
+    /// the storage (already-cloned `TensorStorage` enum — the inner Arc on
+    /// the GPU slice is bumped once at clone time), the shape/strides
+    /// metadata, the device handle, and the original `TensorId` to preserve
+    /// gradient identity.
+    ///
+    /// This is the PyTorch `at::Tensor::from_parts` analogue used by
+    /// `SavedRef::unpack` (autograd's saved-tensor reconstruction) to avoid
+    /// a full extra `Tensor::clone` round when the saved-side already has
+    /// the parts in hand.
+    ///
+    /// `requires_grad` is **not** restored — the reconstructed tensor is
+    /// not tracked by autograd. Callers that need autograd participation
+    /// must set it explicitly. (Saved tensors in backward consumers are
+    /// always treated as detached leaves.)
+    #[inline]
+    pub(crate) fn from_parts(
+        storage: crate::tensor_storage::TensorStorage,
+        shape: Shape,
+        device: Arc<CudaDevice>,
+        id: TensorId,
+        custom_strides: Option<crate::shape::Strides>,
+        view_offset: usize,
+    ) -> Tensor {
+        Tensor {
+            storage,
+            shape,
+            device,
+            id,
+            requires_grad: false,
+            custom_strides,
+            view_offset,
+        }
+    }
+
     /// Create a zeros tensor that matches the receiver's shape/device but uses an explicit dtype.
     #[inline]
     pub fn zeros_like_with_dtype(&self, dtype: DType) -> Result<Self> {
