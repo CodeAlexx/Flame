@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstdio>
+#include <cstdlib>
 #include <math.h>
 #include <limits>
 
@@ -275,6 +276,120 @@ __global__ void rms_norm_kernel(const __nv_bfloat16* __restrict__ x,
     float v = f32_from_bf16(x_ptr[c]) * inv;
     if (weight) v *= f32_from_bf16(weight[c]);
     y_ptr[c] = bf16_from_f32(v);
+  }
+}
+
+// 2026-05-12 perf: vectorized LayerNorm forward (BF16) — 256 threads/row,
+// vec=4 BF16 loads via __align__(8) bf16x4_ln struct, warp-shuffle reduction
+// for both mean and variance, single shared-memory slot for inter-warp
+// reduction. Same pattern as the rms_norm vec kernel landed in commit
+// 2ebc2d1 and the layer_norm backward vec landed in commit 4d46832.
+//
+// The legacy `layer_norm_forward_bf16_kernel` below uses smem-tree reduction
+// with scalar BF16 loads — bandwidth-limited at ~250 GB/s on Ampere. This
+// vec version targets ~750-850 GB/s on the same shapes.
+//
+// Caller MUST verify norm_size % 4 == 0 (production diffusion shapes
+// 1280/2560/3072/4096 all qualify) and dispatch to legacy otherwise.
+struct __align__(8) bf16x4_ln {
+  __nv_bfloat16 v[4];
+};
+
+__global__ void layer_norm_forward_bf16_vec_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ bias,
+    __nv_bfloat16* __restrict__ output,
+    float* __restrict__ mean_out,
+    float* __restrict__ rstd_out,
+    int64_t norm_size,
+    float eps)
+{
+  const int VEC = 4;
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int n_threads = blockDim.x;
+  const int64_t n_vec = norm_size / VEC;
+
+  const bf16x4_ln* X = reinterpret_cast<const bf16x4_ln*>(input  + row * norm_size);
+  bf16x4_ln*       Y = reinterpret_cast<bf16x4_ln*>(output + row * norm_size);
+  const bf16x4_ln* W = (weight != nullptr) ? reinterpret_cast<const bf16x4_ln*>(weight) : nullptr;
+  const bf16x4_ln* B = (bias   != nullptr) ? reinterpret_cast<const bf16x4_ln*>(bias)   : nullptr;
+
+  // Pass 1: parallel sum + sum_sq via vectorized loads.
+  float local_sum = 0.f;
+  float local_sq  = 0.f;
+  for (int64_t i = tid; i < n_vec; i += n_threads) {
+    bf16x4_ln d = X[i];
+    #pragma unroll
+    for (int k = 0; k < VEC; ++k) {
+      float v = __bfloat162float(d.v[k]);
+      local_sum += v;
+      local_sq  += v * v;
+    }
+  }
+
+  // Intra-warp reduction (warp shuffle for both partials).
+  for (int off = 16; off > 0; off >>= 1) {
+    local_sum += __shfl_xor_sync(0xffffffff, local_sum, off);
+    local_sq  += __shfl_xor_sync(0xffffffff, local_sq,  off);
+  }
+
+  // Inter-warp reduction via shared memory.
+  // Smem layout: [n_warps floats sum] [n_warps floats sq] (2 * n_warps total).
+  extern __shared__ float ln_smem[];
+  const int warp_id = tid >> 5;
+  const int lane    = tid & 31;
+  const int n_warps = (n_threads + 31) >> 5;
+
+  if (lane == 0) {
+    ln_smem[warp_id] = local_sum;
+    ln_smem[n_warps + warp_id] = local_sq;
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    float s = (lane < n_warps) ? ln_smem[lane] : 0.f;
+    float q = (lane < n_warps) ? ln_smem[n_warps + lane] : 0.f;
+    for (int off = 16; off > 0; off >>= 1) {
+      s += __shfl_xor_sync(0xffffffff, s, off);
+      q += __shfl_xor_sync(0xffffffff, q, off);
+    }
+    if (lane == 0) {
+      ln_smem[0] = s;
+      ln_smem[n_warps] = q;
+    }
+  }
+  __syncthreads();
+
+  const float total_sum = ln_smem[0];
+  const float total_sq  = ln_smem[n_warps];
+  const float inv_norm = 1.f / static_cast<float>(norm_size);
+  const float mean = total_sum * inv_norm;
+  const float var  = total_sq * inv_norm - mean * mean;
+  const float inv_std = rsqrtf(var + eps);
+
+  if (tid == 0) {
+    mean_out[row] = mean;
+    rstd_out[row] = inv_std;
+  }
+
+  // Pass 2: vectorized normalize + affine.
+  for (int64_t i = tid; i < n_vec; i += n_threads) {
+    bf16x4_ln d = X[i];
+    bf16x4_ln gv;
+    bf16x4_ln bv;
+    if (W != nullptr) gv = W[i];
+    if (B != nullptr) bv = B[i];
+    bf16x4_ln out;
+    #pragma unroll
+    for (int k = 0; k < VEC; ++k) {
+      float v = (__bfloat162float(d.v[k]) - mean) * inv_std;
+      if (W != nullptr) v *= __bfloat162float(gv.v[k]);
+      if (B != nullptr) v += __bfloat162float(bv.v[k]);
+      out.v[k] = __float2bfloat16_rn(v);
+    }
+    Y[i] = out;
   }
 }
 
@@ -609,6 +724,21 @@ extern "C" fc_status_t fc_layer_norm_bf16(const fc_tensor_view_t* x,
       gamma ? static_cast<const __nv_bfloat16*>(gamma->data) : nullptr;
   const __nv_bfloat16* bias =
       beta ? static_cast<const __nv_bfloat16*>(beta->data) : nullptr;
+
+  // 2026-05-12 perf: dispatch to the vec=4 kernel when norm_size is divisible
+  // by 4 (production shapes 1280/2560/3072/4096 all qualify). Env override
+  // FLAME_LAYER_NORM_FWD_LEGACY=1 forces the legacy smem-tree kernel.
+  const char* fwd_legacy_env = getenv("FLAME_LAYER_NORM_FWD_LEGACY");
+  const bool fwd_force_legacy = (fwd_legacy_env != nullptr && fwd_legacy_env[0] != 0 && fwd_legacy_env[0] != '0');
+  if (!fwd_force_legacy && (norm_size % 4 == 0) && norm_size >= 4) {
+    const int block_threads_vec = 256;
+    const int n_warps_vec = (block_threads_vec + 31) >> 5;
+    const size_t smem_vec = 2 * static_cast<size_t>(n_warps_vec) * sizeof(float);
+    layer_norm_forward_bf16_vec_kernel<<<static_cast<int>(outer), block_threads_vec, smem_vec, stream>>>(
+        input, weight, bias, output, mean_out, rstd_out, norm_size, eps);
+    if (cudaGetLastError() != cudaSuccess) return FC_ERR_LAUNCH;
+    return FC_OK;
+  }
 
   int block_threads = 1;
   if (norm_size >= 256) {
