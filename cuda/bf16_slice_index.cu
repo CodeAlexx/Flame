@@ -135,6 +135,18 @@ inline bool axis_is_contiguous(const fc_tensor_view_t* x, int32_t axis) {
     return x->strides[axis] == expected;
 }
 
+// 2026-05-12 perf: full row-major contiguity check. Used by the slice
+// fast-path: when axis==0 AND x is fully contiguous, slicing reduces to a
+// single `cudaMemcpyAsync` of `len * inner_elems * sizeof(bf16)` bytes.
+inline bool is_row_major_contiguous(const fc_tensor_view_t* x) {
+    int64_t expected = 1;
+    for (int32_t d = x->rank - 1; d >= 0; --d) {
+        if (x->strides[d] != expected) return false;
+        expected *= x->dims[d];
+    }
+    return true;
+}
+
 }  // namespace
 
 extern "C" fc_status_t fc_bf16_slice(const fc_tensor_view_t* x,
@@ -172,6 +184,27 @@ extern "C" fc_status_t fc_bf16_slice(const fc_tensor_view_t* x,
 
     const int64_t total = total_elems(dst_info);
     if (total == 0) {
+        return FC_OK;
+    }
+
+    // 2026-05-12 perf: leading-axis fast path. When axis==0 AND x is row-major
+    // contiguous, the slice [start..start+len] along the outermost dim is a
+    // single contiguous chunk of memory — replace the kernel with one
+    // cudaMemcpyAsync (the kernel's div/mod-per-element work is wasted in
+    // this case). Env override FLAME_SLICE_COPY_LEGACY=1 forces the kernel.
+    const char* legacy_env = getenv("FLAME_SLICE_COPY_LEGACY");
+    const bool force_legacy = (legacy_env != nullptr && legacy_env[0] != 0 && legacy_env[0] != '0');
+    if (!force_legacy && axis == 0 && is_row_major_contiguous(x)) {
+        int64_t inner = 1;
+        for (int32_t d = 1; d < x->rank; ++d) inner *= x->dims[d];
+        const size_t bytes = static_cast<size_t>(len) * static_cast<size_t>(inner) * sizeof(__nv_bfloat16);
+        const __nv_bfloat16* src_base = static_cast<const __nv_bfloat16*>(x->data);
+        const __nv_bfloat16* src_chunk = src_base + start * inner;
+        cudaError_t err = cudaMemcpyAsync(y_view_or_buf->data, src_chunk, bytes,
+                                          cudaMemcpyDeviceToDevice, stream);
+        if (err != cudaSuccess) {
+            return FC_ERR_LAUNCH;
+        }
         return FC_OK;
     }
 

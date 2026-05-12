@@ -124,6 +124,12 @@ harness = false
 name = "layer_norm_vec"
 harness = false
 
+# BF16 slice leading-axis fast-path (cudaMemcpyAsync) vs generic kernel
+# (2026-05-12). Toggled via FLAME_SLICE_COPY_LEGACY=1.
+[[bench]]
+name = "slice_copy_bench"
+harness = false
+
 # Add session 4 — first binary, same 5%-within gate.
 [[bench]]
 name = "add_iter_alloc"
