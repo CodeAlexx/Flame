@@ -761,9 +761,76 @@ extern "C" __global__ void masked_fill_kernel(
             return self.contiguous()?.to_dtype(dtype);
         }
 
+        let numel = self.shape.elem_count();
+
+        // 2026-05-12 perf: fast paths for the two hot cast cases. The generic
+        // path below does alloc_aligned_f32 + storage.to_f32 + dtod_copy +
+        // optional second conversion — 2-3 kernels and 2-3 allocs per cast.
+        // Autograd recompute fires casts ~14× per backward pass per block; on
+        // klein 9B/zimage that's ~2K casts/step paying redundant memcpy +
+        // alloc overhead. PyTorch dispatches one fused cast kernel via
+        // TensorIterator; these fast paths match that pattern.
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        {
+            use cudarc::driver::DevicePtr;
+            // BF16 → F32: one kernel, two allocs (output + storage).
+            if self.dtype() == DType::BF16
+                && self.storage.dtype() == DType::BF16
+                && dtype == DType::F32
+            {
+                let src_ptr = self.as_device_ptr_bf16("to_dtype::bf16_to_f32")? as u64;
+                let mut f32_data = crate::cuda_alloc_pool::pool_alloc_f32(&self.device, numel)?;
+                crate::bf16_convert::bf16_to_f32_u16(
+                    self.device.clone(),
+                    src_ptr,
+                    &mut f32_data,
+                    numel,
+                )?;
+                return Ok(Tensor {
+                    storage: TensorStorage::F32 {
+                        data: f32_data.into(),
+                        numel,
+                    },
+                    shape: self.shape.clone(),
+                    device: self.device.clone(),
+                    id: TensorId::new(),
+                    requires_grad: false,
+                    custom_strides: None,
+                    view_offset: 0,
+                });
+            }
+
+            // F32 → BF16: one kernel, two allocs (output BF16 + nothing else).
+            if self.dtype() == DType::F32
+                && self.storage.dtype() == DType::F32
+                && dtype == DType::BF16
+            {
+                let src = self.storage.try_as_slice_f32()?;
+                let mut bf_data = crate::cuda_alloc_pool::pool_alloc_u16(&self.device, numel)?;
+                crate::bf16_convert::f32_to_bf16_u16(
+                    self.device.clone(),
+                    src,
+                    *bf_data.device_ptr(),
+                    numel,
+                )?;
+                return Ok(Tensor {
+                    storage: TensorStorage::BF16 {
+                        data: bf_data.into(),
+                        numel,
+                    },
+                    shape: self.shape.clone(),
+                    device: self.device.clone(),
+                    id: TensorId::new(),
+                    requires_grad: false,
+                    custom_strides: None,
+                    view_offset: 0,
+                });
+            }
+        }
+
         // For now, we store everything as F32 but track the dtype
         // Use aligned allocation for the new tensor to avoid CUDA issues
-        let numel = self.shape.elem_count();
+        let _unused_numel = numel; // keep for clarity in legacy path
 
         // Debug large allocations
         // Commented out for cleaner training output

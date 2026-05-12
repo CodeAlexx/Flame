@@ -165,6 +165,11 @@ harness = false
 name = "group_norm_fwd_bench"
 harness = false
 
+# Tensor::to_dtype cast fast-path benchmark (BF16<->F32). 2026-05-12.
+[[bench]]
+name = "cast_bench"
+harness = false
+
 # Add session 4 — first binary, same 5%-within gate.
 [[bench]]
 name = "add_iter_alloc"

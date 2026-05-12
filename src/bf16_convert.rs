@@ -113,6 +113,25 @@ pub fn f32_to_bf16_u16(
     Ok(())
 }
 
+/// Direct BF16→F32 cast: takes a raw BF16 device pointer (as u64) and writes
+/// into a pre-allocated F32 buffer. Eliminates the F32 staging + dtod_copy
+/// that the generic `to_dtype` path does for BF16 source. 2026-05-12.
+pub fn bf16_to_f32_u16(
+    dev: Arc<CudaDevice>,
+    src: u64,
+    dst: &mut CudaSlice<f32>,
+    n: usize,
+) -> Result<()> {
+    ensure(&dev, "bf16_to_f32", CUDA_TO_F32)?;
+    let f = dev
+        .get_func("bf16_to_f32", "bf16_to_f32")
+        .ok_or_else(|| Error::Cuda("bf16_to_f32 missing".into()))?;
+    unsafe {
+        f.launch(lc_pairs(n), (src, &*dst, n as i64))?;
+    }
+    Ok(())
+}
+
 /// CPU reference for stochastic rounding F32 → BF16.
 ///
 /// Bias-free rounding: keep the high 16 bits (the BF16 representation under
