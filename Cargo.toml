@@ -159,6 +159,12 @@ harness = false
 name = "layer_norm_fwd_bench"
 harness = false
 
+# GroupNorm forward stats kernel (BF16) vec=4 vs legacy. 2026-05-12.
+# Toggled via FLAME_GROUP_NORM_STATS_LEGACY=1.
+[[bench]]
+name = "group_norm_fwd_bench"
+harness = false
+
 # Add session 4 — first binary, same 5%-within gate.
 [[bench]]
 name = "add_iter_alloc"

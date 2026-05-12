@@ -459,6 +459,98 @@ __global__ void layer_norm_forward_bf16_kernel(const __nv_bfloat16* input,
   }
 }
 
+// 2026-05-12 perf: vectorized GroupNorm stats kernel. Same warp-shuffle +
+// smem inter-warp reduction pattern as rms_norm/layer_norm vec kernels.
+// Uses vec=4 BF16 loads (bf16x4_gn) along the contiguous spatial axis.
+// Caller MUST verify spatial_size % 4 == 0 before dispatching here.
+//
+// Index layout: each block handles one (n, g). Threads iterate over
+// `elements_per_group = channels_per_group * spatial_size`. Since input is
+// row-major NCHW with `c` varying slower than `hw`, consecutive thread
+// indices in the *contiguous* axis (hw) land on adjacent input addresses
+// → vec=4 loads coalesce.
+struct __align__(8) bf16x4_gn {
+  __nv_bfloat16 v[4];
+};
+
+__global__ void group_norm_compute_stats_bf16_vec_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    float* __restrict__ mean_out,
+    float* __restrict__ var_out,
+    int batch_size,
+    int channels,
+    int groups,
+    int channels_per_group,
+    int spatial_size)
+{
+  const int VEC = 4;
+  const int group_id = blockIdx.x;
+  const int total_groups = batch_size * groups;
+  if (group_id >= total_groups) return;
+  const int n = group_id / groups;
+  const int g = group_id % groups;
+  const int tid = threadIdx.x;
+  const int n_threads = blockDim.x;
+
+  const int spatial_vec = spatial_size / VEC;          // # of bf16x4_gn per row
+  const int elements_per_group = channels_per_group * spatial_size;
+  const int vec_per_group = channels_per_group * spatial_vec;
+
+  // Pass 1: collaborative sum + sum_sq using vec=4 BF16 loads.
+  float local_sum = 0.f;
+  float local_sq  = 0.f;
+  for (int idx = tid; idx < vec_per_group; idx += n_threads) {
+    const int c_offset = idx / spatial_vec;
+    const int hw_vec   = idx % spatial_vec;
+    const int c = g * channels_per_group + c_offset;
+    // input offset in bf16x4_gn units; the underlying contiguous index
+    // is ((n*channels + c)*spatial_size) + hw_vec*VEC, which is divisible
+    // by VEC because hw_vec*VEC is.
+    const int input_off = ((n * channels + c) * spatial_size) + hw_vec * VEC;
+    const bf16x4_gn d = *reinterpret_cast<const bf16x4_gn*>(input + input_off);
+    #pragma unroll
+    for (int k = 0; k < VEC; ++k) {
+      float v = __bfloat162float(d.v[k]);
+      local_sum += v;
+      local_sq  += v * v;
+    }
+  }
+
+  // Intra-warp reduction.
+  for (int off = 16; off > 0; off >>= 1) {
+    local_sum += __shfl_xor_sync(0xffffffff, local_sum, off);
+    local_sq  += __shfl_xor_sync(0xffffffff, local_sq,  off);
+  }
+
+  // Inter-warp reduction via shared memory.
+  extern __shared__ float gn_smem[];  // size: 2 * n_warps
+  const int warp_id = tid >> 5;
+  const int lane    = tid & 31;
+  const int n_warps = (n_threads + 31) >> 5;
+
+  if (lane == 0) {
+    gn_smem[warp_id] = local_sum;
+    gn_smem[n_warps + warp_id] = local_sq;
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    float s = (lane < n_warps) ? gn_smem[lane] : 0.f;
+    float q = (lane < n_warps) ? gn_smem[n_warps + lane] : 0.f;
+    for (int off = 16; off > 0; off >>= 1) {
+      s += __shfl_xor_sync(0xffffffff, s, off);
+      q += __shfl_xor_sync(0xffffffff, q, off);
+    }
+    if (lane == 0) {
+      const float count = static_cast<float>(elements_per_group);
+      const float mean = s / count;
+      const float var  = q / count - mean * mean;
+      mean_out[group_id] = mean;
+      var_out[group_id] = var;
+    }
+  }
+}
+
 __global__ void group_norm_compute_stats_bf16_kernel(const __nv_bfloat16* input,
                                                      float* mean_out,
                                                      float* var_out,
@@ -866,21 +958,40 @@ extern "C" fc_status_t fc_group_norm_bf16(const fc_tensor_view_t* x,
   const __nv_bfloat16* weight = gamma ? static_cast<const __nv_bfloat16*>(gamma->data) : nullptr;
   const __nv_bfloat16* bias = beta ? static_cast<const __nv_bfloat16*>(beta->data) : nullptr;
 
-  int stats_threads = (spatial > 65536) ? 512 : 256;
+  // 2026-05-12 perf: dispatch to vec stats when spatial_size % 4 == 0.
+  // VAE blocks typically have spatial = H*W = 64*64, 32*32, etc., always
+  // a power-of-2 → divisible by 4. Env override
+  // FLAME_GROUP_NORM_STATS_LEGACY=1 forces the legacy smem-tree path.
+  const char* gn_legacy_env = getenv("FLAME_GROUP_NORM_STATS_LEGACY");
+  const bool gn_force_legacy = (gn_legacy_env != nullptr && gn_legacy_env[0] != 0 && gn_legacy_env[0] != '0');
+  const bool use_gn_vec = !gn_force_legacy && (spatial % 4 == 0) && spatial >= 4;
+
   int total_groups = static_cast<int>(stats_elems);
   dim3 stats_grid(total_groups, 1, 1);
-  dim3 stats_block(stats_threads, 1, 1);
-  size_t stats_shared = static_cast<size_t>(stats_threads) * 2 * sizeof(float);
 
-  group_norm_compute_stats_bf16_kernel<<<stats_grid, stats_block, stats_shared, stream>>>(
-      input,
-      mean_out,
-      var_out,
-      static_cast<int>(batch),
-      static_cast<int>(channels),
-      groups,
-      static_cast<int>(channels_per_group),
-      static_cast<int>(spatial));
+  if (use_gn_vec) {
+    const int block_threads_vec = 256;
+    const int n_warps_vec = (block_threads_vec + 31) >> 5;
+    const size_t smem_vec = 2 * static_cast<size_t>(n_warps_vec) * sizeof(float);
+    dim3 stats_block_vec(block_threads_vec, 1, 1);
+    group_norm_compute_stats_bf16_vec_kernel<<<stats_grid, stats_block_vec, smem_vec, stream>>>(
+        input, mean_out, var_out,
+        static_cast<int>(batch), static_cast<int>(channels), groups,
+        static_cast<int>(channels_per_group), static_cast<int>(spatial));
+  } else {
+    int stats_threads = (spatial > 65536) ? 512 : 256;
+    dim3 stats_block(stats_threads, 1, 1);
+    size_t stats_shared = static_cast<size_t>(stats_threads) * 2 * sizeof(float);
+    group_norm_compute_stats_bf16_kernel<<<stats_grid, stats_block, stats_shared, stream>>>(
+        input,
+        mean_out,
+        var_out,
+        static_cast<int>(batch),
+        static_cast<int>(channels),
+        groups,
+        static_cast<int>(channels_per_group),
+        static_cast<int>(spatial));
+  }
 
   cudaError_t launch_status = cudaGetLastError();
   if (launch_status != cudaSuccess) {
