@@ -1037,6 +1037,7 @@ large tensors until it's rewritten.
 | `FLAME_GEMM_BF16_WORKSPACE_BYTES` | Bytes of persistent cuBLASLt workspace per device for BF16 GEMMs (Fix #C; `0` = no workspace) | `0` |
 | `FLAME_HOT_FAST_PATH_DISABLE` | `1` disables direct-kernel fast path on `Tensor::silu/gelu/add/mul/mul_scalar` for BF16-contig (Fix #F); falls through to TensorIterator | fast path on |
 | `FLAME_PERMUTE_FASTPATH` | `0` disables tuned rank-2 `[1,0]` and rank-4 `[0,1,3,2]` permute kernels (Fix #G); routes to generic scatter | fast path on |
+| `FLAME_NO_CUDNN_SDPA_BWD` | `1` forces decomposed SDPA backward (skip `try_cudnn_sdpa_backward`); rollback for Stage 2 cuDNN bwd re-enable | cuDNN on for aligned shapes |
 
 ### Phase 2 `SavedRef` caveat — version counter is in a side table, not in `TensorStorage`
 
@@ -1381,6 +1382,44 @@ applies the mask tile-by-tile.
 - Chunking the sampler step (unchanged token count per call).
 The stream kernel is the fix; the threshold dispatcher routes to it
 automatically.
+
+---
+
+## cuDNN SDPA backward — Nq 64-alignment + saved-O lookup (2026-05-12, Stage 2)
+
+`try_cudnn_sdpa_backward` (`autograd.rs:817`) requires **`Nq` divisible by
+64** or cuDNN's flash-bwd graph returns `CUDA_ERROR_MISALIGNED_ADDRESS` at
+launch. Guard added at the top of the function — non-64-aligned shapes
+fall back to the decomposed path. Klein 9B production attention uses
+`Nq ∈ {1536, 1568, 1632}`; only `Nq=1536` is aligned and hits cuDNN. To
+extract klein's full predicted gain, would need to pad Q/K/V/O/Stats to
+the next 64-aligned dim and slice the result (~64-element pad = +4%
+memory at Nq=1568, negligible compute) — deferred follow-up.
+
+### ⚠️ Hidden bug class: saved-tensor id-exclusion is broken
+
+`fetch_saved(entry, id)` at `autograd.rs:2090-2115` materializes non-contig
+views via `.contiguous()`, which produces a **fresh `TensorId`**. So any
+code that does:
+
+```rust
+saved_tensors.iter().find(|t| t.id != some_other_id)
+```
+
+is **always wrong** — the fresh-clone id will never match the recorded
+saved-Q/K/V id, so the exclusion clause is a no-op and the first
+shape-match wins. This is exactly how the cuDNN SDPA bwd `grad_norm=inf`
+bug fired pre-Stage 2 (saved-O was always returning saved-Q because they
+share `[B,H,Nq,D]` shape in self-attention).
+
+**Always use the saved-by-id pattern**: at forward record time, store the
+specific `TensorId` you'll need in the `Op` enum (e.g.
+`Op::FlashAttention { output: Option<TensorId>, stats: Option<TensorId>, ..}`).
+At backward, call `fetch_saved(entry, &recorded_id)` directly. Never
+shape-find with id-exclusion.
+
+The `Op::FlashAttention` struct (`autograd.rs:332-348`) is the canonical
+example post-fix.
 
 ---
 

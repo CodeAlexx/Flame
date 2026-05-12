@@ -246,9 +246,35 @@ This is a critical area with several implementations. **Use these for inference*
   Called from `sdpa::forward` when `AutogradContext::is_recording()` and
   any input requires grad. Routes unmasked BF16 head_dim ∈ {64, 96, 128}
   through `flame_cudnn_sdpa_bf16_train_fwd` (emits O + Stats in one graph
-  execute), records `Op::FlashAttention`. Backward then calls
-  `flame_cudnn_sdpa_bwd_bf16` via `autograd::try_cudnn_sdpa_backward`.
-  Unsupported shapes fall through to the decomposed recompute.
+  execute), records `Op::FlashAttention` with `output: Some(out.id())` +
+  `stats: stats_tensor.as_ref().map(|s| s.id())` (added 2026-05-12 — see
+  Stage 2 below). Backward then calls `flame_cudnn_sdpa_bwd_bf16` via
+  `autograd::try_cudnn_sdpa_backward`. Unsupported shapes fall through to
+  the decomposed recompute.
+
+### Stage 2 (2026-05-12) — cuDNN SDPA backward re-enabled
+**Bug fixed**: `autograd.rs:4231-4240` shape-find heuristic returned Q as O
+because `fetch_saved` materializes via `.contiguous()` → fresh `TensorId`s
+break the id-exclusion (`t.id != query_tensor.id`). Replaced with direct
+`fetch_saved(id)` lookup using new `Op::FlashAttention { output, stats, .. }`
+fields (autograd.rs:332-348).
+- New tests at `tests/sdpa_bwd_parity.rs` — 8 cases: 4 same-path
+  determinism + 4 cuDNN-vs-decomposed cross-path. cos ≥ 0.99996,
+  max_abs_diff ≤ 1.2e-2.
+- **Nq 64-alignment guard** at `autograd.rs:817` — cuDNN flash bwd requires
+  Nq divisible by 64 or returns `CUDA_ERROR_MISALIGNED_ADDRESS`. Falls
+  back to decomposed for non-aligned shapes (klein production Nq=1568/1632
+  bail; Nq=1536 hits cuDNN).
+- Loss bit-equal at 4 decimal places vs `FLAME_NO_CUDNN_SDPA_BWD=1`
+  rollback path.
+- Real savings: zimage -200 ms/step (1.8 → 1.6); klein 9B -100 ms (4.7 →
+  4.6, capped by alignment constraint).
+
+⚠️ **Hidden bug class to watch**: anywhere code does
+`saved_tensors.iter().find(|t| t.id != some_id)` is broken because
+`fetch_saved` materializes via `.contiguous()` producing fresh ids.
+Always use the saved-by-id lookup (record the id at forward time, look up
+directly at backward).
 
 ### Helper structs (in `attention/sdpa.rs`, used by training paths)
 - `AttentionConfig` — `:83`
