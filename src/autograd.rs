@@ -35,6 +35,11 @@ use std::sync::{Arc, Mutex};
 /// 4B step that adds up.
 pub type SavedTensors = SmallVec<[(TensorId, Tensor); 3]>;
 
+/// Phase 2 — `SavedRef`-based saved tensors. Inline-sized to 4 (the spec).
+/// Carries the storage version snapshot so backward errors loudly if any
+/// op modified the saved tensor in-place between save and unpack.
+pub type SavedRefs = SmallVec<[crate::saved_ref::SavedRef; 4]>;
+
 /// Return type of `compute_gradients` per tape entry. Most ops produce 1-3
 /// grads, so inlining up to 3 avoids per-op heap allocation during backward.
 pub type GradVec = SmallVec<[(TensorId, Tensor); 3]>;
@@ -418,7 +423,16 @@ pub struct OffloadedTapeEntry {
     pub resident_fallback: SmallVec<[(TensorId, Tensor); 3]>,
 }
 
-/// Entry in the computation tape
+/// Entry in the computation tape.
+///
+/// Phase 2: two parallel saved-state paths. New ops should populate
+/// `saved_refs` via `SavedRef::capture`. Legacy ops continue to populate
+/// `saved_tensors`. The `FLAME_AUTOGRAD_SAVED_LEGACY=1` env knob forces
+/// every call site through the legacy path (the `Into<SavedTensors>`
+/// builder selects between them).
+///
+/// Backward consumers use `get_saved(id)` which transparently checks both
+/// paths, so the migration is non-disruptive.
 #[derive(Clone)]
 struct TapeEntry {
     /// Output tensor ID
@@ -427,26 +441,71 @@ struct TapeEntry {
     /// Operation that produced the output
     op: Op,
 
-    /// Saved tensors needed for backward pass. Inline-sized for the common
-    /// 0-3 tensor case (input, weight, bias) to avoid a Vec heap allocation
-    /// per recorded op.
+    /// Legacy saved-tensor path. Inline-sized for 0-3 tensors. Populated
+    /// when call sites pass `vec![(id, tensor)]` (unchanged callers).
     saved_tensors: SavedTensors,
+
+    /// Phase 2 saved-ref path. Populated when call sites use
+    /// `record_op_refs` or pass a `SavedRefs` to `record_op`.
+    saved_refs: SavedRefs,
 }
 
 impl TapeEntry {
-    /// Look up a saved tensor by ID (linear scan — fast for typical 1-3 entries)
+    /// Look up a saved tensor by ID (linear scan — fast for typical 1-3 entries).
+    /// Checks SavedRef path first (with version-counter validation), then
+    /// falls back to the legacy `saved_tensors` path. Returns a borrow into
+    /// whichever path holds the saved tensor.
     #[inline]
     fn get_saved(&self, id: &TensorId) -> Option<&Tensor> {
+        if let Some(r) = self.saved_refs.iter().find(|r| r.id == *id) {
+            // Version check via unpack_ref — on mismatch returns None so the
+            // backward consumer surfaces its standard "missing saved tensor"
+            // error (loud-fail). This is the empirical safety net the spec
+            // requires.
+            return r.unpack_ref().ok();
+        }
         self.saved_tensors
             .iter()
             .find(|(k, _)| k == id)
             .map(|(_, v)| v)
     }
 
-    /// Iterate over saved tensor IDs
+    /// Iterate over saved tensor IDs across both paths.
     #[inline]
     fn saved_keys(&self) -> impl Iterator<Item = &TensorId> {
-        self.saved_tensors.iter().map(|(k, _)| k)
+        self.saved_refs
+            .iter()
+            .map(|r| &r.id)
+            .chain(self.saved_tensors.iter().map(|(k, _)| k))
+    }
+
+    /// Total saved count across both paths.
+    #[inline]
+    fn saved_count(&self) -> usize {
+        self.saved_refs.len() + self.saved_tensors.len()
+    }
+
+    /// Positional accessor — returns the (id, &tensor) at logical index `i`
+    /// across the combined view of `saved_tensors` then `saved_refs`. Backward
+    /// code that does `saved_tensors[1].1` should use this instead, so the
+    /// SavedRef migration is positionally compatible. Returns `None` if out
+    /// of range.
+    #[inline]
+    fn saved_at(&self, i: usize) -> Option<(TensorId, &Tensor)> {
+        if i < self.saved_tensors.len() {
+            let (id, t) = &self.saved_tensors[i];
+            Some((*id, t))
+        } else {
+            let j = i - self.saved_tensors.len();
+            if j < self.saved_refs.len() {
+                let r = &self.saved_refs[j];
+                // Skip version check here — positional access is best-effort
+                // for backward consumers that expected a `Tensor` value.
+                Some((r.id, &r.tensor))
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -455,7 +514,7 @@ impl std::fmt::Debug for TapeEntry {
         f.debug_struct("TapeEntry")
             .field("output_id", &self.output_id)
             .field("op", &self.op)
-            .field("saved_count", &self.saved_tensors.len())
+            .field("saved_count", &self.saved_count())
             .finish()
     }
 }
@@ -717,6 +776,22 @@ pub fn backward(loss: &Tensor, _retain_graph: bool) -> Result<crate::GradientMap
 ///
 /// Uses the tensors' native strides so permute-views work without
 /// materialization. The output dQ/dK/dV are freshly-allocated contiguous.
+
+/// Diagnostic: log every SDPA-backward dispatch decision when
+/// `FLAME_LOG_SDPA_BWD=1`. Helps pin down whether cuDNN fires or each
+/// block falls back to `attention_backward_recompute` (which is ~12 launches
+/// vs 1 for cuDNN).
+#[inline]
+fn sdpa_bwd_log(msg: &str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        std::env::var("FLAME_LOG_SDPA_BWD").ok().as_deref() == Some("1")
+    }) {
+        return;
+    }
+    eprintln!("[sdpa-bwd] {msg}");
+}
+
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 fn try_cudnn_sdpa_backward(
     q: &Tensor,
@@ -737,22 +812,54 @@ fn try_cudnn_sdpa_backward(
     if *NO_CUDNN_SDPA_BWD.get_or_init(|| {
         std::env::var("FLAME_NO_CUDNN_SDPA_BWD").ok().as_deref() == Some("1")
     }) {
+        sdpa_bwd_log("disabled-by-env");
         return Ok(None);
     }
     // All the reasons to bail out.
-    if mask.is_some() { return Ok(None); }
-    let (Some(o), Some(stats)) = (o, stats) else { return Ok(None); };
+    if mask.is_some() { sdpa_bwd_log("bail:mask-present"); return Ok(None); }
+    let (Some(o), Some(stats)) = (o, stats) else {
+        sdpa_bwd_log("bail:missing-o-or-stats");
+        return Ok(None);
+    };
     let q_dims = q.shape().dims();
     let k_dims = k.shape().dims();
-    if q_dims.len() != 4 || k_dims.len() != 4 { return Ok(None); }
-    let (b, h, n_q, d) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
-    let n_kv = k_dims[2];
-    if !(d == 64 || d == 96 || d == 128) { return Ok(None); }
-    if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16
-        || o.dtype() != DType::BF16 || d_o.dtype() != DType::BF16 {
+    if q_dims.len() != 4 || k_dims.len() != 4 {
+        sdpa_bwd_log(&format!("bail:rank q={} k={}", q_dims.len(), k_dims.len()));
         return Ok(None);
     }
-    if stats.shape().dims() != [b * h, n_q] { return Ok(None); }
+    let (b, h, n_q, d) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
+    let n_kv = k_dims[2];
+    if !(d == 64 || d == 96 || d == 128) {
+        sdpa_bwd_log(&format!("bail:head_dim={d}"));
+        return Ok(None);
+    }
+    // 2026-05-12 investigation: casting `d_o` F32→BF16 here would let cuDNN
+    // bwd fire (currently bails on every block because GradientMap stores
+    // grads as F32 — gradient.rs `InternalFP32_PublicBF16`). The cast itself
+    // is mechanically safe, BUT enabling cuDNN bwd produced `grad_norm=inf`
+    // on zimage rank=8 LoRA training step 1 in a 12-step A/B (vs 0.21 with
+    // the decomposed-recompute fallback). Matches the warning at line ~734
+    // ("Klein 4B step-1 grad_norm spikes of 1e10+"). Root cause unresolved:
+    // possibly stats-tensor convention mismatch (cuDNN expects max+lse, our
+    // forward may emit lse-only) or BF16 d_o precision loss on extreme grad
+    // magnitudes. Until root-caused, keep the dtype bail. Fix would save
+    // ~300 ms/step (4.0→3.7) on zimage but ships broken gradients.
+    if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16
+        || o.dtype() != DType::BF16 || d_o.dtype() != DType::BF16 {
+        sdpa_bwd_log(&format!(
+            "bail:dtype q={:?} k={:?} v={:?} o={:?} d_o={:?}",
+            q.dtype(), k.dtype(), v.dtype(), o.dtype(), d_o.dtype()
+        ));
+        return Ok(None);
+    }
+    if stats.shape().dims() != [b * h, n_q] {
+        sdpa_bwd_log(&format!(
+            "bail:stats-shape got={:?} want=[{},{n_q}]",
+            stats.shape().dims(), b * h
+        ));
+        return Ok(None);
+    }
+    sdpa_bwd_log(&format!("fired cuDNN bf16 [B={b},H={h},Nq={n_q},Nkv={n_kv},d={d}]"));
 
     // Read each tensor's native 4D strides.
     let q_strides  = strides_4d(q)?;
@@ -930,6 +1037,27 @@ impl AutogradContext {
 
         let saved_tensors: SavedTensors = saved_tensors.into();
 
+        // Phase 2: optionally convert to SavedRef path. Default behavior
+        // populates `saved_refs` (lighter — single Tensor::clone per saved
+        // tensor plus an Arc<AtomicU32> snapshot, vs. legacy's Tensor::clone
+        // bundled into a Vec-converted SmallVec). Legacy mode keeps the old
+        // `saved_tensors` path for A/B testing via
+        // `FLAME_AUTOGRAD_SAVED_LEGACY=1`.
+        let (legacy_tensors, refs) = if crate::saved_ref::legacy_saved_mode() {
+            (saved_tensors, SavedRefs::new())
+        } else {
+            let mut refs = SavedRefs::with_capacity(saved_tensors.len());
+            for (id, t) in &saved_tensors {
+                refs.push(crate::saved_ref::SavedRef {
+                    id: *id,
+                    tensor: t.clone(),
+                    version_counter: t.storage_ref().version_handle(),
+                    version_at_save: t.storage_ref().version(),
+                });
+            }
+            (SavedTensors::new(), refs)
+        };
+
         let mut ctx = match AUTOGRAD_CONTEXT.lock() {
             Ok(guard) => guard,
             Err(_) => return,
@@ -945,12 +1073,15 @@ impl AutogradContext {
         // CHECKPOINT_HAS_ENTRIES is false by default and only set when CPUOffload
         // policy is active, so for pure Recompute checkpointing this is a ~1ns
         // atomic load instead of a ~25ns uncontended mutex lock per recorded op.
-        if !saved_tensors.is_empty()
+        if (!legacy_tensors.is_empty() || !refs.is_empty())
             && CHECKPOINT_HAS_ENTRIES.load(std::sync::atomic::Ordering::Relaxed)
         {
             if let Ok(mut mgr) = CHECKPOINT_MANAGER.lock() {
-                for (id, tensor) in &saved_tensors {
+                for (id, tensor) in &legacy_tensors {
                     let _ = mgr.checkpoint_saved_tensor(*id, tensor);
+                }
+                for r in &refs {
+                    let _ = mgr.checkpoint_saved_tensor(r.id, &r.tensor);
                 }
             }
         }
@@ -958,7 +1089,8 @@ impl AutogradContext {
         ctx.record(TapeEntry {
             output_id,
             op,
-            saved_tensors,
+            saved_tensors: legacy_tensors,
+            saved_refs: refs,
         });
     }
 
@@ -967,6 +1099,11 @@ impl AutogradContext {
         if let Ok(mut ctx) = AUTOGRAD_CONTEXT.lock() {
             ctx.clear();
         }
+        // Phase 2: flush the version-counter side table at step boundaries.
+        // Any in-flight SavedRef keeps a private Arc<AtomicU32> clone so
+        // its check stays valid; the flush only prevents unbounded growth
+        // across long training runs.
+        crate::tensor_storage::clear_version_table();
     }
 
     /// Test-only: register a set of intermediate tensor IDs whose gradients
@@ -1178,6 +1315,9 @@ impl AutogradContext {
                             for (tid, _) in &e.saved_tensors {
                                 ids.push(*tid);
                             }
+                            for r in &e.saved_refs {
+                                ids.push(r.id);
+                            }
                             match &e.op {
                                 Op::Add { lhs, rhs, .. } | Op::Sub { lhs, rhs }
                                 | Op::Mul { lhs, rhs } | Op::Div { lhs, rhs, .. }
@@ -1270,6 +1410,11 @@ impl AutogradContext {
                         for (tid, tensor) in &e.saved_tensors {
                             if tensor.requires_grad() {
                                 ids.insert(*tid);
+                            }
+                        }
+                        for r in &e.saved_refs {
+                            if r.tensor.requires_grad() {
+                                ids.insert(r.id);
                             }
                         }
                     }
@@ -1706,6 +1851,7 @@ impl AutogradContext {
                     original_tape_len: 0,
                 },
                 saved_tensors: saved,
+                saved_refs: SavedRefs::new(),
             });
         }
 
@@ -1782,7 +1928,16 @@ impl AutogradContext {
                 let mut handles = SmallVec::new();
                 let mut resident = SmallVec::new();
 
-                for (tid, tensor) in &entry.saved_tensors {
+                // Walk both legacy saved_tensors AND new saved_refs. The
+                // SavedRef path stores a Tensor inside, so we can adapt it
+                // to the same (tid, tensor) shape for offload registration.
+                let combined: Vec<(TensorId, Tensor)> = entry
+                    .saved_tensors
+                    .iter()
+                    .map(|(tid, t)| (*tid, t.clone()))
+                    .chain(entry.saved_refs.iter().map(|r| (r.id, r.tensor.clone())))
+                    .collect();
+                for (tid, tensor) in &combined {
                     saved_ids.push(*tid);
                     // Only offload BF16 activations that require grad (intermediates).
                     // Skip: frozen weights (no grad, already GPU-resident, unchanged
@@ -1857,6 +2012,7 @@ impl AutogradContext {
                     sub_tape: offloaded_entries,
                 },
                 saved_tensors: SmallVec::new(), // All saved tensors are in the sub-tape
+                saved_refs: SavedRefs::new(),
             });
         }
 
@@ -1914,6 +2070,7 @@ fn compute_gradients(
             .saved_tensors
             .iter()
             .map(|(_, t)| t.shape().dims().to_vec())
+            .chain(entry.saved_refs.iter().map(|r| r.tensor.shape().dims().to_vec()))
             .collect();
         println!("[backtrace] op={:?}", entry.op);
         println!("[backtrace] out_grad={:?} saved={:?}", og, saved);
@@ -2368,6 +2525,7 @@ fn compute_gradients(
             let original_input_ids: Vec<TensorId> = entry.saved_tensors
                 .iter()
                 .map(|(tid, _)| *tid)
+                .chain(entry.saved_refs.iter().map(|r| r.id))
                 .collect();
             // We don't actually pass detached inputs to the closure — the
             // closure captures its own input clones. The detach concept here
@@ -2426,6 +2584,12 @@ fn compute_gradients(
                         all_needed.insert(*sid);
                     }
                 }
+                for r in &e.saved_refs {
+                    if r.tensor.requires_grad() {
+                        trainable_ids.insert(r.id);
+                        all_needed.insert(r.id);
+                    }
+                }
             }
 
             // Build compact gradient map for the sub-backward
@@ -2434,6 +2598,7 @@ fn compute_gradients(
                 let ids = sub_tape.iter().flat_map(|e| {
                     let mut ids = vec![e.output_id];
                     for (sid, _) in &e.saved_tensors { ids.push(*sid); }
+                    for r in &e.saved_refs { ids.push(r.id); }
                     ids
                 }).chain(std::iter::once(*input));
                 CompactIndex::from_tensor_ids(ids)
@@ -2556,6 +2721,7 @@ fn compute_gradients(
                         output_id: oe.output_id,
                         op: oe.op.clone(),
                         saved_tensors: saved,
+                        saved_refs: SavedRefs::new(),
                     };
 
                     let input_grads = compute_gradients(&tmp_entry, &sg, device)?;
@@ -2799,7 +2965,7 @@ fn compute_gradients(
             if let Some(grad_bias) = grad_bias {
                 // Check if bias was saved in the tape entry
                 // The bias would be the third saved tensor if it exists
-                if entry.saved_tensors.len() > 2 {
+                if entry.saved_count() > 2 {
                     // Get the bias tensor ID from the saved tensors
                     let bias_id = entry
                         .saved_keys()
@@ -2913,16 +3079,16 @@ fn compute_gradients(
             // Forward saves: [input, weight?, bias?, mean, rstd]
             // Weight is at index 1 if it was saved (affine LayerNorm).
             // Bias is at index 2 if both weight and bias were saved.
-            let weight_tensor = if entry.saved_tensors.len() > 3 {
+            let weight_tensor = if entry.saved_count() > 3 {
                 // 5 entries: input, weight, bias, mean, rstd
                 // OR 4 entries: input, weight, mean, rstd (weight-only, no bias)
-                Some(&entry.saved_tensors[1].1)
+                entry.saved_at(1).map(|(_, t)| t)
             } else {
                 None
             };
-            let bias_tensor = if entry.saved_tensors.len() > 4 {
+            let bias_tensor = if entry.saved_count() > 4 {
                 // 5 entries: input, weight, bias, mean, rstd
-                Some(&entry.saved_tensors[2].1)
+                entry.saved_at(2).map(|(_, t)| t)
             } else {
                 None
             };
@@ -2957,16 +3123,20 @@ fn compute_gradients(
             if let Some(grad_w) = grad_weight {
                 // For LayerNorm with affine parameters, weight and bias are separate tensors
                 // Find them in saved_tensors (they would be saved after the input tensor)
-                if entry.saved_tensors.len() > 1 {
+                if entry.saved_count() > 1 {
                     // Second tensor is weight
-                    gradients.push((entry.saved_tensors[1].0, ensure_bf16(grad_w)?));
+                    if let Some((wid, _)) = entry.saved_at(1) {
+                        gradients.push((wid, ensure_bf16(grad_w)?));
+                    }
                 }
             }
             if let Some(grad_b) = grad_bias {
                 // For LayerNorm with affine parameters, bias is the third tensor
-                if entry.saved_tensors.len() > 2 {
+                if entry.saved_count() > 2 {
                     // Third tensor is bias
-                    gradients.push((entry.saved_tensors[2].0, ensure_bf16(grad_b)?));
+                    if let Some((bid, _)) = entry.saved_at(2) {
+                        gradients.push((bid, ensure_bf16(grad_b)?));
+                    }
                 }
             }
 

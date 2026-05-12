@@ -12,6 +12,11 @@
 //! - `multi_tensor_l2_norm_sq` — sum of squares across a list of tensors,
 //!   returned as a 1-element F32 device scalar. Used by
 //!   `flame_core::ops::grad_norm::global_l2_norm`.
+//! - `multi_tensor_scale_inplace_packed` — in-place `x[i] *= scale` across
+//!   a list of F32 or BF16 tensors. Collapses an N-launch per-parameter
+//!   `mul_scalar` loop into a single grid-per-tensor kernel launch. Default
+//!   off (`FLAME_MT_SCALE=1` enables in trainer call sites). See
+//!   `EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md`.
 //!
 //! ## Packed-buffer layout
 //!
@@ -325,4 +330,218 @@ pub fn multi_tensor_l2_norm_sq_f32(
     }
 
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-tensor in-place scale (`x[i] *= scale`).
+//
+// Targets the trainer hot path in `train_zimage.rs:880-888` and
+// `train_klein.rs:1213-1226`: when `total_norm > CLIP_GRAD_NORM`, each
+// parameter's gradient is multiplied by the clip-scale via a per-parameter
+// `mul_scalar` kernel launch (280+ launches per step on zimage rank=8 LoRA).
+//
+// This module collapses that into a single launch (grid = n_tensors, one
+// block per tensor + grid-stride inner loop). Bit-identical math: same
+// `x[i] * scale`, same scalar, same element order. Multiplication is a
+// pointwise op — no reduction-order drift.
+//
+// **Dispatch policy:** the trainer guards the call with `scale < 1.0` (no-op
+// when the clip path doesn't fire) and an `FLAME_MT_SCALE` env gate. The
+// kernel itself accepts any scale, including 1.0; the no-op guard is a
+// caller responsibility.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+const CUDA_MT_SCALE_F32: &str = r#"
+extern "C" __global__ void multi_tensor_scale_inplace_f32_kernel(
+    float**          const __restrict__ tensors,
+    const long long* __restrict__ sizes,
+    int   n_tensors,
+    float scale
+) {
+    int t = blockIdx.x;
+    if (t >= n_tensors) return;
+
+    long long n = sizes[t];
+    float* x    = tensors[t];
+
+    int tid    = threadIdx.x;
+    int stride = blockDim.x;
+
+    for (long long i = (long long)tid; i < n; i += (long long)stride) {
+        x[i] = x[i] * scale;
+    }
+}
+"#;
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+const CUDA_MT_SCALE_BF16: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void multi_tensor_scale_inplace_bf16_kernel(
+    __nv_bfloat16**  const __restrict__ tensors,
+    const long long* __restrict__ sizes,
+    int   n_tensors,
+    float scale
+) {
+    int t = blockIdx.x;
+    if (t >= n_tensors) return;
+
+    long long       n = sizes[t];
+    __nv_bfloat16* x  = tensors[t];
+
+    int tid    = threadIdx.x;
+    int stride = blockDim.x;
+
+    for (long long i = (long long)tid; i < n; i += (long long)stride) {
+        float v = __bfloat162float(x[i]);
+        x[i]    = __float2bfloat16(v * scale);
+    }
+}
+"#;
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+const MT_SCALE_MODULE: &str = "multi_tensor_scale";
+
+/// Compile-on-first-use loaders. F32 has no header dependencies and uses
+/// the plain `compile_ptx` path. BF16 requires `cuda_bf16.h` from the CUDA
+/// toolkit, fetched via the `CUDA_INCLUDE_DIR` / `CUDA_HOME` env vars
+/// (matching `bf16_elementwise::ensure_and_get`). Splitting the dispatch
+/// means F32 callers never pay the BF16 toolkit lookup.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn ensure_scale_kernel_f32(device: &Arc<CudaDevice>) -> Result<()> {
+    if device
+        .get_func(MT_SCALE_MODULE, "multi_tensor_scale_inplace_f32_kernel")
+        .is_some()
+    {
+        return Ok(());
+    }
+    let ptx = cudarc::nvrtc::compile_ptx(CUDA_MT_SCALE_F32)
+        .map_err(|e| Error::Cuda(format!("nvrtc multi_tensor_scale f32: {:?}", e)))?;
+    device
+        .load_ptx(
+            ptx,
+            MT_SCALE_MODULE,
+            &["multi_tensor_scale_inplace_f32_kernel"],
+        )
+        .map_err(|e| Error::Cuda(format!("load multi_tensor_scale f32: {:?}", e)))?;
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn ensure_scale_kernel_bf16(device: &Arc<CudaDevice>) -> Result<()> {
+    if device
+        .get_func(MT_SCALE_MODULE, "multi_tensor_scale_inplace_bf16_kernel")
+        .is_some()
+    {
+        return Ok(());
+    }
+    let include_dir = std::env::var("CUDA_INCLUDE_DIR")
+        .or_else(|_| std::env::var("CUDA_HOME").map(|home| format!("{home}/include")))
+        .unwrap_or_else(|_| "/usr/local/cuda/include".into());
+    let mut opts = cudarc::nvrtc::CompileOptions::default();
+    opts.include_paths.push(include_dir);
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(CUDA_MT_SCALE_BF16, opts)
+        .map_err(|e| Error::Cuda(format!("nvrtc multi_tensor_scale bf16: {:?}", e)))?;
+    device
+        .load_ptx(
+            ptx,
+            MT_SCALE_MODULE,
+            &["multi_tensor_scale_inplace_bf16_kernel"],
+        )
+        .map_err(|e| Error::Cuda(format!("load multi_tensor_scale bf16: {:?}", e)))?;
+    Ok(())
+}
+
+/// In-place `x[i] *= scale` across a packed list of device tensors.
+///
+/// **Packed buffer layout** (2 regions, 2n u64 entries total, written by
+/// the caller before calling this function):
+/// ```text
+///   packed[0..n]      = device pointers (u64) to each tensor's first element
+///   packed[n..2n]     = element counts (u64) for each tensor
+/// ```
+///
+/// **Dtype dispatch:** the caller asserts homogeneous dtype across the list
+/// and passes `is_bf16` to select the kernel. Pointers in `packed[0..n]`
+/// must be valid for the selected dtype (BF16: each pointer addresses a
+/// `__nv_bfloat16` array; F32: each pointer addresses a `float` array).
+/// Mixing dtypes within a single call is undefined.
+///
+/// **Numerical contract:** bit-identical to a per-tensor `mul_scalar`
+/// kernel for F32 (same `x * scale` math, same iteration order). BF16 path
+/// does `__float2bfloat16(__bfloat162float(x) * scale)` — same as
+/// flame-core's per-tensor BF16 `mul_scalar`. Parity to per-tensor BF16
+/// `mul_scalar` is within 1 ULP and verified by
+/// `tests/multi_tensor_scale_parity.rs`.
+///
+/// **Memory:** no allocations beyond the cache's metadata buffer (reused
+/// across calls when `n` is stable). Tensors are modified in place; their
+/// device pointers must remain valid for the kernel's lifetime.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub fn multi_tensor_scale_inplace_packed(
+    cache: &mut MultiTensorMetaCache,
+    device: &Arc<CudaDevice>,
+    n: usize,
+    packed: &[u64],
+    scale: f32,
+    is_bf16: bool,
+) -> Result<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    if packed.len() != 2 * n {
+        return Err(Error::InvalidInput(format!(
+            "multi_tensor_scale_inplace_packed: packed.len() = {}, expected 2*n = {}",
+            packed.len(),
+            2 * n
+        )));
+    }
+    if is_bf16 {
+        ensure_scale_kernel_bf16(device)?;
+    } else {
+        ensure_scale_kernel_f32(device)?;
+    }
+    cache.ensure_meta(device, 2 * n)?;
+
+    let dev_buf = cache
+        .buf
+        .as_mut()
+        .expect("ensure_meta post-condition: buf is Some");
+    device
+        .htod_sync_copy_into(packed, dev_buf)
+        .map_err(|e| Error::Cuda(format!("mt_scale h2d: {e:?}")))?;
+
+    let base = *dev_buf.device_ptr();
+    let stride = (n * std::mem::size_of::<u64>()) as u64;
+    let ptrs_arr_ptr = base;
+    let sizes_arr_ptr = base + stride;
+
+    let kernel_name = if is_bf16 {
+        "multi_tensor_scale_inplace_bf16_kernel"
+    } else {
+        "multi_tensor_scale_inplace_f32_kernel"
+    };
+    let func = device
+        .get_func(MT_SCALE_MODULE, kernel_name)
+        .ok_or_else(|| Error::Cuda(format!("missing kernel: {kernel_name}")))?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (n as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_i32 = n as i32;
+    let mut params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(4);
+    params.push(&ptrs_arr_ptr as *const u64 as *mut std::ffi::c_void);
+    params.push(&sizes_arr_ptr as *const u64 as *mut std::ffi::c_void);
+    params.push(&n_i32 as *const i32 as *mut std::ffi::c_void);
+    params.push(&scale as *const f32 as *mut std::ffi::c_void);
+
+    unsafe {
+        func.launch(cfg, &mut params)
+            .map_err(|e| Error::Cuda(format!("mt_scale launch: {e:?}")))?;
+    }
+
+    Ok(())
 }

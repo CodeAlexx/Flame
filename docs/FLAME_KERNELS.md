@@ -197,14 +197,26 @@ including the DECOUPLED-WD ordering receipt.
 |---|---|
 | `multi_tensor_l2_norm_sq_stage1_f32_kernel` | Stage 1 of the multi-tensor L2 norm. One block per tensor, block-wide tree reduction in shared memory, writes per-tensor partial sum-of-squares to `partials[N]`. Used by `flame_core::ops::grad_norm::global_l2_norm` when every grad is F32 + contiguous. |
 | `multi_tensor_l2_norm_sq_stage2_kernel` | Stage 2: single-block reduction across `partials[N]` → `out[1]`. `N` can exceed `blockDim` (256); loop strides until exhausted. |
+| `multi_tensor_scale_inplace_f32_kernel` | In-place `x[i] *= scale` across a list of F32 tensors. One block per tensor, grid-stride inner loop. Pointwise — no reduction, so bit-identical to per-tensor `mul_scalar`. Added 2026-05-12 (Phase 2) for the trainer clip-grad path; default-off in callers via `FLAME_MT_SCALE=1`. |
+| `multi_tensor_scale_inplace_bf16_kernel` | BF16 variant. Loads `__nv_bfloat16`, multiplies via `__bfloat162float → float * scale → __float2bfloat16`. Within 1 ULP of per-tensor BF16 `mul_scalar` because both go through the same cast chain. |
 
-The 2-stage pattern replaces `2N + (N-1) + 1 = 2N` legacy launches (per-
-tensor `square().sum()` + serial fold-add + sqrt) with 3 launches.
+The 2-stage L2 norm pattern replaces `2N + (N-1) + 1 = 2N` legacy launches
+(per-tensor `square().sum()` + serial fold-add + sqrt) with 3 launches.
 Parity is tolerance-bound, not bit-identical, because parallel-tree
 reduction sums in a different order than serial fold-add. Tests in
 `tests/multi_tensor_l2_norm_parity.rs` document the ≤ 1e-5 absolute /
 ≤ 1e-6 relative bound. Env override `FLAME_MT_L2NORM=0` falls back to
 legacy.
+
+The in-place scale primitive replaces `N` per-parameter `mul_scalar`
+launches with `1` grid-per-tensor launch when the trainer's clip-grad
+scale fires. Pointwise math means F32 is bit-exact and BF16 is 1-ULP-
+bound — both verified by `tests/multi_tensor_scale_parity.rs`.
+Currently default-off in trainer call sites (`train_zimage.rs`,
+`train_klein.rs`) because production grad-norms stay below the clip
+threshold; enable via `FLAME_MT_SCALE=1`. See
+`EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md` for the
+deferral rationale.
 
 The shared `MultiTensorMetaCache` (`ops/multi_tensor.rs`) is separate
 from `adam::MultiTensorMetaCache` — different region layouts (L2 norm

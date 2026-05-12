@@ -996,6 +996,40 @@ gradient checkpointing it makes per-step backward ~45 min for DiT models.
 | `dtype_trace` | Compile in dtype trace prints (slow) | off |
 | `legacy_cpu_autograd` | **EXPLICITLY BANNED** — `compile_error!` if set | n/a |
 
+### Runtime env knobs (read at process start)
+
+| Env var | What it does | Default |
+|---|---|---|
+| `FLAME_ALLOC_POOL` | `0` disables the CUDA alloc pool (production scripts use 0) | pool on |
+| `FLAME_ASSERT_GRAD_FLOW` | `1` asserts all leaves received grad at backward (see TRAINER_DIAGNOSTICS) | off |
+| `FLAME_LOG_SDPA_BWD` | `1` logs every `try_cudnn_sdpa_backward` bail-out reason | off |
+| `FLAME_TRACE_PERMUTE_GENERIC` | `1` enables `permute_generic_trace` (counts `(shape, perm, dtype)` tuples per call) | off |
+| `FLAME_MT_SCALE` | `1` enables Phase 2 multi-tensor scale kernel in clip-grad path | off (production grad_norms don't trip clip threshold) |
+| `FLAME_TI_CACHE_DISABLE` | `1` disables Phase 1 TensorIterator geometry cache | cache on |
+| `FLAME_AUTOGRAD_SAVED_LEGACY` | `1` routes `record_op` through pre-Phase-2 `Vec<(TensorId, Tensor)>` instead of `SmallVec<[SavedRef; 4]>` | SavedRef on |
+
+### Phase 2 `SavedRef` caveat — version counter is in a side table, not in `TensorStorage`
+
+The naive PyTorch port would put `AtomicU32 version` inside the
+`TensorStorage` enum variants (so it's shared across all `Tensor::clone()`
+siblings via the inner `Arc`). flame-core does **not** do that, because
+`TensorStorage::Drop` hand-rolls a `ptr::read` + `Arc::try_unwrap` to return
+memory to the alloc pool — wrapping the variants in `Arc<StorageInner<_>>`
+breaks that across all 6 variants.
+
+Instead, version counters live in a process-global `RwLock<HashMap<usize,
+Arc<AtomicU32>>>` keyed by inner Arc-pointer address (`tensor_storage.rs:1-256`).
+Captured `SavedRef`s hold a private `Arc<AtomicU32>` clone so their version
+check survives `AutogradContext::clear()`'s flush of the table.
+
+**What this means for you**:
+- Any new in-place mutator on a `TensorStorage` variant MUST call
+  `storage.bump_version()` after the write. `add_inplace_same_dtype`,
+  `evict_block`, and any `as_mut_device_ptr*` write path already do this.
+- The table is flushed at `AutogradContext::clear()` — fine for normal
+  trainer loops which call clear per step. A long-running test without
+  clear could grow the table; bound it manually if needed.
+
 ---
 
 ## Block offloading conventions
@@ -1180,17 +1214,33 @@ collapse N launches into 1. Two locations to check first:
   Adam optimizer. The new `param_is_bf16: bool` discriminator (Phase 1,
   2026-05-12) routes between BF16 and F32 multi-tensor kernels.
 - `ops::multi_tensor` (new module, Phase 3, 2026-05-12) — generalized
-  packed-buffer + kernel-loader pattern. Currently has L2 norm; future
-  expansion documented in
-  `EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md`.
+  packed-buffer + kernel-loader pattern. Currently has L2 norm and
+  in-place scale (Phase 2, default-off in callers — see below).
 
 The packed-buffer pattern: build `Vec<u64>` of pointers + sizes (extract
-each pointer via `g.as_mut_slice_f32(...).device_ptr_mut()` or
-`g.as_mut_device_ptr_bf16(...)`), drop the `&mut` borrow per iteration
-(the u64 doesn't carry a Rust lifetime), single H2D copy of the packed
-buffer, one kernel launch with grid = n_tensors. See
-`adam.rs:1093-1230` and `ops/multi_tensor.rs::multi_tensor_l2_norm_sq_f32`
-for the canonical implementation.
+each pointer via `g.as_mut_device_ptr_f32(...)` for F32 or
+`g.as_mut_device_ptr_bf16(...)` for BF16 — the helper returns `u64`
+directly so callers don't need to depend on cudarc just to call
+`device_ptr_mut`). Drop the `&mut` borrow per iteration (the u64
+doesn't carry a Rust lifetime), single H2D copy of the packed buffer,
+one kernel launch with grid = n_tensors. See `adam.rs:1093-1230`,
+`ops/multi_tensor.rs::multi_tensor_l2_norm_sq_f32`, and
+`ops/multi_tensor.rs::multi_tensor_scale_inplace_packed` for canonical
+implementations.
+
+**Trainer-side wiring of `multi_tensor_scale_inplace_packed` (Phase 2,
+2026-05-12, default-off):** the trainer's clip-grad path used to do
+`for param in &params { g_scaled = g.mul_scalar(scale)?; param.set_grad(g_scaled); }`
+— N launches per step when `total_norm > CLIP_GRAD_NORM`. The new path
+extracts pointers via `g.as_mut_device_ptr_f32(...)` from
+`grads.get_mut(param.id())` (which releases the `&mut Tensor` between
+iterations because the u64 escapes the borrow), builds
+`packed = [ptrs(n) | sizes(n)]`, and calls
+`multi_tensor_scale_inplace_packed` once. Default off because zimage
+and klein production grad-norms hover at 0.004–0.17 and never trip
+the `> 1.0` clip; enable per-trainer via `FLAME_MT_SCALE=1` for
+configs where the path fires. See
+`EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md`.
 
 ### cudarc launch path: context-pin skips `cuCtxSetCurrent` (Phase 4, 2026-05-12)
 

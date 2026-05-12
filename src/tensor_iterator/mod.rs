@@ -13,6 +13,7 @@
 
 pub mod base;
 pub mod broadcast;
+pub(crate) mod cache;
 pub mod config;
 pub mod dim_vec;
 pub mod dispatch;

@@ -113,6 +113,53 @@ silu / gelu / ge / ...` all route here when dtype is BF16. F32 paths still
 use `GpuOps`. See [`FLAME_INDEX.md`](./FLAME_INDEX.md) "tensor_iterator/ops/"
 for the full op list.
 
+**Phase 1 cache (2026-05-12, dispatch refactor):**
+`tensor_iterator/cache.rs` — `Lazy<Mutex<HashMap<IterCacheKey, CachedIterGeometry>>>`
+keyed on `(operand shapes, element-strides, dtypes, pending-output bitmap,
+num_outputs, static_dtype, static_shape, packed flag bundle)`. On cache hit,
+`TensorIteratorConfig::build` skips steps 2-4 + 6-7 (compute_shape /
+compute_strides / reorder / coalesce / 32bit-indexing). Steps 1
+(populate_operands), 5 (allocate_or_resize_outputs) still run because they
+touch live tensors / per-call allocations. Capacity bound 4096 (drop-all on
+overflow). `FLAME_TI_CACHE_DISABLE=1` is the rollback knob. Hit/miss
+`AtomicU64` counters; rate-limited `log::trace!`. Mirrors the cuDNN AlgoKey
+pattern at `cudnn/conv3d.rs`. The cache stores `logical_output_shape`
+(= `invert_perm(shape_)`) so the hit path can replicate
+`allocate_or_resize_outputs` without relying on the (already coalesce-
+invalidated) `perm_`.
+
+### ⭐ `saved_ref.rs` (added 2026-05-12, Phase 2)
+PyTorch `SavedVariable` analog. `SavedRef { id, tensor, version_counter:
+Arc<AtomicU32>, version_at_save: u32 }` captures the storage version at
+record time so backward fails loudly if the saved tensor was mutated in
+place. `SavedRef::capture(&Tensor)` and `unpack/unpack_ref() -> Result<Tensor>`.
+Implementation note: the version counter is held in a **side table** keyed
+by inner Arc-pointer address, NOT inside `TensorStorage`. The existing
+`TensorStorage::Drop` does a hand-rolled `ptr::read` + `Arc::try_unwrap` to
+return memory to the alloc pool — wrapping the storage variants in
+`Arc<StorageInner<_>>` would have broken that across 6 variants. Side
+table is flushed at `AutogradContext::clear()`; captured `SavedRef`s carry
+private `Arc<AtomicU32>` clones so their version check stays valid across
+flushes. See `tensor_storage.rs:1-256` for the table + `bump_version`.
+Rollback: `FLAME_AUTOGRAD_SAVED_LEGACY=1` routes `record_op` through the
+pre-Phase-2 `Vec<(TensorId, Tensor)>` path.
+
+### ⭐ `structured/` (added 2026-05-12, Phase 4 exemplar)
+PyTorch's structured-kernel pattern (meta + impl split). `kernel.rs` defines
+the `StructuredKernel` trait with associated `Input<'a>` GAT and three
+methods: `meta(input) -> Tensor` (validate + allocate output, no GPU
+compute), `impl_(input, output) -> Tensor` (write kernel result into the
+pre-allocated output), and `dispatch(input)` (meta → autograd record →
+impl_). `silu.rs` is the exemplar: `SiluStructured` allocates via
+`Tensor::empty_dtype` in meta and routes through
+`TensorIteratorBase::build_unary_op(Some(&out), x)` in impl_ so the iterator
+short-circuits its alloc path. Exposed as `Tensor::silu_structured` — the
+existing `Tensor::silu` is untouched. Parity tests in
+`tests/structured_silu_parity.rs`. The current exemplar is op-count-
+equivalent to the existing path; the value is the seam for future `meta`
+caching (caller-supplied output, scratch reuse) without touching `impl_` or
+call sites.
+
 ### ⭐ `bf16_elementwise.rs`
 Post-TensorIterator this file only hosts fused/structured BF16 kernels that
 aren't pointwise: `softmax_lastdim_bf16` (fused last-dim softmax — one
@@ -649,16 +696,28 @@ Current entries:
   device tensor. Two NVRTC kernels: stage 1 (block-per-tensor → partial
   sums) and stage 2 (single-block reduction → scalar). Used by
   `ops::grad_norm::global_l2_norm` fast path.
+- `multi_tensor_scale_inplace_packed(cache, dev, n, &packed, scale, is_bf16)`
+  (added 2026-05-12, Phase 2 of launch-storm refactor) — single-launch
+  in-place `x[i] *= scale` across a packed list of F32 or BF16 tensors.
+  Pointwise math (no reduction) so F32 is bit-exact and BF16 is 1-ULP-
+  bound vs per-tensor `mul_scalar`. Two NVRTC kernels
+  (`multi_tensor_scale_inplace_f32_kernel`,
+  `multi_tensor_scale_inplace_bf16_kernel`), both loaded under
+  `MT_SCALE_MODULE = "multi_tensor_scale"`. Trainer call sites
+  (`train_zimage.rs`, `train_klein.rs`) gate the dispatch behind
+  `FLAME_MT_SCALE=1` because production grad-norms in those configs sit
+  well below the `CLIP_GRAD_NORM = 1.0` threshold, so the clip path
+  doesn't fire and the multi-tensor primitive saves nothing in steady
+  state. See `EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md`.
 
-The packed-buffer layout for L2 norm is `[ptrs(n) | sizes(n)]` (2n u64
-entries). Each kernel is compiled once on first use, loaded into a
-`MT_L2_NORM_MODULE` cudarc module, looked up by name on subsequent
-launches.
+The packed-buffer layout is `[ptrs(n) | sizes(n)]` (2n u64 entries) for
+both L2 norm and scale. Each kernel is compiled once on first use,
+loaded into a per-primitive cudarc module (`MT_L2_NORM_MODULE`,
+`MT_SCALE_MODULE`), looked up by name on subsequent launches.
 
-Future expansion: multi-tensor scale-by-scalar (Phase 2, deferred — see
-`EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md`), and
-other foreach-pattern targets (grad clip, fp16-master scatter, etc.)
-as they prove valuable in profiles.
+Future expansion: other foreach-pattern targets (fp16-master scatter,
+multi-tensor `set_grad` for BF16 grad casts, etc.) as they prove
+valuable in profiles.
 
 ### `parameter.rs`
 `Parameter` (a `Tensor` wrapper with `requires_grad=true`) — re-exported as

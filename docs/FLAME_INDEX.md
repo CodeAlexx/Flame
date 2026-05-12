@@ -123,6 +123,7 @@
 - `.matmul(&Tensor)` — 2D matmul (cuBLASLt for BF16)
 - `.bmm(&Tensor)` — 3D batched matmul
 - `.silu / .gelu / .relu / .sigmoid / .tanh / .neg / .abs / .square` — BF16 through `tensor_iterator::ops::unary::*_bf16_iter`
+- `.silu_structured()` — Phase 4 exemplar (added 2026-05-12). Same forward+backward as `.silu()`; demonstrates PyTorch meta+impl split via `structured::SiluStructured`. Test: `tests/structured_silu_parity.rs`.
 - `.exp / .log / .sqrt / .rsqrt / .recip` — BF16 through `tensor_iterator::ops::transcendentals::*_bf16_iter` (f32-opmath inside)
 - `.ge / .gt / .le / .lt / .eq / .ne` — BF16 through `tensor_iterator::ops::comparison::*_bf16_iter` (output is BF16 0.0/1.0)
 - `.softmax(dim)` — fast-path dispatches to `bf16_elementwise::softmax_lastdim_bf16` for BF16 last-dim
@@ -457,6 +458,32 @@ port, this file only hosts fused and memory-layout kernels. Pointwise
   pre-transpose).
 - `patchify_bf16 / unpatchify_bf16` — `:374,426` — DiT patch ops.
 
+### `tensor_iterator/cache.rs` — Phase 1 geometry cache (added 2026-05-12)
+- `cache::IterCacheKey` — keyed on `(operand_shapes, element-strides,
+  dtypes, pending-output bitmap, num_outputs, static_dtype, static_shape,
+  packed flags)`.
+- `cache::CachedIterGeometry` — `(shape, perm, stride_bytes per operand,
+  has_coalesced_dimensions, all_ops_same_shape, requires_32bit_indexing,
+  common_dtype, fast_setup, target_dtypes, logical_output_shape)`.
+- `cache::cache()` — `&'static Mutex<HashMap<IterCacheKey, CachedIterGeometry>>`.
+- `cache::cache_disabled()` — `OnceLock<bool>` read of `FLAME_TI_CACHE_DISABLE`.
+- Hit/miss counters: `cache::record_hit / record_miss` (`AtomicU64`).
+- Inserted at the top of `TensorIteratorConfig::build`: hit short-circuits
+  steps 2-4 + 6-7 (compute_shape / compute_strides / reorder / coalesce /
+  32bit-indexing). Steps 1 + 5 always run.
+
+### Phase 4 — Structured-kernel pattern (added 2026-05-12)
+- `structured::StructuredKernel` trait — `Input<'a>` GAT, `meta(input) ->
+  Tensor` (validate + allocate), `impl_(input, output) -> Tensor` (write
+  kernel result into pre-allocated output), `dispatch(input) -> Tensor`
+  (meta → autograd record → impl_).
+- `structured::SiluStructured` — exemplar. Routes through
+  `TensorIteratorBase::build_unary_op(Some(&out), x)` so the iterator
+  short-circuits its alloc path.
+- `Tensor::silu_structured(&self) -> Result<Tensor>` — public entrypoint.
+  Bit-identical forward + backward to `Tensor::silu`. Test:
+  `tests/structured_silu_parity.rs`.
+
 ### `tensor_iterator/ops/` — BF16 elementwise via PyTorch-style TensorIterator (Phases 4–11)
 All entries are `pub fn <op>_bf16_iter(...)` and route through the shared
 dispatch registry in `tensor_iterator/dispatch.rs`.
@@ -728,6 +755,26 @@ backward. Foundation of the "offload instead of recompute" checkpoint path.
 - `AutogradContext::set_enabled(bool)` — global on/off
 - `Tensor::backward()` — entry point
 
+### Phase 2 — `SavedRef` + storage version counter (added 2026-05-12)
+- `saved_ref::SavedRef { id, tensor, version_counter: Arc<AtomicU32>, version_at_save: u32 }`
+  — PyTorch `SavedVariable` analog. `capture(&Tensor) -> SavedRef` and
+  `unpack/unpack_ref() -> Result<Tensor>` (errors on version mismatch).
+- `saved_ref::legacy_saved_mode() -> bool` — `OnceCell` read of
+  `FLAME_AUTOGRAD_SAVED_LEGACY`.
+- `autograd::SavedRefs = SmallVec<[SavedRef; 4]>` — replacement for the
+  legacy `Vec<(TensorId, Tensor)>` save-list.
+- `autograd::TapeEntry` — dual-path: carries BOTH `saved_tensors` (legacy)
+  and `saved_refs` (new). `record_op` picks one per call based on
+  `legacy_saved_mode()`. `get_saved(id)`, `saved_keys`, `saved_count`,
+  `saved_at(i)` expose a unified view.
+- `tensor_storage::register_version / lookup_version / unregister_version /
+  clear_version_table` — process-global `RwLock<HashMap<usize, Arc<AtomicU32>>>`
+  side-table keyed on inner Arc-pointer address.
+- `TensorStorage::version_key / version / version_handle / bump_version`
+  — read/bump the storage version counter.
+- `AutogradContext::clear()` — now also flushes the version table.
+- Rollback: `FLAME_AUTOGRAD_SAVED_LEGACY=1` (read once at process start).
+
 ### Op variants (forward-recording sites + backward dispatchers)
 Each variant has a forward `record_op` site and a backward arm in
 `autograd::backward_op`. When adding a new training-path primitive:
@@ -813,6 +860,8 @@ Recently-added variants:
 - ⭐ `ops::grad_norm::global_l2_norm_with_scale(grads, max_norm, eps)` — `ops/grad_norm.rs:103`. Same but also returns the clip-scale factor as a 1-element device tensor. One D2H sync at the end if logging needed.
 - `ops::multi_tensor::multi_tensor_l2_norm_sq_f32(cache, &[&Tensor]) -> Tensor` — `ops/multi_tensor.rs`. Two-stage Apex-style reduction kernel. Stage 1 = block-per-tensor sum-of-squares in shared memory → partials[N]. Stage 2 = single-block reduction across partials → F32[1]. F32 grads + contiguous required; legacy fallback in caller handles BF16. Parity ≤ 1e-5 abs / 1e-6 rel vs legacy fold (parallel-tree reordering, not bit-exact).
 - `ops::multi_tensor::MultiTensorMetaCache` — `ops/multi_tensor.rs`. Process-wide cache for the L2 norm packed buffer + per-tensor partials buffer. Held behind a `Mutex` in `ops::grad_norm` (`MT_L2_CACHE`). Reallocates when n_tensors changes (one-time on step 0 in steady training). Note: this is a **separate** cache from `adam::MultiTensorMetaCache` — region layouts differ.
+- `ops::multi_tensor::multi_tensor_scale_inplace_packed(cache, dev, n, &packed, scale, is_bf16) -> Result<()>` — `ops/multi_tensor.rs`. Single-launch in-place `x[i] *= scale` across a packed list of F32 or BF16 tensors. Targets the trainer clip-grad path (`train_zimage.rs`, `train_klein.rs`): collapses N per-parameter `mul_scalar` launches into one grid-per-tensor launch when `total_norm > clip`. Packed layout = `[ptrs(n) | sizes(n)]` (2n u64 entries). F32 path is bit-exact vs per-tensor `mul_scalar`; BF16 within 1 ULP. **Default off in callers:** zimage and klein only enable via `FLAME_MT_SCALE=1` env var because production grad-norms stay below clip threshold (Phase 2 of launch-storm refactor, 2026-05-12; see `EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md`).
+- `Tensor::as_mut_device_ptr_f32(tag) -> Result<u64>` — `tensor.rs:~605`. Raw mutable F32 device pointer as a `u64`. Mirrors `as_mut_device_ptr_bf16`. Intended for callers building packed pointer buffers for multi-tensor kernels without taking cudarc as a direct dependency.
 
 ---
 

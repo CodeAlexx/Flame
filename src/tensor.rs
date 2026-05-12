@@ -602,6 +602,19 @@ extern "C" __global__ void masked_fill_kernel(
             .map_err(|_| Error::InvalidOperation(format!("[{tag}] expected F32 backing storage")))
     }
 
+    /// Returns the raw mutable F32 device pointer as a `u64`.
+    ///
+    /// Useful for callers that need to build packed pointer buffers for
+    /// multi-tensor kernels without taking cudarc as a direct dependency.
+    /// Mirrors `as_mut_device_ptr_bf16`. The returned pointer is valid for
+    /// the lifetime of the underlying storage; do not use after the tensor
+    /// is dropped or reallocated.
+    pub fn as_mut_device_ptr_f32(&mut self, tag: &str) -> Result<u64> {
+        use cudarc::driver::DevicePtrMut as _;
+        let s = self.as_mut_slice_f32(tag)?;
+        Ok(*s.device_ptr_mut())
+    }
+
     /// Copy full tensor contents from another F32 tensor of identical shape.
     pub fn copy_f32_from(&mut self, src: &Tensor) -> Result<()> {
         if self.shape != src.shape {
@@ -2110,6 +2123,19 @@ extern "C" __global__ void f32_to_bool_kernel(
             }
         }
         Ok(output)
+    }
+
+    /// SiLU (Swish) activation via the [`crate::structured`] kernel pattern.
+    ///
+    /// Phase 4 exemplar: behaves identically to [`Self::silu`] for BF16
+    /// inputs, but routes through `structured::SiluStructured::dispatch`
+    /// (meta → autograd record → impl_) instead of
+    /// `dispatch_unary_bf16(silu_bf16_iter, …)`. Non-BF16 inputs error out
+    /// (the structured exemplar is BF16-only); callers wanting the F32
+    /// fallback should keep using `Tensor::silu`.
+    pub fn silu_structured(&self) -> Result<Tensor> {
+        use crate::structured::{SiluStructured, StructuredKernel};
+        SiluStructured::dispatch(self)
     }
 
     /// SiLU (Swish) activation

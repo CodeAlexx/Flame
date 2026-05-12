@@ -15,6 +15,86 @@ use std::sync::Arc;
 // Import CUDA C kernel sources
 use crate::cuda_kernel_sources::*;
 
+/// `permute_generic` call tracing. Default off — set `FLAME_TRACE_PERMUTE_GENERIC=1`
+/// to enable, then call `dump_permute_generic_trace()` to print + reset the
+/// tally. Records (shape, perm, dtype) tuples and their counts so a profile
+/// can pin down which call sites still flow into the generic permute kernel.
+pub mod permute_generic_trace {
+    use crate::DType;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Hash, PartialEq, Eq, Clone)]
+    pub struct Key {
+        pub shape: Vec<usize>,
+        pub perm: Vec<usize>,
+        pub dtype: DType,
+    }
+
+    static TALLY: OnceLock<Mutex<HashMap<Key, u64>>> = OnceLock::new();
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    fn enabled() -> bool {
+        *ENABLED.get_or_init(|| {
+            std::env::var("FLAME_TRACE_PERMUTE_GENERIC")
+                .ok()
+                .as_deref()
+                .map(|v| matches!(v, "1" | "true" | "TRUE"))
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn record(shape: &[usize], perm: &[usize], dtype: DType) {
+        if !enabled() {
+            return;
+        }
+        let key = Key {
+            shape: shape.to_vec(),
+            perm: perm.to_vec(),
+            dtype,
+        };
+        let map = TALLY.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(mut g) = map.lock() {
+            *g.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    /// Snapshot the current tally as a sorted Vec (most-frequent first) and
+    /// reset the table. Returns empty if tracing was never enabled.
+    pub fn drain_sorted() -> Vec<(Key, u64)> {
+        let Some(map) = TALLY.get() else {
+            return Vec::new();
+        };
+        let Ok(mut g) = map.lock() else {
+            return Vec::new();
+        };
+        let mut entries: Vec<(Key, u64)> = g.drain().collect();
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries
+    }
+
+    /// Convenience: print the current tally to stderr in a fixed-width table
+    /// and reset. No-op when tracing is disabled.
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let entries = drain_sorted();
+        if entries.is_empty() {
+            return;
+        }
+        let total: u64 = entries.iter().map(|(_, c)| *c).sum();
+        eprintln!("[permute_generic_trace] {} unique (shape,perm,dtype) tuples, {total} total calls", entries.len());
+        eprintln!("[permute_generic_trace] {:>9}  {:>5}  {:?} ← shape ← perm", "count", "dtype", "");
+        for (k, c) in &entries {
+            eprintln!(
+                "[permute_generic_trace] {c:>9}  {:?}  shape={:?}  perm={:?}",
+                k.dtype, k.shape, k.perm
+            );
+        }
+    }
+}
+
 #[inline]
 fn ensure_f32_tensor(t: &Tensor) -> Result<Tensor> {
     if t.dtype() == DType::F32 && t.storage_dtype() == DType::F32 {
@@ -2771,6 +2851,12 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         let out_dims: Vec<usize> = perm.iter().map(|&idx| shape[idx]).collect();
         let total = tensor.shape.elem_count();
         let dtype = tensor.dtype();
+
+        // Trace tally: `FLAME_TRACE_PERMUTE_GENERIC=1` records every call's
+        // (shape, perm, dtype) tuple to a process-wide HashMap. Dump via
+        // `flame_core::cuda_kernels::dump_permute_generic_trace()`. Default
+        // off, gated by an OnceLock so a single env read is amortized.
+        permute_generic_trace::record(shape, perm, dtype);
 
         let mut in_strides = vec![1i64; rank];
         for i in (0..rank.saturating_sub(1)).rev() {

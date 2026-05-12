@@ -8,7 +8,113 @@ use cudarc::driver::DeviceRepr;
 use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice};
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// Phase 2 — version-counter side table
+// ---------------------------------------------------------------------------
+//
+// PyTorch's `SavedVariable` snapshots a `version_counter_` on the underlying
+// `StorageImpl` at save-time and re-checks at unpack-time; if the live counter
+// has advanced, the saved tensor was modified in-place and backward would be
+// silently wrong. flame-core's `TensorStorage` is an enum cloned by value
+// (each `Tensor` clone makes a sibling enum holding the same inner `Arc`),
+// so adding `AtomicU32` to the variants directly does NOT share the counter
+// across clones. Instead we keep a global side-table keyed by the inner
+// `Arc<CudaSlice<T>>` pointer (or raw `*const u16` for BF16Arena / BF16View).
+//
+// Pointer values are unique per live allocation: when the backing Arc is
+// dropped and its pointer is later reused for a fresh allocation, the new
+// allocation should start at version 0, which is automatic because the prior
+// entry is removed in `unregister`. Caller responsibility:
+//
+//   * Storage construction sites call `register_version(...)` at the moment
+//     a fresh backing allocation appears (real `cudaMalloc` / pool checkout /
+//     arena lease) so version starts at 0.
+//   * Storage *Drop* impl calls `unregister_version(...)` to release the
+//     entry when the last clone goes away.
+//   * In-place mutators call `TensorStorage::bump_version()` after writing.
+//   * `TensorStorage::version()` returns the current counter (0 if not
+//     registered — i.e. legacy callers that haven't been migrated).
+//
+// The side table is a `RwLock<HashMap>` keyed by `usize` (pointer cast). Most
+// reads come from the autograd hot path; we use Relaxed atomics inside the
+// `AtomicU32` and an `RwLock` for the map so concurrent reads don't contend.
+// Inserts/removes are rare (per real allocation, not per clone) so the writer
+// lock is acceptable.
+
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+/// Global version-counter table keyed by storage-pointer address.
+static VERSION_TABLE: once_cell::sync::Lazy<RwLock<HashMap<usize, Arc<AtomicU32>>>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(HashMap::with_capacity(4096)));
+
+/// Register a fresh allocation in the version table. Returns the new counter
+/// (always starts at 0). Idempotent: re-registering an existing key returns
+/// the existing counter (preserves cross-clone sharing semantics).
+#[inline]
+pub(crate) fn register_version(key: usize) -> Arc<AtomicU32> {
+    if key == 0 {
+        return Arc::new(AtomicU32::new(0));
+    }
+    if let Ok(table) = VERSION_TABLE.read() {
+        if let Some(existing) = table.get(&key) {
+            return existing.clone();
+        }
+    }
+    if let Ok(mut table) = VERSION_TABLE.write() {
+        // Re-check under the writer lock.
+        return table
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU32::new(0)))
+            .clone();
+    }
+    Arc::new(AtomicU32::new(0))
+}
+
+/// Remove a key from the version table. Called from `TensorStorage::Drop`
+/// when the last clone of a storage releases the backing allocation. Safe
+/// to call with an unknown key (no-op).
+#[inline]
+pub(crate) fn unregister_version(key: usize) {
+    if key == 0 {
+        return;
+    }
+    if let Ok(mut table) = VERSION_TABLE.write() {
+        let _ = table.remove(&key);
+    }
+}
+
+/// Clear the entire version-counter side table. Called by
+/// `AutogradContext::clear()` at the end of each training step to avoid
+/// unbounded growth. Any SavedRef captured before the clear keeps a private
+/// `Arc<AtomicU32>` clone, so its version check remains valid — clearing
+/// the table only affects future captures, which will lazily re-register.
+pub fn clear_version_table() {
+    if let Ok(mut table) = VERSION_TABLE.write() {
+        table.clear();
+    }
+}
+
+/// Number of entries currently in the version-counter table. Test/diag only.
+pub fn version_table_len() -> usize {
+    VERSION_TABLE.read().map(|t| t.len()).unwrap_or(0)
+}
+
+/// Look up the current version counter for a storage key. Returns `None` if
+/// not registered.
+#[inline]
+pub(crate) fn lookup_version(key: usize) -> Option<Arc<AtomicU32>> {
+    if key == 0 {
+        return None;
+    }
+    if let Ok(table) = VERSION_TABLE.read() {
+        return table.get(&key).cloned();
+    }
+    None
+}
 
 #[cfg(feature = "shared_storage")]
 pub(crate) type StorageSlice<T> = Arc<CudaSlice<T>>;
@@ -47,6 +153,22 @@ pub(crate) fn ensure_unique_slice<T: DeviceRepr + Clone>(
 #[cfg(not(feature = "shared_storage"))]
 pub(crate) fn ensure_unique_slice<T>(slice: &mut StorageSlice<T>) -> Result<&mut CudaSlice<T>> {
     Ok(slice)
+}
+
+/// Pointer-derived key for the version-counter side-table.
+/// With `shared_storage` (default): the Arc address (stable across clones).
+/// Without: the CudaSlice's device pointer.
+#[cfg(feature = "shared_storage")]
+#[inline]
+pub(crate) fn storage_key_t<T>(s: &StorageSlice<T>) -> usize {
+    Arc::as_ptr(s) as *const () as usize
+}
+
+#[cfg(not(feature = "shared_storage"))]
+#[inline]
+pub(crate) fn storage_key_t<T>(s: &StorageSlice<T>) -> usize {
+    use cudarc::driver::DevicePtr;
+    *s.device_ptr() as usize
 }
 
 /// Actual storage backend for tensors with proper dtype support
@@ -100,6 +222,62 @@ pub enum TensorStorage {
 }
 
 impl TensorStorage {
+    /// Return a unique-per-allocation key used to look up the version counter
+    /// in the global side table. For owning variants this is the inner Arc
+    /// pointer (cast to `usize`); for non-owning BF16View it's the raw u16
+    /// pointer; for BF16Arena it's the lease pointer.
+    ///
+    /// Pointer reuse is correct because the Drop impl removes the entry
+    /// before the allocation can be re-handed-out, so a fresh allocation
+    /// starting at the same address sees no stale counter.
+    #[inline]
+    pub(crate) fn version_key(&self) -> usize {
+        match self {
+            TensorStorage::F32 { data, .. } => storage_key_t(data),
+            TensorStorage::F16 { data, .. } => storage_key_t(data),
+            #[cfg(not(feature = "bf16_u16"))]
+            TensorStorage::BF16 { data, .. } => storage_key_t(data),
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16 { data, .. } => storage_key_t(data),
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16Arena { ptr, .. } => ptr.as_ptr() as usize,
+            #[cfg(feature = "bf16_u16")]
+            TensorStorage::BF16View { ptr, .. } => ptr.as_ptr() as usize,
+            TensorStorage::I8 { data, .. } => storage_key_t(data),
+            TensorStorage::I32 { data, .. } => storage_key_t(data),
+            TensorStorage::Bool { data, .. } => storage_key_t(data),
+        }
+    }
+
+    /// Current version counter for this storage. Lazily-registers if the
+    /// allocation site missed the registration (returns 0 for unregistered
+    /// storages, which is the legacy behavior — no in-place detection).
+    #[inline]
+    pub fn version(&self) -> u32 {
+        let key = self.version_key();
+        match lookup_version(key) {
+            Some(arc) => arc.load(Ordering::Relaxed),
+            None => 0,
+        }
+    }
+
+    /// Lazily-fetch (or create) the version counter Arc for this storage.
+    /// `SavedRef::capture` calls this so it can snapshot+share the counter
+    /// without re-doing the side-table lookup at unpack time.
+    #[inline]
+    pub(crate) fn version_handle(&self) -> Arc<AtomicU32> {
+        register_version(self.version_key())
+    }
+
+    /// Bump the storage's version counter. Called from in-place mutators.
+    /// Safe to call before any registration — registers on first call.
+    #[inline]
+    pub fn bump_version(&self) {
+        let key = self.version_key();
+        let arc = register_version(key);
+        arc.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Get the dtype of this storage
     pub fn dtype(&self) -> DType {
         match self {
@@ -637,6 +815,14 @@ unsafe fn make_dummy_slice<T>(device: Arc<CudaDevice>) -> CudaSlice<T> {
 
 impl Drop for TensorStorage {
     fn drop(&mut self) {
+        // Phase 2: best-effort cleanup of the version-counter entry. We only
+        // unregister when this is the LAST clone of an owning variant (Arc
+        // strong_count == 1 inside the match arms below — implicitly the
+        // case when `Arc::try_unwrap` succeeds for pool-return). For shared
+        // storage where another clone is live we leave the entry in place
+        // so other clones still see consistent versioning. Side table is
+        // also flushed at AutogradContext::clear() (per training step).
+
         // Only intercept when the pool is enabled.
         if crate::cuda_alloc_pool::pool_disabled() {
             return;

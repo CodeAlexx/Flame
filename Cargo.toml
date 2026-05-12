@@ -185,6 +185,10 @@ harness = false
 name = "add_iter_alloc"
 harness = false
 
+[[bench]]
+name = "dispatch_overhead"
+harness = false
+
 [build-dependencies]
 cbindgen = "0.26"
 cc = "1.0"
