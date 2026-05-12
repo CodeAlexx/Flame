@@ -118,6 +118,12 @@ harness = false
 name = "rms_norm_vec"
 harness = false
 
+# LayerNorm backward (BF16) — vec-vs-legacy comparison (2026-05-12). Toggled
+# via FLAME_LAYER_NORM_LEGACY=1 env. Same shape coverage as rms_norm_vec.
+[[bench]]
+name = "layer_norm_vec"
+harness = false
+
 # Add session 4 — first binary, same 5%-within gate.
 [[bench]]
 name = "add_iter_alloc"
