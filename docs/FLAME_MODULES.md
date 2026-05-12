@@ -181,6 +181,37 @@ Fused BF16 inference primitives that don't fit in `fused_inference.rs`:
 TensorIterator port (not on the live inference path — `Tensor::silu` etc.
 route through `tensor_iterator::ops::unary::silu_bf16_iter` now). All NVRTC.
 
+**Hot-path BF16-contig direct wrappers (added 2026-05-12, Fix #F):**
+`silu_bf16_contig_direct` / `gelu_bf16_contig_direct` /
+`add_bf16_contig_direct` / `mul_bf16_contig_direct` /
+`mul_scalar_bf16_contig_direct`. These wrap the existing `flame_<op>_bf16_kernel`
+C entry points the slow path uses, populating `IterMetadata` inline for a
+1-D contig launch — bypassing the TensorIterator config/build chain.
+Bit-identical to the slow path (same C kernel). Called from `Tensor::silu`
+etc. as a `dtype()==BF16 && is_contiguous() && same-shape` fast path.
+Rollback: `FLAME_HOT_FAST_PATH_DISABLE=1`.
+
+### ⭐ `bf16_reduce.rs` (added 2026-05-12, Fix #B)
+BF16-native scalar reductions. Two NVRTC kernels:
+- `sum_bf16_to_f32_scalar_kernel` — per-thread grid-stride F32 accumulator
+  over BF16 input, shared-mem tree reduce per block, single `atomicAdd` of
+  block result into a F32 scratch. block=256, grid capped at 4096 with
+  grid-stride loop covering any `n`. **Single launch, no input-sized F32
+  temp buffer.**
+- `f32_scalar_to_bf16_kernel` — 1-thread cast with fused `* scale` arg
+  (`scale=1.0` for `sum`, `scale=1/n` for `mean` — divide happens on-device,
+  no host D2H sync).
+
+Public entry points: `sum_bf16(x) -> Tensor`, `mean_bf16(x) -> Tensor`.
+Wired into `GpuOps::sum` and `Tensor::mean` BF16 paths; falls through to the
+legacy cast-then-F32-reduce-then-cast path on `FLAME_BF16_REDUCE_LEGACY=1`.
+Mirrors `pytorch/aten/src/ATen/native/cuda/ReduceSumProdKernel.cu`'s
+`(scalar_t in, acc_t acc)` `func_wrapper` pattern.
+
+**Landmine documented in CONVENTIONS**: legacy F32 `SUM_KERNEL` silently
+drops elements past index 262144 (no grid-stride loop). New BF16 kernel is
+correct for any size.
+
 ### ⭐ `bf16_convert.rs`
 BF16↔F32 cast kernels. `bf16_u16_to_f32` and `f32_to_bf16_u16` are the
 backing fns called from `ops::cast::cast_bf16_to_f32` / `cast_f32_to_bf16`.
@@ -437,7 +468,7 @@ training experiments.
 ### `cuda/mod.rs` + submodules
 The "low-level CUDA glue" namespace. Submodules:
 - `cuda::ffi` — every `extern "C"` declaration of the build-time `.cu` files
-- `cuda::device_lt` — cuBLASLt handle + stream pointer accessors
+- `cuda::device_lt` — cuBLASLt handle + stream pointer accessors. **Updated 2026-05-12 (Fix #C)**: `thread_local! Cell<Option<(ordinal, stream, handle)>>` TLS front for `stream_ptr` / `cublaslt_handle_ptr`. Hot path is now a lock-free Cell read; global `Mutex<HashMap>` only touched on TLS miss (first call per thread+ordinal). Pattern follows `cudarc-pinctx`'s `cuCtxSetCurrent` TLS approach. Rollback: `FLAME_HANDLE_TLS_DISABLE=1`.
 - `cuda::dtype_tag` — DType ↔ CUDA dtype tag
 - `cuda::utils` — small CUDA helpers
 - `cuda::kernels` — early F32 kernel wrappers (training)
@@ -495,6 +526,30 @@ is the raw entry used by `ops::gemm_bf16` and the older `linear` paths.
 ---
 
 ## Memory / staging
+
+### ⭐ `cuda_alloc_pool.rs`
+General CUDA allocator pool used by every `Tensor::empty_dtype` /
+`zeros_dtype` call path. Activated via `FLAME_ALLOC_POOL=1` (production
+scripts currently use `0`).
+
+**Updated 2026-05-12 (Fix #A):**
+- **PyTorch BFC-style bucket rounding** (mirrors `c10/core/AllocatorConfig.h`):
+  `< 1 MiB → 512 B`; `1 MiB–10 MiB → 2 MiB`; `>= 10 MiB → 2 MiB`. Cache
+  key now `(device_ptr, bucket_elems, dtype)`. Returned slice keeps
+  `len == original_request` so cudarc's `dtod_copy` length assertions hold.
+- **F32 cache miss no longer zero-inits**: callers either explicitly memset
+  (`alloc_zeros_from_pool`, `TensorStorage::zeros`) or fully overwrite via
+  `dtod_copy`/`htod_copy_into`/a kernel that touches every element. New
+  default is `unsafe device.alloc::<f32>()` (uninitialized, matches the
+  pre-existing BF16 path and PT BFCAllocator). Rollback:
+  `FLAME_F32_ZERO_INIT=1`.
+- `hits` / `misses` / `bucket_saves` AtomicU64 counters; `log::trace!` per
+  call + `eprintln!` summary in `print_pool_stats`.
+- Side fix: main + pool=ON was OOMing at step 0 (pre-existing exact-match
+  fragmentation bug). Pool=ON now usable end-to-end.
+
+dispatch_overhead bench pool=ON delta: zimage block -24%, small -45%,
+tiny -48%. zimage 12-step pool=ON: 1.9 → 1.8 s/step.
 
 ### `memory_pool.rs`
 F32 device memory pool. ~15 pub fns. Mostly training, but the pool is also

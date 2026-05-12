@@ -1031,6 +1031,12 @@ large tensors until it's rewritten.
 | `FLAME_MT_SCALE` | `1` enables Phase 2 multi-tensor scale kernel in clip-grad path | off (production grad_norms don't trip clip threshold) |
 | `FLAME_TI_CACHE_DISABLE` | `1` disables Phase 1 TensorIterator geometry cache | cache on |
 | `FLAME_AUTOGRAD_SAVED_LEGACY` | `1` routes `record_op` through pre-Phase-2 `Vec<(TensorId, Tensor)>` instead of `SmallVec<[SavedRef; 4]>` | SavedRef on |
+| `FLAME_F32_ZERO_INIT` | `1` re-enables F32 zero-init on alloc-pool cache miss (Fix #A1 default: uninit, matches PT BFCAllocator) | uninit |
+| `FLAME_BF16_REDUCE_LEGACY` | `1` routes `Tensor::sum`/`mean` BF16 through cast-then-F32-reduce-then-cast instead of native BF16-in / F32-accum / BF16-out (Fix #B) | native BF16 on |
+| `FLAME_HANDLE_TLS_DISABLE` | `1` disables TLS Cell for cublasLt handle/stream lookups + per-shape GEMM cache in `gemm_bf16_fp32acc.cu` (Fix #C) | TLS on |
+| `FLAME_GEMM_BF16_WORKSPACE_BYTES` | Bytes of persistent cuBLASLt workspace per device for BF16 GEMMs (Fix #C; `0` = no workspace) | `0` |
+| `FLAME_HOT_FAST_PATH_DISABLE` | `1` disables direct-kernel fast path on `Tensor::silu/gelu/add/mul/mul_scalar` for BF16-contig (Fix #F); falls through to TensorIterator | fast path on |
+| `FLAME_PERMUTE_FASTPATH` | `0` disables tuned rank-2 `[1,0]` and rank-4 `[0,1,3,2]` permute kernels (Fix #G); routes to generic scatter | fast path on |
 
 ### Phase 2 `SavedRef` caveat — version counter is in a side table, not in `TensorStorage`
 

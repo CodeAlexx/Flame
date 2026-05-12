@@ -75,6 +75,12 @@
 - `Tensor::eye_dtype(n, dtype, device)` — typed identity (BF16/F16/F32) —
   `tensor_ops_extended.rs:1138`. Used by OFT-Neumann series
   `R = I + 2Q + 2Q^2 + ...` in the LyCORIS family.
+- `Tensor::from_parts(storage, shape, device, id, custom_strides, view_offset) -> Tensor`
+  — `pub(crate)` constructor added 2026-05-12 (Phase 2 groundwork). Builds a
+  `Tensor` from already-owned parts without re-bumping inner Arcs that the
+  caller already cloned. Mirrors `at::Tensor::Tensor(TensorImpl)`. Caller is
+  responsible for `Arc::clone` semantics. Sets `requires_grad=false` (saved
+  tensors are detached leaves in backward).
 
 ### Shape / metadata
 - `.shape() -> &Shape`
