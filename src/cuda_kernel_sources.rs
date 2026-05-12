@@ -264,17 +264,24 @@ extern "C" __global__ void sum_kernel(
     int n
 ) {
     extern __shared__ float sdata[];
-    
+
     int tid = threadIdx.x;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
+
+    // Grid-stride loop: each thread accumulates its strided slice into
+    // a register before the shared-mem tree reduction. This is required
+    // because the launch config caps gridDim.x at 1024 (cuda_kernels.rs:
+    // sum()), so without striding any element past
+    // gridDim.x * blockDim.x (= 262144 at block_size=256) would be
+    // silently dropped. Mirrors PyTorch's ATen Reduce.cuh reduce_kernel.
     float sum = 0.0f;
-    if (idx < n) {
-        sum = input[idx];
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += gridDim.x * blockDim.x) {
+        sum += input[i];
     }
     sdata[tid] = sum;
     __syncthreads();
-    
+
     // Reduction in shared memory
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
@@ -282,7 +289,7 @@ extern "C" __global__ void sum_kernel(
         }
         __syncthreads();
     }
-    
+
     // Write result for this block
     if (tid == 0) {
         atomicAdd(out, sdata[0]);
