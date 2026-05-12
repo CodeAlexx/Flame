@@ -179,7 +179,14 @@ pub fn softmax_lastdim_bf16(x: &Tensor) -> Result<Tensor> {
 
     let f = ensure_and_get(&x.device, "softmax_lastdim_bf16_kernel", CUDA_SOFTMAX_LASTDIM_BF16)?;
 
-    let block_size = if cols <= 128 { 128usize }
+    // 2026-05-12 perf: match block_size to cols (round up to multiple of 32).
+    // The legacy formula used min=128 threads — for cols<128 (e.g. head_dim
+    // 64) it leaves half the threads idle and burns launch overhead. Tail
+    // threads in the kernel still no-op via `if (tid < cols)` so correctness
+    // holds; saves launch overhead per row.
+    let block_size = if cols <= 32 { 32usize }
+                     else if cols <= 64 { 64 }
+                     else if cols <= 128 { 128 }
                      else if cols <= 256 { 256 }
                      else { 256 };
 

@@ -170,6 +170,11 @@ harness = false
 name = "cast_bench"
 harness = false
 
+# Softmax lastdim BF16 — block_size right-sized for small cols. 2026-05-12.
+[[bench]]
+name = "softmax_bench"
+harness = false
+
 # Add session 4 — first binary, same 5%-within gate.
 [[bench]]
 name = "add_iter_alloc"
