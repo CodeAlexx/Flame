@@ -79,6 +79,49 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     );
 
+    /// Rank-2 [1,0] transpose (matrix transpose). Shape [A, B] -> [B, A].
+    /// 2026-05-12: added for permute_generic fast-path coverage of the
+    /// 840 calls/step of rank-2 transposes in zimage backward (matmul
+    /// weight-grad and friends). See cuda/permute0213.cu for tile strategy.
+    pub fn launch_permute10_bf16(
+        src: *const core::ffi::c_void,
+        dst: *mut core::ffi::c_void,
+        A: i32,
+        B: i32,
+        stream: *mut core::ffi::c_void,
+    );
+
+    pub fn launch_permute10_f32(
+        src: *const f32,
+        dst: *mut f32,
+        A: i32,
+        B: i32,
+        stream: *mut core::ffi::c_void,
+    );
+
+    /// Rank-4 [0,1,3,2] (swap inner-two-dims). Shape [N, A, B, C] -> [N, A, C, B].
+    /// 2026-05-12: 120 calls/step in zimage trace (QK^T transpose and friends).
+    /// Internally collapses to rank-3 [0,2,1] with N' = N*A.
+    pub fn launch_permute0132_bf16(
+        src: *const core::ffi::c_void,
+        dst: *mut core::ffi::c_void,
+        N: i32,
+        A: i32,
+        B: i32,
+        C: i32,
+        stream: *mut core::ffi::c_void,
+    );
+
+    pub fn launch_permute0132_f32(
+        src: *const f32,
+        dst: *mut f32,
+        N: i32,
+        A: i32,
+        B: i32,
+        C: i32,
+        stream: *mut core::ffi::c_void,
+    );
+
     // Pinned host memory helpers
     pub fn flame_cuda_alloc_pinned_host(size: usize, flags: u32) -> *mut core::ffi::c_void;
     pub fn flame_cuda_free_pinned_host(ptr: *mut core::ffi::c_void) -> i32;

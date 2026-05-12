@@ -688,6 +688,7 @@ default. Use them only when benching or hunting a numerical regression:
 | `FLAME_LAYER_NORM_FWD_LEGACY=1` | Smem-tree LayerNorm forward | `cuda/cuda_ops.cu` |
 | `FLAME_LAYER_NORM_LEGACY=1` | Scalar LayerNorm backward (no cross-row kernel) | `cuda/src/flame_norm_bf16.cu` |
 | `FLAME_PERMUTE_LEGACY=1` | Scalar grid-strided `permute0213` / `permute021` | `cuda/permute0213.cu` |
+| `FLAME_PERMUTE_FASTPATH=0` | Bypass `permute_generic` fast-path dispatcher (rank-2 `[1,0]` + rank-4 `[0,1,3,2]` route to slow scatter kernel instead of `launch_permute10_*` / `launch_permute0132_*`) | `src/cuda_kernels.rs::CudaKernels::permute_fastpath` |
 | `FLAME_SWIGLU_LEGACY=1` | Scalar `swiglu_fused_bf16_kernel` (no vec2 pair loads) | `src/bf16_ops.rs` |
 | `FLAME_SLICE_COPY_LEGACY=1` | Generic strided slice kernel (no `cudaMemcpyAsync` fast path) | `cuda/bf16_slice_index.cu` |
 | `FLAME_GROUP_NORM_STATS_LEGACY=1` | Smem-tree GroupNorm stats kernel | `cuda/cuda_ops.cu` |

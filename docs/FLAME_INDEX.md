@@ -86,7 +86,7 @@
 - `.reshape(&[usize])`
 - `.view(&[isize])` — with -1 inference
 - `.unsqueeze(dim)` / `.squeeze(Some(dim))` / `.squeeze_dim(dim)`
-- `.permute(&[dims])` — uses `GpuOps::permute_generic` fallback for non-fast-path orders
+- `.permute(&[dims])` — uses `GpuOps::permute_generic` fallback for non-fast-path orders. Fast-path (`CudaKernels::permute_fastpath`, `cuda_kernels.rs:3005`) routes rank-2 `[1,0]` (`launch_permute10_*`) and rank-4 `[0,1,3,2]` (`launch_permute0132_*`) to tuned tiled kernels; rank-3 `[0,2,1]` and rank-4 `[0,2,1,3]` are routed upstream by `Tensor::contiguous` to `GpuOps::permute_021` / `permute_0213`. Bypass via `FLAME_PERMUTE_FASTPATH=0`.
 - `.transpose() / .t() / .transpose_dims(d0, d1)`
 - `.narrow(dim, start, len)` — zero-copy view; Arc-clones parent storage
 - `.narrow_owning(dim, start, len)` ⭐ — like `narrow` but materializes into

@@ -2858,6 +2858,30 @@ extern "C" __global__ void max_dim_keepdim_kernel(
         // off, gated by an OnceLock so a single env read is amortized.
         permute_generic_trace::record(shape, perm, dtype);
 
+        // 2026-05-12 perf: fast-path dispatch.
+        //
+        // The generic kernel below does per-thread strided divmod over up to
+        // 8 dims — measured at ~13 ms/call for production zimage shapes
+        // (~40% of per-step kernel time). PT's equivalent path uses
+        // unrolled_elementwise_kernel at ~0.5 ms total for the same work.
+        //
+        // We dispatch the high-frequency (shape, perm) tuples to tuned
+        // tile-based kernels in cuda/permute0213.cu. Trace evidence (zimage,
+        // 12 steps): 840/964 calls are rank-2 [1,0], 120/964 are rank-4
+        // [0,1,3,2]. Together → 99.6% coverage. The leftover rare cases
+        // (rank-6 patchify, etc) fall through to the generic kernel.
+        //
+        // Bypass via FLAME_PERMUTE_FASTPATH=0 (e.g. for parity testing).
+        let fastpath_enabled = std::env::var("FLAME_PERMUTE_FASTPATH")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if fastpath_enabled && total > 0 {
+            if let Some(fast) = self.permute_fastpath(tensor, perm, &out_dims)? {
+                return Ok(fast);
+            }
+        }
+
         let mut in_strides = vec![1i64; rank];
         for i in (0..rank.saturating_sub(1)).rev() {
             in_strides[i] = in_strides[i + 1] * shape[i + 1] as i64;
@@ -2976,6 +3000,133 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                 other
             ))),
         }
+    }
+
+    /// Fast-path dispatcher for high-frequency `(rank, perm)` tuples.
+    ///
+    /// Returns `Ok(Some(tensor))` if a tuned kernel was launched, `Ok(None)`
+    /// if the tuple isn't covered (caller falls through to the generic
+    /// scatter kernel). Returns `Err` only on kernel-launch failure.
+    ///
+    /// Covered patterns:
+    ///   - rank-2 `[1,0]`  → `launch_permute10_{bf16,f32}` (matrix transpose,
+    ///     tiled with shared-memory bank-conflict-free layout)
+    ///   - rank-4 `[0,1,3,2]` → `launch_permute0132_{bf16,f32}` (inner-2-dim
+    ///     swap; collapses to rank-3 `[0,2,1]` with N' = N*A)
+    ///
+    /// Rank-3 `[0,2,1]` and rank-4 `[0,2,1,3]` are already routed to
+    /// `permute_021` / `permute_0213` upstream by `Tensor::contiguous`.
+    /// They reach `permute_generic` only when a caller bypasses
+    /// `contiguous()` (rare); covering them here would be redundant.
+    fn permute_fastpath(
+        &self,
+        tensor: &Tensor,
+        perm: &[usize],
+        out_dims: &[usize],
+    ) -> Result<Option<Tensor>> {
+        use crate::cuda::ffi;
+        use std::os::raw::c_void;
+
+        let shape = tensor.shape.dims();
+        let rank = shape.len();
+        let dtype = tensor.dtype();
+        let device = tensor.device.clone();
+
+        // Convert dimensions to i32 with overflow guard. Returning None
+        // here is correct: the generic kernel uses i64 strides and handles
+        // huge tensors fine, while these specialized kernels take i32.
+        let to_i32 = |v: usize| -> Option<i32> { i32::try_from(v).ok() };
+
+        // ── rank-2 [1, 0] : matrix transpose ────────────────────────────
+        if rank == 2 && perm == [1, 0] {
+            let (a, b) = match (to_i32(shape[0]), to_i32(shape[1])) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return Ok(None),
+            };
+            let stream: *mut c_void = device.cuda_stream_raw_ptr();
+            let mut output = Tensor::empty_dtype(
+                Shape::from_dims(out_dims),
+                dtype,
+                device.clone(),
+            )?;
+            match dtype {
+                DType::F32 => {
+                    let src = tensor.storage.try_as_slice_f32()?;
+                    let dst = output.storage.try_as_slice_f32()?;
+                    let src_ptr = *src.device_ptr() as *const f32;
+                    let dst_ptr = *dst.device_ptr() as *mut f32;
+                    unsafe { ffi::launch_permute10_f32(src_ptr, dst_ptr, a, b, stream); }
+                    return Ok(Some(output));
+                }
+                DType::BF16 => {
+                    #[cfg(feature = "bf16_u16")]
+                    {
+                        let src_ptr =
+                            tensor.as_device_ptr_bf16("permute10:src")? as *const c_void;
+                        let dst_ptr =
+                            output.as_mut_device_ptr_bf16("permute10:dst")? as *mut c_void;
+                        unsafe { ffi::launch_permute10_bf16(src_ptr, dst_ptr, a, b, stream); }
+                        return Ok(Some(output));
+                    }
+                    #[cfg(not(feature = "bf16_u16"))]
+                    { return Ok(None); }
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        // ── rank-4 [0, 1, 3, 2] : inner-2 swap ──────────────────────────
+        if rank == 4 && perm == [0, 1, 3, 2] {
+            let (n, a, b, c) = match (
+                to_i32(shape[0]),
+                to_i32(shape[1]),
+                to_i32(shape[2]),
+                to_i32(shape[3]),
+            ) {
+                (Some(n), Some(a), Some(b), Some(c)) => (n, a, b, c),
+                _ => return Ok(None),
+            };
+            // Guard against N*A overflow (rare; trace max is 30*1=30).
+            if (n as i64).checked_mul(a as i64).is_none() {
+                return Ok(None);
+            }
+            let stream: *mut c_void = device.cuda_stream_raw_ptr();
+            let mut output = Tensor::empty_dtype(
+                Shape::from_dims(out_dims),
+                dtype,
+                device.clone(),
+            )?;
+            match dtype {
+                DType::F32 => {
+                    let src = tensor.storage.try_as_slice_f32()?;
+                    let dst = output.storage.try_as_slice_f32()?;
+                    let src_ptr = *src.device_ptr() as *const f32;
+                    let dst_ptr = *dst.device_ptr() as *mut f32;
+                    unsafe {
+                        ffi::launch_permute0132_f32(src_ptr, dst_ptr, n, a, b, c, stream);
+                    }
+                    return Ok(Some(output));
+                }
+                DType::BF16 => {
+                    #[cfg(feature = "bf16_u16")]
+                    {
+                        let src_ptr =
+                            tensor.as_device_ptr_bf16("permute0132:src")? as *const c_void;
+                        let dst_ptr =
+                            output.as_mut_device_ptr_bf16("permute0132:dst")? as *mut c_void;
+                        unsafe {
+                            ffi::launch_permute0132_bf16(src_ptr, dst_ptr, n, a, b, c, stream);
+                        }
+                        return Ok(Some(output));
+                    }
+                    #[cfg(not(feature = "bf16_u16"))]
+                    { return Ok(None); }
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        Ok(None)
     }
 
     /// Materialize a strided view (custom_strides and/or non-zero view_offset)
