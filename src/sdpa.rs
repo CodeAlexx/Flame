@@ -196,6 +196,16 @@ pub fn forward_train(
                     mask: mask_id,
                     scale,
                     causal: false,
+                    // Stage 2 fix (2026-05-12): record saved-O and saved-Stats
+                    // ids directly so the backward dispatch can use
+                    // `fetch_saved(id)` instead of a shape-find heuristic.
+                    // The shape-finder was broken because `fetch_saved`
+                    // materializes non-contig views into fresh `TensorId`s,
+                    // so the id-exclusion fired false-positive and Q was
+                    // picked up as O — destroyed cuDNN flash-bwd's dO·O^T
+                    // identity and produced grad_norm=inf.
+                    output: Some(out.id()),
+                    stats: stats_tensor.as_ref().map(|s| s.id()),
                 },
                 saved,
             );

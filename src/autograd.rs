@@ -336,6 +336,15 @@ pub enum Op {
         mask: Option<TensorId>,
         scale: f32,
         causal: bool,
+        /// Saved output tensor id (recorded by `sdpa::forward_train`).
+        /// `None` keeps backward-compat with any older record sites.
+        /// Stage 2 fix (2026-05-12): replaces the broken shape-find heuristic
+        /// at the backward dispatch — `fetch_saved` materializes non-contig
+        /// views with fresh `TensorId`s, so the id-exclusion never fired and
+        /// Q was being picked up as O. Direct id lookup fixes it.
+        output: Option<TensorId>,
+        /// Saved Stats (LSE) tensor id for cuDNN backward.
+        stats: Option<TensorId>,
     },
     SageAttention {
         query_id: TensorId,
@@ -805,13 +814,13 @@ fn try_cudnn_sdpa_backward(
     device: &Arc<cudarc::driver::CudaDevice>,
 ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
     // FLAME_NO_CUDNN_SDPA_BWD=1 forces the decomposed-recompute backward.
-    // Diagnostic escape hatch: the cuDNN sdpa-bwd path can produce
-    // extreme-magnitude gradients on certain BF16 Q/K magnitudes (observed
-    // during Klein 4B LoRA training as step-1 grad_norm spikes of 1e10+).
-    static NO_CUDNN_SDPA_BWD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *NO_CUDNN_SDPA_BWD.get_or_init(|| {
-        std::env::var("FLAME_NO_CUDNN_SDPA_BWD").ok().as_deref() == Some("1")
-    }) {
+    // Diagnostic escape hatch: kept available for parity-harness comparisons
+    // and emergency rollback if a future cuDNN regression appears. Read on
+    // every call (not cached via OnceLock) so test harnesses can toggle the
+    // env mid-process. SDPA-bwd is called ~30/step in zimage and ~32/step
+    // in klein — a per-call `std::env::var` read (~50 ns) is negligible
+    // against the cuDNN kernel cost (~10-15 ms).
+    if std::env::var("FLAME_NO_CUDNN_SDPA_BWD").ok().as_deref() == Some("1") {
         sdpa_bwd_log("disabled-by-env");
         return Ok(None);
     }
@@ -833,25 +842,43 @@ fn try_cudnn_sdpa_backward(
         sdpa_bwd_log(&format!("bail:head_dim={d}"));
         return Ok(None);
     }
-    // 2026-05-12 investigation: casting `d_o` F32→BF16 here would let cuDNN
-    // bwd fire (currently bails on every block because GradientMap stores
-    // grads as F32 — gradient.rs `InternalFP32_PublicBF16`). The cast itself
-    // is mechanically safe, BUT enabling cuDNN bwd produced `grad_norm=inf`
-    // on zimage rank=8 LoRA training step 1 in a 12-step A/B (vs 0.21 with
-    // the decomposed-recompute fallback). Matches the warning at line ~734
-    // ("Klein 4B step-1 grad_norm spikes of 1e10+"). Root cause unresolved:
-    // possibly stats-tensor convention mismatch (cuDNN expects max+lse, our
-    // forward may emit lse-only) or BF16 d_o precision loss on extreme grad
-    // magnitudes. Until root-caused, keep the dtype bail. Fix would save
-    // ~300 ms/step (4.0→3.7) on zimage but ships broken gradients.
+    // cuDNN flash bwd requires Nq and Nkv to be 64-element aligned.
+    // Empirically validated 2026-05-12: zimage Nq=1536 (64*24) works;
+    // klein 9B Nq=1632 (not div by 64) produces CUDA_ERROR_MISALIGNED_ADDRESS
+    // during the kernel's dQ/dK/dV stores. The forward path tolerates
+    // arbitrary Nq, but the bwd kernel makes stricter alignment
+    // assumptions. Fall back to decomposed for non-aligned shapes.
+    if n_q % 64 != 0 || n_kv % 64 != 0 {
+        sdpa_bwd_log(&format!("bail:nq-nkv-align Nq={n_q} Nkv={n_kv}"));
+        return Ok(None);
+    }
+    // Q/K/V/O must be BF16 (saved from the BF16 forward). If they aren't,
+    // we're in a non-flash codepath and must bail to the decomposed fallback.
     if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16
-        || o.dtype() != DType::BF16 || d_o.dtype() != DType::BF16 {
+        || o.dtype() != DType::BF16 {
         sdpa_bwd_log(&format!(
-            "bail:dtype q={:?} k={:?} v={:?} o={:?} d_o={:?}",
-            q.dtype(), k.dtype(), v.dtype(), o.dtype(), d_o.dtype()
+            "bail:dtype q={:?} k={:?} v={:?} o={:?}",
+            q.dtype(), k.dtype(), v.dtype(), o.dtype()
         ));
         return Ok(None);
     }
+    // Stage 2 fix (2026-05-12): `d_o` is provided by GradientMap which stores
+    // grads as F32 (gradient.rs `InternalFP32_PublicBF16`). The earlier
+    // `grad_norm=inf` regression was caused by the saved-O shape-find bug at
+    // `autograd.rs:4231-4240` picking up Q as O (fresh `TensorId`s after
+    // `fetch_saved`'s `.contiguous()` defeated the id-exclusion). With that
+    // bug fixed (direct id lookup from `Op::FlashAttention { output, .. }`),
+    // casting `d_o` F32→BF16 here is mathematically safe — BF16 has the same
+    // 8-bit exponent as F32 so gradient direction and magnitude class are
+    // preserved. Precision loss is ~1e-3 relative which is well inside the
+    // BF16 training tolerance band already accepted on every forward op.
+    let d_o_bf16_owned: Tensor;
+    let d_o = if d_o.dtype() != DType::BF16 {
+        d_o_bf16_owned = d_o.to_dtype_no_grad(DType::BF16)?;
+        &d_o_bf16_owned
+    } else {
+        d_o
+    };
     if stats.shape().dims() != [b * h, n_q] {
         sdpa_bwd_log(&format!(
             "bail:stats-shape got={:?} want=[{},{n_q}]",
@@ -4196,6 +4223,8 @@ fn compute_gradients(
             mask,
             scale,
             causal: _,
+            output,
+            stats,
         } => {
             // Phase 2c (2026-04-23): cuDNN SDPA backward is the primary path
             // for shapes the frontend supports (head_dim ∈ {64, 96, 128},
@@ -4227,30 +4256,24 @@ fn compute_gradients(
             let q_dims = query_tensor.shape().dims().to_vec();
             let k_dims = key_tensor.shape().dims().to_vec();
 
-            // Find saved O (same shape as output_grad, distinct from Q/K/V).
-            let output_tensor = entry
-                .saved_tensors
-                .iter()
-                .map(|(_, t)| t)
-                .find(|t| {
-                    t.shape().dims() == output_grad.shape().dims()
-                        && t.id != query_tensor.id
-                        && t.id != key_tensor.id
-                        && t.id != value_tensor.id
-                });
-
-            // Find saved Stats: contiguous FP32 [B*H, Nq] — what
-            // `flame_cudnn_sdpa_bf16_train_fwd` writes. (Also still
-            // matches the legacy WMMA LSE layout pre-Phase-2c.)
-            let stats_tensor = if q_dims.len() == 4 {
-                let bh = q_dims[0] * q_dims[1];
-                let sq = q_dims[2];
-                entry.saved_tensors.iter().map(|(_, t)| t).find(|t| {
-                    t.dtype() == DType::F32 && t.shape().dims() == [bh, sq]
-                })
-            } else {
-                None
+            // Stage 2 fix (2026-05-12): direct id lookup for saved O and
+            // saved Stats. The previous shape-find heuristic was broken —
+            // `fetch_saved` materializes non-contig views via `.contiguous()`
+            // which produces FRESH `TensorId`s, so `t.id != query_tensor.id`
+            // always fired false-positive and the first shape match (saved Q)
+            // was picked up as O. This destroyed cuDNN flash-bwd's
+            // `dO·O^T` identity → `grad_norm=inf`. Direct lookup keyed on
+            // the ids recorded at forward time fixes it.
+            let output_tensor_owned = match output {
+                Some(id) => Some(fetch_saved(id)?),
+                None => None,
             };
+            let stats_tensor_owned = match stats {
+                Some(id) => Some(fetch_saved(id)?),
+                None => None,
+            };
+            let output_tensor = output_tensor_owned.as_ref();
+            let stats_tensor = stats_tensor_owned.as_ref();
 
             // Try cuDNN backward for supported shapes.
             let cudnn_result = try_cudnn_sdpa_backward(
