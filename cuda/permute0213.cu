@@ -44,6 +44,51 @@ __global__ void permute0213_kernel(
     y[out_offset] = x[in_offset];
 }
 
+// 2026-05-12 perf: BF16 vec=4 + 4D-grid permute0213.
+//
+// The legacy permute0213_kernel is grid-strided with linear output index →
+// per-thread divmod over (n, a, b, c). Measured ~348 GB/s on production
+// attention shapes (~35% of 1 TB/s peak). Two issues:
+//   1. Each thread does 4 divmod ops in the index unravel (ALU overhead)
+//   2. Single BF16 load/store per thread (2-byte transactions)
+//
+// This vec kernel: 4D grid (n, b-tile, a-tile, c-vec) with index math by
+// addition only. Each thread reads/writes one bf16x4 (4 BF16 = 8 bytes).
+// Within a warp threads vary in c-vec → input/output stride 8 bytes →
+// coalesced LDG.E.64 / STG.E.64 transactions.
+//
+// Constraint: C must be a multiple of 4 (head_dim 128 always satisfies).
+// Falls back to the legacy kernel otherwise.
+struct __align__(8) bf16x4 {
+    __nv_bfloat16 v[4];
+};
+
+__global__ void permute0213_vec4_bf16_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    int N, int A, int B, int C)
+{
+    const int C_VEC = C / 4;
+    const int c_vec = blockIdx.x * blockDim.x + threadIdx.x;
+    const int a     = blockIdx.y * blockDim.y + threadIdx.y;
+    const int nb    = blockIdx.z;
+    const int n     = nb / B;
+    const int b     = nb % B;
+
+    if (a >= A || c_vec >= C_VEC) return;
+
+    const long long c_off = (long long)c_vec * 4;
+
+    // input[n, a, b, c_off..c_off+3]
+    const long long in_off = ((((long long)n * A + a) * B + b) * C + c_off);
+    const bf16x4* X = reinterpret_cast<const bf16x4*>(x + in_off);
+    // output[n, b, a, c_off..c_off+3]
+    const long long out_off = ((((long long)n * B + b) * A + a) * C + c_off);
+    bf16x4* Y = reinterpret_cast<bf16x4*>(y + out_off);
+
+    *Y = *X;
+}
+
 // Launch helpers matching the narrow kernels style the crate already uses.
 extern "C" void launch_permute0213_f32(
     const float* x,
@@ -69,6 +114,22 @@ extern "C" void launch_permute0213_bf16(
     int C,
     cudaStream_t stream)
 {
+    // 2026-05-12 perf: vec=4 path when C % 4 == 0 (production attention
+    // head_dims 64/128/256 all qualify). Env override
+    // FLAME_PERMUTE_LEGACY=1 forces the scalar grid-strided kernel.
+    const char* legacy_env = getenv("FLAME_PERMUTE_LEGACY");
+    const bool force_legacy = (legacy_env != nullptr && legacy_env[0] != 0 && legacy_env[0] != '0');
+    if (!force_legacy && (C % 4 == 0) && C >= 4) {
+        const int C_VEC = C / 4;
+        // 32 threads in x cover one full c row when head_dim = 128.
+        // 32 threads in y cover up to 32 a values per block.
+        const int TX = (C_VEC < 32) ? C_VEC : 32;
+        const int TY = (A     < 32) ? A     : 32;
+        dim3 block(TX, TY, 1);
+        dim3 grid((C_VEC + TX - 1) / TX, (A + TY - 1) / TY, N * B);
+        permute0213_vec4_bf16_kernel<<<grid, block, 0, stream>>>(x, y, N, A, B, C);
+        return;
+    }
     const long long total = static_cast<long long>(N) * A * B * C;
     const int block = 256;
     const int grid = static_cast<int>((total + block - 1) / block);
