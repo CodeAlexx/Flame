@@ -21,7 +21,9 @@
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
 use cudarc::driver::{DevicePtr, DevicePtrMut};
-use flame_core::adam::{adam_fused_multi_tensor_step, adam_fused_step, MultiTensorMetaCache};
+use flame_core::adam::{
+    adam_fused_multi_tensor_step, adam_fused_step, adam_fused_step_f32, MultiTensorMetaCache,
+};
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
 
 mod parity_helpers;
@@ -136,6 +138,7 @@ fn multi_tensor_matches_per_tensor_one_step_bit_exact() {
         &mut cache,
         &dev,
         n,
+        true,  // param_is_bf16: BF16 params
         false, // grad_is_bf16: F32 grads
         &packed,
         lr, beta1, beta2, eps, wd,
@@ -230,7 +233,7 @@ fn multi_tensor_matches_per_tensor_100_steps() {
             packed.push(shape.elem_count() as u64);
         }
         adam_fused_multi_tensor_step(
-            &mut cache, &dev, n, false, &packed,
+            &mut cache, &dev, n, true, false, &packed,
             lr, beta1, beta2, eps, wd, bc1, bc2,
             None,
         )
@@ -263,5 +266,202 @@ fn multi_tensor_matches_per_tensor_100_steps() {
             shapes[i].dims(),
             r.pretty()
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F32-param multi-tensor parity (Phase 1 of the launch-storm refactor).
+//
+// Zimage LoRA training holds F32 params (no-quantization rule), and prior to
+// Phase 1 the optimizer's per-tensor F32 kernel fired once per LoRA parameter
+// — 560 launches/step at rank=8. The new
+// `adam_fused_multi_f32param_f32grad_kernel` collapses those into a single
+// launch with bit-identical per-element math.
+// ---------------------------------------------------------------------------
+
+fn build_state_f32(shapes: &[Shape]) -> (Vec<Tensor>, Vec<Tensor>, Vec<Tensor>, Vec<Tensor>) {
+    let dev = global_cuda_device();
+    let mut params = Vec::with_capacity(shapes.len());
+    let mut grads = Vec::with_capacity(shapes.len());
+    let mut ms = Vec::with_capacity(shapes.len());
+    let mut vs = Vec::with_capacity(shapes.len());
+
+    for (i, shape) in shapes.iter().enumerate() {
+        let n = shape.elem_count();
+        // F32 params, F32 grads (no BF16 round-trip — zimage LoRA case).
+        let p_f32 = deterministic_data(n, 1000 + i as u64, 0.05);
+        params.push(Tensor::from_vec(p_f32, shape.clone(), dev.clone()).unwrap());
+        let g_f32 = deterministic_data(n, 2000 + i as u64, 0.01);
+        grads.push(Tensor::from_vec(g_f32, shape.clone(), dev.clone()).unwrap());
+        ms.push(Tensor::from_vec(vec![0.0_f32; n], shape.clone(), dev.clone()).unwrap());
+        vs.push(Tensor::from_vec(vec![0.0_f32; n], shape.clone(), dev.clone()).unwrap());
+    }
+    (params, grads, ms, vs)
+}
+
+#[test]
+fn multi_tensor_f32param_matches_per_tensor_one_step_bit_exact() {
+    let dev = global_cuda_device();
+    let shapes = make_shapes();
+    let n = shapes.len();
+
+    let (lr, beta1, beta2, eps, wd) = (3e-5_f32, 0.9_f32, 0.999_f32, 1e-8_f32, 0.01_f32);
+    let bc1 = 1.0 - beta1.powi(1);
+    let bc2 = 1.0 - beta2.powi(1);
+
+    // ---------- Path A: single multi-tensor launch (F32 params) ----------
+    let (mut p_a, g_a, mut m_a, mut v_a) = build_state_f32(&shapes);
+
+    let mut packed = Vec::with_capacity(5 * n);
+    // Region 0: F32 param pointers
+    for p in &mut p_a {
+        packed.push(*p.as_mut_slice_f32("test:p_f32").unwrap().device_ptr_mut());
+    }
+    // Region 1: F32 grad pointers
+    for g in &g_a {
+        packed.push(*g.as_slice_f32("test:g_f32").unwrap().device_ptr());
+    }
+    // Region 2: F32 m pointers
+    for m in &mut m_a {
+        packed.push(*m.as_mut_slice_f32("test:m_f32").unwrap().device_ptr_mut());
+    }
+    // Region 3: F32 v pointers
+    for v in &mut v_a {
+        packed.push(*v.as_mut_slice_f32("test:v_f32").unwrap().device_ptr_mut());
+    }
+    // Region 4: sizes
+    for shape in &shapes {
+        packed.push(shape.elem_count() as u64);
+    }
+
+    let mut cache = MultiTensorMetaCache::new();
+    adam_fused_multi_tensor_step(
+        &mut cache,
+        &dev,
+        n,
+        false, // param_is_bf16 = false → F32 params
+        false, // grad_is_bf16 = false
+        &packed,
+        lr, beta1, beta2, eps, wd,
+        bc1, bc2,
+        None,
+    )
+    .expect("multi-tensor F32 launch");
+    dev.synchronize().expect("sync after multi-tensor F32");
+
+    let p_a_snap: Vec<Vec<f32>> = p_a.iter().map(snapshot_f32).collect();
+    let m_a_snap: Vec<Vec<f32>> = m_a.iter().map(snapshot_f32).collect();
+    let v_a_snap: Vec<Vec<f32>> = v_a.iter().map(snapshot_f32).collect();
+
+    // ---------- Path B: per-tensor F32 launches ----------
+    let (mut p_b, g_b, mut m_b, mut v_b) = build_state_f32(&shapes);
+    for i in 0..n {
+        adam_fused_step_f32(
+            &mut p_b[i],
+            &g_b[i],
+            &mut m_b[i],
+            &mut v_b[i],
+            lr, beta1, beta2, eps, wd,
+            bc1, bc2,
+        )
+        .expect("per-tensor F32 launch");
+    }
+    dev.synchronize().expect("sync after per-tensor F32");
+
+    let p_b_snap: Vec<Vec<f32>> = p_b.iter().map(snapshot_f32).collect();
+    let m_b_snap: Vec<Vec<f32>> = m_b.iter().map(snapshot_f32).collect();
+    let v_b_snap: Vec<Vec<f32>> = v_b.iter().map(snapshot_f32).collect();
+
+    for i in 0..n {
+        assert_eq!(
+            p_a_snap[i], p_b_snap[i],
+            "F32 param[{i}] (shape={:?}): multi-tensor and per-tensor diverged",
+            shapes[i].dims()
+        );
+        assert_eq!(
+            m_a_snap[i], m_b_snap[i],
+            "F32 m[{i}] (shape={:?}) diverged",
+            shapes[i].dims()
+        );
+        assert_eq!(
+            v_a_snap[i], v_b_snap[i],
+            "F32 v[{i}] (shape={:?}) diverged",
+            shapes[i].dims()
+        );
+    }
+}
+
+#[test]
+fn multi_tensor_f32param_matches_per_tensor_100_steps() {
+    // Weaker gate than bit-exact: 100 sequential steps on both paths, compare
+    // at the end. Catches any subtle drift that would amplify across many
+    // steps. F32 params don't have BF16 ULP truncation, so we expect
+    // bit-identical results here too — but compare with a tiny F32 tolerance
+    // to allow for any non-determinism in floating-point reductions.
+    let dev = global_cuda_device();
+    let shapes = make_shapes();
+    let n = shapes.len();
+
+    let (lr, beta1, beta2, eps, wd) = (3e-5_f32, 0.9_f32, 0.999_f32, 1e-8_f32, 0.01_f32);
+
+    let (mut p_a, g_a, mut m_a, mut v_a) = build_state_f32(&shapes);
+    let mut cache = MultiTensorMetaCache::new();
+    for t in 1..=100u32 {
+        let bc1 = 1.0 - beta1.powi(t as i32);
+        let bc2 = 1.0 - beta2.powi(t as i32);
+        let mut packed = Vec::with_capacity(5 * n);
+        for p in &mut p_a {
+            packed.push(*p.as_mut_slice_f32("test:p_f32").unwrap().device_ptr_mut());
+        }
+        for g in &g_a {
+            packed.push(*g.as_slice_f32("test:g_f32").unwrap().device_ptr());
+        }
+        for m in &mut m_a {
+            packed.push(*m.as_mut_slice_f32("test:m_f32").unwrap().device_ptr_mut());
+        }
+        for v in &mut v_a {
+            packed.push(*v.as_mut_slice_f32("test:v_f32").unwrap().device_ptr_mut());
+        }
+        for shape in &shapes {
+            packed.push(shape.elem_count() as u64);
+        }
+        adam_fused_multi_tensor_step(
+            &mut cache, &dev, n, false, false, &packed,
+            lr, beta1, beta2, eps, wd, bc1, bc2,
+            None,
+        )
+        .unwrap();
+    }
+    dev.synchronize().unwrap();
+
+    let (mut p_b, g_b, mut m_b, mut v_b) = build_state_f32(&shapes);
+    for t in 1..=100u32 {
+        let bc1 = 1.0 - beta1.powi(t as i32);
+        let bc2 = 1.0 - beta2.powi(t as i32);
+        for i in 0..n {
+            adam_fused_step_f32(
+                &mut p_b[i], &g_b[i], &mut m_b[i], &mut v_b[i],
+                lr, beta1, beta2, eps, wd, bc1, bc2,
+            )
+            .unwrap();
+        }
+    }
+    dev.synchronize().unwrap();
+
+    for i in 0..n {
+        let a = snapshot_f32(&p_a[i]);
+        let b = snapshot_f32(&p_b[i]);
+        assert_eq!(a.len(), b.len(), "shape len mismatch [{i}]");
+        // Both paths share identical per-element math, but `eq` here would
+        // also pass — we use `abs(a-b) <= 1e-7 * max(|a|,|b|, eps)` as a
+        // safety belt against a future float-reassociation regression.
+        for (j, (av, bv)) in a.iter().zip(b.iter()).enumerate() {
+            let scale = av.abs().max(bv.abs()).max(1e-6);
+            let drift = (av - bv).abs();
+            assert!(
+                drift <= 1e-7 * scale,
+                "F32 param[{i}][{j}] drifted: a={av} b={bv} delta={drift} after 100 steps"
+            );
+        }
     }
 }

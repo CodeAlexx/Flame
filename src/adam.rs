@@ -40,7 +40,9 @@ use cudarc::driver::{DevicePtr, DevicePtrMut};
 // points for the fused Adam kernels — production code should use
 // `Adam::step` / `AdamW::step` instead, which select the right path.
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-pub use fused::{adam_fused_multi_tensor_step, adam_fused_step, MultiTensorMetaCache};
+pub use fused::{
+    adam_fused_multi_tensor_step, adam_fused_step, adam_fused_step_f32, MultiTensorMetaCache,
+};
 
 // ---------------------------------------------------------------------------
 // Fused Adam CUDA kernels (inline PTX, compiled on first use)
@@ -302,6 +304,61 @@ extern "C" __global__ void adam_fused_multi_bf16_f32grad_kernel(
     }
 }
 
+extern "C" __global__ void adam_fused_multi_f32param_f32grad_kernel(
+    float**          const __restrict__ params,
+    const float**    const __restrict__ grads,
+    float**          const __restrict__ ms,
+    float**          const __restrict__ vs,
+    const long long* __restrict__ sizes,
+    int n_tensors,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    float bias_correction1,
+    float bias_correction2
+) {
+    // Per-element math is identical to the single-tensor
+    // `adam_fused_f32param_f32grad_kernel` (lines 147-180). The only
+    // difference is the launch shape: this kernel uses one thread block
+    // per tensor with a grid-stride inner loop, mirroring
+    // `adam_fused_multi_bf16_f32grad_kernel` above. Since each thread
+    // touches a distinct (t, i) pair, m[i] / v[i] / p[i] reads and writes
+    // do not race, and the per-element ordering is identical to the
+    // per-tensor kernel. Multi-tensor parity is therefore bit-identical
+    // to single-tensor — see `tests/adam_multi_tensor_parity.rs`.
+    int t = blockIdx.x;
+    if (t >= n_tensors) return;
+
+    long long n = sizes[t];
+    float*       p = params[t];
+    const float* g = grads[t];
+    float*       m = ms[t];
+    float*       v = vs[t];
+
+    int tid    = threadIdx.x;
+    int stride = blockDim.x;
+
+    for (long long i = (long long)tid; i < n; i += (long long)stride) {
+        float gv = g[i];
+        float pv = p[i];
+
+        float mi = beta1 * m[i] + (1.0f - beta1) * gv;
+        float vi = beta2 * v[i] + (1.0f - beta2) * gv * gv;
+        m[i] = mi;
+        v[i] = vi;
+
+        float m_hat = mi / bias_correction1;
+        float v_hat = vi / bias_correction2;
+        pv -= lr * m_hat / (sqrtf(v_hat) + eps);
+        if (weight_decay > 0.0f) {
+            pv -= lr * weight_decay * pv;
+        }
+        p[i] = pv;
+    }
+}
+
 extern "C" __global__ void adam_fused_multi_bf16_bf16grad_kernel(
     __nv_bfloat16**         const __restrict__ params,
     const __nv_bfloat16**   const __restrict__ grads,
@@ -530,6 +587,7 @@ mod fused {
                     "adam_fused_f32param_f32grad_kernel",
                     "adam_fused_f32param_bf16grad_kernel",
                     "adam_fused_multi_bf16_f32grad_kernel",
+                    "adam_fused_multi_f32param_f32grad_kernel",
                     "adam_fused_multi_bf16_bf16grad_kernel",
                     "adam_fused_bf16_f32grad_stoch_kernel",
                     "adam_fused_multi_bf16_f32grad_stoch_kernel",
@@ -781,12 +839,16 @@ mod fused {
     ///
     /// `packed` must be exactly `5 * n` u64 entries laid out as five
     /// region-contiguous slabs: `[params(n) | grads(n) | ms(n) | vs(n) | sizes(n)]`.
-    /// All `params` and `m`/`v` storages must be BF16/F32/F32 respectively;
-    /// all `grads` must share a single dtype (BF16 or F32) selected by
-    /// `grad_is_bf16`. The caller (typically `Adam::step`) is responsible
-    /// for that pre-classification and for extracting the raw device
-    /// pointers under whatever borrowing discipline the parameter storage
-    /// requires.
+    /// `m`/`v` storages are always F32. The (param, grad) dtype pair is
+    /// selected by the two boolean discriminators:
+    ///   `param_is_bf16=true,  grad_is_bf16=false` → `adam_fused_multi_bf16_f32grad_kernel`
+    ///   `param_is_bf16=true,  grad_is_bf16=true`  → `adam_fused_multi_bf16_bf16grad_kernel`
+    ///   `param_is_bf16=false, grad_is_bf16=false` → `adam_fused_multi_f32param_f32grad_kernel`
+    ///   `param_is_bf16=false, grad_is_bf16=true`  → returns Err (no kernel; caller must
+    ///                                                use per-param `adam_fused_step_f32`).
+    /// The caller (typically `Adam::step`) is responsible for the
+    /// pre-classification and for extracting the raw device pointers under
+    /// whatever borrowing discipline the parameter storage requires.
     ///
     /// `cache` is held by the calling `Adam` instance so the device-side
     /// metadata buffer is allocated once and reused — without it, allocating
@@ -796,6 +858,7 @@ mod fused {
         cache: &mut MultiTensorMetaCache,
         device: &Arc<CudaDevice>,
         n: usize,
+        param_is_bf16: bool,
         grad_is_bf16: bool,
         packed: &[u64],
         lr: f32,
@@ -840,11 +903,29 @@ mod fused {
         let vs_arr_ptr = base + 3 * stride_bytes;
         let sizes_arr_ptr = base + 4 * stride_bytes;
 
-        // Stoch round only available for the F32-grad variant; falls back
-        // silently to round-to-nearest for BF16 grads (an unreachable branch
-        // via the public Parameter API).
-        let stoch_active = stoch_seed.is_some() && !grad_is_bf16;
-        let kernel_name = if grad_is_bf16 {
+        // Dispatch matrix:
+        //   (BF16 param, F32 grad)          → BF16 fused multi-tensor
+        //   (BF16 param, F32 grad, stoch)   → BF16 multi-tensor + stochastic round
+        //   (BF16 param, BF16 grad)         → BF16 multi-tensor + BF16 grad cast
+        //   (F32  param, F32 grad)          → F32  multi-tensor (no casts, no stoch)
+        //   (F32  param, BF16 grad)         → ERROR — no kernel; classifier
+        //                                     must route to per-param fallback
+        //                                     via adam_fused_step_f32.
+        //
+        // Stoch rounding is only meaningful for BF16 param store; F32 params
+        // don't benefit. The classifier in `Adam::step` clears the seed for
+        // F32-param dispatch.
+        let stoch_active = stoch_seed.is_some() && param_is_bf16 && !grad_is_bf16;
+        let kernel_name = if !param_is_bf16 {
+            if grad_is_bf16 {
+                return Err(Error::Cuda(
+                    "adam_fused_multi_tensor_step: (F32 param, BF16 grad) has no \
+                     multi-tensor kernel; classifier must route to per-param fallback"
+                        .into(),
+                ));
+            }
+            "adam_fused_multi_f32param_f32grad_kernel"
+        } else if grad_is_bf16 {
             "adam_fused_multi_bf16_bf16grad_kernel"
         } else if stoch_active {
             "adam_fused_multi_bf16_f32grad_stoch_kernel"
@@ -991,15 +1072,17 @@ impl Adam {
         // ----------------------------------------------------------------
         // Multi-tensor fast path (Fusion Sprint Phase 4 follow-up).
         //
-        // Eligible iff: every parameter is BF16, every grad is present and
-        // F32. This is the dominant LoRA training case (Parameter::set_grad
-        // casts incoming grads to F32, so BF16 params consistently see F32
-        // grads). Collapses N kernel launches to 1, saving ~5 μs of launch
-        // overhead per parameter.
+        // Eligible cases (mixed dtype across params falls back to per-param):
+        //   1. All BF16 params + F32 grads — dominant LoRA training case
+        //      (Parameter::set_grad casts incoming grads to F32).
+        //   2. All F32 params + F32 grads — added Phase 1 of the launch-storm
+        //      refactor: zimage LoRA uses F32 params (no-quantization rule),
+        //      which previously fell through to the per-param F32 kernel
+        //      (560 launches/step on zimage @ rank=8).
         //
-        // Numerically equivalent to the per-param fused path: same kernel
-        // math, same DECOUPLED-WD receipt, identical step ordering. Verified
-        // by the toy-MLP parity test in `tests/adam_multi_tensor_parity.rs`.
+        // Both collapse N kernel launches to 1 with bit-identical per-param
+        // math (same DECOUPLED-WD receipt, same moment update order).
+        // Verified by `tests/adam_multi_tensor_parity.rs`.
         // ----------------------------------------------------------------
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
         {
@@ -1011,14 +1094,28 @@ impl Adam {
                 .as_deref()
                 .map(|v| matches!(v, "1" | "true" | "TRUE"))
                 .unwrap_or(false);
-            let all_bf16_with_f32_grad = !multi_disabled
-                && n > 0
-                && parameters.iter().all(|p| {
-                    p.dtype().ok() == Some(DType::BF16)
-                        && p.grad().map_or(false, |g| g.dtype() == DType::F32)
-                });
 
-            if all_bf16_with_f32_grad {
+            // Three-way classifier: all BF16 params w/ F32 grads,
+            // all F32 params w/ F32 grads, or "fall through to per-param".
+            // Mixed dtype across params still falls through — multi-tensor
+            // requires homogeneous dtype across the pack.
+            let mt_param_is_bf16: Option<bool> = if multi_disabled || n == 0 {
+                None
+            } else if parameters.iter().all(|p| {
+                p.dtype().ok() == Some(DType::BF16)
+                    && p.grad().map_or(false, |g| g.dtype() == DType::F32)
+            }) {
+                Some(true)
+            } else if parameters.iter().all(|p| {
+                p.dtype().ok() == Some(DType::F32)
+                    && p.grad().map_or(false, |g| g.dtype() == DType::F32)
+            }) {
+                Some(false)
+            } else {
+                None
+            };
+
+            if let Some(param_is_bf16) = mt_param_is_bf16 {
                 // Lazy m/v init for any new param. Same shape + F32 dtype
                 // contract as the per-param path so a switch between the
                 // multi-tensor and per-param paths leaves state consistent.
@@ -1036,15 +1133,26 @@ impl Adam {
 
                 // Build the 5-region packed pointer + size buffer. Region
                 // ordering must match the kernel's slab layout — see
-                // `CUDA_ADAM_FUSED_MULTI_BF16` and `adam_fused_multi_tensor_step`.
+                // `CUDA_ADAM_FUSED_MULTI_BF16` / `CUDA_ADAM_FUSED_MULTI_F32`
+                // and `adam_fused_multi_tensor_step`.
                 let mut packed: Vec<u64> = Vec::with_capacity(5 * n);
 
-                // Region 0: BF16 param data pointers.
-                for param in parameters {
-                    let p_ptr: u64 = param.with_data_mut(|t| {
-                        Ok(t.as_mut_device_ptr_bf16("adam_mt:p")? as u64)
-                    })?;
-                    packed.push(p_ptr);
+                // Region 0: param data pointers (dtype switch per param_is_bf16).
+                if param_is_bf16 {
+                    for param in parameters {
+                        let p_ptr: u64 = param.with_data_mut(|t| {
+                            Ok(t.as_mut_device_ptr_bf16("adam_mt:p")? as u64)
+                        })?;
+                        packed.push(p_ptr);
+                    }
+                } else {
+                    for param in parameters {
+                        let p_ptr: u64 = param.with_data_mut(|t| {
+                            let s = t.as_mut_slice_f32("adam_mt:p_f32")?;
+                            Ok(*s.device_ptr_mut())
+                        })?;
+                        packed.push(p_ptr);
+                    }
                 }
                 // Region 1: F32 grad pointers.
                 for param in parameters {
@@ -1083,12 +1191,16 @@ impl Adam {
                     .device
                     .clone();
 
-                let seed = self.stoch_seed();
+                // Stochastic rounding is only meaningful for BF16 param
+                // store. F32 params write the full float — clear the seed
+                // so the dispatcher doesn't even consider it.
+                let seed = if param_is_bf16 { self.stoch_seed() } else { None };
                 fused::adam_fused_multi_tensor_step(
                     &mut self.multi_tensor_meta,
                     &device,
                     n,
-                    false, // grad_is_bf16: F32 grads in this branch
+                    param_is_bf16,
+                    false, // grad_is_bf16: classifier above only accepts F32 grads
                     &packed,
                     self.lr,
                     self.beta1,
