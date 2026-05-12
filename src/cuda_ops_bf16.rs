@@ -243,29 +243,22 @@ pub fn rms_norm_bf16(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> Result<Te
     if let Some(w) = weight {
         ensure_bf16(w, "rms_norm_bf16:weight")?;
     }
-    let mut out = Tensor::empty_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
-    debug_assert_eq!(out.dtype(), DType::BF16);
-
-    let stream = default_stream(x);
-    let vx = tensor_as_view_bf16(x, "rms_norm_bf16:x")?;
-    let vw = if let Some(w) = weight {
-        Some(tensor_as_view_bf16(w, "rms_norm_bf16:weight")?)
-    } else {
-        None
-    };
-    let mut vy = tensor_as_view_bf16_mut(&mut out, "rms_norm_bf16:out")?;
-
-    let status = unsafe {
-        fc_rms_norm_bf16(
-            &vx,
-            vw.as_ref().map(|v| v as *const _).unwrap_or(ptr::null()),
-            eps,
-            &mut vy,
-            stream.as_raw(),
-        )
-    };
-    status_to_result(status, "fc_rms_norm_bf16")?;
-    Ok(out)
+    // 2026-05-12: unify with training path. flame_core::norm::rms_norm
+    // dispatches to the vec/legacy kernel based on norm_size; inference
+    // benefits from the same 13-16x BF16 speedup we landed for training
+    // today (commit 2ebc2d1). The fc_rms_norm_bf16 .cu kernel remains as
+    // a fallback path inside norm:: when norm_size % 4 != 0.
+    //
+    // Inference contract preserved: weight is BF16, output is BF16, no
+    // autograd recording (caller's `x` doesn't require grad in inference).
+    // The normalized_shape arg is the trailing dim (RMSNorm always
+    // normalizes along the last dim in flame's contract).
+    let last_dim = *x
+        .shape()
+        .dims()
+        .last()
+        .ok_or_else(|| Error::InvalidInput("rms_norm_bf16: input must have rank >= 1".into()))?;
+    crate::norm::rms_norm(x, &[last_dim], weight, eps)
 }
 
 /// RMSNorm with BF16 input → F32 output (no weight).

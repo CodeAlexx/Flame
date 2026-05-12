@@ -141,6 +141,18 @@ harness = false
 name = "swiglu_bench"
 harness = false
 
+# SDPA causal: stream vs attention_impl entry points (2026-05-12).
+# Confirms whether the 1000x bench artifact is real perf or wrong-API.
+[[bench]]
+name = "sdpa_causal_bench"
+harness = false
+
+# RMSNorm inference path (cuda_ops_bf16::rms_norm_bf16) post-unification
+# verification (2026-05-12). Confirms inference now hits the vec kernel.
+[[bench]]
+name = "rms_norm_inference_bench"
+harness = false
+
 # Add session 4 — first binary, same 5%-within gate.
 [[bench]]
 name = "add_iter_alloc"
