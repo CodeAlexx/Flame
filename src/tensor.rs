@@ -770,8 +770,17 @@ extern "C" __global__ void masked_fill_kernel(
         // klein 9B/zimage that's ~2K casts/step paying redundant memcpy +
         // alloc overhead. PyTorch dispatches one fused cast kernel via
         // TensorIterator; these fast paths match that pattern.
+        //
+        // 2026-05-12 (launch-storm Phase 0 diagnosis): the fast paths return
+        // a fresh tensor with `requires_grad: false` regardless of the
+        // source. That silently broke zimage trainer's autograd chain —
+        // any intermediate cast inside a training forward erases the grad
+        // marker, the loss ends up not-requires-grad, backward() fails.
+        // Restrict the fast path to inputs that do NOT require grad. When
+        // the source requires grad, fall through to the legacy path which
+        // routes through `Tensor::cast` (autograd-aware via Op::Cast).
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-        {
+        if !self.requires_grad {
             use cudarc::driver::DevicePtr;
             // BF16 → F32: one kernel, two allocs (output + storage).
             if self.dtype() == DType::BF16
