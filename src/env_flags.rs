@@ -116,3 +116,14 @@ pub fn assert_grad_flow_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     flag_enabled("FLAME_ASSERT_GRAD_FLOW", &CACHED)
 }
+
+/// `FLAME_HOT_FAST_PATH_DISABLE=1` — turn off the BF16-contiguous fast path
+/// added to `Tensor::{silu,gelu,add,mul,mul_scalar}` and fall back to the
+/// full `TensorIterator` dispatch chain. Rollback knob: bit-equivalent and
+/// autograd-equivalent to the slow path, so flipping this on must not
+/// change training output, only restore the old per-op CPU latency.
+#[inline]
+pub fn hot_fast_path_disabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    flag_enabled("FLAME_HOT_FAST_PATH_DISABLE", &CACHED)
+}

@@ -1976,6 +1976,41 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Element-wise addition
     pub fn add(&self, other: &Tensor) -> Result<Tensor> {
+        // Hot-path collapse: BF16 + BF16 + contig + same shape → call the
+        // existing `flame_add_bf16_kernel` C entry directly, skipping
+        // `TensorIteratorBase::build_binary_op` and `Config::build()`. The
+        // device-side functor is unchanged (same kernel either way), so the
+        // output is bit-identical with the slow path. Autograd recording
+        // still happens at the method level below — saved-tensor semantics
+        // are preserved. The slow path remains the only correctness oracle
+        // for broadcast / strided / non-BF16 cases. Set
+        // `FLAME_HOT_FAST_PATH_DISABLE=1` to rollback.
+        if !crate::env_flags::hot_fast_path_disabled()
+            && self.dtype() == DType::BF16
+            && other.dtype() == DType::BF16
+            && self.is_contiguous()
+            && other.is_contiguous()
+            && self.shape() == other.shape()
+        {
+            let mut output = crate::bf16_ops::add_bf16_contig_direct(self, other)?;
+            if self.requires_grad || other.requires_grad {
+                output.requires_grad = true;
+                if AutogradContext::is_recording() {
+                    AutogradContext::record_op(
+                        output.id,
+                        Op::Add {
+                            lhs: self.id,
+                            rhs: other.id,
+                            lhs_shape: self.shape.clone(),
+                            rhs_shape: other.shape.clone(),
+                        },
+                        Vec::new(),
+                    );
+                }
+            }
+            return Ok(output);
+        }
+
         // Phase 10: BF16+BF16 → TensorIterator, else → GpuOps::add. The
         // `*_bf16_iter` functions handle their own cuda-feature gating
         // (return InvalidOperation on non-cuda builds), so no extra cfg
@@ -2037,6 +2072,35 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Element-wise multiplication (Hadamard product)
     pub fn mul(&self, other: &Tensor) -> Result<Tensor> {
+        // Hot-path collapse: see `Tensor::add` for the rationale. Same
+        // bit-identical / autograd-equivalent guarantees apply here. The
+        // saved-tensor list for `Op::Mul` (both lhs and rhs are saved,
+        // unlike Add) is built at the method level — fast path does not
+        // alter it.
+        if !crate::env_flags::hot_fast_path_disabled()
+            && self.dtype() == DType::BF16
+            && other.dtype() == DType::BF16
+            && self.is_contiguous()
+            && other.is_contiguous()
+            && self.shape() == other.shape()
+        {
+            let mut output = crate::bf16_ops::mul_bf16_contig_direct(self, other)?;
+            if self.requires_grad || other.requires_grad {
+                output.requires_grad = true;
+                if AutogradContext::is_recording() {
+                    AutogradContext::record_op(
+                        output.id,
+                        Op::Mul {
+                            lhs: self.id,
+                            rhs: other.id,
+                        },
+                        vec![(self.id, self.clone()), (other.id, other.clone())],
+                    );
+                }
+            }
+            return Ok(output);
+        }
+
         // Phase 10: BF16+BF16 → TensorIterator, else → GpuOps::mul.
         let mut output = crate::tensor_iterator::dispatch_binary_bf16(
             self,
@@ -2062,6 +2126,31 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Scalar multiplication
     pub fn mul_scalar(&self, scalar: f32) -> Result<Tensor> {
+        // Hot-path collapse: BF16 + contig → direct kernel call, skipping
+        // `build_unary_op` / `Config::build()`. The functor (an opmath
+        // round-trip with the f32 scalar captured) is identical, so output
+        // is bit-identical. `Op::MulScalar` saves no tensors.
+        if !crate::env_flags::hot_fast_path_disabled()
+            && self.dtype() == DType::BF16
+            && self.is_contiguous()
+        {
+            let mut output = crate::bf16_ops::mul_scalar_bf16_contig_direct(self, scalar)?;
+            if self.requires_grad {
+                output.requires_grad = true;
+                if AutogradContext::is_recording() {
+                    AutogradContext::record_op(
+                        output.id,
+                        Op::MulScalar {
+                            input: self.id,
+                            scalar,
+                        },
+                        Vec::new(),
+                    );
+                }
+            }
+            return Ok(output);
+        }
+
         // Phase 10: BF16 → TensorIterator (scalar captured in stateful
         // functor, mirrors PyTorch's opmath_gpu_kernel_with_scalars).
         // Other dtypes → GpuOps::mul_scalar (F32 path).
@@ -2141,6 +2230,28 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// GELU activation
     pub fn gelu(&self) -> Result<Tensor> {
+        // Hot-path collapse: see `Tensor::silu` for the rationale. Same
+        // kernel as `gelu_bf16_iter`, only the iterator-build chain is
+        // skipped. The legacy `bf16_ops::gelu_bf16` (2-way vec NVRTC) is
+        // deliberately NOT used here — it is slower on large numel.
+        if !crate::env_flags::hot_fast_path_disabled()
+            && self.dtype() == DType::BF16
+            && self.is_contiguous()
+        {
+            let mut output = crate::bf16_ops::gelu_bf16_contig_direct(self)?;
+            if self.requires_grad {
+                output.requires_grad = true;
+                if AutogradContext::is_recording() {
+                    AutogradContext::record_op(
+                        output.id,
+                        Op::GELU { input: self.id },
+                        vec![(self.id, self.clone())],
+                    );
+                }
+            }
+            return Ok(output);
+        }
+
         // Phase 10: BF16 → TensorIterator, else → GpuOps::gelu.
         let mut output = crate::tensor_iterator::dispatch_unary_bf16(
             self,
@@ -2175,6 +2286,34 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// SiLU (Swish) activation
     pub fn silu(&self) -> Result<Tensor> {
+        // Hot-path collapse: BF16 + contig → direct call into the SAME
+        // `flame_silu_bf16_kernel` C entry that the slow path's
+        // `silu_bf16_kernel` invokes, skipping
+        // `TensorIteratorBase::build_unary_op` + `Config::build()`.
+        // Kernel-side: identical (vec=4 launch_gpu_kernel template), so
+        // output is bit-identical AND there is no kernel-perf regression
+        // on large numel. CPU saving is the iterator-build chain only.
+        // NOTE: do not use `bf16_ops::silu_bf16` here — that kernel is the
+        // older 2-way vectorized NVRTC version retained as a parity oracle;
+        // on large numel it is measurably slower than the iter kernel.
+        if !crate::env_flags::hot_fast_path_disabled()
+            && self.dtype() == DType::BF16
+            && self.is_contiguous()
+        {
+            let mut output = crate::bf16_ops::silu_bf16_contig_direct(self)?;
+            if self.requires_grad {
+                output.requires_grad = true;
+                if AutogradContext::is_recording() {
+                    AutogradContext::record_op(
+                        output.id,
+                        Op::SiLU { input: self.id },
+                        vec![(self.id, self.clone())],
+                    );
+                }
+            }
+            return Ok(output);
+        }
+
         // Phase 10: BF16 → TensorIterator, else → GpuOps::silu.
         let mut output = crate::tensor_iterator::dispatch_unary_bf16(
             self,

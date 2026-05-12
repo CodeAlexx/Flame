@@ -356,6 +356,345 @@ pub fn silu_bf16(x: &Tensor) -> Result<Tensor> {
     Ok(out)
 }
 
+// =============================================================================
+// Hot-path BF16-contig direct kernel wrappers for `Tensor::{add,mul,mul_scalar}`
+// =============================================================================
+//
+// These bypass `TensorIteratorBase::build_binary_op` / `build_unary_op` for the
+// common case (BF16, contig, same shape — no broadcasting, no strided views).
+// They populate `IterMetadata` inline for a 1-D contig iteration and call the
+// existing `flame_<op>_bf16_kernel` C entry points directly. The kernel
+// functors are unchanged (same as `tensor_iterator::ops::binary::*_iter`), so
+// device-side math is bit-identical with the slow path.
+//
+// PyTorch reference: `at::add(a, b)` lands in `at::native::structured_add_out::
+// impl()` which goes through `TensorIterator::binary_float_op(out, a, b)` and
+// then the dispatched kernel. The slow path mirrors that exactly. For
+// contig+same-dtype same-shape, PyTorch's
+// `gpu_kernel_with_scalars`/`launch_vectorized_kernel` skips most of the
+// `TensorIteratorBase::build()` work because shape inference is trivial.
+// flame's slow path currently always walks the full builder. This fast path
+// collapses it.
+
+#[cfg(feature = "cuda")]
+#[inline(always)]
+fn make_contig_iter_metadata_1d_binary(
+    out_ptr: *mut std::os::raw::c_void,
+    a_ptr: *mut std::os::raw::c_void,
+    b_ptr: *mut std::os::raw::c_void,
+    numel: usize,
+) -> crate::tensor_iterator::IterMetadata {
+    use crate::tensor_iterator::IterMetadata;
+    let mut meta = IterMetadata::zeroed();
+    meta.ndim = 1;
+    meta.num_args = 3;
+    meta.num_outputs = 1;
+    meta._pad = 0;
+    meta.numel = numel as i64;
+    meta.is_contiguous = true;
+    meta.requires_32bit_indexing = true;
+    meta.sizes[0] = numel as i64;
+    // Each operand is 1-D contig with element stride 1.
+    meta.strides[0][0] = 1;
+    meta.strides[1][0] = 1;
+    meta.strides[2][0] = 1;
+    meta.offsets_elems[0] = 0;
+    meta.offsets_elems[1] = 0;
+    meta.offsets_elems[2] = 0;
+    meta.data_ptrs[0] = out_ptr;
+    meta.data_ptrs[1] = a_ptr;
+    meta.data_ptrs[2] = b_ptr;
+    meta
+}
+
+#[cfg(feature = "cuda")]
+#[inline(always)]
+fn make_contig_iter_metadata_1d_unary(
+    out_ptr: *mut std::os::raw::c_void,
+    a_ptr: *mut std::os::raw::c_void,
+    numel: usize,
+) -> crate::tensor_iterator::IterMetadata {
+    use crate::tensor_iterator::IterMetadata;
+    let mut meta = IterMetadata::zeroed();
+    meta.ndim = 1;
+    meta.num_args = 2;
+    meta.num_outputs = 1;
+    meta._pad = 0;
+    meta.numel = numel as i64;
+    meta.is_contiguous = true;
+    meta.requires_32bit_indexing = true;
+    meta.sizes[0] = numel as i64;
+    meta.strides[0][0] = 1;
+    meta.strides[1][0] = 1;
+    meta.offsets_elems[0] = 0;
+    meta.offsets_elems[1] = 0;
+    meta.data_ptrs[0] = out_ptr;
+    meta.data_ptrs[1] = a_ptr;
+    meta
+}
+
+#[cfg(feature = "cuda")]
+#[inline]
+fn alloc_contig_bf16_like(t: &Tensor) -> Result<Tensor> {
+    let n = t.shape().elem_count();
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&t.device, n)?;
+    Ok(Tensor {
+        storage: TensorStorage::BF16 {
+            data: data.into(),
+            numel: n,
+        },
+        shape: t.shape().clone(),
+        device: t.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+    })
+}
+
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn flame_add_bf16_kernel(
+        meta: *const crate::tensor_iterator::IterMetadata,
+        stream: *mut std::os::raw::c_void,
+    ) -> i32;
+    fn flame_mul_bf16_kernel(
+        meta: *const crate::tensor_iterator::IterMetadata,
+        stream: *mut std::os::raw::c_void,
+    ) -> i32;
+    fn flame_mul_scalar_bf16_kernel(
+        meta: *const crate::tensor_iterator::IterMetadata,
+        scalar: f32,
+        stream: *mut std::os::raw::c_void,
+    ) -> i32;
+    fn flame_silu_bf16_kernel(
+        meta: *const crate::tensor_iterator::IterMetadata,
+        stream: *mut std::os::raw::c_void,
+    ) -> i32;
+    fn flame_gelu_bf16_kernel(
+        meta: *const crate::tensor_iterator::IterMetadata,
+        stream: *mut std::os::raw::c_void,
+    ) -> i32;
+}
+
+/// Direct BF16-contig fast path for `Tensor::silu`. Precondition: `x` is BF16,
+/// contiguous. Calls the SAME kernel as `silu_bf16_iter` (the vectorized
+/// `launch_gpu_kernel<1, SiluBF16Op>` from `src/cuda/unary/silu.cu`), so output
+/// is bit-identical AND the device-side perf matches the slow path (vec=4 on
+/// large numel). The only CPU saving is the `TensorIteratorConfig::build()`
+/// chain.
+pub fn silu_bf16_contig_direct(x: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        debug_assert_eq!(x.dtype(), DType::BF16);
+        debug_assert!(x.is_contiguous());
+
+        let mut out = alloc_contig_bf16_like(x)?;
+        let numel = x.shape().elem_count();
+        let x_ptr = x.as_device_ptr_bf16("silu_bf16_contig_direct: x")?
+            as *mut std::os::raw::c_void;
+        let out_ptr = match &mut out.storage {
+            TensorStorage::BF16 { data, .. } => {
+                let s = ensure_unique_slice(data)?;
+                use cudarc::driver::DevicePtrMut as _;
+                (*s.device_ptr_mut()) as *mut std::os::raw::c_void
+            }
+            _ => unreachable!("alloc_contig_bf16_like returns BF16"),
+        };
+        let meta = make_contig_iter_metadata_1d_unary(out_ptr, x_ptr, numel);
+        use crate::device::CudaStreamRawPtrExt;
+        let stream = x.device.cuda_stream_raw_ptr();
+        let status = unsafe { flame_silu_bf16_kernel(&meta, stream) };
+        if status != 0 {
+            return Err(Error::Cuda(format!(
+                "flame_silu_bf16_kernel (contig fast path) failed with code {}",
+                status
+            )));
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = x;
+        Err(Error::InvalidOperation(
+            "silu_bf16_contig_direct requires the cuda feature".into(),
+        ))
+    }
+}
+
+/// Direct BF16-contig fast path for `Tensor::gelu`. Same kernel as
+/// `gelu_bf16_iter`. See `silu_bf16_contig_direct`.
+pub fn gelu_bf16_contig_direct(x: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        debug_assert_eq!(x.dtype(), DType::BF16);
+        debug_assert!(x.is_contiguous());
+
+        let mut out = alloc_contig_bf16_like(x)?;
+        let numel = x.shape().elem_count();
+        let x_ptr = x.as_device_ptr_bf16("gelu_bf16_contig_direct: x")?
+            as *mut std::os::raw::c_void;
+        let out_ptr = match &mut out.storage {
+            TensorStorage::BF16 { data, .. } => {
+                let s = ensure_unique_slice(data)?;
+                use cudarc::driver::DevicePtrMut as _;
+                (*s.device_ptr_mut()) as *mut std::os::raw::c_void
+            }
+            _ => unreachable!("alloc_contig_bf16_like returns BF16"),
+        };
+        let meta = make_contig_iter_metadata_1d_unary(out_ptr, x_ptr, numel);
+        use crate::device::CudaStreamRawPtrExt;
+        let stream = x.device.cuda_stream_raw_ptr();
+        let status = unsafe { flame_gelu_bf16_kernel(&meta, stream) };
+        if status != 0 {
+            return Err(Error::Cuda(format!(
+                "flame_gelu_bf16_kernel (contig fast path) failed with code {}",
+                status
+            )));
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = x;
+        Err(Error::InvalidOperation(
+            "gelu_bf16_contig_direct requires the cuda feature".into(),
+        ))
+    }
+}
+
+/// Direct BF16-contig fast path for `Tensor::add`. Precondition: both inputs
+/// are BF16, contiguous, same shape. Output is a fresh contig BF16 tensor.
+/// Bit-identical with `tensor_iterator::ops::binary::add_bf16_iter` on the
+/// same inputs.
+pub fn add_bf16_contig_direct(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        debug_assert_eq!(a.dtype(), DType::BF16);
+        debug_assert_eq!(b.dtype(), DType::BF16);
+        debug_assert!(a.is_contiguous());
+        debug_assert!(b.is_contiguous());
+        debug_assert_eq!(a.shape(), b.shape());
+
+        let mut out = alloc_contig_bf16_like(a)?;
+        let numel = a.shape().elem_count();
+        let a_ptr = a.as_device_ptr_bf16("add_bf16_contig_direct: a")? as *mut std::os::raw::c_void;
+        let b_ptr = b.as_device_ptr_bf16("add_bf16_contig_direct: b")? as *mut std::os::raw::c_void;
+        let out_ptr = match &mut out.storage {
+            TensorStorage::BF16 { data, .. } => {
+                let s = ensure_unique_slice(data)?;
+                use cudarc::driver::DevicePtrMut as _;
+                (*s.device_ptr_mut()) as *mut std::os::raw::c_void
+            }
+            _ => unreachable!("alloc_contig_bf16_like returns BF16"),
+        };
+        let meta = make_contig_iter_metadata_1d_binary(out_ptr, a_ptr, b_ptr, numel);
+        use crate::device::CudaStreamRawPtrExt;
+        let stream = a.device.cuda_stream_raw_ptr();
+        let status = unsafe { flame_add_bf16_kernel(&meta, stream) };
+        if status != 0 {
+            return Err(Error::Cuda(format!(
+                "flame_add_bf16_kernel (contig fast path) failed with code {}",
+                status
+            )));
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (a, b);
+        Err(Error::InvalidOperation(
+            "add_bf16_contig_direct requires the cuda feature".into(),
+        ))
+    }
+}
+
+/// Direct BF16-contig fast path for `Tensor::mul`. Same preconditions/contract
+/// as `add_bf16_contig_direct`.
+pub fn mul_bf16_contig_direct(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        debug_assert_eq!(a.dtype(), DType::BF16);
+        debug_assert_eq!(b.dtype(), DType::BF16);
+        debug_assert!(a.is_contiguous());
+        debug_assert!(b.is_contiguous());
+        debug_assert_eq!(a.shape(), b.shape());
+
+        let mut out = alloc_contig_bf16_like(a)?;
+        let numel = a.shape().elem_count();
+        let a_ptr = a.as_device_ptr_bf16("mul_bf16_contig_direct: a")? as *mut std::os::raw::c_void;
+        let b_ptr = b.as_device_ptr_bf16("mul_bf16_contig_direct: b")? as *mut std::os::raw::c_void;
+        let out_ptr = match &mut out.storage {
+            TensorStorage::BF16 { data, .. } => {
+                let s = ensure_unique_slice(data)?;
+                use cudarc::driver::DevicePtrMut as _;
+                (*s.device_ptr_mut()) as *mut std::os::raw::c_void
+            }
+            _ => unreachable!("alloc_contig_bf16_like returns BF16"),
+        };
+        let meta = make_contig_iter_metadata_1d_binary(out_ptr, a_ptr, b_ptr, numel);
+        use crate::device::CudaStreamRawPtrExt;
+        let stream = a.device.cuda_stream_raw_ptr();
+        let status = unsafe { flame_mul_bf16_kernel(&meta, stream) };
+        if status != 0 {
+            return Err(Error::Cuda(format!(
+                "flame_mul_bf16_kernel (contig fast path) failed with code {}",
+                status
+            )));
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (a, b);
+        Err(Error::InvalidOperation(
+            "mul_bf16_contig_direct requires the cuda feature".into(),
+        ))
+    }
+}
+
+/// Direct BF16-contig fast path for `Tensor::mul_scalar`. Precondition: `x` is
+/// BF16, contiguous. Bit-identical with
+/// `tensor_iterator::ops::binary::mul_scalar_bf16_iter`.
+pub fn mul_scalar_bf16_contig_direct(x: &Tensor, scalar: f32) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        debug_assert_eq!(x.dtype(), DType::BF16);
+        debug_assert!(x.is_contiguous());
+
+        let mut out = alloc_contig_bf16_like(x)?;
+        let numel = x.shape().elem_count();
+        let x_ptr = x.as_device_ptr_bf16("mul_scalar_bf16_contig_direct: x")?
+            as *mut std::os::raw::c_void;
+        let out_ptr = match &mut out.storage {
+            TensorStorage::BF16 { data, .. } => {
+                let s = ensure_unique_slice(data)?;
+                use cudarc::driver::DevicePtrMut as _;
+                (*s.device_ptr_mut()) as *mut std::os::raw::c_void
+            }
+            _ => unreachable!("alloc_contig_bf16_like returns BF16"),
+        };
+        let meta = make_contig_iter_metadata_1d_unary(out_ptr, x_ptr, numel);
+        use crate::device::CudaStreamRawPtrExt;
+        let stream = x.device.cuda_stream_raw_ptr();
+        let status = unsafe { flame_mul_scalar_bf16_kernel(&meta, scalar, stream) };
+        if status != 0 {
+            return Err(Error::Cuda(format!(
+                "flame_mul_scalar_bf16_kernel (contig fast path) failed with code {}",
+                status
+            )));
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (x, scalar);
+        Err(Error::InvalidOperation(
+            "mul_scalar_bf16_contig_direct requires the cuda feature".into(),
+        ))
+    }
+}
+
 // ---- Fused RoPE: complex rotation in one kernel, no intermediates ----
 
 const CUDA_ROPE_FUSED: &str = r#"

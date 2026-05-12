@@ -509,6 +509,16 @@ dispatch registry in `tensor_iterator/dispatch.rs`.
   inference path.
 - `square_bf16(x)` — `:170` — same role for `square_bf16_iter`.
 - `silu_bf16(x)` — `:322` — same role for `silu_bf16_iter`.
+- ⭐ `add_bf16_contig_direct(a, b)` / `mul_bf16_contig_direct(a, b)` /
+  `mul_scalar_bf16_contig_direct(x, scalar)` / `silu_bf16_contig_direct(x)`
+  / `gelu_bf16_contig_direct(x)` — hot-path collapse helpers added
+  2026-05-12. Direct C-FFI into `flame_{add,mul,mul_scalar,silu,gelu}_bf16_kernel`
+  with an inline-populated `IterMetadata` (1-D contig, same-shape, no
+  broadcasting). Skip `TensorIteratorConfig::build()` / `build_iter_metadata()`
+  on the hot path. Same kernel as the corresponding `*_iter` slow path, so
+  output is bit-identical. Used by `Tensor::{silu,gelu,add,mul,mul_scalar}`
+  when input(s) are BF16, contig, same-shape. Rollback knob:
+  `FLAME_HOT_FAST_PATH_DISABLE=1` (see `env_flags::hot_fast_path_disabled`).
 - `softmax_last_dim_bf16(x)` — `:264` — older fused softmax (one block per row).
 - ⭐ `rope_fused_bf16(x, cos, sin)` — `:476` — interleaved-pair RoPE.
 - ⭐ `rope_fused_bf16_f32pe(x, cos, sin)` — `:595` — RoPE with F32 positional embeddings. Records `Op::RoPePrecomputed` (saves BF16-cast cos/sin for backward dispatcher); see `feedback_rope_fused_autograd.md`.
