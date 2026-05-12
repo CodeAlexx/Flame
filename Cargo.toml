@@ -194,3 +194,10 @@ approx = "0.5"
 libm = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# 2026-05-12 (launch-storm Phase 4): vendored cudarc 0.11.9 with the
+# bind_to_thread thread-local fast-path. Cuts cuCtxSetCurrent storm
+# from ~91k/step to ~1/thread/program. See cudarc-pinctx/src/driver/
+# safe/threading.rs for the one-file patch and rationale.
+[patch.crates-io]
+cudarc = { path = "../cudarc-pinctx" }
