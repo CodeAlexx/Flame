@@ -130,6 +130,12 @@ harness = false
 name = "slice_copy_bench"
 harness = false
 
+# Permute 0213/021 current-kernel bandwidth measurement (2026-05-12). Read-only
+# bench; used to decide whether tiled-transpose rewrite is worth the effort.
+[[bench]]
+name = "permute_bench"
+harness = false
+
 # Add session 4 — first binary, same 5%-within gate.
 [[bench]]
 name = "add_iter_alloc"
