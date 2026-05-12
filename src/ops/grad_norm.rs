@@ -45,7 +45,15 @@
 //!   a magic global lookup).
 
 use crate::{global_cuda_device, DType, Error, Result, Shape, Tensor};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+// Phase 3: process-wide cache for the multi-tensor L2 norm primitives.
+// Held behind a Mutex because `global_l2_norm` is a free function and
+// callers may invoke it from any thread. Contention is per-step and
+// trivial; allocator state is the only thing being protected.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+static MT_L2_CACHE: Mutex<crate::ops::multi_tensor::MultiTensorMetaCache> =
+    Mutex::new(crate::ops::multi_tensor::MultiTensorMetaCache::new());
 
 /// Compute the global L2 norm of a slice of gradient tensors.
 ///
@@ -64,6 +72,33 @@ pub fn global_l2_norm(grads: &[&Tensor]) -> Result<Tensor> {
         let dev = global_cuda_device();
         return Tensor::from_vec(vec![0.0_f32], Shape::from_dims(&[1]), dev);
     }
+
+    // Multi-tensor fast path (Phase 3 of launch-storm refactor). Collapses
+    // 2N+(N-1)+1 launches into 3 (stage1 + stage2 + sqrt). Eligible iff
+    // every grad is contiguous F32. Mixed-dtype slices and non-contiguous
+    // tensors fall through to the per-tensor path below.
+    //
+    // Env override `FLAME_MT_L2NORM=0` forces legacy path for A/B testing.
+    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+    {
+        let mt_disabled = std::env::var("FLAME_MT_L2NORM")
+            .ok()
+            .as_deref()
+            .map(|v| matches!(v, "0" | "false" | "FALSE"))
+            .unwrap_or(false);
+        let all_f32_contig = !mt_disabled
+            && grads.iter().all(|g| g.dtype() == DType::F32 && g.is_contiguous());
+        if all_f32_contig {
+            let mut cache = MT_L2_CACHE
+                .lock()
+                .map_err(|_| Error::Training("MT_L2_CACHE mutex poisoned".into()))?;
+            let total_sq = crate::ops::multi_tensor::multi_tensor_l2_norm_sq_f32(
+                &mut cache, grads,
+            )?;
+            return total_sq.sqrt();
+        }
+    }
+
     let dev = grads[0].device().clone();
 
     // Per-tensor sum-of-squares in FP32. Each call is one or two kernel
@@ -82,7 +117,8 @@ pub fn global_l2_norm(grads: &[&Tensor]) -> Result<Tensor> {
     // Reduce all per-tensor scalars on device. fold-add is N-1 launches
     // but each is a tiny scalar add — total latency is dominated by per-
     // tensor square+sum, not by the fold. Apex's two-stage kernel reduces
-    // this to a single launch; left as a follow-up.
+    // this to a single launch; multi-tensor fast path above does exactly
+    // that.
     let zero = Tensor::from_vec(vec![0.0_f32], Shape::from_dims(&[1]), dev.clone())?;
     let total_sq = sq_sums.into_iter().try_fold(zero, |acc, s| {
         // s is shape [1] FP32; acc is shape [1] FP32. Direct add works.
