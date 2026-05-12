@@ -71,6 +71,13 @@ ensure / get_func / launch dance.
 |---|---|---|
 | `deinterleave_pair_f32_kernel` | `:25` | **Last-dim deinterleave**, vectorized via `float2` reinterpret_cast. Splits `[..., 2K]` F32 into two `[..., K]` halves (even/odd columns). Used by interleaved-SwiGLU MLPs to skip the stride-2 generic gather (`materialize_strided_f32_kernel` was ~1.35 s for 18 M elements vs ~0.5 ms here on a 3090 Ti) — the host-side path went `reshape→narrow(stride 2)→.contiguous()` and lost on coalescing; this kernel does one vectorized 8-byte read + two 4-byte writes per thread. |
 
+### `bf16_reduce.rs` — BF16-native scalar reductions (added 2026-05-12)
+
+| Kernel | Line | Purpose / notes |
+|---|---|---|
+| `sum_bf16_to_f32_scalar_kernel` | `:50` | **BF16-native sum reduce.** Per-thread grid-stride F32 accumulator over BF16 input, shared-mem tree reduce per block, `atomicAdd` of block result into a single F32 scratch scalar. Block=256, grid capped at 4096 with grid-stride loop covering arbitrary `n`. Replaces the legacy F32 `sum_kernel` for BF16 inputs (Foundation fix #B), eliminating the BF16→F32 cast + F32-reduce + F32→BF16 cast triple pass. Note: legacy F32 `sum_kernel` (`cuda_kernel_sources.rs:260`) hard-caps grid at 1024 blocks and silently drops elements past `1024 * 256 = 262144` — this kernel's grid-stride loop is correct for any size. |
+| `f32_scalar_to_bf16_kernel` | `:80` | 1-thread cast of an F32 scalar to BF16, with a fused `* scale` multiply so `mean_bf16` can pass `1/n` and keep the entire reduction on a single CUDA stream (no host D2H sync). |
+
 ### `bf16_convert.rs` — BF16↔F32 cast
 
 | Kernel | Line | Purpose / notes |
@@ -640,9 +647,11 @@ This is the largest single `.cu` file. All the `fc_*` BF16 op entries live here.
 | `fc_gemm_bf16` | `:357` | Standard 2D GEMM, BF16 in/out, FP32 accumulate, optional bias epilogue. |
 | `fc_batched_gemm_bf16` | `:518` | Strided batched variant. |
 
-### `cuda/gemm_bf16_fp32acc.cu`
-Helper utilities for the BF16+FP32 accumulation path (not directly callable
-from Rust; included in the `gemm_bf16_cublaslt.cu` translation unit).
+### `cuda/gemm_bf16_fp32acc.cu` — BF16 strided-batched GEMM (trainer hot path)
+
+| Symbol | Line | Notes |
+|---|---|---|
+| `gemm_bf16_fp32acc_stridedBatched` | `extern "C"` | BF16 in/out, FP32 accumulate, row-major, strided-batched. Used by `matmul_bf16_trans` and `bmm_bf16_fp32acc_out` — i.e. every Linear forward/backward and every SDPA Q@K^T / P@V in the BF16 trainer path. Per-shape cache (op desc + 3 layouts + preference + winning algo) keyed on `(m,n,k,lda,ldb,ldc,strideA,strideB,strideC,batchCount,opA,opB)`. Persistent per-device workspace pool (default 0; opt-in via `FLAME_GEMM_BF16_WORKSPACE_BYTES`). Cache rollback knob: `FLAME_HANDLE_TLS_DISABLE=1` reverts to build-everything-per-call. Cache pattern mirrors `gemm_bf16_cublaslt.cu::lt_matmul_run`. |
 
 ### `cuda/conv2d_nhwc_bf16.cu` — BF16 conv2d (im2col + GEMM)
 

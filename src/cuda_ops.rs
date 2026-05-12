@@ -438,6 +438,21 @@ impl GpuOps {
 
     /// Sum reduction
     pub fn sum(tensor: &Tensor) -> Result<Tensor> {
+        // Foundation fix #B (2026-05-12): for BF16 inputs, dispatch to
+        // the BF16-native single-kernel reduce (`bf16_reduce::sum_bf16`)
+        // which reads BF16, accumulates in F32 in-kernel, and writes
+        // BF16 — eliminating the BF16→F32 cast / F32-reduce / F32→BF16
+        // cast triple pass that this function used to do. Gate the
+        // legacy path behind `FLAME_BF16_REDUCE_LEGACY=1` for parity
+        // bisection.
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        {
+            if tensor.dtype() == crate::DType::BF16
+                && !crate::env_flags::bf16_reduce_legacy()
+            {
+                return crate::bf16_reduce::sum_bf16(tensor);
+            }
+        }
         let target_dtype = tensor.dtype();
         let tensor_f32 = Self::cast_to_f32_tensor(tensor)?;
         let kernels = Self::get_kernels(&tensor_f32.device)?;

@@ -2292,6 +2292,36 @@ extern "C" __global__ void f32_to_bool_kernel(
 
     /// Mean reduction (reduce in FP32 for stability, then downcast if needed)
     pub fn mean(&self) -> Result<Tensor> {
+        // Foundation fix #B (2026-05-12): BF16 fast path dispatches to
+        // the BF16-native reduce kernel which reads BF16, accumulates
+        // in F32 in-kernel, fuses the 1/n divide into the F32→BF16
+        // conversion, and writes the BF16 result — all on-device, no
+        // host sync — eliminating the BF16→F32 upcast + F32 sum +
+        // F32→BF16 cast triple pass. Gated by `FLAME_BF16_REDUCE_LEGACY=1`
+        // for parity bisection. Autograd `Op::Mean` is still recorded
+        // against `self`, so gradient flow is unchanged.
+        #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+        {
+            if matches!(self.dtype(), DType::BF16)
+                && !crate::env_flags::bf16_reduce_legacy()
+            {
+                let mut out = crate::bf16_reduce::mean_bf16(self)?;
+                if self.requires_grad {
+                    out.requires_grad = true;
+                    if AutogradContext::is_recording() {
+                        AutogradContext::record_op(
+                            out.id,
+                            Op::Mean {
+                                input: self.id,
+                                input_shape: self.shape.clone(),
+                            },
+                            vec![(self.id, self.clone())],
+                        );
+                    }
+                }
+                return Ok(out);
+            }
+        }
         // Upcast to F32 for numerically stable reduction
         let x32 = if matches!(self.dtype(), DType::F32) {
             self.clone_result()?

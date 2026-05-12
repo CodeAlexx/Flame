@@ -528,6 +528,22 @@ dispatch registry in `tensor_iterator/dispatch.rs`.
   lower-16-bit hash logic inline so the AdamW kernel does not need a
   separate temp F32 → BF16 round-trip.
 
+### `bf16_reduce.rs` — BF16-native scalar reductions (added 2026-05-12)
+- ⭐ `sum_bf16(x)` — `:120` — sum reduction over all elements of a BF16
+  tensor, producing a 0-dim BF16 scalar. Grid-stride F32-accumulator
+  in-kernel + atomicAdd into single F32 scratch, then a 1-thread cast
+  kernel writes the BF16 result. Replaces the legacy BF16→F32 cast +
+  F32 reduce + F32→BF16 cast triple pass that `cuda_ops.rs::GpuOps::sum`
+  used for BF16 inputs (Foundation fix #B). Bonus: legacy F32
+  `sum_kernel` capped grid at 1024 blocks and silently dropped elements
+  past `1024 * 256 = 262144`; the new BF16 kernel uses a grid-stride
+  loop so it's correct for any tensor size. Gated by
+  `FLAME_BF16_REDUCE_LEGACY=1` (default off).
+- ⭐ `mean_bf16(x)` — `:200` — same reduce kernel, but the BF16 cast
+  fuses the `* (1/n)` multiply (the cast kernel takes a `scale` arg)
+  so the entire mean stays on a single CUDA stream — no host-side
+  D2H sync. Wired into `Tensor::mean` BF16 fast path.
+
 ### `bf16_convert.rs` — BF16↔F32 cast
 - `bf16_u16_to_f32(...)` — `:54` — vectorized via `__nv_bfloat162` (2-element/thread)
 - `f32_to_bf16_u16(...)` — `:100` — wraps the `f32_to_bf16` NVRTC kernel; takes
@@ -651,8 +667,8 @@ convention (`fc_status_t` returns), different file generation:
 - `flame_status_to_result(status, op)` (`:566`) — error mapper
 
 ### `cuda/device_lt.rs` — cuBLASLt + stream helpers
-- `device_lt::stream_ptr(device)` — get the default stream pointer
-- `device_lt::cublaslt_handle_ptr(device)` — get the cuBLASLt handle (cached per device)
+- ⭐ `device_lt::stream_ptr(device)` — `:117` — default-stream pointer for the device. TLS-cached; first call per thread+ordinal hits a global `Mutex<HashMap>`, subsequent calls are lock-free `Cell` reads. Rollback: `FLAME_HANDLE_TLS_DISABLE=1` falls back to global-mutex-on-every-call.
+- ⭐ `device_lt::cublaslt_handle_ptr(device)` — `:121` — cached cuBLASLt handle (process-singleton per device; `cublasLtCreate` runs exactly once). Same TLS cache + rollback knob as `stream_ptr`. Called by every BF16 GEMM, fused linear, fused modulate, fused RMS norm — Foundation-#C hot path.
 
 ### `cuda/dtype_tag.rs` — DType <-> CUDA dtype tags
 

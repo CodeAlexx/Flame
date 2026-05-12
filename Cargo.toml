@@ -73,6 +73,22 @@ python = ["pyo3", "numpy"]
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+# Matched-config bench vs PyTorch (2026-05-12). Source lives outside the
+# flame-core tree so it can be co-located with the Python side and the
+# orchestrator scripts. Read EriDiffusion-v2/benches/matched_config/README.md.
+[[bin]]
+name = "matched_bench"
+path = "../EriDiffusion-v2/benches/matched_config/flame_side.rs"
+required-features = ["cuda"]
+
+# Kernel-count diff bench vs PyTorch (2026-05-12). Single transformer block,
+# forward+backward, designed to be profiled by `nsys profile --trace=cuda`.
+# Read EriDiffusion-v2/benches/kernel_count_diff/README.md.
+[[bin]]
+name = "block_count_bench"
+path = "../EriDiffusion-v2/benches/kernel_count_diff/flame_block_bin.rs"
+required-features = ["cuda"]
+
 # FA2 forward-kernel throughput bench (Phase 1, 2026-04). `harness = false`
 # because we use our own minimal timing harness — criterion has heavy startup
 # overhead relative to these sub-millisecond kernels.

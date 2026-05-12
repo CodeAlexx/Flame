@@ -978,6 +978,29 @@ gradient checkpointing it makes per-step backward ~45 min for DiT models.
 **Gradient checkpointing per block is the fix** — see
 `gradient_checkpointing.rs` docs.
 
+### Reductions: BF16 inputs use a dedicated single-kernel path
+
+`Tensor::sum` and `Tensor::mean` on BF16 inputs dispatch to
+`bf16_reduce::sum_bf16` / `mean_bf16` — a single kernel that reads
+BF16, accumulates in F32 in-kernel, and writes BF16 (Foundation fix
+#B, 2026-05-12). The legacy BF16→F32 cast + F32-reduce + F32→BF16
+cast triple pass is preserved behind `FLAME_BF16_REDUCE_LEGACY=1`.
+
+The mean path fuses the `1/n` divide into the F32→BF16 cast kernel
+so the entire reduction stays on a single CUDA stream — do **not**
+add a host-side `dtoh_sync_copy` to read the F32 scratch back to
+multiply on the host. That serializes the training pipeline (~10%
+slowdown observed during initial prototyping). Pass `1/n` as a kernel
+arg to `f32_scalar_to_bf16_kernel` instead.
+
+**Known landmine in the F32 sum kernel** (`cuda_kernel_sources.rs:260`):
+`sum_kernel` launches with `grid_size = n.div_ceil(256).min(1024)`
+and each thread reads exactly one element with no grid-stride loop.
+For `n > 256 * 1024 = 262144`, elements past index 262143 are
+**silently dropped**. The BF16-native replacement uses a grid-stride
+loop so it's correct for any size. Don't trust the F32 sum kernel on
+large tensors until it's rewritten.
+
 ---
 
 ## Build flags

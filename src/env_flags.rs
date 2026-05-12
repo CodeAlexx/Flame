@@ -94,6 +94,17 @@ pub fn cuda_graph_enabled() -> bool {
     flag_enabled("FLAME_CUDA_GRAPH", &CACHED)
 }
 
+/// `FLAME_BF16_REDUCE_LEGACY=1` — force the legacy BF16→F32 cast →
+/// F32 reduce → cast-back path for `Tensor::sum` / `Tensor::mean` on
+/// BF16 inputs. Default OFF (i.e., the BF16-native single-kernel
+/// reduce is used). Knob exists for parity bisection against the
+/// pre-2026-05-12 behavior.
+#[inline]
+pub fn bf16_reduce_legacy() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    flag_enabled("FLAME_BF16_REDUCE_LEGACY", &CACHED)
+}
+
 /// `FLAME_ASSERT_GRAD_FLOW=1` — panic when `diagnostics::assert_grad_flow`
 /// finds any parameter whose gradient is missing or zero after backward.
 /// When unset, the helper returns its report without panicking, so the

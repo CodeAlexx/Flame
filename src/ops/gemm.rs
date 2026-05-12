@@ -12,10 +12,19 @@ use std::sync::{Arc, OnceLock};
 use super::cast;
 
 /// Cached cuBLAS handle with TF32 tensor core math enabled.
+///
 /// Creating a CudaBlas handle calls `cublasCreate` which is expensive (~ms),
-/// so we cache one globally and reuse it under a lock.
-/// CudaBlas is Send+Sync so a global Mutex is safe.
-static CUBLAS_CACHE: OnceLock<std::sync::Mutex<Option<CudaBlas>>> = OnceLock::new();
+/// so we keep one per process. The handle is built once under a `OnceLock`
+/// (no per-call mutex) and shared via `Arc<CudaBlas>`. `CudaBlas` itself is
+/// declared `Send + Sync` upstream — cuBLAS handles are thread-safe per
+/// NVIDIA, and the cudarc `gemm`/`gemm_strided_batched` wrappers only read
+/// the handle, so no external locking is needed for the GEMM call itself.
+///
+/// PyTorch's `CublasHandlePool.cpp` uses the same pattern (one handle per
+/// device, no per-call lock). Pre-TLS, flame-core had a global `Mutex` here
+/// that serialized every F32 GEMM through a critical section — that's the
+/// cost we're paying down with the foundation-#C TLS pass.
+static CUBLAS_CACHE: OnceLock<Arc<CudaBlas>> = OnceLock::new();
 
 fn create_cublas_with_tf32(device: &Arc<CudaDevice>) -> Result<CudaBlas, Error> {
     let blas = CudaBlas::new(device.clone()).map_err(|_| Error::CuBlas)?;
@@ -35,17 +44,22 @@ fn create_cublas_with_tf32(device: &Arc<CudaDevice>) -> Result<CudaBlas, Error> 
 }
 
 /// Run a closure with a cached cuBLAS handle, creating one on first use.
+/// Hot path is lock-free after first init.
 fn with_cached_cublas<F, R>(device: &Arc<CudaDevice>, f: F) -> Result<R, Error>
 where
     F: FnOnce(&CudaBlas) -> Result<R, Error>,
 {
-    let mutex = CUBLAS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
-    let mut guard = mutex.lock().map_err(|_| Error::CuBlas)?;
-    if guard.is_none() {
-        *guard = Some(create_cublas_with_tf32(device)?);
+    if let Some(blas) = CUBLAS_CACHE.get() {
+        return f(blas.as_ref());
     }
-    let blas = guard.as_ref().unwrap();
-    f(blas)
+    // Race-tolerant init: if two threads hit this together, `set_blas` is
+    // racy but `OnceLock::set` is the arbiter — the loser drops their
+    // freshly built CudaBlas (cublasDestroy in cudarc::CudaBlas::drop)
+    // and reads the winner from the OnceLock.
+    let fresh = Arc::new(create_cublas_with_tf32(device)?);
+    let _ = CUBLAS_CACHE.set(fresh);
+    let blas = CUBLAS_CACHE.get().ok_or(Error::CuBlas)?;
+    f(blas.as_ref())
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

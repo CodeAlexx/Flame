@@ -203,6 +203,8 @@ pub mod bf16_normal;
 #[cfg(feature = "bf16_u16")]
 #[allow(dead_code, unused_imports, unused_variables, unused_mut)]
 pub mod bf16_ops;
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub mod bf16_reduce;
 pub mod fp16;
 pub mod tensor_ops_extended;
 // Provide missing convenience ops (div_scalar, etc.) unconditionally
