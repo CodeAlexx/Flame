@@ -1224,6 +1224,43 @@ Tests: `tests/autograd_v2_phase4a.rs` (12 tests).
   `param` is on the v1 `CastToF32` policy (catches policy/contract
   mismatches early).
 
+### Autograd v2 (Phase 4b — GradientMap dtype-preserving policy)
+
+Phase 4b closes the second half of `BF16_GRAD_DECISION.md` Option A by
+giving `GradientMap` a `MatchInsertedDtype` policy variant. v1 / v3
+trainers using `GradientMap::new` / `with_index` see zero behavior
+change; v2 callers opt in via `new_v2` / `with_index_v2`. Trainer
+integration (flipping Z-Image's `loss.backward()` to a v2 grad-storage
+path) is Phase 5 work — see `docs/BF16_GRAD_DECISION.md` "Deliverable C"
+section. Tests: `tests/autograd_v2_gradientmap_v2.rs` (17 tests).
+
+- `autograd::policy::GradStorePolicy` — `src/autograd/policy.rs:28` —
+  enum gained the `MatchInsertedDtype` variant. Now derives `PartialEq`
+  / `Eq` for tests.
+- `gradient::GradientMap::new_v2(device)` — `src/gradient.rs:99` —
+  constructs an autograd-v2 GradientMap (HashMap fallback mode).
+- `gradient::GradientMap::with_index_v2(device, index)` —
+  `src/gradient.rs:112` — constructs an autograd-v2 GradientMap with
+  the Vec-fast-path compact index.
+- `gradient::GradientMap::policy()` — `src/gradient.rs:124` — read-only
+  policy accessor (used by the test suite).
+- `gradient::GradientMap::set_ones_dtype(id, shape, dtype)` —
+  `src/gradient.rs:153` — v2-friendly loss seed at an explicit dtype.
+  Under v1 forces F32 regardless (legacy invariant preserved).
+- `gradient::GradientMap::get_or_create_dtype(id, shape, dtype)` —
+  `src/gradient.rs:403` — v2-friendly zero-pre-allocate at explicit
+  dtype. Under v1 forces F32.
+- `gradient::GradientMap::get_public_grad` / `take_public_grads` —
+  `src/gradient.rs:215, 234` — both now branch on policy; v2 returns
+  native-dtype grads (no BF16 cast), v1 returns the BF16-cast output
+  (unchanged from pre-Phase-4b).
+- `gradient::GradientMap::insert` — `src/gradient.rs:274` — under v1
+  still upcasts BF16 → F32; under v2 preserves dtype.
+- `gradient::GradientMap::accumulate` — `src/gradient.rs:312` —
+  dispatches on policy: `accumulate_v1` keeps the legacy deferred-
+  upcast behavior; `accumulate_v2` keeps the storage dtype and errs on
+  dtype mismatch.
+
 ### Legacy / dead
 - ⚠️ `autograd.rs` (top-level) — types still re-exported
 - ⚠️ `autograd_simple.rs` — early stub

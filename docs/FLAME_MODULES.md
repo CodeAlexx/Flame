@@ -639,14 +639,22 @@ and the `CheckpointGradFn` skeleton. Phase 3a wires the recording surface
 6 view ops + HAZARD-2026-05-13-1 characterization. Phase 3c1 ships
 `layer_norm` + the full `CheckpointGradFn::apply` (no longer
 `NotImplementedYet`). Phase 3c2 (forward-mode AD across 11 ops) is
-deferred. Phase 4a (this milestone) ships the optimizer surface
-(`OptimizerV2` trait + `AdamWV2` wrapper at `optim.rs`), the
-`GradDtypePolicy::MatchParamDtype` path in `Parameter`, the BF16-grad
-classifier arms in `src/adam.rs`, and `multi_tensor_l2_norm_sq_bf16` in
-`src/ops/multi_tensor.rs`. Phase 4b (`GradientMap` rewrite + trainer
-integration smoke) is deferred. See
+deferred. Phase 4a ships the optimizer surface (`OptimizerV2` trait +
+`AdamWV2` wrapper at `optim.rs`), the `GradDtypePolicy::MatchParamDtype`
+path in `Parameter`, the BF16-grad classifier arms in `src/adam.rs`,
+and `multi_tensor_l2_norm_sq_bf16` in `src/ops/multi_tensor.rs`.
+Phase 4b (this milestone) ships the `GradientMap` half of the v2
+grad-storage path: a new `GradStorePolicy::MatchInsertedDtype` variant
++ `GradientMap::new_v2` / `with_index_v2` / `policy` / `set_ones_dtype`
+/ `get_or_create_dtype` helpers. v1 / v3 trainers keep the default
+`InternalFP32_PublicBF16` policy unchanged; v2 callers opt in
+explicitly. Real-trainer integration (flipping Z-Image's
+`loss.backward()` to a v2 grad-storage path) is **not** in Phase 4b —
+the Z-Image forward graph still uses v3 ops and the v2 forward surface
+is 13 ops; adding the missing ~20+ ops is Phase 5 work. See
 `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` for the phase roadmap and
-`docs/BF16_GRAD_DECISION.md` for the dtype policy.
+`docs/BF16_GRAD_DECISION.md` for the dtype policy (Deliverable C
+section explains the trainer-integration gap).
 
 Key Phase 1 design points:
 - **Weak accumulator cycle break (§1):** `AutogradMetaV2::grad_accumulator`
@@ -799,6 +807,34 @@ What Phase 4a explicitly does NOT do:
 - **No trainer integration smoke.** Klein crashes on this box per
   Phase 0 skeptic notes; Z-Image LoRA is the next-session target.
 
+Phase 4b additions (`GradientMap` half of the v2 grad-storage path):
+- **`GradStorePolicy::MatchInsertedDtype`** — new enum variant in
+  `src/autograd/policy.rs`. v1 default is unchanged.
+- **`GradientMap::new_v2` / `with_index_v2`** — `src/gradient.rs:99,
+  112` — construct on the v2 policy.
+- **`GradientMap::policy()` / `set_ones_dtype` / `get_or_create_dtype`**
+  — explicit-dtype helpers for v2 callers.
+- **`get_public_grad` / `take_public_grads` / `insert` / `accumulate`**
+  — all branch on policy. v1 path is byte-equivalent to pre-Phase-4b
+  behavior. v2 path preserves grad dtype end-to-end; `accumulate`
+  errors on dtype mismatch (mirrors `AccumulateGrad::apply` in
+  `accumulator.rs`).
+
+What Phase 4b explicitly does NOT do:
+- **No trainer-side integration of v2 GradientMap.** Z-Image's
+  `loss.backward()` goes through `AutogradContext::backward` which
+  constructs a default-policy GradientMap. Flipping the trainer
+  requires either porting the model's forward graph to v2 ops (~30+
+  ops missing — Phase 5 work) or adding a `loss.backward_v2()` entry
+  that builds `with_index_v2` from the existing tape (~200-line
+  duplication of v3 backward — out of scope per the additive
+  constraint). See `BF16_GRAD_DECISION.md` "Deliverable C" section.
+
+Tests added in Phase 4b: `tests/autograd_v2_gradientmap_v2.rs`
+(17 tests = 4 constructor-policy contracts + 3 insert v1-vs-v2 +
+3 accumulate v1-vs-v2 + 2 get_public_grad v1-vs-v2 + 3 set_ones_dtype
++ 2 get_or_create_dtype).
+
 Files: `accumulator.rs`, `checkpoint.rs`, `dispatch.rs`, `engine.rs`,
 `error.rs`, `hooks.rs`, `input_buffer.rs`, `meta.rs`, `mod.rs`,
 `node.rs`, `optim.rs` (Phase 4a), `recording.rs`, `saved_tensor.rs`,
@@ -824,6 +860,21 @@ Older autograd attempts. Dead code; kept for reference.
 `GradientMap` (re-exported as `GradientMap` and `GradStore`), `TensorGradExt`
 trait. The collection that holds `tensor_id → grad_tensor` mappings during
 backward.
+
+As of Phase 4b, the map carries a `GradStorePolicy` (see
+`src/autograd/policy.rs`):
+- **`InternalFP32_PublicBF16`** (default; `GradientMap::new` /
+  `with_index`) — v1 / v3 behavior. Loss seed is F32, every insert
+  upcasts BF16 → F32, public reads convert F32 → BF16.
+- **`MatchInsertedDtype`** (autograd v2; `GradientMap::new_v2` /
+  `with_index_v2`) — preserves the inserted grad's native dtype.
+  Helpers: `set_ones_dtype(id, shape, dtype)`,
+  `get_or_create_dtype(id, shape, dtype)`. `accumulate` errors on
+  dtype mismatch (the producer is expected to feed a consistent
+  dtype).
+
+The v3 default path is unchanged; no live trainer flips to v2 in
+Phase 4b. See `docs/BF16_GRAD_DECISION.md`.
 
 ### `gradient_clip.rs`
 Gradient clipping helpers (per-norm and per-value).

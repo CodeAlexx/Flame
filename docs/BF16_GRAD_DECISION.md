@@ -1,13 +1,15 @@
 # BF16 Gradient Storage Decision (autograd v2 Phase 0)
 
-**Date**: 2026-05-13 (Phase 0 decision); updated 2026-05-13 (Phase 4a partial).
+**Date**: 2026-05-13 (Phase 0 decision); updated 2026-05-13 (Phase 4a
+partial); updated 2026-05-13 (Phase 4b).
 **Scope**: flame-core autograd v2 cross-cutting policy for gradient dtype.
-**Status**: Phase 4a partial. The `Parameter` + `Adam` + `grad_norm`
-F32-coercion sites listed below have been rewritten or have the
-dtype-preserving path wired (see "Phase 4a status" markers per site).
-The `GradientMap` rewrite and trainer integration smoke are deferred to
-Phase 4b. See `src/autograd_v2/optim.rs` for the v2-facing optimizer
-surface added in Phase 4a.
+**Status**: Phase 4b shipped — the `GradientMap` `MatchInsertedDtype`
+policy is wired alongside Phase 4a's `Parameter` / `Adam` / `grad_norm`
+infrastructure. The v2 grad-dtype surface inside flame-core is now
+complete. Trainer-side integration (flipping Z-Image to v2 grad-dtype
+end-to-end) is **not** done in Phase 4b — Z-Image's forward graph still
+relies on v3 ops, so `loss.backward()` is the v3 path. See "Deliverable
+C status" near the end of this file.
 
 ## Decision
 
@@ -46,35 +48,44 @@ audit; no source change in Phase 0.
 
 ### `GradientMap` (`src/gradient.rs`)
 
-**Phase 4a status: DEFERRED to Phase 4b.** v2 grads do not flow through
-`GradientMap` on the recording path (they land in
-`AutogradMetaV2::grad` via `AccumulateGrad`). The Phase 4b decision is
-whether to add the `MatchParamDtype` variant here or route v2 grads
-exclusively through `meta.grad` and leave GradientMap as a pure v3
-artifact. Defer until trainer integration smoke shows what shape
-trainers actually need.
+**Phase 4b status: SHIPPED.** The `GradStorePolicy` enum gained a
+second variant, `MatchInsertedDtype` (Option A). `GradientMap::new_v2`
+and `GradientMap::with_index_v2` construct on it. The v1 / v3 default
+(`GradientMap::new` / `with_index`) remains `InternalFP32_PublicBF16`
+with no behavior change. Trainer-side integration of the v2 path is
+NOT wired by Phase 4b — Z-Image's trainer still goes through
+`loss.backward()` (the v3 path which constructs a default-policy
+GradientMap). Switching the trainer requires either porting the model's
+forward graph to autograd v2 ops (currently 13 v2 ops vs ~30+ needed)
+or adding a `loss.backward_v2()` entry that builds a `with_index_v2`
+GradientMap from the existing tape. Phase 5 work.
 
-- **Line 99** — `set_ones(...)` hard-codes `Tensor::ones_dtype(..., DType::F32, ...)`.
-  Under Option A: must allocate ones in the loss tensor's dtype (BF16
-  for a BF16 loss).
-- **Lines 145-153** — `get_public_grad(...)` does `g_fp32.to_dtype(DType::BF16)`.
-  Under Option A: grad is already BF16 — no cast needed. The
-  `GradStorePolicy::InternalFP32_PublicBF16` enum variant becomes a
-  legacy v1-only path; v2 needs a new variant `MatchParamDtype` (or
-  similar) that returns grads in their native storage dtype.
-- **Lines 156-170** — `take_public_grads(...)` same pattern as above.
-- **Lines 184-189** — `insert(...)` calls `grad.to_dtype(DType::F32)`
-  unconditionally. Under Option A: preserve grad dtype.
-- **Lines 209-213** — `ensure_f32` helper inside `accumulate()` upcasts
-  any non-F32 existing entry. Under Option A: instead, accumulate in
-  the target dtype with F32 only inside the kernel.
-- **Lines 218-223** — `add_to_existing` (in `accumulate`) casts incoming
-  grad to F32 when dtypes differ. Under Option A: enforce matching
-  dtypes via the upstream contract; cast only as opmath inside the
-  kernel.
-- **Lines 245, 253** — `Tensor::zeros_dtype(shape, DType::F32, ...)`
-  in `get_or_zeros`-style helpers. Under Option A: take the dtype from
-  the inserted grad / parameter.
+Rewrites that landed (all under `src/gradient.rs`):
+
+- **`set_ones(id, shape)`** — unchanged behavior: F32 seed under both
+  policies. v2 callers that want a BF16 loss seed call
+  `set_ones_dtype(id, shape, DType::BF16)` (new).
+- **`set_ones_dtype(id, shape, dtype)`** — new helper. Under
+  `InternalFP32_PublicBF16` forces F32 (v1 invariant). Under
+  `MatchInsertedDtype` honors the requested dtype.
+- **`get_public_grad`** — under v1 still does the BF16 cast (unchanged).
+  Under v2 returns the native-dtype grad without casting.
+- **`take_public_grads`** — same split as `get_public_grad`.
+- **`insert(id, grad)`** — under v1 still upcasts BF16 → F32 (unchanged).
+  Under v2 stores the grad in its native dtype.
+- **`accumulate(id, grad)`** — refactored into `accumulate_v1` (legacy
+  deferred-upcast behavior on second grad) and `accumulate_v2`
+  (preserves stored dtype; errs on dtype mismatch — same contract as
+  `autograd_v2::AccumulateGrad`). Public `accumulate` dispatches on
+  policy.
+- **`get_or_create(id, shape)`** — kept the F32 allocation under both
+  policies for legacy `autograd_simple.rs` callers.
+- **`get_or_create_dtype(id, shape, dtype)`** — new helper. v2 callers
+  can pre-allocate a BF16 slot; v1 still forces F32.
+- **`policy()`** — new accessor.
+
+Tests: `tests/autograd_v2_gradientmap_v2.rs` (17 tests covering both
+policies' contracts; mixed v1-regression + v2-new behavior).
 
 ### `Parameter` (`src/parameter.rs`)
 
@@ -149,13 +160,18 @@ audit; not in scope for this doc.
 
 ## Migration strategy (Phase 4)
 
-The original Phase 4 plan, with Phase 4a status annotations
-(`[4a-DONE]` = shipped; `[4b]` = deferred):
+The original Phase 4 plan, with Phase 4a / 4b status annotations
+(`[4a-DONE]` / `[4b-DONE]` = shipped):
 
-1. `[4b]` Add a new `GradStorePolicy::MatchParamDtype` variant; default
-   v2 `GradientMap::new()` uses it.
-2. `[4b]` Rewrite GradientMap `set_ones` / `set` / `insert` /
-   `accumulate` / `get_public_grad` to honor the new policy.
+1. `[4b-DONE]` Add a new `GradStorePolicy::MatchInsertedDtype` variant
+   (the original spec called it `MatchParamDtype`; renamed because
+   `GradientMap` stores by `TensorId`, not by parameter — the dtype
+   contract is on the inserted gradient, not on a paired parameter
+   handle). `GradientMap::new_v2()` and `with_index_v2()` opt into it;
+   `new()` / `with_index()` keep the v1 default.
+2. `[4b-DONE]` Rewrite GradientMap `set_ones` / `insert` / `accumulate`
+   / `get_public_grad` / `take_public_grads` / `get_or_create` to honor
+   the new policy. See per-method status above.
 3. `[4a-DONE]` Rewrite `Parameter::set_grad` and `apply_update` to
    preserve dtype under v2 — gated via `GradDtypePolicy` enum on the
    parameter (`Parameter::new_v2(t)` constructs with the new policy).
@@ -171,8 +187,59 @@ The original Phase 4 plan, with Phase 4a status annotations
    `adam_step_bf16_param_bf16_grad_matches_f32_reference`).
 
 The v2-facing entry point shipped in Phase 4a is
-`flame_core::autograd_v2::AdamWV2` (a thin wrapper around `AdamW`).
-Trainer integration smoke is Phase 4b.
+`flame_core::autograd_v2::AdamWV2`. The v2 grad-storage surface
+shipped in Phase 4b is `flame_core::GradientMap::new_v2` /
+`with_index_v2`. Together they form the v2 grad-dtype path inside
+flame-core. Real-trainer integration (Phase 4b Deliverable C / Phase 5)
+is described below.
+
+## Phase 4b Deliverable C — trainer integration status
+
+**Z-Image LoRA trainer (`EriDiffusion-v2/crates/eridiffusion-cli/src/bin/train_zimage.rs`)**
+
+The trainer uses `loss.backward()` (v3 path) at line 911. That entry
+point constructs a default-policy `GradientMap::with_index` and walks
+the v3 tape. The trainer then reads grads with `grads.get(param.id())`,
+multiplies by the clip scale, and feeds them to `param.set_grad(...)`.
+
+**Phase 4b did NOT flip the trainer to v2.** Two blockers:
+
+1. Z-Image's model forward graph (in `eridiffusion-core`) is built on
+   the v3 op set: `rms_norm`, `fused_linear3d_native`, `sdpa`, `rope`,
+   `conv2d`, `gelu`, `group_norm`, broadcasting fused ops, etc. The
+   autograd v2 forward surface today is 13 ops: `add_v2`, `mul_v2`,
+   `matmul_v2`, `layer_norm_v2`, `silu_v2`, `sum_v2`, `narrow_v2`,
+   `permute_v2`, `transpose_v2`, `reshape_v2`, `squeeze_v2`,
+   `unsqueeze_v2`, `view_v2`. Without v2 versions of the ~20+ missing
+   ops, `Engine::execute` cannot walk Z-Image's backward graph.
+2. There is no `loss.backward_v2()` entry that would build a
+   `GradientMap::with_index_v2` from the existing v3 tape. Adding one
+   would duplicate ~200 lines of `AutogradContext::backward`. Out of
+   scope for Phase 4b (additive constraint; touches v3 backward).
+
+What Phase 4b did ship that the trainer COULD adopt today (without v2
+forward ops):
+
+- `Parameter::new_v2(...)` for LoRA params (drops the F32 upcast in
+  `set_grad`). Useful once the producer feeds BF16 grads.
+- `AdamWV2` as a typed alias (same kernels, same state shape).
+- `GradientMap::with_index_v2` for any future caller that wants to
+  preserve grad dtype across the map.
+
+But none of this delivers a measurable trainer-side gain until the
+producer (v3 backward) is taught to emit BF16 grads into a v2 map.
+That's a Phase 5 deliverable.
+
+**Smoke that DID run for Phase 4b**:
+- `cargo build -p eridiffusion-cli` succeeded with the new GradientMap
+  symbols in scope.
+- `tests/autograd_v2_gradientmap_v2.rs` (17 tests) green.
+- All v3 regression suites green
+  (`adam_f32_fused`, `adam_multi_tensor_parity`, `grad_norm_parity`,
+  `multi_tensor_l2_norm_parity`, `inplace_version_bump_audit`).
+
+No 1000-step Z-Image smoke. Without trainer-side v2 routing, the smoke
+would run the v3 path and prove only that the v3 path still works.
 
 ## What this is NOT
 

@@ -63,7 +63,8 @@ pub struct GradientMap {
 }
 
 impl GradientMap {
-    /// Create a new gradient map (HashMap fallback mode)
+    /// Create a new gradient map (HashMap fallback mode) on the
+    /// default v1/v3 `InternalFP32_PublicBF16` policy.
     pub fn new(device: Arc<CudaDevice>) -> Self {
         Self {
             vec_store: Vec::new(),
@@ -75,7 +76,8 @@ impl GradientMap {
     }
 
     /// Create a new gradient map with a compact index for Vec-based storage.
-    /// This is the fast path used during backward.
+    /// This is the fast path used during backward. Uses the default
+    /// v1/v3 `InternalFP32_PublicBF16` policy.
     pub fn with_index(device: Arc<CudaDevice>, index: CompactIndex) -> Self {
         let cap = index.capacity();
         Self {
@@ -87,17 +89,87 @@ impl GradientMap {
         }
     }
 
+    /// Construct a GradientMap on the autograd v2
+    /// `MatchInsertedDtype` policy (HashMap fallback mode).
+    ///
+    /// Preserves the dtype of inserted gradients end-to-end. See
+    /// [`GradStorePolicy::MatchInsertedDtype`] and
+    /// `docs/BF16_GRAD_DECISION.md`. The corresponding `Parameter`
+    /// construct is [`crate::Parameter::new_v2`].
+    pub fn new_v2(device: Arc<CudaDevice>) -> Self {
+        Self {
+            vec_store: Vec::new(),
+            index: None,
+            overflow: HashMap::new(),
+            device,
+            policy: GradStorePolicy::MatchInsertedDtype,
+        }
+    }
+
+    /// Construct a GradientMap on the autograd v2
+    /// `MatchInsertedDtype` policy, with a compact index for Vec-based
+    /// storage (fast-path equivalent of [`GradientMap::with_index`]).
+    pub fn with_index_v2(device: Arc<CudaDevice>, index: CompactIndex) -> Self {
+        let cap = index.capacity();
+        Self {
+            vec_store: vec![None; cap],
+            index: Some(index),
+            overflow: HashMap::new(),
+            device,
+            policy: GradStorePolicy::MatchInsertedDtype,
+        }
+    }
+
+    /// Return the active gradient-storage policy.
+    pub fn policy(&self) -> GradStorePolicy {
+        self.policy
+    }
+
     /// Resolve a TensorId to a Vec index (fast path) or None (overflow).
     #[inline]
     fn resolve(&self, id: TensorId) -> Option<usize> {
         self.index.as_ref().and_then(|idx| idx.get(id))
     }
 
-    /// Set gradient to ones (for loss tensor)
+    /// Set gradient to ones (for loss tensor).
+    ///
+    /// Always seeds at F32, regardless of policy. The
+    /// `MatchInsertedDtype` policy preserves the dtype of *inserted*
+    /// gradients but uses F32 for the loss seed when the caller doesn't
+    /// supply an explicit dtype — matches existing trainer behavior
+    /// (loss is cast to F32 before backward via `loss.to_dtype(F32)`).
+    /// v2 callers that want to seed at BF16 should use
+    /// [`GradientMap::set_ones_dtype`].
     pub fn set_ones(&mut self, id: TensorId, shape: Shape) -> Result<()> {
-        // Enforce FP32 gradients
         let ones = Tensor::ones_dtype(shape, DType::F32, self.device.clone())?;
         self.set(id, ones);
+        Ok(())
+    }
+
+    /// Set gradient to ones at an explicit dtype (for loss tensor seed
+    /// under `MatchInsertedDtype`). Permitted under both policies; the
+    /// `InternalFP32_PublicBF16` policy converts the seed to F32
+    /// internally on insert so behavior is unchanged for v3 callers.
+    pub fn set_ones_dtype(
+        &mut self,
+        id: TensorId,
+        shape: Shape,
+        dtype: DType,
+    ) -> Result<()> {
+        let ones = Tensor::ones_dtype(shape, dtype, self.device.clone())?;
+        match self.policy {
+            GradStorePolicy::InternalFP32_PublicBF16 => {
+                let ones_f32 = if ones.dtype() == DType::F32 {
+                    ones
+                } else {
+                    ones.to_dtype(DType::F32)?
+                };
+                self.set(id, ones_f32);
+            }
+            GradStorePolicy::MatchInsertedDtype => {
+                self.set(id, ones);
+            }
+        }
         Ok(())
     }
 
@@ -150,6 +222,12 @@ impl GradientMap {
                 }
                 Ok(grad)
             }
+            GradStorePolicy::MatchInsertedDtype => {
+                // Native-dtype path. Caller is responsible for handling
+                // BF16 grads (Option A of docs/BF16_GRAD_DECISION.md).
+                let g = self.get_fp32(id)?; // helper is "get-or-err", not literally fp32
+                Ok(g.clone())
+            }
         }
     }
 
@@ -166,6 +244,15 @@ impl GradientMap {
                 }
                 Ok(out)
             }
+            GradStorePolicy::MatchInsertedDtype => {
+                // Native-dtype path. Each grad is returned in its
+                // stored dtype without conversion.
+                let mut out = HashMap::with_capacity(self.len());
+                for (tid, g) in self.iter_fp32()? {
+                    out.insert(tid, g.clone());
+                }
+                Ok(out)
+            }
         }
     }
 
@@ -178,15 +265,24 @@ impl GradientMap {
         }
     }
 
-    /// Insert or replace gradient
+    /// Insert or replace gradient.
+    ///
+    /// Under [`GradStorePolicy::InternalFP32_PublicBF16`] (default) the
+    /// gradient is upcast to F32 before storage — preserving v1 / v3
+    /// behavior. Under [`GradStorePolicy::MatchInsertedDtype`] the
+    /// gradient is stored in its native dtype.
     pub fn insert(&mut self, id: TensorId, grad: Tensor) -> Result<()> {
-        // Enforce FP32 storage for all gradients
-        let grad_f32 = if grad.dtype() != DType::F32 {
-            grad.to_dtype(DType::F32)?
-        } else {
-            grad
+        let to_store = match self.policy {
+            GradStorePolicy::InternalFP32_PublicBF16 => {
+                if grad.dtype() != DType::F32 {
+                    grad.to_dtype(DType::F32)?
+                } else {
+                    grad
+                }
+            }
+            GradStorePolicy::MatchInsertedDtype => grad,
         };
-        self.set(id, grad_f32);
+        self.set(id, to_store);
         Ok(())
     }
 
@@ -199,11 +295,30 @@ impl GradientMap {
         }
     }
 
-    /// Accumulate gradient (in-place GPU addition — no temporary tensor allocation)
+    /// Accumulate gradient (in-place GPU addition — no temporary tensor allocation).
+    ///
+    /// Policy semantics:
+    /// - [`GradStorePolicy::InternalFP32_PublicBF16`]: existing entry is
+    ///   raised to F32 on first re-accumulation (deferred upcast from
+    ///   the v3 fast path); incoming grad cast to F32 when dtypes
+    ///   differ. v1 / v3 behavior, unchanged.
+    /// - [`GradStorePolicy::MatchInsertedDtype`]: accumulator stays at
+    ///   the storage dtype. If the incoming grad's dtype differs from
+    ///   the existing entry's, returns `Err` — Phase 4b contract is
+    ///   that the producer (autograd v2 AccumulateGrad) feeds a
+    ///   consistent dtype. F32 is permitted as opmath inside the
+    ///   `add_inplace_same_dtype` kernel; the result is written back at
+    ///   the storage dtype.
     pub fn accumulate(&mut self, id: TensorId, grad: Tensor) -> Result<()> {
-        // Fast path helper: cast to F32 only when needed for accumulation.
-        // First gradient stored directly (even if BF16), cast deferred
-        // until a second gradient arrives for the same ID.
+        match self.policy {
+            GradStorePolicy::InternalFP32_PublicBF16 => self.accumulate_v1(id, grad),
+            GradStorePolicy::MatchInsertedDtype => self.accumulate_v2(id, grad),
+        }
+    }
+
+    /// v1 / v3 path — preserves the legacy "first-grad stored as-is,
+    /// upcast on second accumulation" behavior.
+    fn accumulate_v1(&mut self, id: TensorId, grad: Tensor) -> Result<()> {
         #[inline]
         fn ensure_f32(t: &mut Tensor) -> Result<()> {
             if t.dtype() != DType::F32 {
@@ -238,11 +353,66 @@ impl GradientMap {
         Ok(())
     }
 
-    /// Get or create gradient initialized to zeros
+    /// v2 path — preserves the stored entry's dtype on accumulation.
+    /// Errs on dtype mismatch (the producer is expected to feed a
+    /// consistent dtype; see `autograd_v2::accumulator::AccumulateGrad`
+    /// which enforces the same contract at `meta.grad` level).
+    fn accumulate_v2(&mut self, id: TensorId, grad: Tensor) -> Result<()> {
+        #[inline]
+        fn add_to_existing(existing: &mut Tensor, grad: Tensor) -> Result<()> {
+            if existing.dtype() != grad.dtype() {
+                return Err(Error::InvalidOperation(format!(
+                    "GradientMap accumulate (MatchInsertedDtype): stored dtype {:?} \
+                     does not match incoming {:?}",
+                    existing.dtype(),
+                    grad.dtype()
+                )));
+            }
+            crate::ops::elt::add_inplace_same_dtype(existing, &grad)?;
+            Ok(())
+        }
+
+        if let Some(idx) = self.resolve(id) {
+            match &mut self.vec_store[idx] {
+                Some(existing) => add_to_existing(existing, grad)?,
+                slot @ None => { *slot = Some(grad); }
+            }
+        } else {
+            match self.overflow.get_mut(&id) {
+                Some(existing) => add_to_existing(existing, grad)?,
+                None => { self.overflow.insert(id, grad); }
+            }
+        }
+        Ok(())
+    }
+
+    /// Get or create gradient initialized to F32 zeros.
+    ///
+    /// Used by the legacy `autograd_simple.rs` path. Both policies
+    /// allocate F32 here — under `MatchInsertedDtype` callers wanting a
+    /// specific dtype should use [`GradientMap::get_or_create_dtype`].
     pub fn get_or_create(&mut self, id: TensorId, shape: Shape) -> Result<&mut Tensor> {
+        self.get_or_create_dtype(id, shape, DType::F32)
+    }
+
+    /// Get or create gradient initialized to zeros at an explicit
+    /// dtype. v2 / `MatchInsertedDtype` callers can use this to
+    /// pre-allocate a BF16 slot. v1 / `InternalFP32_PublicBF16`
+    /// callers passing a non-F32 dtype will get an F32 slot (the v3
+    /// invariant).
+    pub fn get_or_create_dtype(
+        &mut self,
+        id: TensorId,
+        shape: Shape,
+        dtype: DType,
+    ) -> Result<&mut Tensor> {
+        let alloc_dtype = match self.policy {
+            GradStorePolicy::InternalFP32_PublicBF16 => DType::F32,
+            GradStorePolicy::MatchInsertedDtype => dtype,
+        };
         if let Some(idx) = self.resolve(id) {
             if self.vec_store[idx].is_none() {
-                let zeros = Tensor::zeros_dtype(shape, DType::F32, self.device.clone())?;
+                let zeros = Tensor::zeros_dtype(shape, alloc_dtype, self.device.clone())?;
                 self.vec_store[idx] = Some(zeros);
             }
             self.vec_store[idx]
@@ -250,7 +420,7 @@ impl GradientMap {
                 .ok_or_else(|| crate::Error::InvalidOperation("gradient missing after insert".into()))
         } else {
             if !self.overflow.contains_key(&id) {
-                let zeros = Tensor::zeros_dtype(shape, DType::F32, self.device.clone())?;
+                let zeros = Tensor::zeros_dtype(shape, alloc_dtype, self.device.clone())?;
                 self.overflow.insert(id, zeros);
             }
             self.overflow
