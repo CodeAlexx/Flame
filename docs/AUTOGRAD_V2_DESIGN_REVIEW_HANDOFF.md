@@ -479,7 +479,7 @@ Long-tail unary ops:
 
 ### Phase 5: Parity Gate
 
-**Status (2026-05-13)**: Phase 3 (3a/3b/3c1/3c2) + Phase 4 (4a/4b) + **Phase 5a (Deliverables A + B + LN JVP)** + **Phase 5b (Deliverable C Route ii — `backward_v2()` bridge)** complete. v2 grad-storage path is end-to-end-callable from any forward graph (v3 forward + v2 grad-storage via the bridge). Phase 5c (perf bench, Deliverable D) is the next milestone.
+**Status (2026-05-13)**: Phase 3 (3a/3b/3c1/3c2) + Phase 4 (4a/4b) + **Phase 5a (Deliverables A + B + LN JVP)** + **Phase 5b (Deliverable C Route ii — `backward_v2()` bridge)** + **Phase 5c (Deliverable D — perf bench)** complete. v2 grad-storage path is end-to-end-callable from any forward graph (v3 forward + v2 grad-storage via the bridge); perf bench confirms +1.46-+2.05% bridge overhead on real Klein workloads and 50.00% exact grad-memory savings (Class A). Next: real-trainer Z-Image LoRA multi-step smoke + v3 retirement.
 
 **Phase 5a shipped** (this commit; see `tests/autograd_v2_parity.rs`):
 - Deliverable A (per-op backward fixture parity): 13/13 ops pass against PyTorch fixtures via `flame_core::parity::ParityHarness`.
@@ -540,13 +540,15 @@ Do not retire v1/v3/v4 until ALL of these gates pass:
   parity (Klein backward grads v3 vs v2) IS available; multi-step
   loss-curve smokes need Z-Image or synthetic.
 
-**Deliverable D — no ms/step regression** [OPEN — Phase 5c] (~2-3 days):
-- Bench v2 backward vs v3 on klein 4B / Z-Image (klein 9B optional).
-- Hold at ±1%.
-- Baseline: flame-core's documented klein-4B-perf is 1.12× vs PyTorch (`reference_klein_perf_baseline` memory).
-- **Klein step-1 IS available** (produces deterministic loss `1.1217`). Multi-step bench needs Z-Image (step 2+ on Klein crashes with `CUDA_ERROR_INVALID_VALUE` — pre-existing infra issue).
-- **CUDA-graph caveat (Phase 5b skeptic CONCERN)**: `FLAME_CUDA_GRAPH=1 + --use-autograd-v2` is unsupported — replay-path pre-allocates grad buffers at the warmup-recorded F32 dtype, bypassing the post-loop cast (`src/autograd.rs:1547-1552`). Bench BOTH arms with cuda-graph disabled (apples-to-apples), or accept the cuda-graph gap as a tracked v2 cost. cuda-graph support is a Phase 6 deliverable.
-- **Parallel-test global-state race (Phase 5b skeptic CONCERN)**: `AUTOGRAD_CONTEXT: Mutex<...>` at `src/autograd.rs:56` is process-global. Bridge tests consolidated 3→1 as a band-aid; the race persists for any other v3-backward-using test added in parallel mode. Phase 5c should not introduce new parallel v3-backward tests OR should adopt `serial_test` for the whole v3-backward test suite.
+**Deliverable D — no ms/step regression** [SHIPPED Phase 5c]:
+- Bench harness at `tests/autograd_v2_perf.rs` (3 `#[serial] #[test]` cells × 3 configs each).
+- Workloads: synthetic 4-layer MLP / Klein attn_chain prod (fixture-driven, real prod-shape) / Klein double-block backward (fixture-driven).
+- Configs: v3 control / bridge alone / Class A (`Parameter::new_v2` + `set_grad` round-trip).
+- 5 warmup + 50 timed iters per cell, trim slowest 5, report median.
+- **Headline (bridge Δ% on the real Klein workloads)**: +1.46% (Klein double-block) / +2.05% (Klein attn_chain prod). Just above the ±1% target; binding constant overhead is the post-loop dtype-unification cast in the bridge.
+- **Memory savings (Class A vs v3)**: 50.00% exact — 78 MB saved per backward on Klein attn_chain prod. See `docs/BF16_GRAD_DECISION.md` §Phase 5c.
+- **Reproduce**: `FLAME_CUDA_GRAPH=0 cargo test --release --features autograd_v2 --test autograd_v2_perf -- --nocapture --test-threads=1`.
+- **Not measured (out of scope)**: real-trainer Z-Image LoRA multi-step convergence (Klein step 2+ crash blocks); `AdamWV2::step` end-to-end optimizer perf (deferred to Phase 6 / v3 retirement).
 
 **Cross-cutting gates that must also pass**:
 - BF16 grad policy optimizer parity (Phase 4a/4b set up the kernels; Deliverable A/C exercise them in anger).

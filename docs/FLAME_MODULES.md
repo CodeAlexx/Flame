@@ -696,6 +696,22 @@ parallel-mode race (Phase 5b skeptic CONCERN #3 carryforward). Tolerance
 `min_cos=0.99 / max_abs_ratio=5e-2` matches the v3 Klein gate; max
 observed `abs_ratio` 0.0093 on `dw_qkv` in attn_chain.
 
+**Phase 5c — perf bench (Deliverable D).** `tests/autograd_v2_perf.rs`
+benches `backward_v2` overhead vs v3 `backward` on three workloads
+(synthetic 4-layer MLP / Klein attn_chain prod / Klein double-block
+backward) × three configs (v3 control / bridge alone / Class A with
+`Parameter::new_v2` + `set_grad` round-trip). 5 warmup + 50 timed iters
+per cell with the slowest 5 trimmed; wall-clock via `std::time::Instant`
++ `device.synchronize()` pre/post; `FLAME_CUDA_GRAPH=0` and
+`FLAME_MT_SCALE` unset to apples-to-apples both arms (per Phase 5b
+skeptic CONCERNs). Three `#[serial] #[test]` cells (one combined-sweep
+test was tried first and failed — cross-cell CUDA state pollution that
+only resets cleanly across `#[test]` binary boundaries). Headline:
+bridge Δ +1.46% / +2.05% on Klein double-block / attn_chain prod;
+Class A delivers 50.00% exact grad-storage savings (78 MB per backward
+on attn_chain prod). Full table in `docs/BF16_GRAD_DECISION.md`
+§Phase 5c.
+
 Key Phase 1 design points:
 - **Weak accumulator cycle break (§1):** `AutogradMetaV2::grad_accumulator`
   and `AccumulateGrad::variable` are both `Weak`, so a leaf with

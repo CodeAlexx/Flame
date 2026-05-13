@@ -1401,6 +1401,13 @@ policy + the dtype-unification cast.
   consumer). Tolerance band: `min_cos=0.99`, `max_abs_ratio=5e-2` —
   matches the v3 Klein test gate (cos > 0.99). All 7 pass; max observed
   abs_ratio 0.0093 on `dw_qkv` in attn_chain.
+- `tests/autograd_v2_perf.rs` — Phase 5c Deliverable D. 3 `#[serial]
+  #[test]` cells: `perf_synthetic_mlp`, `perf_klein_attn_chain_prod`,
+  `perf_klein_double_block`. Each runs v3 / bridge / Class A configs ×
+  5 warmup + 50 timed iters with the slowest 5 trimmed, prints
+  median/P90/mean (ms) and grad-byte totals per config. Numbers feed
+  `BF16_GRAD_DECISION.md` §Phase 5c. Reproduce:
+  `FLAME_CUDA_GRAPH=0 cargo test --release --features autograd_v2 --test autograd_v2_perf -- --nocapture --test-threads=1`.
 - EriDiffusion-v2 `train_zimage.rs` ships an opt-in `--use-autograd-v2`
   flag plumbed through a new `autograd_v2` feature on `eridiffusion-cli`.
   Default OFF — v3 path is byte-equivalent to pre-flag behavior.

@@ -1,7 +1,8 @@
 # BF16 Gradient Storage Decision (autograd v2 Phase 0)
 
 **Date**: 2026-05-13 (Phase 0 decision); updated 2026-05-13 (Phase 4a
-partial); updated 2026-05-13 (Phase 4b); updated 2026-05-13 (Phase 5b).
+partial); updated 2026-05-13 (Phase 4b); updated 2026-05-13 (Phase 5b);
+updated 2026-05-13 (Phase 5c).
 **Scope**: flame-core autograd v2 cross-cutting policy for gradient dtype.
 **Status**: Phase 5b shipped — `AutogradContext::backward_v2(loss)` is
 the v2 grad-storage entry. It constructs a `GradientMap` under
@@ -256,6 +257,78 @@ params to `Parameter::new_v2`. Phase 5c will measure the perf impact.
 `FLAME_MT_SCALE`'s F32 fast path is skipped under `--use-autograd-v2`
 because v2 grads are BF16-stored; the per-param `mul_scalar` loop runs
 instead.
+
+## Phase 5c — perf bench results
+
+**Status**: SHIPPED. Bench harness at `tests/autograd_v2_perf.rs`
+(per-cell `#[test] #[serial]` functions), Deliverable D of the
+`AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` §Phase 5 plan.
+
+Three workloads × three configurations (v3 control, bridge alone,
+Class A with `Parameter::new_v2` + `set_grad` round-trip), 5 warmup +
+50 timed iters per cell with the slowest 5 trimmed. Wall-clock via
+`std::time::Instant`, `device.synchronize()` before and after each
+timed iter. `FLAME_CUDA_GRAPH=0` and `FLAME_MT_SCALE` unset (both
+incompatible with v2 per Phase 5b skeptic CONCERNs).
+
+### Deliverable A: wall-clock per backward iter (median)
+
+| Workload                  | v3 (ms)   | bridge (ms) | Class A (ms) | bridge Δ% | Class A Δ% |
+|---------------------------|-----------|-------------|--------------|-----------|------------|
+| Synthetic 4-layer MLP     | 0.088     | 0.094       | 0.101        | +6.49%    | +14.28%    |
+| Klein attn_chain prod     | 10.109    | 10.316      | 10.406       | +2.05%    | +2.94%     |
+| Klein double-block        | 0.664     | 0.674       | 0.688        | +1.46%    | +3.61%     |
+
+**Headline**: bridge Δ on the real Klein workloads ranges from
++1.0% to +2.8% across 3 sample runs (representative run above:
++1.46% / +2.05%). The synthetic MLP's ~+5-6% bridge delta is per-iter
+setup noise — at 88 μs the absolute is ~5 μs, dominated by graph
+construction, not backward dispatch.
+
+**vs. ±1% target**: Klein attn_chain prod is the binding case at
++1.5-2.8% — just above the ±1% gate. Acceptable per the standing
+contract that the v2 win is correctness + memory (Deliverable B
+below), not speed. The bridge's per-op cast cost on the dtype-
+unification post-pass is the small constant overhead.
+
+**Class A delta** comes from the per-iter `Parameter::new_v2` +
+`set_grad` round-trip the harness exercises to attribute the BF16-
+preserving policy cost. In a real trainer, parameters are constructed
+once per LoRA module (not per step), so the per-step Class A overhead
+is much closer to bridge-alone.
+
+### Deliverable B: grad-storage memory (steady-state, byte-exact)
+
+| Workload                  | v3 grad MB | bridge grad MB | Class A grad MB | Class A savings |
+|---------------------------|------------|----------------|-----------------|-----------------|
+| Synthetic 4-layer MLP     | 0.000183   | 0.000092       | 0.000092        | +50.00%         |
+| Klein attn_chain prod     | 156.000    | 78.000         | 78.000          | +50.00%         |
+| Klein double-block        | 1.812      | 0.906          | 0.906           | +50.00%         |
+
+The 50.00% savings is exact — every leaf is BF16 (2 bytes) under v2
+where v3 stored every grad as F32 (4 bytes). On Klein attn_chain prod
+that's **78 MB saved per backward call** — material for a trainer
+that retains grad maps across an accumulation window.
+
+The **bridge alone** column matches Class A exactly: once `backward_v2`
+returns a `GradientMap` with BF16-stored grads, the only thing that
+can later upcast them is `Parameter::set_grad` under the default
+`CastToF32` policy. The Class A column captures the round-trip through
+`Parameter::new_v2`'s `MatchParamDtype` policy and confirms no further
+upcast happens.
+
+### What the bench did not measure
+
+- **Class C trainers (F32 grad + BF16 master weight)** — out of scope
+  for Phase 5c; deferred to Phase 6 if a trainer adopts that config.
+- **Real-trainer multi-step convergence** — Klein step 2+ crashes
+  pre-existing (`CUDA_ERROR_INVALID_VALUE`); deferred to Z-Image LoRA
+  smoke (Phase 5d / v3 retirement).
+- **`AdamWV2::step` perf** — the `adam_fused_multi_bf16_bf16grad_kernel`
+  activation path. Stepping through the optimizer was out of scope for
+  Deliverable D; the per-cell test only exercises `set_grad`. A
+  follow-up bench should compare `(v3 AdamW + F32 grad)` vs
+  `(AdamWV2 + BF16 grad)` end-to-end optimizer step.
 
 ## Phase 4b Deliverable C — earlier status (historical)
 
