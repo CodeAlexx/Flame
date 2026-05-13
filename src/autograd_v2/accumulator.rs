@@ -9,9 +9,11 @@
 //!   would otherwise leak.
 //! - Stored `sequence_nr` and `topological_nr` (PyTorch parity — not
 //!   recomputed walks).
-//! - `apply()` is a Phase-1 placeholder; Phase 2 implements the
-//!   actual gradient sink semantics (accumulate into `meta.grad`
-//!   respecting BF16-end-to-end / Option A under Phase 4).
+//! - Phase 2 `apply()` implements the real sink semantics: drop empty
+//!   grad inputs silently, accumulate into `meta.grad` honoring the
+//!   parameter's dtype (Option A from `docs/BF16_GRAD_DECISION.md` —
+//!   partial in Phase 2: only the grad dtype is preserved end-to-end
+//!   here; the full optimizer/GradientMap migration is Phase 4).
 
 use std::sync::Weak;
 
@@ -59,6 +61,13 @@ impl AccumulateGrad {
     pub fn variable_alive(&self) -> bool {
         self.variable.upgrade().is_some()
     }
+
+    /// Upgrade the held `Weak<Mutex<AutogradMetaV2>>` to its strong form
+    /// if the variable is still alive. Used by the engine's leaf-grad
+    /// collection path and by `gradient_edge()`.
+    pub fn upgrade_variable(&self) -> Option<AutogradMetaRef> {
+        self.variable.upgrade()
+    }
 }
 
 impl std::fmt::Debug for AccumulateGrad {
@@ -72,20 +81,77 @@ impl std::fmt::Debug for AccumulateGrad {
 }
 
 impl GradFn for AccumulateGrad {
+    /// Sink one input gradient into the leaf tensor's `meta.grad` slot.
+    ///
+    /// Semantics:
+    /// - `grad_outputs[0] == None` → no-op (the engine routed no grad here).
+    /// - Variable already dropped (Weak fails to upgrade) → no-op (the
+    ///   leaf is gone; accumulating would write into nothing).
+    /// - First contributor → store `g` directly.
+    /// - Subsequent contributors with same dtype + shape → in-place
+    ///   accumulation via `ops::elt::add_inplace_same_dtype`.
+    /// - Dtype mismatch → `Err(DtypeMismatch)`.
+    /// - Shape mismatch → `Err(FlameCore(Error::ShapeMismatch))` via the
+    ///   in-place op itself.
+    ///
+    /// Phase 2 always takes the in-place path when dtypes/shapes match
+    /// because `create_graph=true` is not yet plumbed to per-node state
+    /// (it lives on `GraphRoot` and `InputBuffer`). When Phase 3 wires
+    /// recordable adds, AccumulateGrad will pick its path the same way
+    /// `InputBuffer::add` does today.
     fn apply(
         &self,
-        _grad_outputs: Vec<Option<Tensor>>,
+        grad_outputs: Vec<Option<Tensor>>,
         _ctx: &DispatchCtx,
     ) -> Result<Vec<Option<Tensor>>, AutogradV2Error> {
-        // Phase 2 implements:
-        //   1. Upgrade `self.variable`; if None, drop the grad.
-        //   2. Lock the meta, accumulate `grad_outputs[0]` into
-        //      `meta.grad` using the BF16-end-to-end path (Option A).
-        //   3. Fire post hooks.
-        //   4. Return empty (accumulator has no downstream edges).
-        Err(AutogradV2Error::NotImplementedYet(
-            "AccumulateGrad::apply (Phase 2)",
-        ))
+        let g = match grad_outputs.into_iter().next().and_then(|opt| opt) {
+            None => return Ok(Vec::new()),
+            Some(g) => g,
+        };
+
+        // If the leaf's meta has been dropped, silently discard the
+        // grad (the parameter is gone; nothing to write into).
+        let meta_arc = match self.variable.upgrade() {
+            None => return Ok(Vec::new()),
+            Some(m) => m,
+        };
+
+        let mut meta = meta_arc
+            .lock()
+            .map_err(|_| AutogradV2Error::NotImplementedYet(
+                "AccumulateGrad: poisoned meta mutex",
+            ))?;
+
+        match meta.grad.take() {
+            None => {
+                meta.grad = Some(g);
+            }
+            Some(existing) => {
+                if existing.dtype() != g.dtype() {
+                    return Err(AutogradV2Error::DtypeMismatch {
+                        existing: existing.dtype(),
+                        incoming: g.dtype(),
+                    });
+                }
+                #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+                {
+                    let mut e = existing;
+                    crate::ops::elt::add_inplace_same_dtype(&mut e, &g)
+                        .map_err(AutogradV2Error::FlameCore)?;
+                    meta.grad = Some(e);
+                }
+                #[cfg(not(all(feature = "cuda", feature = "bf16_u16")))]
+                {
+                    let _ = existing;
+                    let _ = g;
+                    return Err(AutogradV2Error::NotImplementedYet(
+                        "AccumulateGrad::apply requires cuda+bf16_u16 features",
+                    ));
+                }
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     fn num_inputs(&self) -> usize {
@@ -121,5 +187,11 @@ impl GradFn for AccumulateGrad {
         // but we explicitly note it here so a future reader looking
         // for the saved-tensor release pattern doesn't think it was
         // forgotten.
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        // Override the default so the Phase 2 engine can recognize
+        // leaf accumulators for the `with_inputs` grad-collection path.
+        self
     }
 }

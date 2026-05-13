@@ -1,10 +1,12 @@
 //! Autograd v2 — clean-sheet PyTorch-style DAG autograd engine.
 //!
-//! **Status**: Phase 1 (metadata + core types) shipped. No live
-//! behavior change — the v2 module produces no recorded ops until
-//! Phase 3 wires forward primitives through `gradient_edge()`. Both
-//! the `autograd_v2` feature build and the default build (without the
-//! feature) are green.
+//! **Status**: Phases 1 + 2 shipped. No live behavior change in the
+//! rest of the crate — no forward op records through v2 until Phase 3
+//! wires forward primitives through `gradient_edge()`. The engine
+//! driver, ready queue, hook dispatch, and AccumulateGrad sink are
+//! all functional and tested via synthetic test-only GradFn impls
+//! (see `tests/autograd_v2_engine.rs`). Both the `autograd_v2`
+//! feature build and the default build (without the feature) are green.
 //!
 //! ## Phase roadmap
 //!
@@ -81,7 +83,9 @@
 #![allow(clippy::result_large_err)]
 
 mod accumulator;
+mod checkpoint;
 mod dispatch;
+mod engine;
 mod error;
 mod hooks;
 mod input_buffer;
@@ -90,10 +94,18 @@ mod node;
 mod saved_tensor;
 
 pub use accumulator::AccumulateGrad;
+pub use checkpoint::CheckpointGradFn;
 pub use dispatch::{DeviceStream, DispatchCtx};
+pub use engine::{Engine, GraphRoot};
 pub use error::{AutogradV2Error, V2Result};
 pub use hooks::{Hooks, PostBackwardHook, PreBackwardHook, TensorHook};
 pub use input_buffer::InputBuffer;
-pub use meta::{new_meta_ref, AutogradMetaRef, AutogradMetaV2};
+pub use meta::{gradient_edge, new_meta_ref, AutogradMetaRef, AutogradMetaV2};
 pub use node::{Edge, GradFn, NodeId};
 pub use saved_tensor::SavedTensor;
+
+/// Phase 2 test backdoor — register a (grad_fn, output_nr) association
+/// for a tensor. Test-only; Phase 3 op migration replaces this with a
+/// proper per-tensor `Option<AutogradMetaRef>` field.
+#[doc(hidden)]
+pub use engine::{_v2_clear_tensor_meta, _v2_set_grad_fn};

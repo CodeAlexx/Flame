@@ -39,6 +39,7 @@ use crate::tensor::Tensor;
 /// Shared autograd metadata for a tensor. Wrap in
 /// `Arc<Mutex<AutogradMetaV2>>` at the tensor field (the wrapping is
 /// the `AutogradMetaRef` type alias).
+#[derive(Debug)]
 pub struct AutogradMetaV2 {
     /// Accumulated gradient for this tensor. Populated by the engine
     /// at backward time for leaf tensors with `requires_grad=true` and
@@ -200,4 +201,63 @@ pub type AutogradMetaRef = Arc<Mutex<AutogradMetaV2>>;
 /// Wrap an `AutogradMetaV2` in the canonical `Arc<Mutex<_>>` shape.
 pub fn new_meta_ref(meta: AutogradMetaV2) -> AutogradMetaRef {
     Arc::new(Mutex::new(meta))
+}
+
+/// Resolve the gradient edge for a tensor's metadata. PyTorch parity:
+/// `gradient_edge()` returns the edge that backward should route
+/// gradients through.
+///
+/// - Non-leaf (has a `grad_fn`) → `Edge { function: Some(grad_fn),
+///   input_nr: output_nr }`. The forward output's `output_nr` becomes
+///   the backward input slot.
+/// - Leaf with `requires_grad=true` → materialize-or-cache an
+///   `AccumulateGrad` for this meta. The Weak slot
+///   (`meta.grad_accumulator`) caches the Arc so subsequent
+///   `gradient_edge` calls on the same meta return the same
+///   accumulator. Cycle is broken by the Weak.
+/// - Leaf with `requires_grad=false` → `Edge::null()`. No backward path.
+///
+/// `sequence_nr` is provided by the caller (typically the v2 op
+/// recording site) so newly materialized accumulators inherit a
+/// monotonic creation order even though they're constructed lazily.
+pub fn gradient_edge(meta: &AutogradMetaRef, sequence_nr: u64) -> super::node::Edge {
+    use super::accumulator::AccumulateGrad;
+    use super::node::{Edge, GradFn};
+
+    // Fast path: read-only check on grad_fn / requires_grad / cached
+    // accumulator. We hold the lock for the full materialize-or-cache
+    // sequence so two threads can't both allocate fresh accumulators.
+    let mut m = meta
+        .lock()
+        .expect("autograd_v2: meta mutex poisoned in gradient_edge");
+
+    // Non-leaf: just point at the existing grad_fn.
+    if let Some(ref gf) = m.grad_fn {
+        return Edge {
+            function: Some(gf.clone()),
+            input_nr: m.output_nr,
+        };
+    }
+
+    // Leaf without requires_grad → null edge.
+    if !m.requires_grad {
+        return Edge::null();
+    }
+
+    // Leaf with requires_grad: try cached accumulator first.
+    if let Some(existing) = m.grad_accumulator.upgrade() {
+        return Edge {
+            function: Some(existing),
+            input_nr: 0,
+        };
+    }
+
+    // Cache miss — materialize a fresh AccumulateGrad and stash a Weak
+    // back into the meta slot.
+    let acc_arc: Arc<dyn GradFn> = Arc::new(AccumulateGrad::new(meta, sequence_nr));
+    m.grad_accumulator = Arc::downgrade(&acc_arc);
+    Edge {
+        function: Some(acc_arc),
+        input_nr: 0,
+    }
 }

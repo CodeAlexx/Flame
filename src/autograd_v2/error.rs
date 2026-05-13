@@ -46,6 +46,28 @@ pub enum AutogradV2Error {
     #[error("autograd_v2: not implemented yet in Phase 1: {0}")]
     NotImplementedYet(&'static str),
 
+    /// The engine could not find the source tensor's `grad_fn` /
+    /// `grad_accumulator` — typically because the tensor was never
+    /// produced through `autograd_v2`-recorded ops and has no edge to
+    /// kick off backward from.
+    #[error("autograd_v2: output[{index}] has no grad_fn — nothing to backprop")]
+    NoGradFnOnOutput { index: usize },
+
+    /// `Engine::execute` was called with mismatched output / grad-output
+    /// vector lengths.
+    #[error("autograd_v2: outputs.len()={outputs} != grad_outputs.len()={grad_outputs}")]
+    OutputGradLenMismatch { outputs: usize, grad_outputs: usize },
+
+    /// A `GradFn::apply` returned a `Vec<Option<Tensor>>` whose length
+    /// doesn't match its declared `num_inputs()`. Indicates a per-op
+    /// implementation bug.
+    #[error("autograd_v2: {op} apply returned {got} grads but declared num_inputs={expected}")]
+    ApplyArityMismatch {
+        op: &'static str,
+        expected: usize,
+        got: usize,
+    },
+
     /// Pass-through for any wrapped flame-core error.
     #[error(transparent)]
     FlameCore(#[from] Error),

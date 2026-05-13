@@ -29,7 +29,7 @@ use crate::tensor::Tensor;
 /// Monotonic node identifier. Cheap to construct (single relaxed atomic
 /// fetch_add). Used by the engine for ready-queue keying and by hooks
 /// for per-node dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u64);
 
 impl NodeId {
@@ -163,4 +163,32 @@ pub trait GradFn: Send + Sync + std::fmt::Debug {
     ///
     /// Default no-op; ops with no saved tensors don't override.
     fn release_variables(&self) {}
+
+    /// Type-erased downcast helper for engine internals. The default
+    /// impl returns `None`; concrete ops that the engine needs to
+    /// downcast to (today: `AccumulateGrad` for the `with_inputs` leaf
+    /// grad collection path) override to `Some(self)`.
+    ///
+    /// We add this rather than a blanket `Any` supertrait because
+    /// `dyn GradFn` is held via `Arc<dyn GradFn>` and adding `Any`
+    /// would force every `Arc` cast site to know about it. A scoped
+    /// `as_any(&self) -> &dyn Any` is the minimal surface that lets
+    /// the engine do safe downcast checks without polluting the trait
+    /// bounds.
+    fn as_any(&self) -> &dyn std::any::Any {
+        // Default: no downcast. Concrete impls that the engine needs
+        // to recognize (AccumulateGrad) override this.
+        //
+        // SAFETY: returning a reference to `self as &dyn Any` is sound
+        // because every concrete `GradFn` impl is `Sized + 'static`
+        // (the trait bound `Send + Sync + Debug` is satisfied by
+        // Phase 2's hand-rolled ops, all of which are `'static`).
+        //
+        // To make this default safe we cannot return `self` here — `self`
+        // is `&Self`, and `Self: ?Sized` at the trait declaration. We
+        // return a static no-op marker; impls that want downcast
+        // override.
+        static MARKER: &str = "<no-downcast>";
+        &MARKER
+    }
 }

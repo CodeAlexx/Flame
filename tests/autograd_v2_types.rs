@@ -303,19 +303,24 @@ fn weak_accumulator_in_meta_slot_no_cycle() {
 }
 
 // -----------------------------------------------------------------------
-// AccumulateGrad::apply is NotImplementedYet in Phase 1
+// AccumulateGrad::apply with None grad is a no-op (Phase 2 semantics)
 // -----------------------------------------------------------------------
 
 #[test]
-fn accumulate_grad_apply_is_phase2_placeholder() {
+fn accumulate_grad_apply_none_grad_is_noop() {
+    // Phase 2 changed the semantics: passing `None` returns Ok(empty
+    // edges) instead of NotImplementedYet. Real accumulation logic is
+    // exercised by `tests/autograd_v2_engine.rs` (engine drives end-
+    // to-end).
     let meta: AutogradMetaRef = new_meta_ref(AutogradMetaV2::leaf_requires_grad());
     let acc = AccumulateGrad::new(&meta, 0);
     let ctx = default_ctx();
     let res = GradFn::apply(&acc, vec![None], &ctx);
-    match res {
-        Err(AutogradV2Error::NotImplementedYet(_)) => {}
-        other => panic!("expected NotImplementedYet, got {other:?}"),
-    }
+    let out = res.expect("None grad should be a silent no-op");
+    assert!(out.is_empty(), "AccumulateGrad has no downstream edges");
+    // meta.grad must still be None.
+    let m = meta.lock().unwrap();
+    assert!(m.grad.is_none(), "no grad should be stored for None input");
 }
 
 // -----------------------------------------------------------------------

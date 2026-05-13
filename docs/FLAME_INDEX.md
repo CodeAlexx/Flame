@@ -920,6 +920,45 @@ Phase 1 tests pass under the `autograd_v2` feature.
 - `autograd_v2::V2Result<T>` — `src/autograd_v2/error.rs:71` — alias for
   `Result<T, AutogradV2Error>`.
 
+### Autograd v2 (Phase 2 — engine + accumulator + checkpoint skeleton)
+
+Phase 2 ships the engine driver on top of Phase 1's types. All under
+feature `autograd_v2`; no behavior change in the rest of the crate
+until Phase 3 wires forward op recording. Tests:
+`tests/autograd_v2_engine.rs` (10 tests, all green).
+
+- `autograd_v2::Engine` — `src/autograd_v2/engine.rs` (struct ~line
+  140) — `new()`, `execute(root, ctx) -> Result<Vec<Option<Tensor>>>`.
+  Stateless across calls; nested execute is just
+  `Engine::new().execute(...)` from within a `GradFn::apply`.
+- `autograd_v2::GraphRoot` — `src/autograd_v2/engine.rs` (struct ~line
+  60) — builder: `new(outputs)`, `with_grad_outputs(g)`,
+  `with_inputs(inputs)`, `with_create_graph(b)`, `with_retain_graph(b)`.
+- `autograd_v2::gradient_edge(meta, seq) -> Edge` —
+  `src/autograd_v2/meta.rs` — materialize-or-cache the leaf accumulator,
+  or return `(grad_fn, output_nr)` for a non-leaf. Caches into
+  `meta.grad_accumulator` via Weak.
+- `autograd_v2::AccumulateGrad::apply` — `src/autograd_v2/accumulator.rs`
+  — real Phase 2 impl: drop `None` silently, no-op when meta dropped,
+  in-place accumulation into `meta.grad` honoring dtype.
+- `autograd_v2::AccumulateGrad::upgrade_variable() -> Option<AutogradMetaRef>`
+  — `src/autograd_v2/accumulator.rs` — used by `Engine::with_inputs`
+  collection and tests.
+- `autograd_v2::CheckpointGradFn` — `src/autograd_v2/checkpoint.rs` —
+  skeleton; `apply()` returns `NotImplementedYet` pending Phase 3.
+- `autograd_v2::GradFn::as_any` — `src/autograd_v2/node.rs` —
+  type-erased downcast helper. `AccumulateGrad` is the Phase 2 user
+  (engine's `with_inputs` path needs the downcast).
+- `autograd_v2::_v2_set_grad_fn(tensor, gf, output_nr)` /
+  `_v2_clear_tensor_meta()` — `src/autograd_v2/engine.rs` —
+  **TEST-ONLY** thread-local side table that associates tensors with
+  grad_fns. Phase 3 op migration replaces this with a proper
+  `Option<AutogradMetaRef>` field on `Tensor`.
+- New `AutogradV2Error` variants — `src/autograd_v2/error.rs`:
+  `NoGradFnOnOutput { index }`,
+  `OutputGradLenMismatch { outputs, grad_outputs }`,
+  `ApplyArityMismatch { op, expected, got }`.
+
 ### Legacy / dead
 - ⚠️ `autograd.rs` (top-level) — types still re-exported
 - ⚠️ `autograd_simple.rs` — early stub

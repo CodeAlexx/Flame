@@ -629,13 +629,15 @@ A newer experimental engine with explicit `Gradients` and `graph` types.
 Off by default. The SDPA backward in `autograd_v4/ops/sdpa.rs` is more
 correct than the v3 one in some edge cases.
 
-### `autograd_v2/` (feature `autograd_v2`, Phase 1)
+### `autograd_v2/` (feature `autograd_v2`, Phases 1 + 2)
 Clean-sheet PyTorch-style DAG autograd engine. Designed to replace v1/v3/v4
-once Phase 5 parity gates pass. Phase 1 (this commit) ships the foundational
-types and traits — there is no behavior change yet; no forward op records
-through v2 until Phase 3. See
-`docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` for the phase roadmap and
-`docs/BF16_GRAD_DECISION.md` for the dtype policy.
+once Phase 5 parity gates pass. Phase 1 ships the foundational types
+and traits; Phase 2 ships the engine driver, dependency counting, ready
+queue, hook dispatch, real `AccumulateGrad::apply`, `gradient_edge()`,
+and the `CheckpointGradFn` skeleton. There is still no live behavior
+change in the rest of the crate — no forward op records through v2
+until Phase 3. See `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` for the
+phase roadmap and `docs/BF16_GRAD_DECISION.md` for the dtype policy.
 
 Key Phase 1 design points:
 - **Weak accumulator cycle break (§1):** `AutogradMetaV2::grad_accumulator`
@@ -665,9 +667,43 @@ Key Phase 1 design points:
   shape locks the parameter so non-default streams / multi-device land
   without an ABI break.
 
-Files: `accumulator.rs`, `dispatch.rs`, `error.rs`, `hooks.rs`,
-`input_buffer.rs`, `meta.rs`, `mod.rs`, `node.rs`, `saved_tensor.rs`.
-Tests: `tests/autograd_v2_types.rs` (13 tests, all green).
+Phase 2 additions:
+- **`engine.rs`** — `GraphRoot` builder + `Engine::execute(root, ctx)`.
+  Builds a per-node dependency count from the output `grad_fn`s by
+  walking `next_edges()`, seeds output grads into per-node
+  `InputBuffer`s at slot `output_nr`, drives a `BinaryHeap` ready queue
+  ordered by `(topological_nr desc, sequence_nr desc, node_id desc)`,
+  dispatches `apply()`, routes per-`next_edge` output grads, calls
+  `release_variables(&self)` on each node when `retain_graph=false`.
+  Returns `Result<Vec<Option<Tensor>>, AutogradV2Error>` — `Vec` is
+  populated when `GraphRoot::with_inputs` is set (per-input grads in
+  order via `AccumulateGrad` downcast), empty otherwise.
+- **`checkpoint.rs`** — `CheckpointGradFn` skeleton. Trait shape +
+  state save/restore boundaries wired; `apply()` is
+  `NotImplementedYet("CheckpointGradFn needs Phase 3 forward ops")` —
+  full implementation needs Phase 3 forward-op recording.
+- **`accumulator.rs::AccumulateGrad::apply`** — real impl. Drops
+  `None` grad silently, no-ops if the leaf meta is dropped, in-place
+  accumulates same-dtype/same-shape into `meta.grad`, returns
+  `Err(DtypeMismatch)` on dtype divergence, shape mismatch surfaces
+  through the in-place op as `Err(FlameCore(_))`.
+- **`meta.rs::gradient_edge(meta, seq) -> Edge`** — non-leaf returns
+  `(grad_fn, output_nr)`; leaf with `requires_grad=true` materializes-
+  or-caches an `AccumulateGrad` via the Weak slot; leaf without
+  `requires_grad` returns `Edge::null()`.
+- **`node.rs::GradFn::as_any`** — type-erased downcast helper.
+  Default returns a static no-op marker; `AccumulateGrad` overrides
+  to return `&self` so the engine's `with_inputs` path can resolve
+  leaf accumulators.
+- **`engine.rs::_v2_set_grad_fn / _v2_clear_tensor_meta`** —
+  test-only side-table backdoor. Phase 3 op migration replaces
+  this with a proper `Option<AutogradMetaRef>` field on `Tensor`.
+
+Files: `accumulator.rs`, `checkpoint.rs`, `dispatch.rs`, `engine.rs`,
+`error.rs`, `hooks.rs`, `input_buffer.rs`, `meta.rs`, `mod.rs`,
+`node.rs`, `saved_tensor.rs`. Tests:
+`tests/autograd_v2_types.rs` (13 tests, Phase 1) +
+`tests/autograd_v2_engine.rs` (10 tests, Phase 2). All green.
 
 ### ⚠️ `autograd_simple.rs / autograd_engine.rs / autograd_ops.rs / autograd_ops_complete.rs / autograd_debug.rs`
 Older autograd attempts. Dead code; kept for reference.
