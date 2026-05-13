@@ -16,6 +16,7 @@ use super::super::recording::{
     gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
 };
 use super::super::saved_tensor::SavedTensor;
+use super::fw_mode::{any_fw_grad, tangent_or_zero};
 
 #[derive(Debug)]
 pub struct MulGradFn {
@@ -94,13 +95,28 @@ impl GradFn for MulGradFn {
 }
 
 /// v2 forward wrapper for `mul`.
+///
+/// Phase 3c2 forward-mode AD: product-rule JVP — when any input has
+/// a `fw_grad` installed, `out_fw = a_dot * b + a * b_dot`. Missing
+/// tangents default to zero (zero contribution from the missing term).
 pub fn mul_v2(a: &Tensor, b: &Tensor, ctx: &DispatchCtx) -> Result<Tensor> {
     let out = a.mul(b)?;
-    if needs_grad(&[a, b]) {
+    let any_fw = any_fw_grad(&[a, b]);
+    let mut result = if needs_grad(&[a, b]) {
         let grad_fn = MulGradFn::new(a, b);
         let recorded = record_v2(grad_fn, vec![out], ctx);
-        Ok(recorded.into_iter().next().unwrap())
+        recorded.into_iter().next().unwrap()
     } else {
-        Ok(out)
+        out
+    };
+    if any_fw {
+        let a_dot = tangent_or_zero(a)?;
+        let b_dot = tangent_or_zero(b)?;
+        // JVP(mul): out_fw = a_dot * b + a * b_dot (product rule).
+        let term1 = a_dot.mul(b)?;
+        let term2 = a.mul(&b_dot)?;
+        let out_fw = term1.add(&term2)?;
+        result.set_fw_grad(out_fw);
     }
+    Ok(result)
 }

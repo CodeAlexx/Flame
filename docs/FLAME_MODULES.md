@@ -629,7 +629,7 @@ A newer experimental engine with explicit `Gradients` and `graph` types.
 Off by default. The SDPA backward in `autograd_v4/ops/sdpa.rs` is more
 correct than the v3 one in some edge cases.
 
-### `autograd_v2/` (feature `autograd_v2`, Phases 1 + 2 + 3a + 3b + 3c1 + 4a)
+### `autograd_v2/` (feature `autograd_v2`, Phases 1 + 2 + 3a + 3b + 3c1 + 3c2 + 4a + 4b)
 Clean-sheet PyTorch-style DAG autograd engine. Designed to replace v1/v3/v4
 once Phase 5 parity gates pass. Phase 1 ships the foundational types
 and traits; Phase 2 ships the engine driver, dependency counting, ready
@@ -638,8 +638,18 @@ and the `CheckpointGradFn` skeleton. Phase 3a wires the recording surface
 (`Tensor::autograd_meta`, `record_v2`) + 5 math P0 ops. Phase 3b adds
 6 view ops + HAZARD-2026-05-13-1 characterization. Phase 3c1 ships
 `layer_norm` + the full `CheckpointGradFn::apply` (no longer
-`NotImplementedYet`). Phase 3c2 (forward-mode AD across 11 ops) is
-deferred. Phase 4a ships the optimizer surface (`OptimizerV2` trait +
+`NotImplementedYet`). Phase 3c2 closes Phase 3 by populating the
+`Tensor`-level forward-mode AD slot (`AutogradMetaV2::fw_grad`) inside
+every Phase 3a/3b op's forward wrapper: 11 ops × JVP formulas
+(`add`/`mul`/`sum`/`matmul`/`silu`/`reshape`/`view`/`transpose`/
+`narrow`/`squeeze`/`unsqueeze`/`permute`); `layer_norm` forward-mode
+AD deferred to Phase 5 parity gate. `Tensor::fw_grad` /
+`Tensor::set_fw_grad` accessors land on the public surface (`src/tensor.rs`);
+shared JVP helpers (`any_fw_grad`, `tangent_or_zero`) live at
+`src/autograd_v2/ops/fw_mode.rs`. `set_fw_grad` implicitly allocates
+a fresh `leaf_no_grad()` meta when called on an untracked tensor
+(PyTorch parity; backward-mode tracking is NOT silently enabled).
+Phase 4a ships the optimizer surface (`OptimizerV2` trait +
 `AdamWV2` wrapper at `optim.rs`), the `GradDtypePolicy::MatchParamDtype`
 path in `Parameter`, the BF16-grad classifier arms in `src/adam.rs`,
 and `multi_tensor_l2_norm_sq_bf16` in `src/ops/multi_tensor.rs`.
@@ -838,10 +848,11 @@ Tests added in Phase 4b: `tests/autograd_v2_gradientmap_v2.rs`
 Files: `accumulator.rs`, `checkpoint.rs`, `dispatch.rs`, `engine.rs`,
 `error.rs`, `hooks.rs`, `input_buffer.rs`, `meta.rs`, `mod.rs`,
 `node.rs`, `optim.rs` (Phase 4a), `recording.rs`, `saved_tensor.rs`,
-`ops/mod.rs`, `ops/add.rs`, `ops/mul.rs`, `ops/sum.rs`,
-`ops/matmul.rs`, `ops/silu.rs`, `ops/reshape.rs`, `ops/transpose.rs`,
-`ops/narrow.rs`, `ops/squeeze.rs`, `ops/unsqueeze.rs`,
-`ops/permute.rs`, `ops/layer_norm.rs` (Phase 3c1). Tests:
+`ops/mod.rs`, `ops/fw_mode.rs` (Phase 3c2), `ops/add.rs`,
+`ops/mul.rs`, `ops/sum.rs`, `ops/matmul.rs`, `ops/silu.rs`,
+`ops/reshape.rs`, `ops/transpose.rs`, `ops/narrow.rs`,
+`ops/squeeze.rs`, `ops/unsqueeze.rs`, `ops/permute.rs`,
+`ops/layer_norm.rs` (Phase 3c1). Tests:
 `tests/autograd_v2_types.rs` (13 tests, Phase 1) +
 `tests/autograd_v2_engine.rs` (12 tests, Phase 2 + Phase 3b
 `accumulate_grad_uses_empty_sentinel_when_no_hooks`) +
@@ -849,9 +860,13 @@ Files: `accumulator.rs`, `checkpoint.rs`, `dispatch.rs`, `engine.rs`,
 Phase 3c1 5 layer_norm) + `tests/autograd_v2_checkpoint.rs`
 (4 tests, Phase 3c1) + `tests/autograd_v2_phase4a.rs` (12 tests,
 Phase 4a: 5 Parameter v2, 3 Adam BF16-grad, 2 multi_tensor BF16,
-2 AdamWV2 trait surface). All green (modulo a known
-parallel-CUDA-context flake in autograd_v2_ops / autograd_v2_engine
-pre-existing from Phase 3a — re-run individually to confirm).
+2 AdamWV2 trait surface) +
+`tests/autograd_v2_gradientmap_v2.rs` (17 tests, Phase 4b) +
+`tests/autograd_v2_fw_mode.rs` (13 tests, Phase 3c2: one JVP per
+non-LN op + `set_fw_grad_implicitly_allocates_meta` regression).
+All green (modulo a known parallel-CUDA-context flake in
+autograd_v2_ops / autograd_v2_engine / inplace_version_bump_audit
+pre-existing — re-run individually to confirm).
 
 ### ⚠️ `autograd_simple.rs / autograd_engine.rs / autograd_ops.rs / autograd_ops_complete.rs / autograd_debug.rs`
 Older autograd attempts. Dead code; kept for reference.

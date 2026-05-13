@@ -24,6 +24,7 @@ use super::super::node::{Edge, GradFn, NodeId};
 use super::super::recording::{
     gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
 };
+use super::fw_mode::{any_fw_grad, tangent_or_zero};
 
 #[derive(Debug)]
 pub struct PermuteGradFn {
@@ -102,13 +103,24 @@ impl GradFn for PermuteGradFn {
 }
 
 /// v2 forward wrapper for `permute`.
+///
+/// Phase 3c2 forward-mode AD: linear shape-op JVP — apply the same
+/// permute to the tangent, then `.contiguous()` per HAZARD-2026-05-13-1
+/// + gemm-stride-ignore (same discipline as the backward formula).
 pub fn permute_v2(a: &Tensor, perm: &[usize], ctx: &DispatchCtx) -> Result<Tensor> {
     let out = a.permute(perm)?;
-    if needs_grad(&[a]) {
+    let any_fw = any_fw_grad(&[a]);
+    let mut result = if needs_grad(&[a]) {
         let grad_fn = PermuteGradFn::new(a, perm);
         let recorded = record_v2(grad_fn, vec![out], ctx);
-        Ok(recorded.into_iter().next().unwrap())
+        recorded.into_iter().next().unwrap()
     } else {
-        Ok(out)
+        out
+    };
+    if any_fw {
+        let a_dot = tangent_or_zero(a)?;
+        let out_fw = a_dot.permute(perm)?.contiguous()?;
+        result.set_fw_grad(out_fw);
     }
+    Ok(result)
 }

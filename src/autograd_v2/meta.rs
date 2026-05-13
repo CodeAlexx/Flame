@@ -77,6 +77,15 @@ pub struct AutogradMetaV2 {
     /// view chains. Phase 1 reserves the slot; Phase 3 populates it.
     pub view_base: Option<Weak<Mutex<AutogradMetaV2>>>,
 
+    /// Forward-mode AD companion (Phase 3c2 — §clause 15). When set,
+    /// downstream ops that have a forward-mode JVP formula will read
+    /// this slot for input tangents and write the output tangent to
+    /// the corresponding slot on the output's autograd_meta. PyTorch
+    /// parity: `Tensor._fw_grad`. Unset by default; populated by
+    /// `Tensor::set_fw_grad` (which also lazily allocates a meta when
+    /// the tensor doesn't yet have one).
+    pub fw_grad: Option<Tensor>,
+
     /// Hook bundle. Default empty.
     pub hooks: Hooks,
 }
@@ -94,6 +103,7 @@ impl AutogradMetaV2 {
             requires_grad: false,
             is_view: false,
             view_base: None,
+            fw_grad: None,
             hooks: Hooks::default(),
         }
     }
@@ -111,6 +121,7 @@ impl AutogradMetaV2 {
             requires_grad: true,
             is_view: false,
             view_base: None,
+            fw_grad: None,
             hooks: Hooks::default(),
         }
     }
@@ -126,6 +137,7 @@ impl AutogradMetaV2 {
             requires_grad: true,
             is_view: false,
             view_base: None,
+            fw_grad: None,
             hooks: Hooks::default(),
         }
     }

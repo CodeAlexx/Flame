@@ -33,6 +33,7 @@ use super::super::node::{Edge, GradFn, NodeId};
 use super::super::recording::{
     gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
 };
+use super::fw_mode::{any_fw_grad, tangent_or_zero};
 
 #[derive(Debug)]
 pub struct NarrowGradFn {
@@ -148,11 +149,24 @@ pub fn narrow_v2(
     ctx: &DispatchCtx,
 ) -> Result<Tensor> {
     let out = a.narrow(dim, start, length)?;
-    if needs_grad(&[a]) {
+    let any_fw = any_fw_grad(&[a]);
+    let mut result = if needs_grad(&[a]) {
         let grad_fn = NarrowGradFn::new(a, dim, start, length);
         let recorded = record_v2(grad_fn, vec![out], ctx);
-        Ok(recorded.into_iter().next().unwrap())
+        recorded.into_iter().next().unwrap()
     } else {
-        Ok(out)
+        out
+    };
+    if any_fw {
+        let a_dot = tangent_or_zero(a)?;
+        // JVP(narrow): out_fw = a_dot.narrow(dim, start, length). This
+        // is a READ-only slice of the tangent (a fresh view onto
+        // a_dot's storage); HAZARD-2026-05-13-1 does NOT apply because
+        // no in-place write happens here (the hazard concerns writing
+        // through a narrow view into a parent). The forward JVP only
+        // reads, never writes.
+        let out_fw = a_dot.narrow(dim, start, length)?;
+        result.set_fw_grad(out_fw);
     }
+    Ok(result)
 }

@@ -26,6 +26,7 @@ use super::super::recording::{
     gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
 };
 use super::super::saved_tensor::SavedTensor;
+use super::fw_mode::{any_fw_grad, tangent_or_zero};
 
 #[derive(Debug)]
 pub struct SiLUGradFn {
@@ -108,13 +109,37 @@ impl GradFn for SiLUGradFn {
 }
 
 /// v2 forward wrapper for `silu`.
+///
+/// Phase 3c2 forward-mode AD: `silu'(x) = sigmoid(x) * (1 + x*(1 -
+/// sigmoid(x)))`. JVP — `out_fw = x_dot * silu'(x)`. The derivative is
+/// computed the same way the backward does (see [`SiLUGradFn::apply`]):
+///
+/// ```text
+/// s = sigmoid(x)
+/// term = 1 + x * (1 - s)
+/// silu_deriv = s * term
+/// out_fw = x_dot * silu_deriv
+/// ```
 pub fn silu_v2(x: &Tensor, ctx: &DispatchCtx) -> Result<Tensor> {
     let out = x.silu()?;
-    if needs_grad(&[x]) {
+    let any_fw = any_fw_grad(&[x]);
+    let mut result = if needs_grad(&[x]) {
         let grad_fn = SiLUGradFn::new(x);
         let recorded = record_v2(grad_fn, vec![out], ctx);
-        Ok(recorded.into_iter().next().unwrap())
+        recorded.into_iter().next().unwrap()
     } else {
-        Ok(out)
+        out
+    };
+    if any_fw {
+        let x_dot = tangent_or_zero(x)?;
+        // silu_deriv(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x))).
+        let s = x.sigmoid()?;
+        let one_minus_s = s.mul_scalar(-1.0)?.add_scalar(1.0)?;
+        let x_times_oms = x.mul(&one_minus_s)?;
+        let term = x_times_oms.add_scalar(1.0)?;
+        let silu_deriv = s.mul(&term)?;
+        let out_fw = x_dot.mul(&silu_deriv)?;
+        result.set_fw_grad(out_fw);
     }
+    Ok(result)
 }

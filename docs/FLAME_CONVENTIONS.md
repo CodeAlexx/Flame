@@ -1832,3 +1832,66 @@ under the same `FLAME_MT_L2NORM=0` env gate as the F32 path.
 Mixed-dtype slices (some BF16, some F32) fall through to the legacy
 per-tensor loop. If you see this in a hot path, fix it upstream
 (make the trainer pick one dtype) rather than adding a third kernel.
+
+## Autograd v2 (Phase 3c2) — forward-mode AD conventions
+
+### `Tensor::set_fw_grad` implicitly allocates `autograd_meta`
+
+If you call `set_fw_grad` on a tensor that has no `autograd_meta`
+(common — leaf tensors built by `Tensor::from_vec` start with
+`autograd_meta = None`), Phase 3c2 silently allocates a fresh
+`AutogradMetaV2::leaf_no_grad()`. PyTorch parity: setting `_fw_grad`
+enables forward-mode-AD tracking on a previously-untracked tensor.
+
+**What this does NOT do:** it does NOT enable backward-mode tracking.
+`requires_grad` stays `false` on the auto-allocated meta. If you want
+both gates, install the meta yourself first via
+`new_meta_ref(AutogradMetaV2::leaf_requires_grad())` and then call
+`set_fw_grad`.
+
+### `fw_grad` and `requires_grad` are orthogonal
+
+A tensor can have any combination of `{fw_grad set, requires_grad
+true}`. The v2 op forward wrappers gate the two paths separately:
+
+- `needs_grad(&[a, b, ...])` → controls backward-mode recording
+  (`record_v2` install).
+- `any_fw_grad(&[a, b, ...])` → controls forward-mode JVP install
+  on the output (`Tensor::set_fw_grad`).
+
+A `mul` whose only input with a tangent does NOT have requires_grad
+still installs a JVP on the output. A `mul` whose inputs are
+require_grad-true but have no `fw_grad` still records backward-mode
+but does not install a JVP. Both flow paths are independent.
+
+### Tangent zero-materialisation: `tangent_or_zero`
+
+For multi-input ops (`mul`, `matmul`, `add`), the JVP convention is
+"no tangent ⇒ zero tangent". The helper
+`autograd_v2::ops::fw_mode::tangent_or_zero(t)` returns
+`t.fw_grad().unwrap_or(zeros_like_with_dtype(t.dtype()))`. Downstream
+formulas (e.g. `a_dot @ b + a @ b_dot`) can always operate on real
+tensors. The zeros allocation is cheap on small shapes but a future
+micro-opt can short-circuit the zero-side term — not done today.
+
+### `transpose` / `permute` forward-mode tangents call `.contiguous()`
+
+Same discipline as the backward formulas: a strided view returned by
+`Tensor::transpose` / `Tensor::permute` would scramble any downstream
+gemm/bmm consumer that reads via `try_as_slice_*` and ignores
+strides. The Phase 3c2 forward-mode AD path materialises contiguous
+before storing in `out.fw_grad`. See HAZARD-2026-05-13-1 +
+gemm-stride-ignore conventions above for the underlying class.
+
+### `layer_norm_v2` forward-mode AD is DEFERRED
+
+If you set a `fw_grad` on `x`, `weight`, or `bias` and call
+`layer_norm_v2`, the input tangent is **silently dropped** on the
+output (no JVP install). This matches the "tangent defaults to zero"
+JVP semantics. Phase 5 (parity gate) will ship the LN JVP formula
+and validate it against `torch.autograd.functional.jvp(layer_norm,
+...)`. If your code depends on LN forward-mode AD before Phase 5,
+either (a) avoid LN in the forward-mode path, or (b) decompose LN
+into the constituent ops (`mean`, `sub`, `sqrt`, `mul`, `add`) — but
+those primitives aren't all in the Phase 3c2 op set either, so (a)
+is the only safe choice.

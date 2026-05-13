@@ -19,6 +19,7 @@ use super::super::node::{Edge, GradFn, NodeId};
 use super::super::recording::{
     gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
 };
+use super::fw_mode::{any_fw_grad, tangent_or_zero};
 
 #[derive(Debug)]
 pub struct AddGradFn {
@@ -88,13 +89,27 @@ impl GradFn for AddGradFn {
 /// v2 forward wrapper for `add`. Forwards math through
 /// `Tensor::add`; records a v2 backward node iff at least one input
 /// is being tracked through v2.
+///
+/// Phase 3c2 forward-mode AD: if any input has a `fw_grad` set, the
+/// output's tangent is computed as `out_fw = a_dot + b_dot` (the JVP
+/// of a linear op is the same op applied to tangents). Missing
+/// tangents default to zero per the standard JVP convention.
 pub fn add_v2(a: &Tensor, b: &Tensor, ctx: &DispatchCtx) -> Result<Tensor> {
     let out = a.add(b)?;
-    if needs_grad(&[a, b]) {
+    let any_fw = any_fw_grad(&[a, b]);
+    let mut result = if needs_grad(&[a, b]) {
         let grad_fn = AddGradFn::new(a, b);
         let recorded = record_v2(grad_fn, vec![out], ctx);
-        Ok(recorded.into_iter().next().unwrap())
+        recorded.into_iter().next().unwrap()
     } else {
-        Ok(out)
+        out
+    };
+    if any_fw {
+        let a_dot = tangent_or_zero(a)?;
+        let b_dot = tangent_or_zero(b)?;
+        // JVP(add): out_fw = a_dot + b_dot.
+        let out_fw = a_dot.add(&b_dot)?;
+        result.set_fw_grad(out_fw);
     }
+    Ok(result)
 }

@@ -28,6 +28,7 @@ use super::super::node::{Edge, GradFn, NodeId};
 use super::super::recording::{
     gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
 };
+use super::fw_mode::{any_fw_grad, tangent_or_zero};
 
 #[derive(Debug)]
 pub struct TransposeGradFn {
@@ -98,13 +99,27 @@ impl GradFn for TransposeGradFn {
 }
 
 /// v2 forward wrapper for 2D `transpose`.
+///
+/// Phase 3c2 forward-mode AD: linear shape-op JVP — apply `.transpose()`
+/// to the tangent, then `.contiguous()` per HAZARD-2026-05-13-1 +
+/// gemm-stride-ignore (same discipline as the backward formula above).
 pub fn transpose_v2(a: &Tensor, ctx: &DispatchCtx) -> Result<Tensor> {
     let out = a.transpose()?;
-    if needs_grad(&[a]) {
+    let any_fw = any_fw_grad(&[a]);
+    let mut result = if needs_grad(&[a]) {
         let grad_fn = TransposeGradFn::new(a);
         let recorded = record_v2(grad_fn, vec![out], ctx);
-        Ok(recorded.into_iter().next().unwrap())
+        recorded.into_iter().next().unwrap()
     } else {
-        Ok(out)
+        out
+    };
+    if any_fw {
+        let a_dot = tangent_or_zero(a)?;
+        // HAZARD-2026-05-13-1 + gemm-stride-ignore: materialise
+        // contiguous so a downstream gemm/bmm consumer sees the
+        // correctly-laid-out memory.
+        let out_fw = a_dot.transpose()?.contiguous()?;
+        result.set_fw_grad(out_fw);
     }
+    Ok(result)
 }

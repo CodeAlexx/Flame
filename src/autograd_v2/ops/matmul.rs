@@ -22,6 +22,7 @@ use super::super::recording::{
     gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
 };
 use super::super::saved_tensor::SavedTensor;
+use super::fw_mode::{any_fw_grad, tangent_or_zero};
 
 #[derive(Debug)]
 pub struct MatMulGradFn {
@@ -119,13 +120,31 @@ impl GradFn for MatMulGradFn {
 }
 
 /// v2 forward wrapper for `matmul`.
+///
+/// Phase 3c2 forward-mode AD: product-rule JVP — `out_fw =
+/// a_dot @ b + a @ b_dot`. Missing tangents default to zero. The
+/// zero-tensor materialisation in `tangent_or_zero` ensures both
+/// matmul invocations always run on real tensors (zero matmul is
+/// cheap on tiny shapes; in production a future micro-opt could
+/// skip the zero-side term).
 pub fn matmul_v2(a: &Tensor, b: &Tensor, ctx: &DispatchCtx) -> Result<Tensor> {
     let out = a.matmul(b)?;
-    if needs_grad(&[a, b]) {
+    let any_fw = any_fw_grad(&[a, b]);
+    let mut result = if needs_grad(&[a, b]) {
         let grad_fn = MatMulGradFn::new(a, b);
         let recorded = record_v2(grad_fn, vec![out], ctx);
-        Ok(recorded.into_iter().next().unwrap())
+        recorded.into_iter().next().unwrap()
     } else {
-        Ok(out)
+        out
+    };
+    if any_fw {
+        let a_dot = tangent_or_zero(a)?;
+        let b_dot = tangent_or_zero(b)?;
+        // JVP(matmul): out_fw = a_dot @ b + a @ b_dot.
+        let term1 = a_dot.matmul(b)?;
+        let term2 = a.matmul(&b_dot)?;
+        let out_fw = term1.add(&term2)?;
+        result.set_fw_grad(out_fw);
     }
+    Ok(result)
 }

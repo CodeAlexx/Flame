@@ -1169,11 +1169,79 @@ Tests (4 layer_norm + 4 checkpoint = 8 new):
   - `checkpoint_v2_reentrant_nested` — checkpoint-in-checkpoint, 2 nested engines
   - `checkpoint_v2_multi_output` — multi-output forward, same node id on each
 
-Forward-mode AD population across the 11 prior ops (`SavedTensor::fw_grad_`
-JVP propagation per §clause 15) is **deferred to Phase 3c2**. The slot
-is wired (Phase 1) and tested (`saved_tensor_fw_grad_roundtrip` in
-`tests/autograd_v2_types.rs`); Phase 3c2 populates it inside each op's
-forward wrapper.
+Forward-mode AD (JVP) plumbing across the 11 prior ops shipped in
+Phase 3c2 — see the next section.
+
+### Autograd v2 (Phase 3c2 — forward-mode AD across 11 ops)
+
+Phase 3c2 closes Phase 3 by populating the `Tensor`-level forward-mode
+AD slot (`AutogradMetaV2::fw_grad`) inside every Phase 3a/3b op's
+forward wrapper. The JVP plumbing is independent of the backward-mode
+recording — `fw_grad` and `requires_grad` are orthogonal gates.
+
+- `autograd_v2::AutogradMetaV2::fw_grad` field —
+  `src/autograd_v2/meta.rs:87` — `Option<Tensor>`; defaults to `None`
+  on every constructor (`leaf_no_grad`, `leaf_requires_grad`,
+  `non_leaf`). Populated by `Tensor::set_fw_grad`; read by per-op
+  forward wrappers via `Tensor::fw_grad`.
+- `Tensor::fw_grad(&self) -> Option<Tensor>` —
+  `src/tensor.rs:258` — cloned read of the installed tangent (or
+  `None` when no `autograd_meta` / no tangent). Cheap-zero-overhead
+  on the `None` path: skips lock acquisition entirely.
+- `Tensor::set_fw_grad(&mut self, g: Tensor)` —
+  `src/tensor.rs:276` — installs a tangent on this tensor. PyTorch
+  parity: implicitly allocates a fresh `AutogradMetaV2::leaf_no_grad()`
+  if the tensor doesn't yet have a meta (setting a tangent does NOT
+  silently enable backward-mode tracking — `requires_grad` stays
+  false).
+- `autograd_v2::ops::fw_mode::any_fw_grad(inputs) -> bool` —
+  `src/autograd_v2/ops/fw_mode.rs:34` — gating predicate for op
+  wrappers; mirrors `needs_grad` but for forward-mode AD.
+- `autograd_v2::ops::fw_mode::tangent_or_zero(t) -> Result<Tensor>` —
+  `src/autograd_v2/ops/fw_mode.rs:49` — returns `t.fw_grad()` if set,
+  otherwise a fresh `zeros_like_with_dtype(t.dtype())`. Materialises
+  the JVP convention "no tangent ⇒ zero tangent" so downstream
+  formulas can multiply / matmul against a real tensor.
+
+Per-op JVP additions (formulas in each op file's doc comment):
+
+- `add_v2` (`src/autograd_v2/ops/add.rs:97`) — JVP: `a_dot + b_dot`.
+- `mul_v2` (`src/autograd_v2/ops/mul.rs:102`) — JVP product rule:
+  `a_dot * b + a * b_dot`.
+- `sum_v2` (`src/autograd_v2/ops/sum.rs:102`) — JVP: `sum(a_dot)`.
+- `matmul_v2` (`src/autograd_v2/ops/matmul.rs:130`) — JVP product
+  rule: `a_dot @ b + a @ b_dot`.
+- `silu_v2` (`src/autograd_v2/ops/silu.rs:123`) — JVP:
+  `x_dot * silu_deriv(x)` where
+  `silu_deriv = sigmoid(x) * (1 + x*(1 - sigmoid(x)))`.
+- `reshape_v2` / `view_v2`
+  (`src/autograd_v2/ops/reshape.rs:101, 122`) — JVP applies the same
+  reshape/view to the tangent.
+- `transpose_v2` (`src/autograd_v2/ops/transpose.rs:106`) — JVP:
+  `a_dot.transpose().contiguous()`. HAZARD-2026-05-13-1 +
+  gemm-stride-ignore.
+- `narrow_v2` (`src/autograd_v2/ops/narrow.rs:144`) — JVP:
+  `a_dot.narrow(dim, start, length)`. Read-only slice; no write
+  hazard.
+- `squeeze_v2` (`src/autograd_v2/ops/squeeze.rs:96`) — JVP:
+  `a_dot.squeeze(Some(dim))`.
+- `unsqueeze_v2` (`src/autograd_v2/ops/unsqueeze.rs:93`) — JVP:
+  `a_dot.unsqueeze(dim)`.
+- `permute_v2` (`src/autograd_v2/ops/permute.rs:110`) — JVP:
+  `a_dot.permute(perm).contiguous()`. HAZARD-2026-05-13-1 +
+  gemm-stride-ignore.
+
+`layer_norm_v2` forward-mode AD is **deferred** — its JVP formula
+`out_fw = (x_fw - mean_fw)*rstd*w + x_hat*d_rstd_dx*w + x_hat*rstd*w_fw + b_fw`
+is mechanical but non-trivial; an input tangent on `x` / `weight` /
+`bias` is silently dropped on the LN output (matches "tangent
+defaults to zero" semantics). The Phase 5 parity gate is the right
+time to ship and validate the formula against
+`torch.autograd.functional.jvp(layer_norm, ...)`.
+
+Tests: `tests/autograd_v2_fw_mode.rs` (13 tests — one per JVP-
+supporting op plus `set_fw_grad_implicitly_allocates_meta_on_untracked_tensor`).
+F32-only; BF16 paths will be exercised in Phase 5 parity.
 
 ### Autograd v2 (Phase 4a — optimizer + BF16-grad migration partial)
 

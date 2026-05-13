@@ -247,6 +247,48 @@ impl Tensor {
         self.autograd_meta = meta;
     }
 
+    /// Autograd v2 forward-mode AD accessor (Phase 3c2 — §clause 15).
+    /// Returns a clone of the forward-mode gradient (tangent) installed
+    /// on this tensor's autograd_meta, or `None` if no tangent has been
+    /// set. PyTorch parity: `Tensor._fw_grad`.
+    ///
+    /// Reads through the autograd_meta Arc<Mutex<_>>; cheap on the
+    /// `None` path (no lock acquisition when meta is absent).
+    #[cfg(feature = "autograd_v2")]
+    pub fn fw_grad(&self) -> Option<Tensor> {
+        let meta = self.autograd_meta.as_ref()?;
+        let m = meta.lock().ok()?;
+        m.fw_grad.clone()
+    }
+
+    /// Autograd v2 forward-mode AD mutator (Phase 3c2 — §clause 15).
+    /// Installs a forward-mode gradient (tangent) on this tensor. If
+    /// the tensor does not yet have an autograd_meta, a fresh leaf
+    /// meta is allocated implicitly — mirrors PyTorch's behavior where
+    /// setting `_fw_grad` enables tracking on a previously-untracked
+    /// tensor.
+    ///
+    /// Downstream forward-mode-AD-aware op wrappers (see
+    /// `autograd_v2::ops::*`) read the installed tangent during the
+    /// JVP plumbing and write the computed output tangent back via
+    /// this method on the result.
+    #[cfg(feature = "autograd_v2")]
+    pub fn set_fw_grad(&mut self, g: Tensor) {
+        use crate::autograd_v2::{new_meta_ref, AutogradMetaV2};
+        if self.autograd_meta.is_none() {
+            // Implicit meta allocation: setting a fw_grad on an
+            // untracked tensor allocates a fresh leaf meta. We use
+            // `leaf_no_grad()` (requires_grad=false) so backward-mode
+            // recording is not silently enabled — the user must
+            // explicitly opt into requires_grad.
+            self.autograd_meta = Some(new_meta_ref(AutogradMetaV2::leaf_no_grad()));
+        }
+        let meta = self.autograd_meta.as_ref().expect("just allocated above");
+        if let Ok(mut m) = meta.lock() {
+            m.fw_grad = Some(g);
+        }
+    }
+
     /// Return a fresh handle to this tensor's storage with
     /// `autograd_meta = None`. PyTorch's `detach()` semantics — the
     /// returned tensor shares the underlying storage / shape / dtype

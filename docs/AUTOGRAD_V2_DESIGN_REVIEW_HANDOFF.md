@@ -424,6 +424,32 @@ Toy tests:
 
 ### Phase 3: First Real Ops + View Backward + Forward-Mode (~3 weeks)
 
+**Status (2026-05-13): COMPLETE.** Phase 3 shipped in four subphases:
+
+- **Phase 3a** (commits `bfc371b`, `6ee385f`): recording surface
+  (`Tensor::autograd_meta`, `record_v2`, `gradient_edge_for_tensor`,
+  `needs_grad`, `next_sequence_nr`) + 5 math P0 ops (add, mul, sum,
+  matmul, silu). 18 tests.
+- **Phase 3b** (commit `d471c31`): 6 view ops (reshape, view,
+  transpose, narrow, squeeze, unsqueeze, permute) + HAZARD-2026-05-13-1
+  characterisation (narrow-view-write hazard) + gemm-stride-ignore
+  discipline (`.contiguous()` on transpose/permute backward). 10
+  tests.
+- **Phase 3c1** (commit `2be9770`): `layer_norm_v2` (BF16-only,
+  delegates to fused kernels) + full `CheckpointGradFn::apply`
+  (re-runs forward closure under nested `Engine::execute`). 5 LN
+  tests + 4 checkpoint tests + 1 d_x symmetry regression
+  (`2d9cd0d`).
+- **Phase 3c2** (this commit): forward-mode AD (JVP) plumbing
+  across the 11 Phase 3a/3b ops. `AutogradMetaV2::fw_grad` slot,
+  `Tensor::fw_grad` / `set_fw_grad` accessors,
+  `autograd_v2::ops::fw_mode::{any_fw_grad, tangent_or_zero}`
+  helpers, per-op JVP formula in each forward wrapper. 13 tests at
+  `tests/autograd_v2_fw_mode.rs`. `layer_norm` JVP **deferred** to
+  Phase 5 parity gate (formula in §clause 15 is mechanical but
+  non-trivial; an input tangent on LN currently silently zeroes
+  on the output).
+
 P0/P1 ops:
 - add, mul, sum, reshape, transpose, matmul/linear, silu, layer_norm
 - **view, squeeze, unsqueeze, permute** (view-autograd surface — Phase 3 makes view ops first-class)
@@ -433,8 +459,8 @@ Each op needs:
 - forward wiring under `autograd_v2`
 - backward struct (the `GradFn` impl)
 - **forward-mode AD formula** alongside backward — uses the `SavedTensor::fw_grad_` field
-- PyTorch fixture parity (backward direction)
-- forward-AD parity vs PT's `torch.autograd.functional.jvp`
+- PyTorch fixture parity (backward direction) — Phase 5
+- forward-AD parity vs PT's `torch.autograd.functional.jvp` — Phase 5
 - dtype assertion
 - no unwanted `.to(F32)` in autograd_v2
 

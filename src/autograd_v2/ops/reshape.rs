@@ -26,6 +26,7 @@ use super::super::node::{Edge, GradFn, NodeId};
 use super::super::recording::{
     gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
 };
+use super::fw_mode::{any_fw_grad, tangent_or_zero};
 
 #[derive(Debug)]
 pub struct ReshapeGradFn {
@@ -94,25 +95,44 @@ impl GradFn for ReshapeGradFn {
 }
 
 /// v2 forward wrapper for `reshape`.
+///
+/// Phase 3c2 forward-mode AD: linear-shape-op JVP — apply the same
+/// reshape to the tangent, `out_fw = a_dot.reshape(new_shape)`.
 pub fn reshape_v2(a: &Tensor, new_shape: &[usize], ctx: &DispatchCtx) -> Result<Tensor> {
     let out = a.reshape(new_shape)?;
-    if needs_grad(&[a]) {
+    let any_fw = any_fw_grad(&[a]);
+    let mut result = if needs_grad(&[a]) {
         let grad_fn = ReshapeGradFn::new(a);
         let recorded = record_v2(grad_fn, vec![out], ctx);
-        Ok(recorded.into_iter().next().unwrap())
+        recorded.into_iter().next().unwrap()
     } else {
-        Ok(out)
+        out
+    };
+    if any_fw {
+        let a_dot = tangent_or_zero(a)?;
+        let out_fw = a_dot.reshape(new_shape)?;
+        result.set_fw_grad(out_fw);
     }
+    Ok(result)
 }
 
 /// v2 forward wrapper for `view` (alias of `reshape` in flame-core).
+///
+/// Phase 3c2 forward-mode AD: identical to `reshape` JVP.
 pub fn view_v2(a: &Tensor, new_shape: &[usize], ctx: &DispatchCtx) -> Result<Tensor> {
     let out = a.view(new_shape)?;
-    if needs_grad(&[a]) {
+    let any_fw = any_fw_grad(&[a]);
+    let mut result = if needs_grad(&[a]) {
         let grad_fn = ReshapeGradFn::new(a);
         let recorded = record_v2(grad_fn, vec![out], ctx);
-        Ok(recorded.into_iter().next().unwrap())
+        recorded.into_iter().next().unwrap()
     } else {
-        Ok(out)
+        out
+    };
+    if any_fw {
+        let a_dot = tangent_or_zero(a)?;
+        let out_fw = a_dot.view(new_shape)?;
+        result.set_fw_grad(out_fw);
     }
+    Ok(result)
 }
