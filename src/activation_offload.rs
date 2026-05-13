@@ -130,6 +130,7 @@ extern "C" {
     fn cudaEventDestroy(event: *mut c_void) -> i32;
     fn cudaEventRecord(event: *mut c_void, stream: *mut c_void) -> i32;
     fn cudaStreamWaitEvent(stream: *mut c_void, event: *mut c_void, flags: u32) -> i32;
+    fn cudaStreamSynchronize(stream: *mut c_void) -> i32;
 }
 
 // Re-declare the memcpy helper so we do not have to route through
@@ -247,6 +248,18 @@ fn default_stream_wait_event(event: &CudaEvent) -> Result<()> {
     check_cuda(
         unsafe { cudaStreamWaitEvent(std::ptr::null_mut(), event.raw, 0) },
         "cudaStreamWaitEvent (default stream)",
+    )
+}
+
+/// Make an arbitrary stream wait on `event`. Subsequent kernels submitted to
+/// that stream will block until the event's recording stream completes the
+/// work prior to `record_on`. Used to gate cudarc's `CudaDevice` compute
+/// stream (where cuBLASLt / cuDNN / generic kernels actually run) on a
+/// pull-side HtoD that lands on the transfer stream.
+fn stream_wait_event(stream: *mut c_void, event: &CudaEvent) -> Result<()> {
+    check_cuda(
+        unsafe { cudaStreamWaitEvent(stream, event.raw, 0) },
+        "cudaStreamWaitEvent (arbitrary stream)",
     )
 }
 
@@ -1174,8 +1187,25 @@ impl GrowOnDemandActivationCache {
         let offset = self.cursor_offset;
         self.cursor_offset += bytes;
 
-        // Source device pointer.
-        let src_ptr = src_device_ptr(tensor.storage_ref())?;
+        // Materialize views before reading the storage pointer.
+        // `src_device_ptr` returns the base of the storage and ignores
+        // `view_offset` / `custom_strides`. For narrow- or permute-views
+        // (e.g. `prev_block_out.narrow(1, 1008, 512)` in Klein's double
+        // block loop), reading from offset 0 copies the WRONG bytes —
+        // for narrow-on-non-leading-dim it reads parent data starting
+        // at storage[0] instead of the slice. `contiguous()` is a cheap
+        // clone when already contiguous + view_offset==0, and a strided
+        // gather otherwise. Keeping the contiguous version alive in
+        // `keep_alive` ensures its storage outlives the async DtoH.
+        let contig: Tensor = tensor.contiguous()?;
+        debug_assert!(
+            contig.is_contiguous(),
+            "contiguous() must produce a tensor with view_offset==0 and no custom_strides"
+        );
+
+        // Source device pointer (now points to the start of the
+        // tensor's logical data, post-materialization).
+        let src_ptr = src_device_ptr(contig.storage_ref())?;
         // Destination host pointer.
         let dst_ptr = unsafe {
             self.slabs[slab_idx]
@@ -1216,7 +1246,13 @@ impl GrowOnDemandActivationCache {
             dtype,
             shape: tensor.shape().clone(),
             pull_event,
-            keep_alive: Some(tensor.clone()),
+            // Hold the materialized copy alive across the async DtoH so
+            // its storage isn't reused before the transfer completes. It
+            // drops when pull removes the entry. A future optimization
+            // could record a per-push event and free via cudaFreeAsync
+            // on the transfer stream, but that requires going beyond
+            // cudarc's safe API.
+            keep_alive: Some(contig),
         };
         self.entries.insert(id, entry);
 
@@ -1272,15 +1308,38 @@ impl GrowOnDemandActivationCache {
         };
         let dst_ptr = dst_device_ptr(dst.storage_mut())? as *mut c_void;
 
-        // Enqueue HtoD on the same transfer stream — same-stream FIFO
-        // ordering naturally sequences this after the push's DtoH.
+        // Pulled tensor allocation lives on cudarc's `CudaDevice` internal
+        // stream (cuMemAllocAsync). Per CUDA's stream-ordered memory
+        // allocator contract, **all uses of that memory must be on the
+        // same stream** as the allocation (or properly synchronized via
+        // events). If we enqueue the HtoD on `self.transfer`, it writes
+        // to a buffer that — from the device stream's perspective — is
+        // not yet allocated, and downstream consumers on the device
+        // stream see uninitialized / stale bytes. Root-caused 2026-05-13
+        // by per-pull `cudaMemcpyAsync` D2H readback: same `dst_gpu` ptr
+        // returned different bytes than what was on the host pinned slab.
+        //
+        // Fix: issue the HtoD on the device's own stream, with a
+        // cross-stream wait on the push DtoH event so the host buffer
+        // is fully written before the HtoD reads it. This satisfies
+        // both stream-ordered-alloc lifecycle and the host-buffer
+        // producer-consumer order.
+        let device_stream = *self.device.cu_stream() as *mut c_void;
+
+        // Gate device stream on push DtoH completion (recorded on transfer).
+        let dtoh_done = CudaEvent::new()?;
+        dtoh_done.record_on(&self.transfer)?;
+        stream_wait_event(device_stream, &dtoh_done)?;
+
+        // Enqueue HtoD on the **device** stream — same stream as the
+        // allocation that produced `dst`.
         let ret = unsafe {
             flame_cuda_memcpy_async(
                 dst_ptr,
                 src_ptr,
                 entry.bytes,
                 CUDA_MEMCPY_H2D,
-                self.transfer.as_raw(),
+                device_stream,
             )
         };
         if ret != 0 {
@@ -1289,10 +1348,13 @@ impl GrowOnDemandActivationCache {
             )));
         }
 
-        // Record the pull event on the transfer stream, then make the
-        // default stream wait on it so any subsequent default-stream op
-        // that touches `dst` is correctly ordered after the HtoD.
-        entry.pull_event.record_on(&self.transfer)?;
+        // Record the pull event on the device stream so downstream
+        // null-stream consumers (flame-core NVRTC kernels) wait on the
+        // HtoD landing.
+        check_cuda(
+            unsafe { cudaEventRecord(entry.pull_event.raw, device_stream) },
+            "cudaEventRecord (pull event on device stream)",
+        )?;
         default_stream_wait_event(&entry.pull_event)?;
 
         // keep_alive drops here — the GPU source memory can be reused now.

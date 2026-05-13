@@ -2092,27 +2092,116 @@ impl AutogradContext {
             return f(inputs);
         }
 
-        // 2026-05-13: cache-pull-replay path is DISABLED. Three
-        // attempts (pulled requires_grad off / on, pull_with_id) all
-        // produced incorrect gradients on Klein 9B (grad_norm 0.0028
-        // partial / NaN). Root cause not yet identified — see
-        // `HANDOFF_2026-05-13_PHASE6_KLEIN_OFFLOAD_BLOCKED.md` for
-        // the debugging plan and instrumentation needed.
-        //
-        // Until the bug is found and fixed, this function delegates to
-        // plain `checkpoint`. Callers' API surface is stable, but the
-        // memory win is not yet realized.
-        let _ = GROW_CACHE
-            .read()
-            .ok()
-            .and_then(|g| g.as_ref().cloned());
+        // Check if the grow cache is installed.
+        let cache_opt: Option<Arc<Mutex<crate::activation_offload::GrowOnDemandActivationCache>>> =
+            GROW_CACHE.read().ok().and_then(|g| g.as_ref().cloned());
 
-        let inputs_owned: Vec<Tensor> = inputs.to_vec();
+        if cache_opt.is_none() {
+            // Degraded path: wrap as zero-arg closure with input clones and
+            // delegate to plain `checkpoint`. Same memory profile as plain
+            // checkpoint (strong refs hold inputs alive).
+            let inputs_owned: Vec<Tensor> = inputs.to_vec();
+            let f_arc = Arc::new(f);
+            return Self::checkpoint(inputs, move || {
+                let f = Arc::clone(&f_arc);
+                f(&inputs_owned)
+            });
+        }
+
+        let cache = cache_opt.unwrap();
+        let input_ids: Vec<TensorId> = inputs.iter().map(|t| t.id).collect();
+        let pulled_ids_slot: Arc<Mutex<Vec<TensorId>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        // Run forward with autograd DISABLED — same as plain `checkpoint`.
+        {
+            let mut ctx = AUTOGRAD_CONTEXT.lock()
+                .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+            ctx.enabled = false;
+        }
+        AUTOGRAD_ENABLED.store(false, Ordering::Relaxed);
+
+        let output = f(inputs)?;
+
+        // Push inputs to grow cache. Get handles.
+        let handles: Vec<crate::activation_offload::GrowHandle> = {
+            let mut cache_locked = cache
+                .lock()
+                .map_err(|_| Error::Training("grow cache mutex poisoned".into()))?;
+            inputs
+                .iter()
+                .map(|t| cache_locked.push(t))
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        // Re-enable autograd and build the recompute closure.
+        let cache_for_closure = cache.clone();
+        let slot_for_closure = pulled_ids_slot.clone();
         let f_arc = Arc::new(f);
-        Self::checkpoint(inputs, move || {
+        let recompute_fn = move || -> Result<Tensor> {
+            // Pull the pushed tensors back to device. Each pull enqueues
+            // an HtoD on the transfer stream and makes the default stream
+            // wait on the pull event, so subsequent default-stream kernels
+            // see fully-landed data.
+            let mut cache_locked = cache_for_closure
+                .lock()
+                .map_err(|_| Error::Training("grow cache mutex poisoned".into()))?;
+            let pulled: Vec<Tensor> = handles
+                .iter()
+                .map(|h| cache_locked.pull(*h))
+                .collect::<Result<Vec<_>>>()?;
+            drop(cache_locked);
+
+            // Mark pulled tensors as requiring grad so the sub-tape
+            // built inside `f` propagates grads back through them. The
+            // pulled IDs are fresh (independent of the original input
+            // IDs); the backward arm remaps via `pulled_ids_slot`.
+            let pulled: Vec<Tensor> = pulled
+                .into_iter()
+                .map(|mut t| {
+                    t.requires_grad = true;
+                    t
+                })
+                .collect();
+
+            // Publish pulled IDs into the side-channel slot so the
+            // backward arm can remap grads from pulled-ID → input-ID.
+            {
+                let mut slot = slot_for_closure
+                    .lock()
+                    .map_err(|_| Error::Training("pulled_ids_slot mutex poisoned".into()))?;
+                *slot = pulled.iter().map(|t| t.id).collect();
+            }
+
             let f = Arc::clone(&f_arc);
-            f(&inputs_owned)
-        })
+            f(&pulled)
+        };
+
+        // Mark the returned output as requiring grad. Store the recompute
+        // closure under the output id, then record the new Op variant on
+        // the tape with EMPTY saved_tensors (no strong refs to inputs).
+        let mut out_with_grad = output;
+        out_with_grad.requires_grad = true;
+
+        {
+            let mut ctx = AUTOGRAD_CONTEXT.lock()
+                .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+            ctx.enabled = true;
+            AUTOGRAD_ENABLED.store(true, Ordering::Relaxed);
+            ctx.checkpoint_fns
+                .insert(out_with_grad.id, Arc::new(recompute_fn));
+            ctx.record(TapeEntry {
+                output_id: out_with_grad.id,
+                op: Op::CheckpointOffloadBoundary {
+                    input_ids,
+                    pulled_ids_slot,
+                },
+                saved_tensors: SavedTensors::new(), // intentionally empty
+                saved_refs: SavedRefs::new(),
+            });
+        }
+
+        Ok(out_with_grad)
     }
 
     /// Level 2 activation offload checkpoint. Runs `f()` ONCE with autograd
