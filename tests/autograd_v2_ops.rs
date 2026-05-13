@@ -588,3 +588,337 @@ fn next_sequence_nr_monotonic() {
 // Silence unused import warnings if a particular cfg path drops one.
 #[allow(dead_code)]
 fn _unused_imports_anchor(_ds: &DeviceStream) {}
+
+// ===========================================================================
+// Phase 3b — view-op backward tests + needs_grad skips + HAZARD-2026-05-13-1
+// ===========================================================================
+//
+// Each view op is shape-only — backward is the inverse shape op applied to
+// grad_output. We test:
+//   - backward correctness (each op shipped in Phase 3b)
+//   - needs_grad skip (inference path: no autograd_meta on output)
+//   - HAZARD-2026-05-13-1 characterization (narrow + add_inplace_same_dtype
+//     under shared_storage — pinned to current buggy behavior)
+
+// ---------------------------------------------------------------------------
+// 16. reshape_v2_backward_returns_input_shape
+// ---------------------------------------------------------------------------
+//
+// reshape(4 → [2,2]) with grad_output of ones reshape-backs to [4] of ones.
+
+#[test]
+fn reshape_v2_backward_returns_input_shape() {
+    let a = make_leaf_requires_grad(vec![1.0, 2.0, 3.0, 4.0], &[4]);
+    let ctx = default_ctx();
+    let out = flame_core::autograd_v2::ops::reshape::reshape_v2(&a, &[2, 2], &ctx).unwrap();
+    assert_eq!(out.shape().dims(), &[2, 2]);
+
+    let g = make_f32(vec![10.0, 20.0, 30.0, 40.0], &[2, 2]);
+    let root = GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(g)]);
+    Engine::new().execute(root, &ctx).expect("execute");
+
+    let a_meta = a.autograd_meta().unwrap().lock().unwrap();
+    let da = a_meta.grad.as_ref().unwrap();
+    assert_eq!(da.shape().dims(), &[4], "backward grad must match input shape");
+    assert_eq!(da.to_vec().unwrap(), vec![10.0, 20.0, 30.0, 40.0]);
+}
+
+// ---------------------------------------------------------------------------
+// 17. view_v2_backward_returns_input_shape
+// ---------------------------------------------------------------------------
+
+#[test]
+fn view_v2_backward_returns_input_shape() {
+    let a = make_leaf_requires_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[6]);
+    let ctx = default_ctx();
+    let out = flame_core::autograd_v2::ops::reshape::view_v2(&a, &[2, 3], &ctx).unwrap();
+    assert_eq!(out.shape().dims(), &[2, 3]);
+
+    let g = make_f32(vec![1.0; 6], &[2, 3]);
+    let root = GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(g)]);
+    Engine::new().execute(root, &ctx).expect("execute");
+
+    let a_meta = a.autograd_meta().unwrap().lock().unwrap();
+    let da = a_meta.grad.as_ref().unwrap();
+    assert_eq!(da.shape().dims(), &[6]);
+    assert_eq!(da.to_vec().unwrap(), vec![1.0; 6]);
+}
+
+// ---------------------------------------------------------------------------
+// 18. transpose_v2_backward
+// ---------------------------------------------------------------------------
+//
+// out = a.transpose()  ; backward: d_a = g.transpose() (then .contiguous()).
+// a = [[1,2,3],[4,5,6]] (2x3), g = [[10,20],[30,40],[50,60]] (3x2).
+// d_a = g^T = [[10,30,50],[20,40,60]].
+
+#[test]
+fn transpose_v2_backward() {
+    let a = make_leaf_requires_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    let ctx = default_ctx();
+    let out = flame_core::autograd_v2::ops::transpose::transpose_v2(&a, &ctx).unwrap();
+    assert_eq!(out.shape().dims(), &[3, 2]);
+
+    let g = make_f32(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[3, 2]);
+    let root = GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(g)]);
+    Engine::new().execute(root, &ctx).expect("execute");
+
+    let a_meta = a.autograd_meta().unwrap().lock().unwrap();
+    let da = a_meta.grad.as_ref().unwrap();
+    assert_eq!(da.shape().dims(), &[2, 3]);
+    // d_a[i,j] = g[j,i].
+    // g (3x2 row-major): [10,20,30,40,50,60] → g[0,0]=10, g[0,1]=20,
+    //   g[1,0]=30, g[1,1]=40, g[2,0]=50, g[2,1]=60.
+    // d_a (2x3 row-major): d_a[0,0]=g[0,0]=10, d_a[0,1]=g[1,0]=30,
+    //   d_a[0,2]=g[2,0]=50, d_a[1,0]=g[0,1]=20, d_a[1,1]=g[1,1]=40,
+    //   d_a[1,2]=g[2,1]=60.
+    let want = vec![10.0, 30.0, 50.0, 20.0, 40.0, 60.0];
+    assert_eq!(da.to_vec().unwrap(), want);
+}
+
+// ---------------------------------------------------------------------------
+// 19. narrow_v2_backward_scatters_into_zero
+// ---------------------------------------------------------------------------
+//
+// a = [1,2,3,4,5] (shape [5]); out = a.narrow(0, 1, 3) = [2,3,4].
+// g = [10,20,30] → d_a = [0, 10, 20, 30, 0]. HAZARD-2026-05-13-1 guard:
+// the backward must allocate a fresh zero buffer (NOT write through a
+// narrow view back into a).
+
+#[test]
+fn narrow_v2_backward_scatters_into_zero() {
+    let a = make_leaf_requires_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0], &[5]);
+    let ctx = default_ctx();
+    let out = flame_core::autograd_v2::ops::narrow::narrow_v2(&a, 0, 1, 3, &ctx).unwrap();
+    assert_eq!(out.shape().dims(), &[3]);
+    assert_eq!(out.to_vec().unwrap(), vec![2.0, 3.0, 4.0]);
+
+    let g = make_f32(vec![10.0, 20.0, 30.0], &[3]);
+    let root = GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(g)]);
+    Engine::new().execute(root, &ctx).expect("execute");
+
+    let a_meta = a.autograd_meta().unwrap().lock().unwrap();
+    let da = a_meta.grad.as_ref().unwrap();
+    assert_eq!(da.shape().dims(), &[5]);
+    assert_eq!(da.to_vec().unwrap(), vec![0.0, 10.0, 20.0, 30.0, 0.0]);
+}
+
+// ---------------------------------------------------------------------------
+// 20. squeeze_v2_backward
+// ---------------------------------------------------------------------------
+//
+// a = ones(1, 4); squeeze(0) → shape [4]; backward unsqueezes back to [1, 4].
+
+#[test]
+fn squeeze_v2_backward() {
+    let a = make_leaf_requires_grad(vec![1.0, 2.0, 3.0, 4.0], &[1, 4]);
+    let ctx = default_ctx();
+    let out = flame_core::autograd_v2::ops::squeeze::squeeze_v2(&a, 0, &ctx).unwrap();
+    assert_eq!(out.shape().dims(), &[4]);
+
+    let g = make_f32(vec![10.0, 20.0, 30.0, 40.0], &[4]);
+    let root = GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(g)]);
+    Engine::new().execute(root, &ctx).expect("execute");
+
+    let a_meta = a.autograd_meta().unwrap().lock().unwrap();
+    let da = a_meta.grad.as_ref().unwrap();
+    assert_eq!(da.shape().dims(), &[1, 4]);
+    assert_eq!(da.to_vec().unwrap(), vec![10.0, 20.0, 30.0, 40.0]);
+}
+
+// ---------------------------------------------------------------------------
+// 21. unsqueeze_v2_backward
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unsqueeze_v2_backward() {
+    let a = make_leaf_requires_grad(vec![1.0, 2.0, 3.0], &[3]);
+    let ctx = default_ctx();
+    let out = flame_core::autograd_v2::ops::unsqueeze::unsqueeze_v2(&a, 0, &ctx).unwrap();
+    assert_eq!(out.shape().dims(), &[1, 3]);
+
+    let g = make_f32(vec![10.0, 20.0, 30.0], &[1, 3]);
+    let root = GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(g)]);
+    Engine::new().execute(root, &ctx).expect("execute");
+
+    let a_meta = a.autograd_meta().unwrap().lock().unwrap();
+    let da = a_meta.grad.as_ref().unwrap();
+    assert_eq!(da.shape().dims(), &[3]);
+    assert_eq!(da.to_vec().unwrap(), vec![10.0, 20.0, 30.0]);
+}
+
+// ---------------------------------------------------------------------------
+// 22. permute_v2_backward_uses_inverse_perm
+// ---------------------------------------------------------------------------
+//
+// a = [[[1,2],[3,4],[5,6]]]   shape [1,3,2]
+// perm = [2, 0, 1] → out shape [2, 1, 3]
+// backward applies inverse_perm = [1, 2, 0] to grad_output to get back [1,3,2].
+// To check correctness: backward of a permute is its own inverse permute, so
+// a round-trip (permute(perm) followed by permute(inverse_perm) on the same
+// grad) recovers the input shape and order. We feed a known g and verify
+// the resulting grad has correct shape and that summing-over-axis is invariant.
+
+#[test]
+fn permute_v2_backward_uses_inverse_perm() {
+    // Shape [2, 3] with simple identity-like data.
+    let a = make_leaf_requires_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    let ctx = default_ctx();
+    // perm = [1, 0] (transpose), forward shape becomes [3, 2].
+    let out = flame_core::autograd_v2::ops::permute::permute_v2(&a, &[1, 0], &ctx).unwrap();
+    assert_eq!(out.shape().dims(), &[3, 2]);
+
+    // g shape [3, 2]:
+    //   g = [[10,20],[30,40],[50,60]]
+    let g = make_f32(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[3, 2]);
+    let root = GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(g)]);
+    Engine::new().execute(root, &ctx).expect("execute");
+
+    let a_meta = a.autograd_meta().unwrap().lock().unwrap();
+    let da = a_meta.grad.as_ref().unwrap();
+    assert_eq!(da.shape().dims(), &[2, 3]);
+    // inverse_perm of [1,0] is [1,0]; backward permutes g[3,2] → [2,3].
+    // g[3,2] row-major = [g[0,0], g[0,1], g[1,0], g[1,1], g[2,0], g[2,1]]
+    //                  = [10,20,30,40,50,60]
+    // permute([1,0]) swaps axes: out[i,j] = g[j,i].
+    // out[0,0]=g[0,0]=10, out[0,1]=g[1,0]=30, out[0,2]=g[2,0]=50,
+    // out[1,0]=g[0,1]=20, out[1,1]=g[1,1]=40, out[1,2]=g[2,1]=60.
+    let want = vec![10.0, 30.0, 50.0, 20.0, 40.0, 60.0];
+    assert_eq!(da.to_vec().unwrap(), want);
+}
+
+// ---------------------------------------------------------------------------
+// 23. View-op needs_grad skips (inference path, single parameterized test)
+// ---------------------------------------------------------------------------
+//
+// When no input carries autograd metadata, every view op's forward wrapper
+// must return a tensor with NO autograd_meta — the recording path is
+// skipped entirely (zero inference overhead). This is the shape-only
+// counterpart to `record_v2_skips_when_no_input_requires_grad` for math
+// ops.
+
+#[test]
+fn view_ops_skip_recording_when_no_grad() {
+    let ctx = default_ctx();
+    let a = make_f32(vec![1.0, 2.0, 3.0, 4.0], &[4]); // No requires_grad.
+
+    let r1 = flame_core::autograd_v2::ops::reshape::reshape_v2(&a, &[2, 2], &ctx).unwrap();
+    assert!(r1.autograd_meta().is_none(), "reshape inference must skip");
+
+    let r2 = flame_core::autograd_v2::ops::reshape::view_v2(&a, &[2, 2], &ctx).unwrap();
+    assert!(r2.autograd_meta().is_none(), "view inference must skip");
+
+    let t = make_f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    let r3 = flame_core::autograd_v2::ops::transpose::transpose_v2(&t, &ctx).unwrap();
+    assert!(r3.autograd_meta().is_none(), "transpose inference must skip");
+
+    let r4 = flame_core::autograd_v2::ops::narrow::narrow_v2(&a, 0, 1, 2, &ctx).unwrap();
+    assert!(r4.autograd_meta().is_none(), "narrow inference must skip");
+
+    let sq = make_f32(vec![1.0, 2.0, 3.0], &[1, 3]);
+    let r5 = flame_core::autograd_v2::ops::squeeze::squeeze_v2(&sq, 0, &ctx).unwrap();
+    assert!(r5.autograd_meta().is_none(), "squeeze inference must skip");
+
+    let r6 = flame_core::autograd_v2::ops::unsqueeze::unsqueeze_v2(&a, 0, &ctx).unwrap();
+    assert!(r6.autograd_meta().is_none(), "unsqueeze inference must skip");
+
+    let r7 = flame_core::autograd_v2::ops::permute::permute_v2(&t, &[1, 0], &ctx).unwrap();
+    assert!(r7.autograd_meta().is_none(), "permute inference must skip");
+}
+
+// ---------------------------------------------------------------------------
+// 24. View-op round-trip backward sanity (reshape ∘ reshape)
+// ---------------------------------------------------------------------------
+//
+// a.reshape(s1).reshape(s2) — chain two reshape_v2 calls; backward through
+// both should produce d_a == g re-shaped to a.shape().
+
+#[test]
+fn reshape_v2_round_trip_backward() {
+    let a = make_leaf_requires_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[6]);
+    let ctx = default_ctx();
+    let mid = flame_core::autograd_v2::ops::reshape::reshape_v2(&a, &[2, 3], &ctx).unwrap();
+    let out = flame_core::autograd_v2::ops::reshape::reshape_v2(&mid, &[3, 2], &ctx).unwrap();
+
+    let g = make_f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
+    let root = GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(g)]);
+    Engine::new().execute(root, &ctx).expect("execute");
+
+    let a_meta = a.autograd_meta().unwrap().lock().unwrap();
+    let da = a_meta.grad.as_ref().unwrap();
+    assert_eq!(da.shape().dims(), &[6]);
+    // Two reshape passes are shape-only; values flow through unchanged.
+    assert_eq!(da.to_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+}
+
+// ---------------------------------------------------------------------------
+// HAZARD-2026-05-13-1 — characterization test (pins current buggy behavior).
+// ---------------------------------------------------------------------------
+//
+// WHY THIS TEST EXISTS:
+//
+// Under the `shared_storage` feature (default-on), `parent.narrow(...)`
+// returns a Tensor whose inner Arc<CudaSlice> aliases parent's storage
+// (refcount ≥ 2). When an in-place mutator (e.g. `add_inplace_same_dtype`)
+// goes through `try_as_mut_slice_*`, it calls `ensure_unique_slice`
+// (`src/tensor_storage.rs:147`), which calls `Arc::make_mut`. Because
+// the refcount > 1, `Arc::make_mut` **silently clones** the inner
+// CudaSlice. The view's local Arc now points at the clone; the kernel
+// writes into the clone. The PARENT IS UNTOUCHED. No error, no warning.
+//
+// The equivalent PyTorch pattern (`parent[1:3] += delta`) DOES mutate
+// the parent. Under flame-core's current primitives, the analogous
+// Rust spelling does NOT.
+//
+// Phase 3b does NOT fix this hazard — that's a separate flame-core
+// base-bug workstream (Options A/B/C in `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md`
+// §HAZARD-2026-05-13-1). Phase 3b writes the negative test only.
+//
+// WHAT TO DO IF THIS TEST FAILS:
+//
+// 1. The hazard's current behavior changed — most likely someone landed
+//    a fix to `ensure_unique_slice` or a related path.
+// 2. autograd_v2 view-op backwards assume the hazard exists and route
+//    around it (NarrowGradFn writes into a fresh zero buffer). If the
+//    hazard is now fixed at the storage layer, the routing-around may
+//    be unnecessary; but the routing-around is still CORRECT (it's
+//    just not strictly required anymore).
+// 3. Update §HAZARD-2026-05-13-1 in the design-review doc to record
+//    the fix; consider whether NarrowGradFn can take a simpler path.
+//
+// DO NOT delete this test silently — its job is to alert maintainers
+// that the storage-layer behavior changed.
+
+#[test]
+fn hazard_view_inplace_does_not_mutate_parent_under_shared_storage() {
+    // Build parent F32 [4] = [1, 2, 3, 4].
+    let parent = make_f32(vec![1.0_f32, 2.0, 3.0, 4.0], &[4]);
+    let parent_data_before = parent.to_vec().unwrap();
+
+    // narrow view = [2, 3] at offset 1, length 2.
+    let mut view = parent.narrow(0, 1, 2).expect("narrow");
+    let delta = make_f32(vec![10.0_f32, 20.0], &[2]);
+
+    // In-place add on the view.
+    flame_core::ops::elt::add_inplace_same_dtype(&mut view, &delta)
+        .expect("add_inplace_same_dtype");
+
+    let parent_data_after = parent.to_vec().unwrap();
+    let view_data_after = view.to_vec().unwrap();
+
+    // HAZARD: parent is unchanged (COW detached the view's storage).
+    // If this assertion fails, the hazard has been fixed at the storage
+    // layer — autograd_v2 view-op backward writebacks may now work
+    // through views; update Phase 3b assumptions and §HAZARD-2026-05-13-1.
+    assert_eq!(
+        parent_data_before, parent_data_after,
+        "HAZARD-2026-05-13-1: parent should be UNCHANGED under shared_storage \
+         COW. If this assertion fails, the storage-layer COW-on-aliased-mutation \
+         behavior has changed — review autograd_v2 view-op backward routing \
+         (NarrowGradFn currently writes into a fresh zero buffer to dodge \
+         this exact hazard). See docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md \
+         §HAZARD-2026-05-13-1."
+    );
+    // View IS mutated (writes went to the clone).
+    assert_eq!(view_data_after, vec![12.0, 23.0]);
+}

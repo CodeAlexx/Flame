@@ -938,3 +938,54 @@ fn output_node_is_descendant_of_another_output_no_double_fire() {
     let g = m.grad.as_ref().expect("leaf grad populated");
     assert_eq!(g.to_vec().unwrap(), vec![10.0, 16.0]);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3b carryover fix: AccumulateGrad::hooks() empty-sentinel fast path.
+// ---------------------------------------------------------------------------
+//
+// Phase 2 bug (carryover): `AccumulateGrad::hooks()` returned `&self.hooks`,
+// where `hooks: Hooks` was default-initialised to `Hooks::default()`. That
+// produced a per-struct empty-but-not-sentinel Hooks instance whose address
+// was unique per AccumulateGrad — the engine's pointer-equality fast path
+// (`std::ptr::eq(hooks_ref, Hooks::empty_ref())`) never matched, so every
+// backward step ran the (empty) for-loops in the hook-dispatch branch.
+//
+// Phase 3b fix: `hooks: OnceLock<Hooks>`. Default state (uninitialised)
+// causes `hooks()` to return `Hooks::empty_ref()`, restoring the fast path.
+// After `install_hooks(...)` the per-struct Hooks ref is returned and the
+// fast path no longer fires for that node.
+//
+// This test pins the contract with `std::ptr::eq` on both branches.
+
+#[test]
+fn accumulate_grad_uses_empty_sentinel_when_no_hooks() {
+    use flame_core::autograd_v2::AccumulateGrad;
+
+    // Fresh accumulator, no hooks installed.
+    let leaf_meta: AutogradMetaRef = new_meta_ref(AutogradMetaV2::leaf_requires_grad());
+    let acc = AccumulateGrad::new(&leaf_meta, next_seq());
+
+    let h_ref = acc.hooks();
+    let empty_ref = Hooks::empty_ref();
+    assert!(
+        std::ptr::eq(h_ref as *const Hooks, empty_ref as *const Hooks),
+        "fresh AccumulateGrad.hooks() must point at the empty sentinel \
+         (Phase 2 carryover fix). h_ref = {:p}, empty_ref = {:p}",
+        h_ref,
+        empty_ref,
+    );
+
+    // Install a hooks bundle; pointer must now diverge from sentinel.
+    let installed = Hooks::new();
+    acc.install_hooks(installed).expect("install_hooks should succeed once");
+    let h_ref_after = acc.hooks();
+    assert!(
+        !std::ptr::eq(h_ref_after as *const Hooks, empty_ref as *const Hooks),
+        "after install_hooks(), hooks() must return the per-accumulator \
+         Hooks (NOT the empty sentinel)"
+    );
+
+    // Second install_hooks call returns Err (single-shot).
+    let res = acc.install_hooks(Hooks::new());
+    assert!(res.is_err(), "second install_hooks must be Err (single-shot)");
+}

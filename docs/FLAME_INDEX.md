@@ -1047,6 +1047,71 @@ Plumbing changes (Phase 3a follow-ups to Phase 2 bug-fixer feedback):
   node's apply-time and read out at the end of execute for any
   `with_inputs` entry whose grad_fn isn't an `AccumulateGrad`.
 
+### Autograd v2 (Phase 3b — view-autograd surface + AccumulateGrad hooks() fix)
+
+Phase 3b ships 6 view ops (shape-only, no math) + a Phase 2 carryover
+fix for `AccumulateGrad::hooks()`. Each view op carries a `*GradFn`
+struct + a `*_v2` forward wrapper. View-op backwards are inverse shape
+ops applied to grad_output; HAZARD-2026-05-13-1 discipline applies
+(see §HAZARD-2026-05-13-1 in `AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md`).
+
+- `autograd_v2::ops::reshape::ReshapeGradFn` —
+  `src/autograd_v2/ops/reshape.rs:31` — backward: `grad_output.reshape(input_shape)`.
+  Saves input shape only.
+- `autograd_v2::ops::reshape::reshape_v2(a, new_shape, ctx)` —
+  `src/autograd_v2/ops/reshape.rs:97`.
+- `autograd_v2::ops::reshape::view_v2(a, new_shape, ctx)` —
+  `src/autograd_v2/ops/reshape.rs:109` — alias of `reshape_v2`
+  (flame-core's `Tensor::view` is `reshape` internally).
+- `autograd_v2::ops::transpose::TransposeGradFn` —
+  `src/autograd_v2/ops/transpose.rs:33` — backward: `grad_output.transpose().contiguous()`.
+  `.contiguous()` materialises the strided view (HAZARD-2026-05-13-1 +
+  project-wide gemm-stride-ignore — mirrors Phase 3a matmul fix `6ee385f`).
+- `autograd_v2::ops::transpose::transpose_v2(a, ctx)` —
+  `src/autograd_v2/ops/transpose.rs:101`.
+- `autograd_v2::ops::narrow::NarrowGradFn` —
+  `src/autograd_v2/ops/narrow.rs:38` — backward allocates a fresh zero
+  tensor + scatters via `narrow_backward_scatter_add_cuda` (sole-
+  owner writeback). HAZARD-2026-05-13-1 CRITICAL: never writes through
+  a `narrow()` view back into a parent.
+- `autograd_v2::ops::narrow::narrow_v2(a, dim, start, length, ctx)` —
+  `src/autograd_v2/ops/narrow.rs:143`.
+- `autograd_v2::ops::squeeze::SqueezeGradFn` —
+  `src/autograd_v2/ops/squeeze.rs:29` — backward: `grad_output.unsqueeze(dim)`.
+  Saves dim only.
+- `autograd_v2::ops::squeeze::squeeze_v2(a, dim, ctx)` —
+  `src/autograd_v2/ops/squeeze.rs:92`.
+- `autograd_v2::ops::unsqueeze::UnsqueezeGradFn` —
+  `src/autograd_v2/ops/unsqueeze.rs:24` — backward: `grad_output.squeeze(dim)`.
+  Saves dim only.
+- `autograd_v2::ops::unsqueeze::unsqueeze_v2(a, dim, ctx)` —
+  `src/autograd_v2/ops/unsqueeze.rs:89`.
+- `autograd_v2::ops::permute::PermuteGradFn` —
+  `src/autograd_v2/ops/permute.rs:29` — backward:
+  `grad_output.permute(inverse_perm).contiguous()`. Computes the
+  inverse permutation once at construction. HAZARD-2026-05-13-1 +
+  gemm-stride-ignore: `.contiguous()` materialises the strided view.
+- `autograd_v2::ops::permute::permute_v2(a, perm, ctx)` —
+  `src/autograd_v2/ops/permute.rs:105`.
+
+Phase 2 carryover fix:
+
+- `AccumulateGrad::hooks` field — `src/autograd_v2/accumulator.rs:39`
+  — type changed from `Hooks` to `OnceLock<Hooks>`. Default state is
+  uninitialised so `hooks()` returns `Hooks::empty_ref()` and the
+  engine's pointer-equality fast path
+  (`std::ptr::eq(hooks_ref, Hooks::empty_ref())`) fires. Previously
+  the per-struct `Hooks::default()` instance had a unique address per
+  accumulator, so the fast path never matched.
+- `AccumulateGrad::install_hooks(hooks)` —
+  `src/autograd_v2/accumulator.rs:102` — single-shot Hooks installer.
+  Returns `Err(Hooks)` on second call (the previously-installed Hooks
+  bundle stays; multi-hook merge deferred until Hooks fields carry
+  interior mutability).
+- `AccumulateGrad::hooks()` impl — `src/autograd_v2/accumulator.rs`
+  (the `GradFn::hooks` impl in the `impl GradFn for AccumulateGrad`
+  block) — `self.hooks.get().unwrap_or_else(|| Hooks::empty_ref())`.
+
 ### Legacy / dead
 - ⚠️ `autograd.rs` (top-level) — types still re-exported
 - ⚠️ `autograd_simple.rs` — early stub

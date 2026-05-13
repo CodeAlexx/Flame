@@ -21,8 +21,18 @@
 //! - [`matmul`] — 2D/N-D matrix multiply. Saves both inputs.
 //! - [`silu`] — `x * sigmoid(x)` activation. Saves input.
 //!
-//! Phase 3b adds the view ops (reshape, transpose, narrow, squeeze,
-//! unsqueeze, permute, view) once HAZARD-2026-05-13-1 is closed.
+//! Phase 3b view ops (shape-only; no tensor data saved):
+//! - [`reshape`] — reshape / view alias. Backward reshape-back.
+//! - [`transpose`] — 2D transpose. Backward transposes + `.contiguous()`
+//!   (HAZARD-2026-05-13-1 + gemm-stride-ignore).
+//! - [`narrow`] — slice along a dim. Backward writes into a FRESH zero
+//!   tensor via `narrow_backward_scatter_add_cuda`; NEVER mutates
+//!   through a `narrow()` view back into a parent (HAZARD-2026-05-13-1).
+//! - [`squeeze`] — remove a unit dim. Backward unsqueezes.
+//! - [`unsqueeze`] — insert a unit dim. Backward squeezes.
+//! - [`permute`] — N-D axis reorder. Backward applies the inverse
+//!   permutation + `.contiguous()` (HAZARD-2026-05-13-1 + gemm-stride-
+//!   ignore).
 //!
 //! Phase 3c adds layer_norm, CheckpointGradFn::apply, and per-op
 //! forward-mode AD formulas.
@@ -30,5 +40,11 @@
 pub mod add;
 pub mod matmul;
 pub mod mul;
+pub mod narrow;
+pub mod permute;
+pub mod reshape;
 pub mod silu;
+pub mod squeeze;
 pub mod sum;
+pub mod transpose;
+pub mod unsqueeze;

@@ -36,7 +36,24 @@ pub struct AccumulateGrad {
     node_id: NodeId,
     sequence_nr: u64,
     topological_nr: u64,
-    hooks: Hooks,
+    /// Hooks slot. `None` (uninitialised `OnceLock`) is the canonical
+    /// "no hooks registered" state, and lets `hooks()` return
+    /// `Hooks::empty_ref()` so the engine's pointer-equality fast path
+    /// (`std::ptr::eq(hooks_ref, Hooks::empty_ref())`) fires. Phase 2
+    /// carryover bug: the old `hooks: Hooks` field default-initialised
+    /// to `Hooks::default()`, a unique per-struct empty-but-not-sentinel
+    /// instance — the pointer-equality fast path never matched, so
+    /// every backward step ran the empty for-loops in the hook-dispatch
+    /// branch.
+    ///
+    /// `OnceLock<Hooks>` lets `hooks()` return a `&'self Hooks` that
+    /// lives as long as `&self` — once the OnceLock is initialised
+    /// the storage is stable in memory. Phase 3b ships single-shot
+    /// registration (the AccumulateGrad-on-leaf use case wants at most
+    /// one Hooks bundle per leaf); multi-hook merge can come later
+    /// (Hooks' fields are already Vec<...> so registration could push;
+    /// that requires interior mutability on Hooks itself, deferred).
+    hooks: std::sync::OnceLock<Hooks>,
 }
 
 impl AccumulateGrad {
@@ -52,7 +69,9 @@ impl AccumulateGrad {
             // numbering (engine sets non-leaf nodes' topo to
             // `1 + max(input_topo_nr)`). We mirror that.
             topological_nr: 0,
-            hooks: Hooks::default(),
+            // Default: no hooks. `hooks()` returns the empty sentinel
+            // so the engine's fast path fires.
+            hooks: std::sync::OnceLock::new(),
         }
     }
 
@@ -67,6 +86,21 @@ impl AccumulateGrad {
     /// collection path and by `gradient_edge()`.
     pub fn upgrade_variable(&self) -> Option<AutogradMetaRef> {
         self.variable.upgrade()
+    }
+
+    /// Install a Hooks bundle on this accumulator (single-shot).
+    /// After this call, [`GradFn::hooks`] returns the per-accumulator
+    /// (non-sentinel) Hooks reference; the engine's pointer-equality
+    /// fast path will no longer fire for this node and the for-loops
+    /// in the hook-dispatch branch run.
+    ///
+    /// Returns `Err(())` if a Hooks bundle was already installed —
+    /// Phase 3b ships single-shot registration. Multi-hook merge is
+    /// deferred (would require interior mutability on `Hooks` fields).
+    /// Most uses of AccumulateGrad hooks (parameter grad observation,
+    /// block-swap orchestration) fit the single-shot pattern.
+    pub fn install_hooks(&self, hooks: Hooks) -> std::result::Result<(), Hooks> {
+        self.hooks.set(hooks)
     }
 }
 
@@ -202,7 +236,15 @@ impl GradFn for AccumulateGrad {
     }
 
     fn hooks(&self) -> &Hooks {
-        &self.hooks
+        // Phase 3b: return the empty-sentinel reference when no hooks
+        // have been installed so the engine's pointer-equality fast
+        // path (`std::ptr::eq(hooks_ref, Hooks::empty_ref())`) fires.
+        // Phase 2 bug carryover: the old `hooks: Hooks` field default-
+        // initialised to a per-struct `Hooks::default()` whose address
+        // was unique per AccumulateGrad — the fast path never fired,
+        // so the empty for-loops in the hook-dispatch branch ran on
+        // every backward step.
+        self.hooks.get().unwrap_or_else(|| Hooks::empty_ref())
     }
 
     fn release_variables(&self) {

@@ -726,14 +726,50 @@ Phase 3a additions:
   apply-time, read at the end for any `with_inputs` entry whose
   grad_fn isn't an `AccumulateGrad`.
 
+Phase 3b additions (view-autograd surface + AccumulateGrad hooks fix):
+- **`ops/reshape.rs`** — `ReshapeGradFn` + `reshape_v2` + `view_v2`.
+  Backward reshapes the upstream grad back to the saved input shape;
+  no tensor data saved (shape-only). `view_v2` aliases `reshape_v2`
+  because flame-core's `Tensor::view` is `reshape` internally.
+- **`ops/transpose.rs`** — `TransposeGradFn` + `transpose_v2`. 2D-only
+  (matches `Tensor::transpose`'s shape, see `tensor.rs:2958`).
+  Backward: `grad_output.transpose().contiguous()`. The `.contiguous()`
+  materialises the strided view to dodge HAZARD-2026-05-13-1 + the
+  project-wide gemm-stride-ignore concern (Phase 3a matmul fix
+  commit `6ee385f`).
+- **`ops/narrow.rs`** — `NarrowGradFn` + `narrow_v2`. Backward
+  allocates a FRESH zero buffer of input shape and scatter-adds the
+  grad_output's slab via `narrow_backward_scatter_add_cuda`. CRITICAL:
+  never writes through a `narrow()` view back into a parent — that's
+  HAZARD-2026-05-13-1.
+- **`ops/squeeze.rs`** — `SqueezeGradFn` + `squeeze_v2`. Saves the
+  squeezed dim index; backward unsqueezes at that dim.
+- **`ops/unsqueeze.rs`** — `UnsqueezeGradFn` + `unsqueeze_v2`. Mirror
+  of squeeze: saves dim, backward squeezes.
+- **`ops/permute.rs`** — `PermuteGradFn` + `permute_v2`. Computes
+  inverse permutation once at construction. Backward:
+  `grad_output.permute(inverse_perm).contiguous()`. Same `.contiguous()`
+  discipline as `TransposeGradFn`.
+- **`AccumulateGrad::hooks` field** — changed from `Hooks` (default-
+  init) to `OnceLock<Hooks>`. Default state is uninitialised so
+  `hooks()` returns `Hooks::empty_ref()`, restoring the engine's
+  pointer-equality fast path. Phase 2 carryover bug.
+- **`AccumulateGrad::install_hooks(hooks)`** — single-shot Hooks
+  installer (Phase 4 may add multi-hook merge once Hooks fields carry
+  interior mutability).
+
 Files: `accumulator.rs`, `checkpoint.rs`, `dispatch.rs`, `engine.rs`,
 `error.rs`, `hooks.rs`, `input_buffer.rs`, `meta.rs`, `mod.rs`,
 `node.rs`, `recording.rs`, `saved_tensor.rs`, `ops/mod.rs`,
 `ops/add.rs`, `ops/mul.rs`, `ops/sum.rs`, `ops/matmul.rs`,
-`ops/silu.rs`. Tests: `tests/autograd_v2_types.rs` (13 tests,
-Phase 1) + `tests/autograd_v2_engine.rs` (11 tests, Phase 2 — note
-`record_v2` refactor + the bug-fixer regression) +
-`tests/autograd_v2_ops.rs` (18 tests, Phase 3a). All green.
+`ops/silu.rs`, `ops/reshape.rs`, `ops/transpose.rs`, `ops/narrow.rs`,
+`ops/squeeze.rs`, `ops/unsqueeze.rs`, `ops/permute.rs`. Tests:
+`tests/autograd_v2_types.rs` (13 tests, Phase 1) +
+`tests/autograd_v2_engine.rs` (12 tests, Phase 2 + Phase 3b
+`accumulate_grad_uses_empty_sentinel_when_no_hooks`) +
+`tests/autograd_v2_ops.rs` (28 tests = Phase 3a 18 + Phase 3b 10:
+6 view-op backwards + needs_grad-skip + reshape round-trip +
+HAZARD characterization). All green.
 
 ### ⚠️ `autograd_simple.rs / autograd_engine.rs / autograd_ops.rs / autograd_ops_complete.rs / autograd_debug.rs`
 Older autograd attempts. Dead code; kept for reference.

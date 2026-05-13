@@ -495,6 +495,48 @@ cargo's incremental build sometimes misses `.cu` mtime changes.
 
 ## Common gotchas
 
+### View-autograd backwards under `shared_storage` (HAZARD-2026-05-13-1)
+
+**TL;DR**: For view ops (`narrow`, `transpose`, `permute`, `view`,
+`reshape`, `squeeze`, `unsqueeze`), the backward must NEVER write
+through a view back into a parent tensor. Allocate a fresh zero
+tensor and scatter-add via the dedicated `*_backward_scatter_add_*`
+kernel (e.g. `narrow_backward_scatter_add_cuda` in
+`tensor_narrow.rs:169`).
+
+**Why**: Under the `shared_storage` feature (default-on),
+`parent.narrow(...)` returns a Tensor whose inner `Arc<CudaSlice>`
+aliases the parent's storage (refcount ≥ 2). Any in-place mutation
+through `try_as_mut_slice_*` calls `ensure_unique_slice` →
+`Arc::make_mut`, which SILENTLY clones the slice when the refcount
+> 1. The view's local Arc points at the clone; the kernel writes
+into the clone; the parent is untouched. No error, no warning, silent
+wrong data. This is HAZARD-2026-05-13-1, characterised by the negative
+test `tests/autograd_v2_ops.rs::hazard_view_inplace_does_not_mutate_parent_under_shared_storage`.
+
+**autograd_v2 implementations** (`src/autograd_v2/ops/`):
+- `NarrowGradFn::apply` allocates a fresh `Tensor::zeros_dtype(...)` and calls
+  `Tensor::narrow_backward_scatter_add_cuda(&g, &mut grad_in, dim, start, length)`.
+  That kernel writes through the `&mut grad_in` handle — there's no
+  view/aliasing involved.
+- `ReshapeGradFn` / `SqueezeGradFn` / `UnsqueezeGradFn` reshape grad
+  via `Tensor::reshape` / `unsqueeze` / `squeeze` — those are also
+  metadata-only views (no in-place writes happen inside them) and the
+  resulting tensor is consumed downstream, not written into.
+
+### View-op backwards that return strided views must call `.contiguous()`
+
+Project-wide, `gemm`/`bmm` kernels read storage as if it were row-
+major contiguous and IGNORE per-tensor strides. View backwards that
+return strided views (`TransposeGradFn::apply`, `PermuteGradFn::apply`)
+must call `.contiguous()` on the strided result before returning, so
+downstream gemm/bmm consumers see correctly-laid-out memory. Phase 3a
+matmul fix (commit `6ee385f`) added this same `.contiguous()` to
+`MatMulGradFn`'s transpose paths; Phase 3b applies the discipline
+to `TransposeGradFn` and `PermuteGradFn`. Annotate each `.contiguous()`
+call with a `// HAZARD-2026-05-13-1 + gemm-stride-ignore` comment so
+future maintainers know why it's there.
+
 ### `DType::I32` tensors hold f32 bytes, not real i32 bytes
 
 The `TensorStorage::I32 { data: StorageSlice<f32>, .. }` variant uses an
