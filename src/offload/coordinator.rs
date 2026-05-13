@@ -72,16 +72,52 @@ impl HostRamBudget {
     }
 }
 
-/// Placeholder for the Phase 5 strategy. Three resident-set cases per
-/// OneTrainer (fwd→bwd, fwd→fwd, bwd→fwd) will be implemented here. The
-/// `fraction` knob (0..1) selects how much of the model stays GPU-resident
-/// vs offloads to pinned RAM. Today we record the knob and pass through.
-#[derive(Clone, Copy, Debug)]
+/// Which transition the trainer is in. Drives the resident-set precompute
+/// per OneTrainer's 3-case model:
+///
+/// - **ForwardBackward**: forward pass that will be followed by a
+///   backward — don't offload the LAST layers because they're needed
+///   first in backward (LIFO consumption).
+/// - **ForwardForward**: forward pass followed by another forward (next
+///   step or microbatch) — cyclic; start loading first layers while
+///   executing last ones.
+/// - **BackwardForward**: backward pass — mirror of ForwardBackward,
+///   walking in reverse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransitionCase {
+    ForwardBackward,
+    ForwardForward,
+    BackwardForward,
+}
+
+/// Phase 5 strategy — fraction knob + 3-case resident-set precompute.
+///
+/// The trainer registers per-layer GPU-resident byte sizes once via
+/// [`BlockOffloadStrategy::with_layer_bytes`]. The strategy precomputes
+/// resident-layer indices for each (block_idx, transition_case) cell so
+/// the per-block hot path is a single Vec lookup.
+///
+/// Ported from
+/// `OneTrainer/modules/util/LayerOffloadConductor.py::LayerOffloadStrategy`.
+#[derive(Clone, Debug)]
 pub struct BlockOffloadStrategy {
-    /// Fraction of layers that may stay GPU-resident at peak. `1.0` =
-    /// keep everything resident (offload disabled in practice). `0.0` =
-    /// offload everything (worst-case streaming).
+    /// Fraction of layers (by bytes) to keep offloaded at peak.
+    /// `0.0` = everything resident (offload off in practice).
+    /// `1.0` = offload everything (extreme streaming).
+    /// OneTrainer convention: `target_loaded_bytes = total * (1 - fraction)`.
     pub layer_offload_fraction: f32,
+    /// Per-block GPU-resident byte sizes. Empty until
+    /// [`with_layer_bytes`] is called.
+    layer_bytes: Vec<usize>,
+    /// `forward_backward[i]` = layer indices resident before executing
+    /// layer `i` when the next thing after the forward pass is a
+    /// backward pass. Precomputed at `with_layer_bytes` time.
+    forward_backward: Vec<Vec<usize>>,
+    /// `forward_forward[i]` = same but for the cyclic case (forward
+    /// followed by another forward).
+    forward_forward: Vec<Vec<usize>>,
+    /// `backward_forward[i]` = same but for the backward direction.
+    backward_forward: Vec<Vec<usize>>,
 }
 
 impl BlockOffloadStrategy {
@@ -91,13 +127,142 @@ impl BlockOffloadStrategy {
                 "layer_offload_fraction must be in [0.0, 1.0], got {layer_offload_fraction}"
             )));
         }
-        Ok(Self { layer_offload_fraction })
+        Ok(Self {
+            layer_offload_fraction,
+            layer_bytes: Vec::new(),
+            forward_backward: Vec::new(),
+            forward_forward: Vec::new(),
+            backward_forward: Vec::new(),
+        })
     }
 
     /// Default: keep everything resident. Matches today's no-offload
-    /// behavior and is the safe choice before Phase 5 lands real logic.
+    /// behavior and is the safe choice before the trainer registers
+    /// real layer-byte data.
     pub fn all_resident() -> Self {
-        Self { layer_offload_fraction: 1.0 }
+        Self {
+            layer_offload_fraction: 0.0,
+            layer_bytes: Vec::new(),
+            forward_backward: Vec::new(),
+            forward_forward: Vec::new(),
+            backward_forward: Vec::new(),
+        }
+    }
+
+    /// Register per-block byte sizes. Precomputes the resident-set
+    /// tables for all 3 transition cases. Idempotent — recalling with
+    /// the same data is fine, just wastes a few ms.
+    pub fn with_layer_bytes(mut self, layer_bytes: Vec<usize>) -> Self {
+        let total_bytes: usize = layer_bytes.iter().sum();
+        let target_loaded_bytes =
+            (total_bytes as f32 * (1.0 - self.layer_offload_fraction)) as usize;
+        let n = layer_bytes.len();
+
+        self.forward_backward = (0..n)
+            .map(|i| Self::layers_below(&layer_bytes, i, target_loaded_bytes, true, false))
+            .collect();
+        self.forward_forward = (0..n)
+            .map(|i| Self::layers_below(&layer_bytes, i, target_loaded_bytes, true, true))
+            .collect();
+        self.backward_forward = (0..n)
+            .map(|i| Self::layers_below(&layer_bytes, i, target_loaded_bytes, false, false))
+            .collect();
+
+        self.layer_bytes = layer_bytes;
+        self
+    }
+
+    /// Total bytes registered via `with_layer_bytes` (`0` if not registered).
+    pub fn total_bytes(&self) -> usize {
+        self.layer_bytes.iter().sum()
+    }
+
+    /// Target GPU-resident bytes (`total * (1 - fraction)`).
+    pub fn target_loaded_bytes(&self) -> usize {
+        let total = self.total_bytes() as f32;
+        (total * (1.0 - self.layer_offload_fraction)) as usize
+    }
+
+    /// Resident-layer indices before executing `block_idx` in the
+    /// given transition case. Returns empty vec if `with_layer_bytes`
+    /// hasn't been called yet (interpret as "everything resident").
+    pub fn resident_layers(&self, block_idx: usize, case: TransitionCase) -> &[usize] {
+        let table = match case {
+            TransitionCase::ForwardBackward => &self.forward_backward,
+            TransitionCase::ForwardForward => &self.forward_forward,
+            TransitionCase::BackwardForward => &self.backward_forward,
+        };
+        table.get(block_idx).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Max GPU-resident bytes observed across all (block, case) cells —
+    /// the strategy's peak memory budget guarantee. `0` if not registered.
+    pub fn max_loaded_bytes(&self) -> usize {
+        if self.layer_bytes.is_empty() {
+            return 0;
+        }
+        let mut max = 0usize;
+        for table in [&self.forward_backward, &self.forward_forward, &self.backward_forward] {
+            for resident in table {
+                let sum: usize = resident.iter().map(|&i| self.layer_bytes[i]).sum();
+                if sum > max {
+                    max = sum;
+                }
+            }
+        }
+        max
+    }
+
+    /// OneTrainer's `__get_layers_below`. Returns the list of layer
+    /// indices that, summed by bytes, just exceed `max_bytes` (with a
+    /// minimum of 2 layers always loaded). `is_forward` controls walk
+    /// direction; `is_cyclic` controls whether the walk wraps at the
+    /// model's end.
+    fn layers_below(
+        layer_bytes: &[usize],
+        start_layer: usize,
+        max_bytes: usize,
+        is_forward: bool,
+        is_cyclic: bool,
+    ) -> Vec<usize> {
+        let n = layer_bytes.len();
+        let mut accumulator = 0usize;
+        let mut layers = Vec::new();
+
+        let mut push = |i: usize, acc: &mut usize, lyrs: &mut Vec<usize>| -> bool {
+            *acc += layer_bytes[i];
+            if *acc > max_bytes && lyrs.len() >= 2 {
+                return true; // stop
+            }
+            lyrs.push(i);
+            false
+        };
+
+        if is_forward && is_cyclic {
+            for i in start_layer..n {
+                if push(i, &mut accumulator, &mut layers) { return layers; }
+            }
+            for i in 0..start_layer {
+                if push(i, &mut accumulator, &mut layers) { return layers; }
+            }
+        } else if is_forward && !is_cyclic {
+            for i in start_layer..n {
+                if push(i, &mut accumulator, &mut layers) { return layers; }
+            }
+            for i in (0..start_layer).rev() {
+                if push(i, &mut accumulator, &mut layers) { return layers; }
+            }
+        } else {
+            // backward
+            for i in (0..=start_layer).rev() {
+                if push(i, &mut accumulator, &mut layers) { return layers; }
+            }
+            for i in (start_layer + 1)..n {
+                if push(i, &mut accumulator, &mut layers) { return layers; }
+            }
+        }
+
+        layers
     }
 }
 
@@ -209,8 +374,8 @@ impl OffloadCoordinator {
 
     /// Current strategy. Phase 5 lets trainers update this mid-run for
     /// fraction sweeps; for now it's read-only after construction.
-    pub fn strategy(&self) -> BlockOffloadStrategy {
-        self.strategy
+    pub fn strategy(&self) -> &BlockOffloadStrategy {
+        &self.strategy
     }
 
     /// Current host RAM budget. Phase 8 will enforce; today informational.
@@ -263,8 +428,79 @@ mod tests {
     }
 
     #[test]
-    fn strategy_all_resident_is_1_0() {
-        assert_eq!(BlockOffloadStrategy::all_resident().layer_offload_fraction, 1.0);
+    fn strategy_all_resident_offloads_nothing() {
+        // `all_resident` = fraction 0 = target_loaded = total.
+        let s = BlockOffloadStrategy::all_resident()
+            .with_layer_bytes(vec![100, 100, 100, 100]);
+        assert_eq!(s.target_loaded_bytes(), 400);
+        // Every block-case cell contains all 4 layers.
+        for i in 0..4 {
+            for case in [
+                TransitionCase::ForwardBackward,
+                TransitionCase::ForwardForward,
+                TransitionCase::BackwardForward,
+            ] {
+                let r = s.resident_layers(i, case);
+                assert_eq!(r.len(), 4, "block {} case {:?}", i, case);
+            }
+        }
+    }
+
+    #[test]
+    fn strategy_full_offload_keeps_min_two_layers() {
+        // fraction 1.0 → target_loaded = 0; algorithm guarantees >= 2 resident.
+        let s = BlockOffloadStrategy::new(1.0)
+            .unwrap()
+            .with_layer_bytes(vec![100, 100, 100, 100]);
+        for i in 0..4 {
+            for case in [
+                TransitionCase::ForwardBackward,
+                TransitionCase::ForwardForward,
+                TransitionCase::BackwardForward,
+            ] {
+                let r = s.resident_layers(i, case);
+                assert!(r.len() >= 2, "block {} case {:?}", i, case);
+            }
+        }
+    }
+
+    #[test]
+    fn strategy_resident_starts_at_block_index() {
+        // For forward at block 0, resident should start at 0.
+        let s = BlockOffloadStrategy::new(0.5)
+            .unwrap()
+            .with_layer_bytes(vec![100; 10]);
+        let r = s.resident_layers(0, TransitionCase::ForwardBackward);
+        assert_eq!(r[0], 0);
+        // For backward at block 9, resident should start at 9.
+        let r = s.resident_layers(9, TransitionCase::BackwardForward);
+        assert_eq!(r[0], 9);
+    }
+
+    #[test]
+    fn strategy_max_loaded_bytes_bounds_under_target_plus_one_layer() {
+        // The algorithm exceeds max_bytes by AT MOST one layer's worth
+        // (the one that pushed over the limit; min-2-resident exception
+        // applies otherwise). Verify the bound.
+        let s = BlockOffloadStrategy::new(0.5)
+            .unwrap()
+            .with_layer_bytes(vec![100; 10]);
+        let target = s.target_loaded_bytes(); // 500
+        let max_layer = *s.layer_bytes.iter().max().unwrap(); // 100
+        // max_loaded_bytes >= target (we always include the boundary layer)
+        // and <= target + max_layer (algorithm doesn't double-overshoot).
+        // Account for the min-2 floor which can sit above target when
+        // target is small. Here target=500, fits 5 layers, plenty of room.
+        assert!(s.max_loaded_bytes() >= target);
+        assert!(s.max_loaded_bytes() <= target + max_layer);
+    }
+
+    #[test]
+    fn strategy_resident_layers_without_register_returns_empty() {
+        // Until with_layer_bytes is called, every cell is empty.
+        let s = BlockOffloadStrategy::new(0.5).unwrap();
+        assert_eq!(s.resident_layers(0, TransitionCase::ForwardBackward).len(), 0);
+        assert_eq!(s.resident_layers(99, TransitionCase::BackwardForward).len(), 0);
     }
 
     #[test]

@@ -47,6 +47,7 @@ pub mod transfer_benchmark;
 
 pub use coordinator::{
     AutogradDirection, BlockGuard, BlockOffloadStrategy, HostRamBudget, OffloadCoordinator,
+    TransitionCase,
 };
 pub use ring_slab::{DeviceSlab, RingSlabAllocator};
 pub use manager::{ForcedStrategy, ManagerConfig, OffloadManager, OffloadPhase};
