@@ -474,6 +474,35 @@ Do not retire v1 until:
 - Existing trainers that expect `GradientMap` return values rather than `.grad` fields.
 - CUDA graph capture/replay currently integrated into old backward.
 
+### HAZARD-2026-05-13-1: view + in-place silently detaches under `shared_storage`
+
+**Found**: Phase 1 bug-fixer audit, 2026-05-13. Verified empirically by reading the call chain.
+
+**Mechanism** (default feature `shared_storage` is on):
+
+1. `view = parent.narrow(dim, start, length)?` returns a Tensor that aliases the parent's storage. The inner `Arc<CudaSlice>` refcount becomes ≥2.
+2. `view.add_inplace_same_dtype(&delta)?` (or any in-place mutator that goes through `try_as_mut_slice_*`) calls `ensure_unique_slice` (`src/tensor_storage.rs:147`), which calls `Arc::make_mut(slice)`.
+3. With refcount > 1, `Arc::make_mut` **silently clones** the inner `CudaSlice`. The view's local Arc now points at the new clone.
+4. The kernel writes into the clone. **Parent is untouched. View's storage is detached.** No error, no warning, silent wrong data.
+
+**Equivalent PyTorch behavior**: `parent[1:3] += delta` mutates `parent`. Under flame-core's current primitives, the analogous Rust spelling does NOT.
+
+**In-tree exposure (2026-05-13)**: `rg -n "narrow\([^)]*\)\.add_inplace\|narrow\([^)]*\)\.copy_"` across EriDiffusion returns zero hits. No live code currently relies on this pattern. `narrow_owning` (`src/tensor.rs:3893`) exists as an unrelated escape hatch (it materializes the view to release the parent — opposite intent).
+
+**Why this matters for autograd v2**: Phase 3's view-autograd surface will record `narrow` / `view` / `permute` as `GradFn` impls. If any backward path or `InputBuffer` accumulation writes through a view expecting the parent to see it, the gradient is silently wrong.
+
+**Phase 0 audit miss**: `tests/inplace_version_bump_audit.rs` (17 tests) exercises the sole-owner mutation path only. Add a view-aliased mutation test to that suite, expected to either: (a) bump the parent's version handle through the COW boundary, or (b) return an explicit `Err` instead of silently COWing.
+
+**Where the fix belongs** (tenet 1 — fix the primitive):
+
+- **Option A (preferred)**: change `ensure_unique_slice` to refuse to clone under shared aliasing, returning `Err(SharedStorageWriteWithAliases)`. Callers that need owning semantics use `narrow_owning` (already exists). Callers that need write-through to parent use a yet-to-be-built `narrow_mut` that takes `&mut parent` and threads the lifetime.
+- **Option B**: have `Arc::make_mut`'s clone path also bump the *parent* Arc's version-counter side-table entry (using `Arc::as_ptr` before the make_mut call). Detects the bug at the SavedTensor unpack site without changing public semantics.
+- **Option C**: deprecate `narrow` for the writeback use case entirely; add only `narrow_owning` (detached copy) and `narrow_mut` (proper mutable borrow). PyTorch-flavor `parent[a:b] += x` would lower to the latter.
+
+Pick before Phase 3 view-autograd lands.
+
+**Scope confirmation**: this is a flame-core base bug, present long before autograd v2 work. Not Phase 1's regression; not Phase 1's responsibility to fix. But it WILL bite Phase 3 / Phase 4 unless addressed.
+
 ## Decision
 
 Recommendation: revise and narrow the v2 design before coding.

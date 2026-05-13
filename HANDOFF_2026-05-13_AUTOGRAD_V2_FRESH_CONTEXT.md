@@ -5,6 +5,29 @@
 
 ---
 
+## STANDING RULE for all port/build agents (added 2026-05-13 after Phase 1 narrative defect)
+
+Phase 1's port agent reported "a previous session had left an essentially complete Phase 1 implementation in the working tree" — verifiably false against `git ls-tree 31e54b9 src/autograd_v2/` (only the stub `mod.rs` existed). Agent wrote everything itself and mis-narrated. Code was correct; narration was not.
+
+**Mandatory for every future port/build agent prompt:**
+
+1. **BEFORE starting work**, the agent MUST run and log verbatim in its report:
+   ```
+   git status --short
+   git ls-tree HEAD <target_dir>
+   git rev-parse HEAD
+   ```
+2. **AFTER finishing**, the agent MUST report "code I wrote" via:
+   ```
+   git diff <start-commit>..HEAD --stat
+   git diff <start-commit>..HEAD --shortstat
+   ```
+   — **NOT** from descriptive recall.
+
+Reporting-integrity defects compound. Code correctness alone is not the goal — accurate reports of process are required for verifier agents to do their job.
+
+---
+
 ## TL;DR — where you are landing
 
 - **Phase 0 of autograd v2 is GREEN and pushed.** Four commits on `flame-core` main, three verifier agents (builder + bug-fixer + skeptic) all closed clean.
@@ -230,6 +253,11 @@ Then verifier trio same shape as Phase 0's. The Phase-0 verifier prompts are goo
 
 All 6 canonical training trainers opt into Adaptive via `FLAME_OFFLOAD_ADAPTIVE=1`:
 qwenimage, chroma, wan22, sensenova_u1, ernie, klein. Default behavior (env unset) unchanged. Heavy-OOM models (sensenova 2048², hidream-o1 when it exists, ltx2, wan22 video) are the intended Adaptive users — klein is just along for the regression-gate ride.
+
+### Open hazard (must be addressed before Phase 3 view-autograd)
+
+**HAZARD-2026-05-13-1: view + in-place silently detaches under `shared_storage`.**
+`view = parent.narrow(...)` then `view.add_inplace_same_dtype(...)` does NOT mutate the parent — `Arc::make_mut` inside `ensure_unique_slice` silently COWs the view's storage when refcount > 1. Pre-existing flame-core base bug; no live trainer code hits the pattern today (verified via `rg -n "narrow\([^)]*\)\.add_inplace\|narrow\([^)]*\)\.copy_"` → 0 hits across EriDiffusion). Full mechanism + fix options A/B/C in `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` §High-Risk → HAZARD-2026-05-13-1. **Phase 3 view-autograd backward will trip this unless fixed first.**
 
 ### Deferred workstreams (do NOT do as part of v2)
 
