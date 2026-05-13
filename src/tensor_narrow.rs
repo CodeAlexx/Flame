@@ -158,7 +158,14 @@ impl Tensor {
         ))
     }
 
-    /// Scatter-add backward for narrow: accumulates grad_out into grad_in slice
+    /// Scatter-add backward for narrow: writes grad_out into grad_in's slice
+    /// at [start..start+length) along `dim`. Despite the name, the underlying
+    /// kernel is byte-copy (scatter-assign): every caller passes a freshly-
+    /// zeroed grad_in, and the autograd engine sums cross-op contributions.
+    /// The kernel is dtype-agnostic — it copies `elem_size` bytes per
+    /// element, so F32 and BF16 work identically. (Pre-Class-B this routine
+    /// had a BF16→F32→BF16 cast detour that fired 3 extra kernel launches
+    /// per call. Removed; BF16 now passes straight through.)
     pub fn narrow_backward_scatter_add_cuda(
         grad_out: &Tensor,
         grad_in: &mut Tensor,
@@ -166,22 +173,6 @@ impl Tensor {
         start: usize,
         length: usize,
     ) -> Result<()> {
-        if grad_in.dtype() == crate::DType::BF16 {
-            let grad_out_f32 = grad_out.to_dtype(crate::DType::F32)?;
-            let mut grad_in_f32 = grad_in.to_dtype(crate::DType::F32)?;
-            Tensor::narrow_backward_scatter_add_cuda(
-                &grad_out_f32,
-                &mut grad_in_f32,
-                dim,
-                start,
-                length,
-            )?;
-            let mut converted = grad_in_f32.to_dtype(crate::DType::BF16)?;
-            converted.requires_grad = grad_in.requires_grad;
-            *grad_in = converted;
-            return Ok(());
-        }
-
         // Validate shapes
         let in_shape = grad_in.shape();
         let out_shape = grad_out.shape();
@@ -240,6 +231,11 @@ impl Tensor {
 
         use cudarc::driver::{DevicePtr, DevicePtrMut};
 
+        // The underlying kernel does byte-copy with `elem_size` parameter.
+        // F32 and BF16 both work directly — no cast needed. Pre-Class-B,
+        // BF16 callers went through a F32 round-trip detour (3 extra kernel
+        // launches per call). That's now gone; the dtype check below just
+        // pulls the right storage slice.
         let (go_ptr, gi_ptr): (*const c_void, *mut c_void) = match grad_in.dtype() {
             crate::DType::F32 => {
                 let go_slice = grad_out.storage_ref().try_as_slice_f32().map_err(|_| {
@@ -247,6 +243,18 @@ impl Tensor {
                 })?;
                 let gi_slice = grad_in.storage_mut().try_as_mut_slice_f32().map_err(|_| {
                     Error::InvalidOperation("narrow backward: expected F32 storage".into())
+                })?;
+                (
+                    *go_slice.device_ptr() as *const c_void,
+                    *gi_slice.device_ptr_mut() as *mut c_void,
+                )
+            }
+            crate::DType::BF16 => {
+                let go_slice = grad_out.storage_ref().try_as_slice_u16().map_err(|_| {
+                    Error::InvalidOperation("narrow backward: expected BF16 storage".into())
+                })?;
+                let gi_slice = grad_in.storage_mut().try_as_mut_slice_u16().map_err(|_| {
+                    Error::InvalidOperation("narrow backward: expected BF16 storage".into())
                 })?;
                 (
                     *go_slice.device_ptr() as *const c_void,
