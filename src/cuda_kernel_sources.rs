@@ -847,16 +847,36 @@ extern "C" __global__ void sum_dim_keepdim_kernel(
 pub const SUM_DIM_KEEPDIM_KERNEL_BF16: &str = r#"
 #include <cuda_bf16.h>
 
+// Class C: cooperative reduction along the reduce axis.
+//
+// Pre-Class-C this kernel used one thread per output and a scalar serial
+// inner loop over `dims[reduce_dim]`. For typical transformer shapes
+// (reduce_dim sized 1k-8k) a single thread did 1k-8k sequential f32 adds
+// while the rest of the SM sat idle. The nsys profile flagged this as
+// ~134× slower per call than PyTorch's `aten/src/ATen/native/cuda/Reduce.cuh`.
+//
+// New geometry: one BLOCK per output, threads within the block cooperatively
+// reduce the axis. Two-level combine (warp shuffle within a warp, shared
+// memory + shuffle across warps). F32 opmath_t accumulator, BF16 I/O.
+//
+// Launch contract (set by the host dispatcher):
+//   grid  = (out_elems, 1, 1)
+//   block = (min(reduce_size, 256), 1, 1)   // multiple of warp size when possible
+//   shared_mem_bytes = 32 * sizeof(float)   // one float per warp, up to 32 warps
+//
+// Speed contract clause 4 reference: warp-shuffle + shared-memory tree reduce
+// matches the PT Reduce.cuh shape.
 extern "C" __global__ void sum_dim_keepdim_kernel_bf16(
-    const __nv_bfloat16* input,
-    __nv_bfloat16* output,
-    const float* dims_f32,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    const float* __restrict__ dims_f32,
     int ndim,
     int reduce_dim,
     int out_elems
 ) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= out_elems) return;
+    int out_idx = blockIdx.x;
+    if (out_idx >= out_elems) return;
+    int tid = threadIdx.x;
 
     int dims[8];
     for (int i = 0; i < ndim && i < 8; ++i) dims[i] = (int)dims_f32[i];
@@ -867,7 +887,8 @@ extern "C" __global__ void sum_dim_keepdim_kernel_bf16(
         strides[i] = strides[i + 1] * dims[i + 1];
     }
 
-    int rem = tid;
+    // Decode the output index into per-axis coords (with reduce_dim collapsed).
+    int rem = out_idx;
     int out_coords[8];
     for (int i = 0; i < ndim; ++i) {
         int size = (i == reduce_dim) ? 1 : dims[i];
@@ -878,18 +899,45 @@ extern "C" __global__ void sum_dim_keepdim_kernel_bf16(
         out_coords[i] = (size == 0) ? 0 : (rem / stride) % size;
     }
 
+    // Base input index with reduce_dim = 0; the cooperative loop varies the
+    // reduce-axis component.
     int base_idx = 0;
     for (int i = 0; i < ndim; ++i) {
         int coord = (i == reduce_dim) ? 0 : out_coords[i];
         base_idx += coord * strides[i];
     }
 
-    float sum = 0.0f;
-    for (int d = 0; d < dims[reduce_dim]; ++d) {
-        int idx = base_idx + d * strides[reduce_dim];
-        sum += __bfloat162float(input[idx]);
+    int reduce_size   = dims[reduce_dim];
+    int reduce_stride = strides[reduce_dim];
+
+    // Cooperative load + F32 accumulate. Each thread strides by blockDim.x.
+    float partial = 0.0f;
+    for (int d = tid; d < reduce_size; d += blockDim.x) {
+        partial += __bfloat162float(input[base_idx + d * reduce_stride]);
     }
-    output[tid] = __float2bfloat16_rn(sum);
+
+    // Intra-warp reduce via shuffle.
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+    }
+
+    // Cross-warp combine via shared memory + shuffle on warp 0.
+    extern __shared__ float warp_sums[];
+    int lane    = tid & 31;
+    int warp_id = tid >> 5;
+    if (lane == 0) warp_sums[warp_id] = partial;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        int num_warps = (blockDim.x + 31) >> 5;
+        partial = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            partial += __shfl_down_sync(0xffffffff, partial, offset);
+        }
+        if (lane == 0) {
+            output[out_idx] = __float2bfloat16_rn(partial);
+        }
+    }
 }
 "#;
 

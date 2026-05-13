@@ -2454,7 +2454,27 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                     tensor.device.clone(),
                 )?;
 
-                let cfg = LaunchConfig::for_num_elems(out_elems as u32);
+                // Class C cooperative-reduction launch contract: one block per
+                // output, block sized to the reduce axis (capped at 256 threads,
+                // multiple of warp size where possible). Shared memory holds one
+                // float per warp for the cross-warp combine.
+                let reduce_size = dims[dim] as u32;
+                let mut threads_per_block = reduce_size.min(256).max(1);
+                // Round up to a warp multiple for cleaner reduction unless the
+                // axis is genuinely smaller than a warp.
+                if threads_per_block > 32 {
+                    threads_per_block = (threads_per_block + 31) & !31;
+                    if threads_per_block > 256 {
+                        threads_per_block = 256;
+                    }
+                }
+                let num_warps = (threads_per_block + 31) >> 5;
+                let shared_mem_bytes = num_warps * (std::mem::size_of::<f32>() as u32);
+                let cfg = LaunchConfig {
+                    grid_dim: (out_elems as u32, 1, 1),
+                    block_dim: (threads_per_block, 1, 1),
+                    shared_mem_bytes,
+                };
                 launch_kernel!(
                     f,
                     cfg,
