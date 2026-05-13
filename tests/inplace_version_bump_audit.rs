@@ -250,3 +250,49 @@ fn no_mutation_no_bump() {
     let v1 = a.storage_version();
     assert_eq!(v0, v1, "read-only access should not bump version");
 }
+
+// -----------------------------------------------------------------------
+// Followup 2026-05-13: bug-fixer audit found two missed sites that the
+// initial Phase 0 port did not cover. Both are public in-place mutators
+// that hit the SavedTensor mutation-through-saved-ref failure model.
+// -----------------------------------------------------------------------
+
+#[test]
+fn sgd_step_inplace_bumps_version_f32() {
+    use flame_core::sgd::step_inplace;
+    let mut param = make_f32(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
+    let grad = make_f32(vec![0.1, 0.1, 0.1, 0.1], &[2, 2]);
+    let v0 = param.storage_version();
+    step_inplace(&mut param, &grad, 0.01).expect("sgd::step_inplace");
+    let v1 = param.storage_version();
+    assert!(v1 > v0, "sgd::step_inplace (F32) did not bump version: v0={v0}, v1={v1}");
+}
+
+#[test]
+fn sgd_step_inplace_bumps_version_bf16() {
+    use flame_core::sgd::step_inplace;
+    let mut param = make_bf16(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
+    let grad = make_f32(vec![0.1, 0.1, 0.1, 0.1], &[2, 2]);
+    let v0 = param.storage_version();
+    step_inplace(&mut param, &grad, 0.01).expect("sgd::step_inplace");
+    let v1 = param.storage_version();
+    assert!(v1 > v0, "sgd::step_inplace (BF16) did not bump version: v0={v0}, v1={v1}");
+}
+
+#[test]
+fn rng_rand_fill_bumps_version_f32() {
+    let mut t = make_f32(vec![0.0; 16], &[4, 4]);
+    let v0 = t.storage_version();
+    flame_core::rng::rand_fill_(&mut t, 42).expect("rng::rand_fill_");
+    let v1 = t.storage_version();
+    assert!(v1 > v0, "rng::rand_fill_ (F32) did not bump version: v0={v0}, v1={v1}");
+}
+
+#[test]
+fn rng_rand_fill_bumps_version_bf16() {
+    let mut t = make_bf16(vec![0.0; 16], &[4, 4]);
+    let v0 = t.storage_version();
+    flame_core::rng::rand_fill_(&mut t, 42).expect("rng::rand_fill_");
+    let v1 = t.storage_version();
+    assert!(v1 > v0, "rng::rand_fill_ (BF16) did not bump version: v0={v0}, v1={v1}");
+}

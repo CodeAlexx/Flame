@@ -173,6 +173,12 @@ pub fn rand_fill_(tensor: &mut Tensor, seed: u32) -> Result<(), Error> {
             _ => return Err(Error::Unsupported("rand_fill_: dtype not supported".into())),
         }
     }
+
+    // In-place mutation — bump the storage version so SavedTensor's
+    // version check detects mutation through saved tensors. Phase 0
+    // autograd v2 prereq (audit caught this site 2026-05-13).
+    tensor.storage_mut().bump_version();
+
     Ok(())
 }
 

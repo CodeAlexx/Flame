@@ -110,6 +110,12 @@ pub fn step_inplace(param: &mut Tensor, grad: &Tensor, lr: f32) -> Result<()> {
             _ => unreachable!(),
         }
     }
+
+    // In-place mutation — bump the storage version so SavedTensor's
+    // version check detects mutation through saved tensors. Phase 0
+    // autograd v2 prereq (audit caught this site 2026-05-13).
+    param.storage_mut().bump_version();
+
     Ok(())
 }
 
