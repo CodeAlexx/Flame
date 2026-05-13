@@ -73,10 +73,16 @@ pub fn global_l2_norm(grads: &[&Tensor]) -> Result<Tensor> {
         return Tensor::from_vec(vec![0.0_f32], Shape::from_dims(&[1]), dev);
     }
 
-    // Multi-tensor fast path (Phase 3 of launch-storm refactor). Collapses
-    // 2N+(N-1)+1 launches into 3 (stage1 + stage2 + sqrt). Eligible iff
-    // every grad is contiguous F32. Mixed-dtype slices and non-contiguous
-    // tensors fall through to the per-tensor path below.
+    // Multi-tensor fast path (Phase 3 of launch-storm refactor + Phase 4a
+    // BF16 sibling). Collapses 2N+(N-1)+1 launches into 3 (stage1 +
+    // stage2 + sqrt). Eligible iff every grad is contiguous AND every
+    // grad shares a single dtype (all F32, or all BF16). Mixed-dtype
+    // slices and non-contiguous tensors fall through to the per-tensor
+    // path below.
+    //
+    // Phase 4a (Option A from `docs/BF16_GRAD_DECISION.md`): the BF16
+    // sibling preserves BF16 grads BF16-through-clipping. F32 only
+    // appears as `opmath_t` inside the kernel's sum-of-squares.
     //
     // Env override `FLAME_MT_L2NORM=0` forces legacy path for A/B testing.
     #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
@@ -86,16 +92,31 @@ pub fn global_l2_norm(grads: &[&Tensor]) -> Result<Tensor> {
             .as_deref()
             .map(|v| matches!(v, "0" | "false" | "FALSE"))
             .unwrap_or(false);
-        let all_f32_contig = !mt_disabled
-            && grads.iter().all(|g| g.dtype() == DType::F32 && g.is_contiguous());
-        if all_f32_contig {
-            let mut cache = MT_L2_CACHE
-                .lock()
-                .map_err(|_| Error::Training("MT_L2_CACHE mutex poisoned".into()))?;
-            let total_sq = crate::ops::multi_tensor::multi_tensor_l2_norm_sq_f32(
-                &mut cache, grads,
-            )?;
-            return total_sq.sqrt();
+        if !mt_disabled {
+            let all_f32_contig = grads
+                .iter()
+                .all(|g| g.dtype() == DType::F32 && g.is_contiguous());
+            let all_bf16_contig = grads
+                .iter()
+                .all(|g| g.dtype() == DType::BF16 && g.is_contiguous());
+            if all_f32_contig {
+                let mut cache = MT_L2_CACHE
+                    .lock()
+                    .map_err(|_| Error::Training("MT_L2_CACHE mutex poisoned".into()))?;
+                let total_sq = crate::ops::multi_tensor::multi_tensor_l2_norm_sq_f32(
+                    &mut cache, grads,
+                )?;
+                return total_sq.sqrt();
+            }
+            if all_bf16_contig {
+                let mut cache = MT_L2_CACHE
+                    .lock()
+                    .map_err(|_| Error::Training("MT_L2_CACHE mutex poisoned".into()))?;
+                let total_sq = crate::ops::multi_tensor::multi_tensor_l2_norm_sq_bf16(
+                    &mut cache, grads,
+                )?;
+                return total_sq.sqrt();
+            }
         }
     }
 

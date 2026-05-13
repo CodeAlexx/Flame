@@ -1104,27 +1104,43 @@ impl Adam {
                 .map(|v| matches!(v, "1" | "true" | "TRUE"))
                 .unwrap_or(false);
 
-            // Three-way classifier: all BF16 params w/ F32 grads,
-            // all F32 params w/ F32 grads, or "fall through to per-param".
-            // Mixed dtype across params still falls through — multi-tensor
-            // requires homogeneous dtype across the pack.
-            let mt_param_is_bf16: Option<bool> = if multi_disabled || n == 0 {
+            // Four-way classifier (Phase 4a):
+            //   - All BF16 params + all F32 grads — v1 / v3 dominant LoRA case
+            //   - All BF16 params + all BF16 grads — autograd v2 / Option A
+            //     (`adam_fused_multi_bf16_bf16grad_kernel` — see
+            //     `BF16_GRAD_DECISION.md`).
+            //   - All F32  params + all F32 grads — Phase 1 launch-storm.
+            //   - Anything else (mixed dtype, F32-param+BF16-grad which has
+            //     no multi-tensor kernel, etc.) → fall through to per-param.
+            //
+            // Returned tuple: `Some((param_is_bf16, grad_is_bf16))`.
+            let mt_dtype: Option<(bool, bool)> = if multi_disabled || n == 0 {
                 None
             } else if parameters.iter().all(|p| {
                 p.dtype().ok() == Some(DType::BF16)
                     && p.grad().map_or(false, |g| g.dtype() == DType::F32)
             }) {
-                Some(true)
+                Some((true, false))
+            } else if parameters.iter().all(|p| {
+                p.dtype().ok() == Some(DType::BF16)
+                    && p.grad().map_or(false, |g| g.dtype() == DType::BF16)
+            }) {
+                Some((true, true))
             } else if parameters.iter().all(|p| {
                 p.dtype().ok() == Some(DType::F32)
                     && p.grad().map_or(false, |g| g.dtype() == DType::F32)
             }) {
-                Some(false)
+                Some((false, false))
             } else {
+                // (F32 param, BF16 grad) intentionally NOT here — that
+                // pair has no multi-tensor kernel (see
+                // `adam_fused_multi_tensor_step` dispatch comment), so we
+                // route through the per-param fused path which DOES have
+                // an `adam_fused_f32param_bf16grad_kernel` arm.
                 None
             };
 
-            if let Some(param_is_bf16) = mt_param_is_bf16 {
+            if let Some((param_is_bf16, grad_is_bf16)) = mt_dtype {
                 // Lazy m/v init for any new param. Same shape + F32 dtype
                 // contract as the per-param path so a switch between the
                 // multi-tensor and per-param paths leaves state consistent.
@@ -1163,13 +1179,29 @@ impl Adam {
                         packed.push(p_ptr);
                     }
                 }
-                // Region 1: F32 grad pointers.
-                for param in parameters {
-                    let g = param
-                        .grad()
-                        .expect("grad presence checked in classifier above");
-                    let s = g.as_slice_f32("adam_mt:g")?;
-                    packed.push(*s.device_ptr());
+                // Region 1: grad pointers (dtype switch per grad_is_bf16).
+                // Phase 4a: the (BF16 param, BF16 grad) and
+                // (F32 param, BF16 grad) arms route grad pointers through
+                // `as_device_ptr_bf16` so the kernel reads BF16 storage
+                // directly. The (F32 param, BF16 grad) case never reaches
+                // here — it has no multi-tensor kernel and the classifier
+                // routes it to per-param.
+                if grad_is_bf16 {
+                    for param in parameters {
+                        let g = param
+                            .grad()
+                            .expect("grad presence checked in classifier above");
+                        let p_ptr = g.as_device_ptr_bf16("adam_mt:g_bf16")? as u64;
+                        packed.push(p_ptr);
+                    }
+                } else {
+                    for param in parameters {
+                        let g = param
+                            .grad()
+                            .expect("grad presence checked in classifier above");
+                        let s = g.as_slice_f32("adam_mt:g")?;
+                        packed.push(*s.device_ptr());
+                    }
                 }
                 // Region 2: F32 m pointers. HashMap::get_mut once per id.
                 for param in parameters {
@@ -1202,14 +1234,16 @@ impl Adam {
 
                 // Stochastic rounding is only meaningful for BF16 param
                 // store. F32 params write the full float — clear the seed
-                // so the dispatcher doesn't even consider it.
+                // so the dispatcher doesn't even consider it. The BF16-grad
+                // multi-tensor kernel itself currently keeps round-to-nearest
+                // (see dispatch matrix comment in `adam_fused_multi_tensor_step`).
                 let seed = if param_is_bf16 { self.stoch_seed() } else { None };
                 fused::adam_fused_multi_tensor_step(
                     &mut self.multi_tensor_meta,
                     &device,
                     n,
                     param_is_bf16,
-                    false, // grad_is_bf16: classifier above only accepts F32 grads
+                    grad_is_bf16,
                     &packed,
                     self.lr,
                     self.beta1,

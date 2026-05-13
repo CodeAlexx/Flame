@@ -1,9 +1,13 @@
 # BF16 Gradient Storage Decision (autograd v2 Phase 0)
 
-**Date**: 2026-05-13
+**Date**: 2026-05-13 (Phase 0 decision); updated 2026-05-13 (Phase 4a partial).
 **Scope**: flame-core autograd v2 cross-cutting policy for gradient dtype.
-**Status**: Decision recorded. No behavior change in Phase 0 — full
-implementation lands in Phase 4 (optimizer + trainer integration).
+**Status**: Phase 4a partial. The `Parameter` + `Adam` + `grad_norm`
+F32-coercion sites listed below have been rewritten or have the
+dtype-preserving path wired (see "Phase 4a status" markers per site).
+The `GradientMap` rewrite and trainer integration smoke are deferred to
+Phase 4b. See `src/autograd_v2/optim.rs` for the v2-facing optimizer
+surface added in Phase 4a.
 
 ## Decision
 
@@ -42,6 +46,14 @@ audit; no source change in Phase 0.
 
 ### `GradientMap` (`src/gradient.rs`)
 
+**Phase 4a status: DEFERRED to Phase 4b.** v2 grads do not flow through
+`GradientMap` on the recording path (they land in
+`AutogradMetaV2::grad` via `AccumulateGrad`). The Phase 4b decision is
+whether to add the `MatchParamDtype` variant here or route v2 grads
+exclusively through `meta.grad` and leave GradientMap as a pure v3
+artifact. Defer until trainer integration smoke shows what shape
+trainers actually need.
+
 - **Line 99** — `set_ones(...)` hard-codes `Tensor::ones_dtype(..., DType::F32, ...)`.
   Under Option A: must allocate ones in the loss tensor's dtype (BF16
   for a BF16 loss).
@@ -66,27 +78,41 @@ audit; no source change in Phase 0.
 
 ### `Parameter` (`src/parameter.rs`)
 
-- **Lines 119-123** — `Parameter::set_grad(...)` casts every incoming
-  grad to F32 unconditionally. Under Option A: preserve dtype; if a
-  trainer needs F32 grads, it casts upstream.
-- **Lines 189-197** — `Parameter::apply_update(...)` casts the update
-  to F32, computes the sub in F32, then writes back. Under Option A:
-  follow the param's dtype; F32 only as opmath inside the kernel.
+**Phase 4a status: SHIPPED.** `Parameter` carries a `GradDtypePolicy`
+field with variants `CastToF32` (v1/v3 default — unchanged) and
+`MatchParamDtype` (new — Option A). `Parameter::new_v2(t)` constructs
+with the v2 policy. v3 trainers continue to use `Parameter::new(t)`
+and see no behavior change.
+
+- **Lines 199-218** — `Parameter::set_grad(...)` honors policy: under
+  `CastToF32` casts to F32 as before; under `MatchParamDtype`
+  preserves the incoming grad's dtype.
+- **Lines 303-340** — `Parameter::apply_update(...)` honors policy:
+  under `CastToF32` computes in F32 as before; under
+  `MatchParamDtype` brings the update to the param's native dtype and
+  computes `data - update` at the param's dtype (F32 still permitted
+  as opmath inside the kernel).
+- **Line 243** — `Parameter::grad_bf16_or_f32()` new accessor —
+  returns the native-dtype grad without casting.
 
 ### Adam optimizer (`src/adam.rs`)
 
-- **Lines 1075-1082** (comment) — multi-tensor fast path assumes
-  "BF16 params + F32 grads" because `Parameter::set_grad` casts. Under
-  Option A: this assumption breaks — the classifier needs a 3rd case
-  "(BF16 param, BF16 grad)" routed to
-  `adam_fused_multi_bf16_bf16grad_kernel` (already in
-  `MODULE_NAME`, currently unused).
-- **Lines 1106, 1112** — classifier checks `g.dtype() == DType::F32`.
-  Under Option A: allow BF16 grads too.
-- **Lines 1273-1283** (comment + kernel name) —
-  `adam_fused_f32param_bf16grad_kernel` is unreachable today; Option A
-  makes it live. Same for the BF16-param BF16-grad kernel inside
-  `fused::adam_fused_step`.
+**Phase 4a status: SHIPPED.** Classifier extended from a 2-tuple
+optional to a 4-arm dispatch (`(BF16, F32)`, `(BF16, BF16)`,
+`(F32, F32)`, fall-through for `(F32, BF16)` which has no multi-tensor
+kernel but has a per-param `adam_fused_step_f32` arm with the
+`adam_fused_f32param_bf16grad_kernel` already wired). The previously-
+dead `adam_fused_multi_bf16_bf16grad_kernel` is now reachable.
+
+- **Lines 1107-1144** — Phase 4a four-way classifier. Tests in
+  `tests/autograd_v2_phase4a.rs`:
+  - `adam_step_bf16_param_bf16_grad_no_panic`
+  - `adam_step_bf16_param_bf16_grad_matches_f32_reference`
+  - `adam_step_f32_param_bf16_grad_no_panic`
+- **Lines 1167-1187** — grad-pointer pack region: BF16 branch added
+  for `grad_is_bf16` case.
+- **Line 1213** — `grad_is_bf16` flag now propagates to
+  `fused::adam_fused_multi_tensor_step` (no longer hard-coded false).
 
 ### SGD optimizer
 
@@ -95,16 +121,24 @@ There is no `src/sgd.rs` — SGD-style optimizers live in
 At Phase 4 audit time, sweep that module for the same `to_dtype(F32)`
 patterns.
 
-### Grad norm (`src/ops/grad_norm.rs`)
+### Grad norm (`src/ops/grad_norm.rs` + `src/ops/multi_tensor.rs`)
+
+**Phase 4a status: SHIPPED.** `multi_tensor_l2_norm_sq_bf16` exists at
+`src/ops/multi_tensor.rs:447` with its own stage-1 BF16 kernel (F32
+opmath); the F32 stage-2 reducer is shared.
+`global_l2_norm` in `src/ops/grad_norm.rs:99` routes all-BF16-contiguous
+slices through it. The per-tensor F32 fallback below still casts BF16
+to F32 — that's an opmath cast, not a grad-storage cast, so under
+Option A it's the documented exception.
 
 - **Line 12** (doc) — example shows `g.to_dtype(F32)?.square()?.mean()?`.
-  Under Option A: the doc stays correct as opmath, but the public
-  helper must accept BF16 grads.
-- **Lines 90, 108, 111** — `multi_tensor_l2_norm_sq_f32` enforces
-  "all F32" and the per-tensor fallback casts to F32. Under Option A:
-  the fast path needs a BF16 sibling
-  (`multi_tensor_l2_norm_sq_bf16`), and the per-tensor fallback keeps
-  F32 only as opmath.
+  Now correct as opmath; the public helper accepts BF16 grads through
+  the fast path.
+- **Lines 90, 108, 111** — `multi_tensor_l2_norm_sq_f32` is the F32
+  fast path; `multi_tensor_l2_norm_sq_bf16` is its BF16 sibling. Tests
+  in `tests/autograd_v2_phase4a.rs`:
+  - `multi_tensor_l2_norm_sq_bf16_matches_f32_reference`
+  - `global_l2_norm_routes_bf16_through_fast_path`
 
 ### Trainer-side callers (out of crate)
 
@@ -115,24 +149,30 @@ audit; not in scope for this doc.
 
 ## Migration strategy (Phase 4)
 
-The Phase 4 plan, gated by `#[cfg(feature = "autograd_v2")]`:
+The original Phase 4 plan, with Phase 4a status annotations
+(`[4a-DONE]` = shipped; `[4b]` = deferred):
 
-1. Add a new `GradStorePolicy::MatchParamDtype` variant; default v2
-   `GradientMap::new()` uses it.
-2. Rewrite `set_ones` / `set` / `insert` / `accumulate` /
-   `get_public_grad` to honor the new policy.
-3. Rewrite `Parameter::set_grad` and `apply_update` to preserve dtype
-   under v2 (gate via the `autograd_v2` feature flag — v1 path stays
-   unchanged for parity-gate runs).
-4. Wire the BF16-grad Adam kernels (single + multi-tensor) into the
-   classifier under v2.
-5. Add `multi_tensor_l2_norm_sq_bf16` and route v2 grad-norm through
-   it.
-6. Add optimizer parity tests: same starting state under
-   `(BF16 param, F32 grad)` v1 vs `(BF16 param, BF16 grad)` v2 must
-   converge to within a documented tolerance, since the two are NOT
-   bit-equal (BF16 grad accumulation truncates differently from
-   F32 → BF16 cast at the end).
+1. `[4b]` Add a new `GradStorePolicy::MatchParamDtype` variant; default
+   v2 `GradientMap::new()` uses it.
+2. `[4b]` Rewrite GradientMap `set_ones` / `set` / `insert` /
+   `accumulate` / `get_public_grad` to honor the new policy.
+3. `[4a-DONE]` Rewrite `Parameter::set_grad` and `apply_update` to
+   preserve dtype under v2 — gated via `GradDtypePolicy` enum on the
+   parameter (`Parameter::new_v2(t)` constructs with the new policy).
+   The v1 path is unchanged for parity-gate runs.
+4. `[4a-DONE]` Wire the BF16-grad Adam kernels (single + multi-tensor)
+   into the classifier under v2.
+5. `[4a-DONE]` Add `multi_tensor_l2_norm_sq_bf16` and route v2 grad-
+   norm through it.
+6. `[4a-DONE]` Add optimizer tolerance test: `(BF16 param, BF16 grad)`
+   v2 vs `(F32 param, F32 grad)` reference must converge to within
+   BF16 tolerance (5e-3 absolute on the post-step param at lr=1e-3,
+   verified by
+   `adam_step_bf16_param_bf16_grad_matches_f32_reference`).
+
+The v2-facing entry point shipped in Phase 4a is
+`flame_core::autograd_v2::AdamWV2` (a thin wrapper around `AdamW`).
+Trainer integration smoke is Phase 4b.
 
 ## What this is NOT
 

@@ -1777,3 +1777,58 @@ expected v0, got v1
 Use the literal `"OpName:slot"` form (e.g. `"MulGradFn:a"`,
 `"MatMulGradFn:b"`). Phase 3+ ops will pile up — readable error
 messages save real debugging time.
+
+## Autograd v2 (Phase 4a) — Parameter dtype policy
+
+### `Parameter::new(t)` vs `Parameter::new_v2(t)`
+
+Phase 4a added a `GradDtypePolicy` field on every `Parameter`:
+
+- `Parameter::new(t)` → `CastToF32` (v1/v3 default). `set_grad` casts
+  every incoming grad to F32, regardless of param dtype. This is the
+  invariant existing trainers (Klein, Z-Image, Chroma today) rely on.
+- `Parameter::new_v2(t)` → `MatchParamDtype` (autograd v2). `set_grad`
+  preserves the incoming grad's dtype. BF16 params keep BF16 grads
+  end-to-end through the optimizer, halving gradient memory and
+  routing through the previously-dead BF16-grad Adam kernels.
+
+The two policies are NOT interchangeable mid-run: optimizer state (m,
+v) is keyed by `TensorId`, but the per-step kernel selected by the
+classifier depends on `(param_dtype, grad_dtype)`. Switching policy
+mid-training would mix two kernels' numerical conventions on the same
+m/v slots. Set policy at construction time; don't flip later.
+
+### `param.grad()` vs `param.grad_bf16_or_f32()`
+
+`grad()` is the v1 accessor and remains intact for compatibility.
+`grad_bf16_or_f32()` is the same function with a different name —
+introduced so v2 callers explicitly signal "I'm prepared for a BF16
+grad to come out". Both return the native-dtype grad under
+`MatchParamDtype` and an F32 grad under `CastToF32`.
+
+### Adam classifier dispatch matrix (Phase 4a)
+
+`Adam::step` dispatches on `(param_dtype, grad_dtype)`:
+
+| param dtype | grad dtype | multi-tensor kernel                            | per-param fallback                     |
+|-------------|------------|------------------------------------------------|----------------------------------------|
+| BF16        | F32        | `adam_fused_multi_bf16_f32grad_kernel`         | `adam_fused_step` (BF16-grad F32 path) |
+| BF16        | BF16       | `adam_fused_multi_bf16_bf16grad_kernel` (4a)   | `adam_fused_step` (BF16-grad BF16 path)|
+| F32         | F32        | `adam_fused_multi_f32param_f32grad_kernel`     | `adam_fused_step_f32` (F32 path)       |
+| F32         | BF16       | (no kernel — falls through)                    | `adam_fused_step_f32` → `adam_fused_f32param_bf16grad_kernel` (4a) |
+
+(F32, BF16) has no multi-tensor kernel today; trainers that need it
+should keep their param packs homogeneous (all (BF16, BF16) or all
+(F32, F32)) for the multi-tensor fast path.
+
+### `multi_tensor_l2_norm_sq_bf16` vs `_f32`
+
+Both live in `src/ops/multi_tensor.rs`. The BF16 variant has its own
+stage-1 kernel (BF16 load → F32 opmath → F32 partial); both share the
+F32 stage-2 reducer. `global_l2_norm` in `src/ops/grad_norm.rs`
+auto-routes BF16-only-contiguous slices through the BF16 fast path
+under the same `FLAME_MT_L2NORM=0` env gate as the F32 path.
+
+Mixed-dtype slices (some BF16, some F32) fall through to the legacy
+per-tensor loop. If you see this in a hot path, fix it upstream
+(make the trainer pick one dtype) rather than adding a third kernel.

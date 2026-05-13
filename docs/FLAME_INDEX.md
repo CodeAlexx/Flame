@@ -1175,6 +1175,55 @@ is wired (Phase 1) and tested (`saved_tensor_fw_grad_roundtrip` in
 `tests/autograd_v2_types.rs`); Phase 3c2 populates it inside each op's
 forward wrapper.
 
+### Autograd v2 (Phase 4a — optimizer + BF16-grad migration partial)
+
+Phase 4a ships the parameter / optimizer half of `BF16_GRAD_DECISION.md`
+Option A. v2 trainers can now construct a `Parameter::new_v2(...)` whose
+gradients stay BF16 end-to-end (no upcast on `set_grad`), and an
+`AdamWV2` wrapper routes them through the existing BF16-grad fused Adam
+kernels that were dead code before this phase. The `GradientMap`
+rewrite + actual trainer-integration smoke are deferred to Phase 4b.
+Tests: `tests/autograd_v2_phase4a.rs` (12 tests).
+
+- `parameter::GradDtypePolicy` — `src/parameter.rs:31` — enum with
+  variants `CastToF32` (v1/v3 default) and `MatchParamDtype` (v2). Re-
+  exported as `flame_core::GradDtypePolicy`.
+- `Parameter::new_v2(t)` — `src/parameter.rs:93` — constructs a parameter
+  with `GradDtypePolicy::MatchParamDtype`; BF16 params keep BF16 grads
+  through `set_grad`, F32 params keep F32 grads.
+- `Parameter::grad_dtype_policy()` / `Parameter::set_grad_dtype_policy()`
+  — `src/parameter.rs:112, 119` — policy accessors.
+- `Parameter::grad_bf16_or_f32()` — `src/parameter.rs:243` — v2-facing
+  grad accessor; returns the native-dtype grad without casting (mirrors
+  `grad()` but names the contract explicitly).
+- Phase 4a `Parameter::set_grad` / `Parameter::apply_update` — rewrites
+  at `src/parameter.rs:199` and `src/parameter.rs:303` — preserve
+  dtype under `MatchParamDtype`; unchanged under `CastToF32` so
+  existing v3 trainers keep their F32-grad invariant.
+- `adam::Adam::step` — `src/adam.rs:1107` — classifier extended to
+  3 multi-tensor arms: `(BF16 param, F32 grad)`, `(BF16 param, BF16
+  grad)`, `(F32 param, F32 grad)`. `(F32 param, BF16 grad)` routes
+  through the per-param fused path which has the existing
+  `adam_fused_f32param_bf16grad_kernel` arm.
+- `ops::multi_tensor::multi_tensor_l2_norm_sq_bf16(cache, grads)` —
+  `src/ops/multi_tensor.rs:447` — BF16 sibling for
+  `multi_tensor_l2_norm_sq_f32`. Same 2-launch stage1+stage2 reduction,
+  F32 only as `opmath_t` inside the kernel. Re-uses the stage2 reducer
+  from the F32 module.
+- `ops::grad_norm::global_l2_norm` — `src/ops/grad_norm.rs:99` —
+  routes all-BF16-contiguous slices through
+  `multi_tensor_l2_norm_sq_bf16`.
+- `autograd_v2::OptimizerV2` trait — `src/autograd_v2/optim.rs:47` —
+  `step(params, ctx)` + `zero_grad(params)`.
+- `autograd_v2::AdamWV2` — `src/autograd_v2/optim.rs:68` — thin v2
+  wrapper around `AdamW`; same state shape, same kernels, same
+  checkpoint format. `inner_adamw()` / `inner_adamw_mut()` borrow the
+  inner state for callers that need the full v1 surface.
+- `autograd_v2::set_param_grad_v2(param, grad)` —
+  `src/autograd_v2/optim.rs:143` — convenience setter; returns `Err` if
+  `param` is on the v1 `CastToF32` policy (catches policy/contract
+  mismatches early).
+
 ### Legacy / dead
 - ⚠️ `autograd.rs` (top-level) — types still re-exported
 - ⚠️ `autograd_simple.rs` — early stub

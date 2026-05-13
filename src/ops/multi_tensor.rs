@@ -167,8 +167,60 @@ extern "C" __global__ void multi_tensor_l2_norm_sq_stage2_kernel(
 }
 "#;
 
+/// Stage-1 kernel source for the BF16-input variant of the multi-tensor
+/// L2-norm reduction. The stage-2 reducer is reused from the F32 module
+/// (it works on F32 partials regardless of stage-1's input dtype).
+///
+/// Phase 4a addition: keeps BF16 gradients BF16 end-to-end through
+/// gradient clipping under autograd v2's Option A (see
+/// `docs/BF16_GRAD_DECISION.md`). The kernel reads BF16 storage, casts
+/// to F32 inside the inner loop (`opmath_t`), accumulates in F32, and
+/// writes an F32 partial per tensor — same numerical contract as the
+/// F32 path.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+const CUDA_MT_L2_NORM_BF16: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void multi_tensor_l2_norm_sq_stage1_bf16_kernel(
+    const __nv_bfloat16** const __restrict__ tensors,
+    const long long*      __restrict__ sizes,
+    float*                __restrict__ partials,   // length = n_tensors
+    int n_tensors
+) {
+    int t = blockIdx.x;
+    if (t >= n_tensors) return;
+
+    long long n           = sizes[t];
+    const __nv_bfloat16* x = tensors[t];
+
+    int   tid    = threadIdx.x;
+    int   stride = blockDim.x;
+    float acc    = 0.0f;
+
+    // F32 accumulation (opmath_t) — bit-equivalent fold ordering to the
+    // F32 kernel above, just with a `__bfloat162float` widening at load.
+    for (long long i = (long long)tid; i < n; i += (long long)stride) {
+        float v = __bfloat162float(x[i]);
+        acc += v * v;
+    }
+
+    __shared__ float sm[256];
+    sm[tid] = acc;
+    __syncthreads();
+
+    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+        if (tid < off) sm[tid] += sm[tid + off];
+        __syncthreads();
+    }
+
+    if (tid == 0) partials[t] = sm[0];
+}
+"#;
+
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 const MT_L2_NORM_MODULE: &str = "multi_tensor_l2_norm";
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+const MT_L2_NORM_BF16_MODULE: &str = "multi_tensor_l2_norm_bf16";
 
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 fn ensure_l2_norm_kernels(device: &Arc<CudaDevice>) -> Result<()> {
@@ -190,6 +242,40 @@ fn ensure_l2_norm_kernels(device: &Arc<CudaDevice>) -> Result<()> {
             ],
         )
         .map_err(|e| Error::Cuda(format!("load multi_tensor_l2_norm: {:?}", e)))?;
+    Ok(())
+}
+
+/// Load the BF16 stage-1 kernel under its own module. The stage-2 kernel
+/// (F32 partials → F32 sum) is loaded by [`ensure_l2_norm_kernels`] in the
+/// same call site since both BF16 and F32 callers need it.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn ensure_l2_norm_bf16_kernel(device: &Arc<CudaDevice>) -> Result<()> {
+    if device
+        .get_func(
+            MT_L2_NORM_BF16_MODULE,
+            "multi_tensor_l2_norm_sq_stage1_bf16_kernel",
+        )
+        .is_some()
+    {
+        return Ok(());
+    }
+    // BF16 stage-1 source needs `cuda_bf16.h` from the CUDA toolkit.
+    // Match the include-path resolution pattern used by
+    // `ensure_scale_kernel_bf16` below.
+    let include_dir = std::env::var("CUDA_INCLUDE_DIR")
+        .or_else(|_| std::env::var("CUDA_HOME").map(|home| format!("{home}/include")))
+        .unwrap_or_else(|_| "/usr/local/cuda/include".into());
+    let mut opts = cudarc::nvrtc::CompileOptions::default();
+    opts.include_paths.push(include_dir);
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(CUDA_MT_L2_NORM_BF16, opts)
+        .map_err(|e| Error::Cuda(format!("nvrtc multi_tensor_l2_norm bf16: {:?}", e)))?;
+    device
+        .load_ptx(
+            ptx,
+            MT_L2_NORM_BF16_MODULE,
+            &["multi_tensor_l2_norm_sq_stage1_bf16_kernel"],
+        )
+        .map_err(|e| Error::Cuda(format!("load multi_tensor_l2_norm bf16: {:?}", e)))?;
     Ok(())
 }
 
@@ -327,6 +413,155 @@ pub fn multi_tensor_l2_norm_sq_f32(
         stage2
             .launch(stage2_cfg, &mut s2_params)
             .map_err(|e| Error::Cuda(format!("mt_l2 stage2 launch: {e:?}")))?;
+    }
+
+    Ok(out)
+}
+
+/// BF16 sibling of [`multi_tensor_l2_norm_sq_f32`].
+///
+/// Sum of squares across a list of BF16 tensors, returned as a 1-element
+/// **F32** device tensor (partials are F32; the BF16 input is widened to
+/// F32 inside the kernel — F32 only as `opmath_t`, never written back to
+/// BF16).
+///
+/// Phase 4a addition. Used by [`crate::ops::grad_norm::global_l2_norm`]
+/// when every grad in the slice is BF16-contiguous — keeps BF16 grads
+/// BF16 through gradient clipping (no `to_dtype(F32)` per-tensor detour).
+///
+/// **Dispatch constraints:**
+/// - All tensors must be BF16 logical & BF16 storage.
+/// - Tensors must be contiguous.
+/// - Non-empty slice (caller short-circuits empty).
+///
+/// **Numerical contract:** identical algebra to the F32 path (same
+/// stage-1 block-wise reduction, same stage-2 reducer). Drift vs. a
+/// reference `F32(grad).square().sum()` per-tensor fold is bounded by
+/// the BF16→F32 widening (1 ULP at the input) plus the parallel-tree
+/// reduction ULP × tree depth, the same parity bound as the F32 path.
+///
+/// **Launch count:** 2 kernel launches (stage 1 across all tensors,
+/// stage 2 reduction). Replaces the legacy per-tensor pattern in
+/// `global_l2_norm` which fired 2N + (N-1) + 1 launches.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub fn multi_tensor_l2_norm_sq_bf16(
+    cache: &mut MultiTensorMetaCache,
+    grads: &[&Tensor],
+) -> Result<Tensor> {
+    use crate::DType;
+
+    if grads.is_empty() {
+        return Err(Error::InvalidInput(
+            "multi_tensor_l2_norm_sq_bf16: empty grads slice".into(),
+        ));
+    }
+    let n = grads.len();
+    let device = grads[0].device().clone();
+    // Stage-2 reuses the F32 module's reducer kernel — ensure both
+    // modules are loaded.
+    ensure_l2_norm_kernels(&device)?;
+    ensure_l2_norm_bf16_kernel(&device)?;
+
+    for (i, g) in grads.iter().enumerate() {
+        if g.dtype() != DType::BF16 {
+            return Err(Error::InvalidInput(format!(
+                "multi_tensor_l2_norm_sq_bf16: grads[{i}] is {:?}, expected BF16",
+                g.dtype()
+            )));
+        }
+        if !g.is_contiguous() {
+            return Err(Error::InvalidInput(format!(
+                "multi_tensor_l2_norm_sq_bf16: grads[{i}] is non-contiguous; \
+                 callers must `.contiguous()` first"
+            )));
+        }
+    }
+
+    // Pack [ptrs(n) | sizes(n)] = 2n u64 entries. Same layout as the F32
+    // path; only the pointer dtype changes (BF16 storage pointer).
+    cache.ensure_meta(&device, 2 * n)?;
+    cache.ensure_partials(&device, n)?;
+
+    let mut packed: Vec<u64> = Vec::with_capacity(2 * n);
+    for g in grads {
+        let p = g.as_device_ptr_bf16("mt_l2_bf16:g")? as u64;
+        packed.push(p);
+    }
+    for g in grads {
+        packed.push(g.shape().elem_count() as u64);
+    }
+
+    let dev_buf = cache
+        .buf
+        .as_mut()
+        .expect("ensure_meta post-condition: buf is Some");
+    device
+        .htod_sync_copy_into(&packed, dev_buf)
+        .map_err(|e| Error::Cuda(format!("mt_l2_bf16 h2d: {e:?}")))?;
+
+    let base = *dev_buf.device_ptr();
+    let stride = (n * std::mem::size_of::<u64>()) as u64;
+    let ptrs_arr_ptr = base;
+    let sizes_arr_ptr = base + stride;
+
+    let partials = cache
+        .partials
+        .as_mut()
+        .expect("ensure_partials post-condition: partials is Some");
+    let partials_ptr = *partials.device_ptr_mut();
+
+    // Stage 1: per-tensor BF16 sum-of-squares → F32 partials[n].
+    let stage1 = device
+        .get_func(
+            MT_L2_NORM_BF16_MODULE,
+            "multi_tensor_l2_norm_sq_stage1_bf16_kernel",
+        )
+        .ok_or_else(|| Error::Cuda("missing kernel: stage1 bf16".into()))?;
+
+    let n_i32 = n as i32;
+    let stage1_cfg = LaunchConfig {
+        grid_dim: (n as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut s1_params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(4);
+    s1_params.push(&ptrs_arr_ptr as *const u64 as *mut std::ffi::c_void);
+    s1_params.push(&sizes_arr_ptr as *const u64 as *mut std::ffi::c_void);
+    s1_params.push(&partials_ptr as *const u64 as *mut std::ffi::c_void);
+    s1_params.push(&n_i32 as *const i32 as *mut std::ffi::c_void);
+
+    unsafe {
+        stage1
+            .launch(stage1_cfg, &mut s1_params)
+            .map_err(|e| Error::Cuda(format!("mt_l2_bf16 stage1 launch: {e:?}")))?;
+    }
+
+    // Stage 2: reduce partials[n] → out[1] (single-block) — reused
+    // from the F32 module.
+    let mut out = Tensor::from_vec(vec![0.0_f32; 1], Shape::from_dims(&[1]), device.clone())?;
+    let out_ptr = {
+        let s = out.as_mut_slice_f32("mt_l2_bf16:out")?;
+        *s.device_ptr_mut()
+    };
+
+    let stage2 = device
+        .get_func(MT_L2_NORM_MODULE, "multi_tensor_l2_norm_sq_stage2_kernel")
+        .ok_or_else(|| Error::Cuda("missing kernel: stage2".into()))?;
+
+    let stage2_cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut s2_params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(3);
+    s2_params.push(&partials_ptr as *const u64 as *mut std::ffi::c_void);
+    s2_params.push(&out_ptr as *const u64 as *mut std::ffi::c_void);
+    s2_params.push(&n_i32 as *const i32 as *mut std::ffi::c_void);
+
+    unsafe {
+        stage2
+            .launch(stage2_cfg, &mut s2_params)
+            .map_err(|e| Error::Cuda(format!("mt_l2_bf16 stage2 launch: {e:?}")))?;
     }
 
     Ok(out)

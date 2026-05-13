@@ -238,7 +238,7 @@ pub type FlameError = Error;
 pub use gradient::{GradientMap, TensorGradExt};
 pub use group_norm::{group_norm, GroupNorm};
 pub use parameter::Parameter as Var;
-pub use parameter::Parameter;
+pub use parameter::{GradDtypePolicy, Parameter};
 pub use rng::global_rng;
 pub use shape::{Shape, D};
 pub use strict::{

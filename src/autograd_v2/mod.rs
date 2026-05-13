@@ -92,6 +92,7 @@ mod input_buffer;
 mod meta;
 mod node;
 pub mod ops;
+mod optim;
 mod recording;
 mod saved_tensor;
 
@@ -104,5 +105,6 @@ pub use hooks::{Hooks, PostBackwardHook, PreBackwardHook, TensorHook};
 pub use input_buffer::InputBuffer;
 pub use meta::{gradient_edge, new_meta_ref, AutogradMetaRef, AutogradMetaV2};
 pub use node::{Edge, GradFn, NodeId};
+pub use optim::{set_param_grad_v2, AdamWV2, OptimizerV2};
 pub use recording::{gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2};
 pub use saved_tensor::SavedTensor;

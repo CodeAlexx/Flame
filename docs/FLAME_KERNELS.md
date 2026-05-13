@@ -203,7 +203,8 @@ including the DECOUPLED-WD ordering receipt.
 | Kernel | Purpose |
 |---|---|
 | `multi_tensor_l2_norm_sq_stage1_f32_kernel` | Stage 1 of the multi-tensor L2 norm. One block per tensor, block-wide tree reduction in shared memory, writes per-tensor partial sum-of-squares to `partials[N]`. Used by `flame_core::ops::grad_norm::global_l2_norm` when every grad is F32 + contiguous. |
-| `multi_tensor_l2_norm_sq_stage2_kernel` | Stage 2: single-block reduction across `partials[N]` → `out[1]`. `N` can exceed `blockDim` (256); loop strides until exhausted. |
+| `multi_tensor_l2_norm_sq_stage1_bf16_kernel` | BF16 stage 1 (Phase 4a, 2026-05-13). Reads `__nv_bfloat16` storage, widens to F32 inside the inner loop (`opmath_t`), accumulates in F32, writes F32 partials. Same block-wise tree-reduction shape as the F32 kernel. Used by `global_l2_norm` when every grad is BF16 + contiguous — keeps BF16 grads BF16 through gradient clipping under autograd v2 / `BF16_GRAD_DECISION.md` Option A. |
+| `multi_tensor_l2_norm_sq_stage2_kernel` | Stage 2: single-block reduction across `partials[N]` → `out[1]`. `N` can exceed `blockDim` (256); loop strides until exhausted. Shared by BF16 and F32 stage-1 paths. |
 | `multi_tensor_scale_inplace_f32_kernel` | In-place `x[i] *= scale` across a list of F32 tensors. One block per tensor, grid-stride inner loop. Pointwise — no reduction, so bit-identical to per-tensor `mul_scalar`. Added 2026-05-12 (Phase 2) for the trainer clip-grad path; default-off in callers via `FLAME_MT_SCALE=1`. |
 | `multi_tensor_scale_inplace_bf16_kernel` | BF16 variant. Loads `__nv_bfloat16`, multiplies via `__bfloat162float → float * scale → __float2bfloat16`. Within 1 ULP of per-tensor BF16 `mul_scalar` because both go through the same cast chain. |
 

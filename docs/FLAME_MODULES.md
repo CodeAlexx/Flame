@@ -629,7 +629,7 @@ A newer experimental engine with explicit `Gradients` and `graph` types.
 Off by default. The SDPA backward in `autograd_v4/ops/sdpa.rs` is more
 correct than the v3 one in some edge cases.
 
-### `autograd_v2/` (feature `autograd_v2`, Phases 1 + 2 + 3a + 3b + 3c1)
+### `autograd_v2/` (feature `autograd_v2`, Phases 1 + 2 + 3a + 3b + 3c1 + 4a)
 Clean-sheet PyTorch-style DAG autograd engine. Designed to replace v1/v3/v4
 once Phase 5 parity gates pass. Phase 1 ships the foundational types
 and traits; Phase 2 ships the engine driver, dependency counting, ready
@@ -639,9 +639,14 @@ and the `CheckpointGradFn` skeleton. Phase 3a wires the recording surface
 6 view ops + HAZARD-2026-05-13-1 characterization. Phase 3c1 ships
 `layer_norm` + the full `CheckpointGradFn::apply` (no longer
 `NotImplementedYet`). Phase 3c2 (forward-mode AD across 11 ops) is
-deferred. Phase 4 (optimizer + trainer integration) does NOT depend on
-Phase 3c2. See `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` for the
-phase roadmap and `docs/BF16_GRAD_DECISION.md` for the dtype policy.
+deferred. Phase 4a (this milestone) ships the optimizer surface
+(`OptimizerV2` trait + `AdamWV2` wrapper at `optim.rs`), the
+`GradDtypePolicy::MatchParamDtype` path in `Parameter`, the BF16-grad
+classifier arms in `src/adam.rs`, and `multi_tensor_l2_norm_sq_bf16` in
+`src/ops/multi_tensor.rs`. Phase 4b (`GradientMap` rewrite + trainer
+integration smoke) is deferred. See
+`docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` for the phase roadmap and
+`docs/BF16_GRAD_DECISION.md` for the dtype policy.
 
 Key Phase 1 design points:
 - **Weak accumulator cycle break (§1):** `AutogradMetaV2::grad_accumulator`
@@ -768,20 +773,49 @@ Phase 3b additions (view-autograd surface + AccumulateGrad hooks fix):
   installer (Phase 4 may add multi-hook merge once Hooks fields carry
   interior mutability).
 
+Phase 4a additions (optimizer + BF16-grad migration partial):
+- **`optim.rs`** — `OptimizerV2` trait + `AdamWV2` thin wrapper around
+  the existing `AdamW`. Same state shape, same kernels, same
+  checkpoint format. `set_param_grad_v2` is a typed convenience that
+  errors if the parameter is on the v1 `CastToF32` policy.
+- **`crate::Parameter` extensions** (in `src/parameter.rs`) —
+  `GradDtypePolicy` enum + `Parameter::new_v2`, `grad_bf16_or_f32`,
+  policy-aware `set_grad` / `apply_update`. Phase 4a only touches the
+  NEW `MatchParamDtype` path; the v3 `CastToF32` path is unchanged so
+  existing trainers keep their F32-grad invariant.
+- **`src/adam.rs` classifier extension** — 4-way `(param_dtype,
+  grad_dtype)` classifier with the previously-dead
+  `adam_fused_multi_bf16_bf16grad_kernel` and
+  `adam_fused_f32param_bf16grad_kernel` arms activated.
+- **`src/ops/multi_tensor.rs::multi_tensor_l2_norm_sq_bf16`** — BF16
+  sibling for `multi_tensor_l2_norm_sq_f32`. Reused by
+  `ops::grad_norm::global_l2_norm` for all-BF16 grad slices.
+
+What Phase 4a explicitly does NOT do:
+- **No `GradientMap` rewrite.** v2 grads land in `AutogradMetaV2::grad`
+  (per `accumulator.rs`), bypassing GradientMap on the recording path.
+  Phase 4b reconsiders this once trainer integration shows what shape
+  trainers actually need.
+- **No trainer integration smoke.** Klein crashes on this box per
+  Phase 0 skeptic notes; Z-Image LoRA is the next-session target.
+
 Files: `accumulator.rs`, `checkpoint.rs`, `dispatch.rs`, `engine.rs`,
 `error.rs`, `hooks.rs`, `input_buffer.rs`, `meta.rs`, `mod.rs`,
-`node.rs`, `recording.rs`, `saved_tensor.rs`, `ops/mod.rs`,
-`ops/add.rs`, `ops/mul.rs`, `ops/sum.rs`, `ops/matmul.rs`,
-`ops/silu.rs`, `ops/reshape.rs`, `ops/transpose.rs`, `ops/narrow.rs`,
-`ops/squeeze.rs`, `ops/unsqueeze.rs`, `ops/permute.rs`,
-`ops/layer_norm.rs` (Phase 3c1). Tests:
+`node.rs`, `optim.rs` (Phase 4a), `recording.rs`, `saved_tensor.rs`,
+`ops/mod.rs`, `ops/add.rs`, `ops/mul.rs`, `ops/sum.rs`,
+`ops/matmul.rs`, `ops/silu.rs`, `ops/reshape.rs`, `ops/transpose.rs`,
+`ops/narrow.rs`, `ops/squeeze.rs`, `ops/unsqueeze.rs`,
+`ops/permute.rs`, `ops/layer_norm.rs` (Phase 3c1). Tests:
 `tests/autograd_v2_types.rs` (13 tests, Phase 1) +
 `tests/autograd_v2_engine.rs` (12 tests, Phase 2 + Phase 3b
 `accumulate_grad_uses_empty_sentinel_when_no_hooks`) +
 `tests/autograd_v2_ops.rs` (33 tests = Phase 3a 18 + Phase 3b 10 +
 Phase 3c1 5 layer_norm) + `tests/autograd_v2_checkpoint.rs`
-(4 tests, Phase 3c1: same-grads / inference-skip / reentrant-nested
-/ multi-output). All green.
+(4 tests, Phase 3c1) + `tests/autograd_v2_phase4a.rs` (12 tests,
+Phase 4a: 5 Parameter v2, 3 Adam BF16-grad, 2 multi_tensor BF16,
+2 AdamWV2 trait surface). All green (modulo a known
+parallel-CUDA-context flake in autograd_v2_ops / autograd_v2_engine
+pre-existing from Phase 3a — re-run individually to confirm).
 
 ### ⚠️ `autograd_simple.rs / autograd_engine.rs / autograd_ops.rs / autograd_ops_complete.rs / autograd_debug.rs`
 Older autograd attempts. Dead code; kept for reference.
