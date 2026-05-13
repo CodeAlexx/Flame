@@ -403,6 +403,21 @@ pub enum Op {
         /// Number of tape entries the original forward produced (for validation).
         original_tape_len: usize,
     },
+    /// Phase 2b boundary checkpoint: inputs pushed to grow cache; tape entry
+    /// holds only the input IDs and cache handles, NOT strong tensor refs.
+    /// Between forward and backward, the original input GPU storage can be
+    /// freed once all clones drop. At backward time, the recompute closure
+    /// (stored in `ctx.checkpoint_fns` keyed by output_id) pulls inputs
+    /// from cache, calls the user closure with pulled tensors, and the
+    /// resulting sub-tape is walked in reverse.
+    ///
+    /// Semantically equivalent to `Op::Checkpoint` but with the strong-ref
+    /// path replaced by cache replay. Single-shot (one push, one pull).
+    CheckpointOffloadBoundary {
+        /// IDs of the original input tensors (for grad routing back to the
+        /// outer autograd graph). Storage-less — we don't hold tensor refs.
+        input_ids: Vec<TensorId>,
+    },
     /// Fused SwiGLU: silu(gate) * up in one kernel.
     /// Backward: d_gate = dsilu(gate) * up * dout, d_up = silu(gate) * dout
     FusedSwiGLU {
@@ -1455,6 +1470,9 @@ impl AutogradContext {
                                 | Op::Cast { input, .. } => {
                                     ids.push(*input);
                                 }
+                                Op::CheckpointOffloadBoundary { input_ids } => {
+                                    for tid in input_ids { ids.push(*tid); }
+                                }
                                 Op::Conv2d { input, weight, .. } | Op::Conv2dNHWC { input, weight, .. }
                                 | Op::AddBias { input, bias: weight } => {
                                     ids.push(*input); ids.push(*weight);
@@ -1740,7 +1758,12 @@ impl AutogradContext {
                         // authored against BF16 scalar/non-leaf grads (observed:
                         // `CUDA_ERROR_INVALID_VALUE` from Mean/Mul backwards with BF16
                         // output_grad).
-                        let is_checkpoint = matches!(&entry.op, Op::Checkpoint { .. } | Op::CheckpointOffload { .. });
+                        let is_checkpoint = matches!(
+                            &entry.op,
+                            Op::Checkpoint { .. }
+                                | Op::CheckpointOffload { .. }
+                                | Op::CheckpointOffloadBoundary { .. }
+                        );
                         let t_accum = std::time::Instant::now();
                         for (tensor_id, grad) in input_grads {
                             if is_checkpoint || needed_grad_ids.contains(&tensor_id) {
@@ -2030,16 +2053,26 @@ impl AutogradContext {
         Ok(out_with_grad)
     }
 
-    /// Phase 2a (OFFLOAD_NEXT_GEN_DESIGN): narrow-scope checkpoint with
-    /// closure-input-passing semantics. The closure takes `&[Tensor]` so
-    /// it does NOT capture inputs by reference — Phase 2b will swap input
-    /// storage between forward and backward (push to grow cache after fwd,
-    /// pull before bwd recompute), achieving the OneTrainer "save block I/O
-    /// only, recompute internal" memory win.
+    /// Phase 2b (OFFLOAD_NEXT_GEN_DESIGN): narrow-scope checkpoint with
+    /// closure-input-passing semantics + grow-cache backed memory offload.
+    /// The closure takes `&[Tensor]` so it does NOT capture inputs by
+    /// reference — between forward and backward the original input GPU
+    /// storage can be freed once all clones drop. At backward time, the
+    /// recompute closure pulls inputs from the global grow cache, calls
+    /// the user closure with the pulled tensors, and the resulting
+    /// sub-tape is backwards-traversed (same pattern as `Op::Checkpoint`).
     ///
-    /// Phase 2a behavior: equivalent to `checkpoint(inputs, || f(inputs))`.
-    /// Establishes the API surface that trainers can wire against now;
-    /// Phase 2b will swap the body without changing the signature.
+    /// Behavior:
+    ///   - Autograd off OR no grow cache installed: degrades to plain
+    ///     `checkpoint(inputs, || f(inputs))` — closure-capture path.
+    ///   - With cache installed: forward runs `f(inputs)` once with
+    ///     autograd disabled; inputs pushed to grow cache; tape entry
+    ///     holds input_ids + handles (no strong tensor refs);
+    ///     `checkpoint_fns` stores a recompute closure that pulls inputs
+    ///     from cache and calls `f(pulled)`.
+    ///
+    /// Install the cache once at training setup via
+    /// `set_grow_activation_cache(...)`.
     pub fn checkpoint_offload_boundary<F>(inputs: &[Tensor], f: F) -> Result<Tensor>
     where
         F: Fn(&[Tensor]) -> Result<Tensor> + Send + Sync + 'static,
@@ -2054,16 +2087,85 @@ impl AutogradContext {
             return f(inputs);
         }
 
-        // Phase 2a: wrap the input-passing closure as a zero-arg closure
-        // that owns clones of the inputs, then delegate to plain checkpoint.
-        // The memory-freeing path (push to grow cache + no-strong-ref tape
-        // entry) is Phase 2b.
-        let inputs_owned: Vec<Tensor> = inputs.to_vec();
+        // Check if the grow cache is installed.
+        let cache_opt: Option<Arc<Mutex<crate::activation_offload::GrowOnDemandActivationCache>>> =
+            GROW_CACHE.read().ok().and_then(|g| g.as_ref().cloned());
+
+        if cache_opt.is_none() {
+            // Degraded path: wrap as zero-arg closure with input clones and
+            // delegate to plain `checkpoint`. Same memory profile as plain
+            // checkpoint (strong refs hold inputs alive).
+            let inputs_owned: Vec<Tensor> = inputs.to_vec();
+            let f_arc = Arc::new(f);
+            return Self::checkpoint(inputs, move || {
+                let f = Arc::clone(&f_arc);
+                f(&inputs_owned)
+            });
+        }
+
+        let cache = cache_opt.unwrap();
+        let input_ids: Vec<TensorId> = inputs.iter().map(|t| t.id).collect();
+
+        // Run forward with autograd DISABLED — same as plain `checkpoint`.
+        {
+            let mut ctx = AUTOGRAD_CONTEXT.lock()
+                .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+            ctx.enabled = false;
+        }
+        AUTOGRAD_ENABLED.store(false, Ordering::Relaxed);
+
+        let output = f(inputs)?;
+
+        // Push inputs to grow cache. Get handles.
+        let handles: Vec<crate::activation_offload::GrowHandle> = {
+            let mut cache_locked = cache
+                .lock()
+                .map_err(|_| Error::Training("grow cache mutex poisoned".into()))?;
+            inputs
+                .iter()
+                .map(|t| cache_locked.push(t))
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        // Re-enable autograd and build the recompute closure.
+        let cache_for_closure = cache.clone();
         let f_arc = Arc::new(f);
-        Self::checkpoint(inputs, move || {
+        let recompute_fn = move || -> Result<Tensor> {
+            let mut cache_locked = cache_for_closure
+                .lock()
+                .map_err(|_| Error::Training("grow cache mutex poisoned".into()))?;
+            let pulled: Vec<Tensor> = handles
+                .iter()
+                .map(|h| cache_locked.pull(*h))
+                .collect::<Result<Vec<_>>>()?;
+            drop(cache_locked);
             let f = Arc::clone(&f_arc);
-            f(&inputs_owned)
-        })
+            f(&pulled)
+        };
+
+        // Mark the returned output as requiring grad. Store the recompute
+        // closure under the output id, then record the new Op variant on
+        // the tape with EMPTY saved_tensors (no strong refs to inputs).
+        let mut out_with_grad = output;
+        out_with_grad.requires_grad = true;
+
+        {
+            let mut ctx = AUTOGRAD_CONTEXT.lock()
+                .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+            ctx.enabled = true;
+            AUTOGRAD_ENABLED.store(true, Ordering::Relaxed);
+            ctx.checkpoint_fns.insert(out_with_grad.id, Arc::new(recompute_fn));
+            ctx.record(TapeEntry {
+                output_id: out_with_grad.id,
+                op: Op::CheckpointOffloadBoundary {
+                    input_ids: input_ids.clone(),
+                },
+                saved_tensors: SavedTensors::new(),  // intentionally empty
+                saved_refs: SavedRefs::new(),
+            });
+        }
+
+        Ok(out_with_grad)
     }
 
     /// Level 2 activation offload checkpoint. Runs `f()` ONCE with autograd
@@ -2864,6 +2966,112 @@ fn compute_gradients(
             // ── Step 5: Return only chain + trainable gradients ──
             // Intermediate chain gradients served their purpose during the
             // local backward and are NOT propagated to the outer graph.
+            let mut result: GradVec = SmallVec::new();
+            for (tid, g) in sub_grads.drain_all()? {
+                if trainable_ids.contains(&tid) {
+                    result.push((tid, g));
+                }
+            }
+            Ok(result)
+        }
+
+        Op::CheckpointOffloadBoundary { input_ids } => {
+            // Same detach-recompute pattern as Op::Checkpoint above, but:
+            //   - No strong tensor refs in saved_tensors (entry.saved_tensors
+            //     is empty by construction).
+            //   - Input IDs come from the Op variant, not saved_tensors.
+            //   - The recompute closure (stored in checkpoint_fns) pulls
+            //     inputs from the GrowOnDemandActivationCache internally
+            //     before calling the user closure.
+            let recompute_fn = {
+                let ctx = AUTOGRAD_CONTEXT.lock()
+                    .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+                ctx.checkpoint_fns.get(&entry.output_id).cloned()
+                    .ok_or_else(|| Error::Training(
+                        "CheckpointOffloadBoundary backward: no recompute closure".into()
+                    ))?
+            };
+
+            // Recompute with autograd → local sub-tape.
+            let tape_start = {
+                let ctx = AUTOGRAD_CONTEXT.lock()
+                    .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+                ctx.tape.len()
+            };
+            {
+                let mut ctx = AUTOGRAD_CONTEXT.lock()
+                    .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+                ctx.enabled = true;
+                AUTOGRAD_ENABLED.store(true, Ordering::Relaxed);
+            }
+            let recomputed_output = (recompute_fn)()?;
+            let mut sub_tape: Vec<TapeEntry> = {
+                let mut ctx = AUTOGRAD_CONTEXT.lock()
+                    .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+                ctx.enabled = false;
+                AUTOGRAD_ENABLED.store(false, Ordering::Relaxed);
+                if ctx.tape.len() > tape_start {
+                    ctx.tape.drain(tape_start..).collect()
+                } else {
+                    Vec::new()
+                }
+            };
+            drop(recomputed_output);
+
+            // Build trainable/all-needed sets including all original inputs.
+            let mut trainable_ids = std::collections::HashSet::new();
+            let mut all_needed = std::collections::HashSet::new();
+            for tid in input_ids {
+                trainable_ids.insert(*tid);
+                all_needed.insert(*tid);
+            }
+            for e in &sub_tape {
+                all_needed.insert(e.output_id);
+                for (sid, st) in &e.saved_tensors {
+                    if st.requires_grad() {
+                        trainable_ids.insert(*sid);
+                        all_needed.insert(*sid);
+                    }
+                }
+                for r in &e.saved_refs {
+                    if r.tensor.requires_grad() {
+                        trainable_ids.insert(r.id);
+                        all_needed.insert(r.id);
+                    }
+                }
+            }
+
+            let sub_compact = {
+                use crate::gradient::CompactIndex;
+                let ids = sub_tape.iter().flat_map(|e| {
+                    let mut ids = vec![e.output_id];
+                    for (sid, _) in &e.saved_tensors { ids.push(*sid); }
+                    for r in &e.saved_refs { ids.push(r.id); }
+                    ids
+                }).chain(input_ids.iter().copied());
+                CompactIndex::from_tensor_ids(ids)
+            };
+            let mut sub_grads = crate::gradient::GradientMap::with_index(
+                device.clone(), sub_compact);
+
+            if let Some(last_entry) = sub_tape.last() {
+                sub_grads.set(last_entry.output_id, output_grad.clone());
+            }
+
+            sub_tape.reverse();
+            for sub_entry in sub_tape.drain(..) {
+                if let Some(sg) = sub_grads.take(sub_entry.output_id) {
+                    let input_grads = compute_gradients(&sub_entry, &sg, device)?;
+                    for (tid, g) in input_grads {
+                        if all_needed.contains(&tid) {
+                            sub_grads.accumulate(tid, g)?;
+                        }
+                    }
+                }
+            }
+            drop(sub_tape);
+            crate::cuda_alloc_pool::clear_pool_cache();
+
             let mut result: GradVec = SmallVec::new();
             for (tid, g) in sub_grads.drain_all()? {
                 if trainable_ids.contains(&tid) {
@@ -4723,6 +4931,7 @@ fn op_tag(op: &Op) -> &'static str {
         Op::RoPePrecomputed { .. } => "RoPePrecomputed",
         Op::GateResidual { .. } => "GateResidual",
         Op::Checkpoint { .. } => "Checkpoint",
+        Op::CheckpointOffloadBoundary { .. } => "CheckpointOffloadBoundary",
         Op::CheckpointOffload { .. } => "CheckpointOffload",
     }
 }
