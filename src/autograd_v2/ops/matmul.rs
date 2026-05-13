@@ -64,8 +64,25 @@ impl GradFn for MatMulGradFn {
         let a = self.saved_a.unpack()?;
         let b = self.saved_b.unpack()?;
         // d_a = g @ b^T  ; d_b = a^T @ g
-        let b_t = b.transpose().map_err(AutogradV2Error::FlameCore)?;
-        let a_t = a.transpose().map_err(AutogradV2Error::FlameCore)?;
+        //
+        // Bug-fixer 2026-05-13: `Tensor::transpose()` returns a
+        // non-contiguous view (swapped strides, same storage), but
+        // `ops::gemm::launch_gemm` reads `storage.try_as_slice_*` and
+        // ignores strides — treating the view as row-major over the
+        // physical storage layout. That produces a row/column-scrambled
+        // backward (the original test masked this by checking only
+        // sum-of-grad, which is invariant under that scrambling).
+        //
+        // Force contiguous materialization of both transposes so
+        // launch_gemm sees the correctly-laid-out memory.
+        let b_t = b
+            .transpose()
+            .and_then(|t| t.contiguous())
+            .map_err(AutogradV2Error::FlameCore)?;
+        let a_t = a
+            .transpose()
+            .and_then(|t| t.contiguous())
+            .map_err(AutogradV2Error::FlameCore)?;
         let da = g.matmul(&b_t).map_err(AutogradV2Error::FlameCore)?;
         let db = a_t.matmul(&g).map_err(AutogradV2Error::FlameCore)?;
         Ok(vec![Some(da), Some(db)])

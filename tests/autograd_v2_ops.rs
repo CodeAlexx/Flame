@@ -282,6 +282,76 @@ fn matmul_v2_backward_correct_shapes() {
 }
 
 // ---------------------------------------------------------------------------
+// 9b. matmul_v2_backward_per_element_correct
+// ---------------------------------------------------------------------------
+//
+// Bug-fixer 2026-05-13: the original `matmul_v2_backward_correct_shapes`
+// test deliberately checked only `sum(da) == rows(g) * sum(b)` because
+// the agent that wrote it observed that "the row/column convention can
+// flip depending on how the matmul kernel interprets the strided
+// transpose view". That sum is invariant under row/column scrambling,
+// so the test passed even when the backward produced the wrong
+// per-element grad. This test asserts the actual canonical formula
+// `da = g @ b^T` element-by-element.
+
+#[test]
+fn matmul_v2_backward_per_element_correct() {
+    // a = [[1, 2, 3],
+    //      [4, 5, 6]]  (2x3)
+    // b = [[1, 0, 0, 1],
+    //      [0, 1, 1, 0],
+    //      [1, 0, 1, 1]]  (3x4)
+    // g = ones(2x4)
+    //
+    // d_a = g @ b^T   has shape (2x3). With g all-ones, each row of d_a
+    //                 = column-sums of g^T @ b = row-sums of b.
+    //                 row-sums(b) = [2, 2, 3] → d_a = [[2,2,3],[2,2,3]].
+    //
+    // d_b = a^T @ g   has shape (3x4). With g all-ones,
+    //                 d_b[k, j] = sum_i a[i,k] * 1 = column-sum of a.
+    //                 col-sums(a) = [5, 7, 9].
+    //                 d_b = [[5,5,5,5],[7,7,7,7],[9,9,9,9]].
+    let a = make_leaf_requires_grad(
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        &[2, 3],
+    );
+    let b = make_leaf_requires_grad(
+        vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+        &[3, 4],
+    );
+    let ctx = default_ctx();
+    let out = flame_core::autograd_v2::ops::matmul::matmul_v2(&a, &b, &ctx).unwrap();
+    let g = make_f32(vec![1.0; 2 * 4], &[2, 4]);
+    let root = GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(g)]);
+    Engine::new().execute(root, &ctx).expect("execute");
+
+    let a_meta = a.autograd_meta().unwrap().lock().unwrap();
+    let b_meta = b.autograd_meta().unwrap().lock().unwrap();
+    let da = a_meta.grad.as_ref().unwrap().to_vec().unwrap();
+    let db = b_meta.grad.as_ref().unwrap().to_vec().unwrap();
+
+    let want_da = vec![2.0, 2.0, 3.0, 2.0, 2.0, 3.0];
+    let want_db = vec![5.0, 5.0, 5.0, 5.0, 7.0, 7.0, 7.0, 7.0, 9.0, 9.0, 9.0, 9.0];
+
+    for (i, (g, w)) in da.iter().zip(want_da.iter()).enumerate() {
+        assert!(
+            (g - w).abs() < 1e-4,
+            "da[{i}] = {g}, want {w} (full da = {:?}, want {:?})",
+            da,
+            want_da
+        );
+    }
+    for (i, (g, w)) in db.iter().zip(want_db.iter()).enumerate() {
+        assert!(
+            (g - w).abs() < 1e-4,
+            "db[{i}] = {g}, want {w} (full db = {:?}, want {:?})",
+            db,
+            want_db
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 10. silu_v2_backward_at_zero
 // ---------------------------------------------------------------------------
 
