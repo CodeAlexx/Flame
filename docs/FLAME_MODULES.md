@@ -1178,6 +1178,44 @@ mismatched files force a re-bench. Other FlexTensor `state_handler.py`
 surface (tensor-mode persistence, multi-process shm coordination) is
 out of scope — flame-core has no equivalent.
 
+### Offload telemetry export — `offload::telemetry` (Phase 4, 2026-05-12)
+
+⭐ Production-grade JSON exporters on top of the Phase 1 telemetry sink.
+Makes counters and event traces visible *outside* the process without
+requiring source edits in every trainer. All export paths are atomic
+(write-to-tmp + rename) and host-only — no CUDA calls.
+
+**Three export entry points** in `offload/telemetry.rs`:
+
+- `snapshot_to_file(path)` — single JSON document, the current
+  `TelemetryCounters` snapshot. Cheap; a few hundred bytes per call.
+- `ring_buffer_to_file(path)` — JSON-lines (one event per line) dump of
+  the per-event ring buffer. Empty when trace mode is off.
+- `dump_all(dir)` — convenience pair-dump. When `dir = None`, falls back
+  to `$FLAME_OFFLOAD_TELEMETRY_DUMP_DIR`, then to
+  `std::env::temp_dir()`. Returns the directory actually used.
+
+**Periodic dump.** Set `FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS=N` (or
+call `Telemetry::set_periodic_dump_interval(N)` programmatically) and
+every Nth recorded prefetch / await event triggers a `dump_all` to the
+configured directory. Cheap when disabled — one relaxed atomic load
+per event. Failures are logged via `eprintln!` and swallowed so a
+missing dump dir cannot break training.
+
+**Serde derive on the data types.** `TelemetryCounters`, `TelemetryEvent`,
+and `TelemetryEventKind` all `derive(Serialize, Deserialize)`. External
+tools can read the JSON without depending on flame-core.
+
+**Tenet alignment.** Clause 1 of `SPEED_CONTRACT.md` (no implicit syncs)
+is satisfied trivially — the export path never touches a CUDA function.
+The atomic-rename pattern (tmp file + `std::fs::rename`) means a process
+crash mid-write leaves the previous file intact, so an external monitor
+can read the file at any time.
+
+See [`OFFLOAD_GETTING_STARTED.md`](./OFFLOAD_GETTING_STARTED.md) for a
+consumer-facing tutorial covering BlockOffloader, strategies, manager,
+and telemetry together.
+
 ### Remaining wiring (not yet done)
 
 Three things need to happen before activation offload is live in training:

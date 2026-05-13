@@ -982,17 +982,100 @@ Phase 1 telemetry sink.
 | `offload::strategy::Knapsack` | `offload/strategy/knapsack.rs` | Value-based selection bounded by a byte budget. Greedy value-per-byte sort (~5% of optimal at <1 µs). Score = inverse recency + frequency + requested bonus. `with_budget(bytes)` / `unbounded()`. |
 | `offload::strategy::Adaptive` | `offload/strategy/adaptive.rs` | VRAM-pressure-driven sizing. Shrinks above high_watermark (default 0.85), grows below low_watermark (default 0.60), holds in between (hysteresis). Wraps a Knapsack with a dynamic budget. |
 | `offload::planner::PlanRequest` / `PlanResult` | `offload/planner.rs` | Plain capacity-bounded block selection. `plan_smallest_first` (maximize count) / `plan_largest_first` (fewer transfers) / `max_block_bytes`. Used by strategies and callers that want a "just fit" baseline. |
-| ⭐ `BlockOffloader::set_strategy(Box<dyn Strategy>)` | `offload/mod.rs` | Attach strategy; opt-in only. Default = no strategy = bit-identical pre-Phase-2 behavior. |
-| `BlockOffloader::with_strategy(self, …)` / `clear_strategy()` / `strategy_name()` | `offload/mod.rs` | Builder, detacher, telemetry accessor. |
-| `BlockOffloader::block_sizes()` / `resident_blocks()` | `offload/mod.rs` | Accessors used to size strategy budgets externally. |
-| `Telemetry::record_strategy_decision(name, evicted, kept, target_bytes)` | `offload/telemetry.rs` | Strategy decision hook (cheap when telemetry disabled). Adds `strategy_plans`, `strategy_eviction_decisions`, `strategy_keep_total`, `strategy_last_target_resident_bytes` to `TelemetryCounters`. |
+| ⭐ `BlockOffloader::set_strategy(Box<dyn Strategy>)` | `offload/mod.rs:911` | Attach strategy; opt-in only. Default = no strategy = bit-identical pre-Phase-2 behavior. |
+| `BlockOffloader::with_strategy(self, …)` | `offload/mod.rs:916` | Builder-style variant. |
+| `BlockOffloader::clear_strategy()` | `offload/mod.rs:923` | Detach. |
+| `BlockOffloader::strategy_name()` | `offload/mod.rs:929` | `"none"` when unset, else the active strategy's `name()` (`"two_slot"`, `"knapsack"`, `"adaptive"`). |
+| `BlockOffloader::block_sizes()` | `offload/mod.rs:940` | Per-block BF16 footprint, for sizing strategy budgets externally. |
+| `BlockOffloader::resident_blocks()` | `offload/mod.rs:946` | Block IDs currently parked on a GPU slot. |
+| `Telemetry::record_strategy_decision(name, evicted, kept, target_bytes)` | `offload/telemetry.rs:321` | Strategy decision hook (cheap when telemetry disabled). Adds `strategy_plans`, `strategy_eviction_decisions`, `strategy_keep_total`, `strategy_last_target_resident_bytes` to `TelemetryCounters`. |
 
-Deliberately deferred to Phase 3 (not ported): FlexTensor's `OffloadManager`
-state machine, `state_handler.py` persistence, `tensor_discovery` /
-`trap_tensor_mode` (rely on PyTorch `__torch_function__`),
-`memory_block_planner.py` adjacency-graph coloring (flame-core's blocks are
-flat IDs from `BlockFacilitator`), `shm/` cross-process plumbing
-(single-process trainers only).
+### Block offload manager — `offload::manager` (Phase 3 FlexTensor port, 2026-05-12)
+
+⭐ Wraps a `BlockOffloader` in a `NotInitialized → Discovery → Profiling →
+Active` state machine. Auto-selects a `Strategy` at `activate()` time
+based on observed VRAM headroom (`TwoSlot` when block fits comfortably,
+`Adaptive` otherwise). Trainers opt in by constructing an
+`OffloadManager` instead of using `BlockOffloader` directly. See
+[`FLAME_MODULES.md`](./FLAME_MODULES.md#offload-manager--offloadmanager-phase-3-flextensor-port-2026-05-12).
+
+| Symbol | Location | Purpose |
+|---|---|---|
+| ⭐ `offload::OffloadManager` | `offload/manager.rs:174` | State-machine wrapper around `BlockOffloader`. Re-exported at `flame_core::offload::OffloadManager`. |
+| `offload::OffloadPhase` | `offload/manager.rs:82` | `NotInitialized` / `Discovery` / `Profiling` / `Active`. `as_str()` returns the stable name. |
+| `offload::ManagerConfig` | `offload/manager.rs:118` | Tunables: `bench_config`, `force_strategy`, `cache_path`, `vram_headroom_bytes`, `low_pressure_keep_fraction`. |
+| `offload::ForcedStrategy` | `offload/manager.rs:157` | `Auto` / `TwoSlot` / `Knapsack(budget)` / `Adaptive`. Setting anything other than `Auto` skips the auto-decision in `activate()`. |
+| `OffloadManager::new(device, offloader)` | `offload/manager.rs:203` | Construct in `NotInitialized` with default config. |
+| `OffloadManager::with_config(device, offloader, config)` | `offload/manager.rs:208` | Same with custom `ManagerConfig`. |
+| `OffloadManager::load(...)` | `offload/manager.rs:226` | One-shot ctor: pass `BlockOffloader::load` args through. |
+| `OffloadManager::phase()` | `offload/manager.rs:238` | Current `OffloadPhase`. |
+| `OffloadManager::offloader()` / `offloader_mut()` | `offload/manager.rs:243-250` | Borrow the wrapped `BlockOffloader`. |
+| `OffloadManager::block_sizes()` | `offload/manager.rs:256` | Forwarded accessor. |
+| `OffloadManager::bandwidth_profile()` | `offload/manager.rs:262` | `Option<&TransferBandwidthProfile>` — `None` until `Profiling` finishes. |
+| `OffloadManager::active_strategy_name()` | `offload/manager.rs:268` | `"none"` until `activate()`, then the chosen strategy's name. |
+| `OffloadManager::into_offloader()` | `offload/manager.rs:275` | Tear the manager apart, return the underlying offloader. |
+| `OffloadManager::discover()` | `offload/manager.rs:289` | `NotInitialized → Discovery`. Snapshots block geometry. |
+| `OffloadManager::run_profile()` | `offload/manager.rs:309` | `Discovery → Profiling`. Loads cached profile from disk if present, else runs `transfer_benchmark::run_benchmark` and writes the result back. |
+| `OffloadManager::activate()` | `offload/manager.rs:381` | `Profiling → Active`. Picks + installs a strategy. Reads `cuda_mem_get_info` once for the headroom test. |
+| `OffloadManager::discover_profile_activate()` | `offload/manager.rs:418` | One-shot: do all three transitions back-to-back. |
+
+### Block offload strategy constructors — `offload::strategy::*` (Phase 2 FlexTensor port, 2026-05-13)
+
+Strategy impl builders for callers that want to attach a strategy manually
+(via `BlockOffloader::set_strategy`) instead of relying on `OffloadManager`.
+
+| Symbol | Location | Purpose |
+|---|---|---|
+| `strategy::TwoSlot::new()` | `offload/strategy/two_slot.rs:29` | Default ping-pong. Stateless. |
+| `strategy::Knapsack::with_budget(bytes)` | `offload/strategy/knapsack.rs:84` | Greedy value-per-byte under a fixed byte budget. |
+| `strategy::Knapsack::unbounded()` | `offload/strategy/knapsack.rs:94` | No byte cap; still emits a priority ordering. |
+| `strategy::Knapsack::with_weights(w)` | `offload/strategy/knapsack.rs:103` | Override scoring weights. |
+| `strategy::ValueWeights` | `offload/strategy/knapsack.rs:40` | `recency` / `frequency` / `requested_bonus` (`f32`s). |
+| `strategy::Adaptive::new()` | `offload/strategy/adaptive.rs:60` | VRAM-pressure-driven (defaults: low=0.60, high=0.85, shrink=0.5). |
+| `strategy::Adaptive::with_watermarks(low, high)` | `offload/strategy/adaptive.rs:72` | Builder. |
+| `strategy::Adaptive::with_shrink_fraction(f)` | `offload/strategy/adaptive.rs:83` | Builder. |
+| `strategy::Adaptive::with_value_weights(w)` | `offload/strategy/adaptive.rs:89` | Builder; forwarded to the inner Knapsack. |
+| `strategy::Adaptive::last_observed_pressure()` | `offload/strategy/adaptive.rs:97` | Last VRAM-pressure ratio plan() saw. |
+| `strategy::Adaptive::last_target_bytes()` | `offload/strategy/adaptive.rs:103` | Last target resident-set size. |
+
+### Block offload state persistence — `offload::state` (Phase 3 FlexTensor port, 2026-05-12)
+
+JSON serde for the `TransferBandwidthProfile`, so a profile sweep
+amortizes across runs.
+
+| Symbol | Location | Purpose |
+|---|---|---|
+| `offload::state::DEFAULT_PROFILE_FILENAME` | `offload/state.rs:44` | `"offload_profile.json"`. |
+| `offload::state::PROFILE_PATH_ENV` | `offload/state.rs:47` | `"FLAME_OFFLOAD_PROFILE_PATH"`. |
+| `offload::state::default_profile_path()` | `offload/state.rs:133` | Honors `$FLAME_OFFLOAD_PROFILE_PATH` → else `$XDG_CACHE_HOME/flame-core/offload_profile.json` → else `~/.cache/flame-core/...`. |
+| `offload::state::save_profile(path, profile)` | `offload/state.rs:160` | Atomic-write JSON. Schema-versioned (`SCHEMA_VERSION = 1`). |
+| `offload::state::load_profile(path)` | `offload/state.rs:193` | Read + version-check. Schema mismatch → error so the caller re-benches. |
+| `offload::state::relative_error(a, b)` | `offload/state.rs:224` | Helper for parity tests. |
+
+### Block offload telemetry export — `offload::telemetry` (Phase 4, 2026-05-12)
+
+⭐ On-disk exporters that surface the in-process telemetry state without
+source edits in every trainer. Atomic writes (tmp-file + rename); no CUDA
+calls. See [`OFFLOAD_GETTING_STARTED.md`](./OFFLOAD_GETTING_STARTED.md).
+
+| Symbol | Location | Purpose |
+|---|---|---|
+| `offload::telemetry::snapshot_to_file(path)` | `offload/telemetry.rs` | JSON-serialize the current counter snapshot to `path` atomically. |
+| `offload::telemetry::ring_buffer_to_file(path)` | `offload/telemetry.rs` | JSON-lines dump of the per-event ring buffer. Returns count written. |
+| `offload::telemetry::dump_all(dir)` | `offload/telemetry.rs` | Convenience pair-dump. Honors `$FLAME_OFFLOAD_TELEMETRY_DUMP_DIR` when `dir = None`. |
+| `Telemetry::set_periodic_dump_interval(N)` | `offload/telemetry.rs` | Every `N` recorded events trigger a `dump_all` to the configured dir. `0` disables. |
+| `Telemetry::periodic_dump_interval()` | `offload/telemetry.rs` | Read back the current interval. |
+| `offload::telemetry::DUMP_SNAPSHOT_FILENAME` | `offload/telemetry.rs` | `"flame_offload_telemetry_snapshot.json"`. |
+| `offload::telemetry::DUMP_EVENTS_FILENAME` | `offload/telemetry.rs` | `"flame_offload_telemetry_events.jsonl"`. |
+| `offload::telemetry::DUMP_DIR_ENV` | `offload/telemetry.rs` | `"FLAME_OFFLOAD_TELEMETRY_DUMP_DIR"`. |
+| `offload::telemetry::DUMP_INTERVAL_ENV` | `offload/telemetry.rs` | `"FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS"`. |
+| `TelemetryCounters` / `TelemetryEvent` / `TelemetryEventKind` | `offload/telemetry.rs` | All three now derive `Serialize` / `Deserialize`. |
+
+Deliberately *still* deferred (not in Phase 3 or 4): FlexTensor's
+`tensor_discovery` / `trap_tensor_mode` (rely on PyTorch
+`__torch_function__`), `memory_block_planner.py` adjacency-graph coloring
+(flame-core's blocks are flat IDs from `BlockFacilitator`), `shm/`
+cross-process plumbing (single-process trainers only).
 
 ### Gradient utilities
 - `gradient::GradientMap / TensorGradExt` — re-exported as `GradientMap`
