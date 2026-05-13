@@ -357,6 +357,18 @@ Process-global Mutex at `src/autograd.rs:56`. Band-aided by `serial_test`. Archi
 
 Verified pre-existing at `2baa221`. Phase 5d item #5 diagnoses.
 
+### Perf backlog carried over (NOT autograd v2's scope, but needs a home)
+
+These two items live elsewhere today and were nearly lost on this handoff. Capturing them so they survive the next /clear:
+
+1. **cuDNN SDPA backward disabled (grad_norm=inf)** — full context in `HANDOFF_2026-05-12_DISPATCHER_NEXT_AND_LORA_BASELINE.md` §A and memory `feedback_cudnn_sdpa_bwd_inf_grad`. Decomposed bwd path does ~12 kernels per attention site × 30 blocks. The cuDNN fused bwd would do 1 launch but produces `grad_norm=inf` when `d_o` is cast F32→BF16. Likely stats-convention mismatch. **Worth ~200-400 ms/step if root-caused.** Investigation needs a per-block dQ/dK/dV parity harness against the decomposed path.
+
+2. **~120 permute_generic launches/step on plain-LoRA Klein path** — captured 2026-05-13 in memory `project_permute_generic_residual_per_block`. After Fix #1 (`EDv2/ab8ee68`), ~4 residual `permute_generic` calls per block × 30 blocks. Each ~3-5 ms post Fix #G. **Worth ~400-600 ms/step** if replaceable with fast-path perms or pre-baked transposes. Use `FLAME_TRACE_PERMUTE_GENERIC=1` (existing instrumentation) to localize the call sites.
+
+### Klein step-2 crash RESOLVED 2026-05-13 (was in hazards, moved here)
+
+`EriDiffusion-v2/4511140` — `train_klein.rs:main()` auto-sets `FLAME_ALLOC_POOL=0` before any flame_core call, mirroring `prepare_klein.rs:194`. Root cause: FLAME alloc pool corruption after BlockOffloader-exercising backward replay. Same recurring failure mode as `feedback_prepare_bins_pool_off`. Verified: Klein 9B + `--offload` runs 5 steps clean, no env vars set, steady-state ~4.4 s/step matching documented baseline. Memory `project_klein9b_step2_crash_isolation` has the bisect detail.
+
 ---
 
 ## User decisions / preferences (load-bearing)
