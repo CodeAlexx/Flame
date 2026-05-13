@@ -1133,6 +1133,51 @@ On a single 3090 Ti the smoke test (5 sizes, 64 KiB → 16 MiB) measured
 peak ≈26 GB/s H2D / D2H — close to PCIe 4.0 x16 theoretical max for
 unidirectional traffic.
 
+### Offload manager — `offload::manager` (Phase 3 FlexTensor port, 2026-05-12)
+
+⭐ State-machine wrapper around `BlockOffloader` that auto-selects a
+strategy at activation time. Closes Phase 3 of the FlexTensor port:
+Phase 1 (telemetry) measures, Phase 2 (strategy trait) supplies
+primitives, Phase 3 ties them together with an autonomous policy.
+
+**Motivation.** PCIe bandwidth is the hardware ceiling (Phase 1 measured
+~26 GB/s on this 3090 Ti). Phase 3 is *not* about beating that — it is
+about **operational reliability for heavy memory-pressure workloads**
+(sensenova_u1 @ 2048², hidream-o1 32B mixed-precision experts,
+ltx2/wan22 video DiTs). Trainers ask the manager to "figure it out"
+instead of hand-configuring `set_strategy` per model.
+
+**Lifecycle.** `OffloadPhase` is `NotInitialized → Discovery → Profiling
+→ Active`. Each transition is explicit; the upstream FlexTensor
+`OffloadPhase` had `INFERENCE` as the final phase — flame-core does not
+distinguish inference vs training at this layer (both run through the
+same slot mechanic), so `Active` subsumes both.
+
+- `discover()` snapshots the offloader's block geometry. Flame-core has
+  no `__torch_function__` tensor crawler; block IDs are stable inputs
+  declared via `BlockFacilitator`.
+- `run_profile()` loads a cached `TransferBandwidthProfile` from disk if
+  available, or runs the PCIe sweep + writes the result back. Default
+  cache path is `${XDG_CACHE_HOME:-$HOME/.cache}/flame-core/offload_profile.json`
+  (honors `FLAME_OFFLOAD_PROFILE_PATH`).
+- `activate()` installs a `Strategy` on the underlying `BlockOffloader`.
+  Default decision: if `2 × max_block_bytes < 0.3 × (free_VRAM −
+  vram_headroom_bytes)` → `TwoSlot`; otherwise → `Adaptive`. Override
+  via `ManagerConfig::force_strategy`.
+
+**Tenet alignment.** Strategy decisions are pure host logic — no CUDA
+launches, no `cudaStreamSynchronize`. The single CUDA touchpoint is the
+`cuda_mem_get_info` call inside `activate()`, which is a non-blocking
+driver query. `BlockOffloader`'s existing public API is unchanged;
+existing trainers (and Phase 2 manual `set_strategy` callers) are
+bit-identical to pre-Phase-3 behavior.
+
+**Phase 3 also ships `offload::state`** — serde JSON persistence of the
+`TransferBandwidthProfile`. Schema-versioned (`SCHEMA_VERSION = 1`),
+mismatched files force a re-bench. Other FlexTensor `state_handler.py`
+surface (tensor-mode persistence, multi-process shm coordination) is
+out of scope — flame-core has no equivalent.
+
 ### Remaining wiring (not yet done)
 
 Three things need to happen before activation offload is live in training:

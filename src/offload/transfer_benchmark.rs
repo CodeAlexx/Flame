@@ -196,6 +196,25 @@ pub struct TransferBandwidthProfile {
 }
 
 impl TransferBandwidthProfile {
+    /// Reconstruct a profile from previously-persisted parts. Intended only
+    /// for [`crate::offload::state::load_profile`] — the field layout is a
+    /// private contract between the two modules. Callers that want a fresh
+    /// profile call [`run_benchmark`].
+    #[doc(hidden)]
+    pub fn __from_persisted_parts(
+        h2d: Vec<TransferMeasurement>,
+        d2h: Vec<TransferMeasurement>,
+        peak_h2d_bps: f64,
+        peak_d2h_bps: f64,
+    ) -> Self {
+        Self {
+            h2d,
+            d2h,
+            peak_h2d_bps,
+            peak_d2h_bps,
+        }
+    }
+
     /// All H2D measurements, ordered by increasing transfer size.
     pub fn h2d(&self) -> &[TransferMeasurement] {
         &self.h2d

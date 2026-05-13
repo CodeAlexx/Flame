@@ -26,11 +26,24 @@
 //! * [`transfer_benchmark`] — one-time PCIe H2D/D2H bandwidth sweep used
 //!   to build a [`transfer_benchmark::TransferBandwidthProfile`] for
 //!   future strategy work (Phase 2). Not on the per-step path.
+//! * [`strategy`] — Phase 2: resident-set strategy trait + three impls
+//!   (`TwoSlot`, `Knapsack`, `Adaptive`). Opt-in via `set_strategy`.
+//! * [`manager`] — Phase 3: `OffloadManager` state machine
+//!   (`NotInitialized → Discovery → Profiling → Active`) that wraps a
+//!   `BlockOffloader` and auto-selects a strategy based on observed
+//!   VRAM headroom. Trainers opt in by constructing an `OffloadManager`.
+//! * [`state`] — Phase 3: serde JSON persistence of the bandwidth
+//!   profile (and only the profile — strategies are stateless or
+//!   nearly so). Survives process restart.
 
+pub mod manager;
 pub mod planner;
+pub mod state;
 pub mod strategy;
 pub mod telemetry;
 pub mod transfer_benchmark;
+
+pub use manager::{ForcedStrategy, ManagerConfig, OffloadManager, OffloadPhase};
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
