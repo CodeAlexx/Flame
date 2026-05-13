@@ -234,6 +234,14 @@ This is a critical area with several implementations. **Use these for inference*
   The chunked streaming SDPA used by LTX-2. Takes a `causal` flag and chunk size.
   **Note**: this is the catastrophically slow path for d=64 / causal — see
   PERF_SDPA_FLASH_KERNEL.md.
+  **Post-Class-E (2026-05-12, commit `542c531`)** the C-side launch wrapper
+  `sdpa_stream_bf16_launch` in `cuda/sdpa_stream_bf16.cu` caches an 11-buffer
+  fused workspace (`SdpaStreamWorkspace`) per device + a process-singleton
+  `cublasHandle_t` per device (`sdpa_ws_get_cublas_handle`). Was: 11
+  `cudaMalloc` + 11 `cudaFree` + 1 `cublasCreate` per call. Now: zero
+  allocations on the hot path (grown only on shape change). Mirrors the
+  cuBLASLt workspace cache pattern in `gemm_bf16_cublaslt.cu`. Reference
+  impl for SPEED_CONTRACT clause 1's "cached per-device workspace" pattern.
 
 ### ⚠️ Legacy / training-only
 - `attention/sdpa_legacy.rs` — old impl, keep for reference, do NOT call
@@ -668,7 +676,7 @@ C=4) passed within BF16 tolerance.
 ### `cuda/ffi.rs` — Rust FFI declarations
 The `extern "C"` block declaring all the C-side `flame_*` symbols. Look here
 to see what kernels are linked in. Notable groups:
-- `flame_narrow_strided_launch / flame_narrow_backward_scatter_add_launch` (`:10,15`) — narrow ops
+- `flame_narrow_strided_launch / flame_narrow_backward_scatter_add_launch` (`:10,15`) — narrow ops. **Post-Class-E (2026-05-12, commit `b552f61`)**: metadata (shape + strides) passes inline via a `NarrowMeta` kernel-arg struct — no per-call `cudaMalloc` / `cudaMemcpyAsync` / `cudaStreamSynchronize` / `cudaFree`. Reference impl for SPEED_CONTRACT clause 1 ("Sync — primitives do not host-stall"). Real-trainer impact: klein 9B step went 268 → 0 `cudaStreamSynchronize` calls/step.
 - `flame_cuda_alloc_pinned_host / flame_cuda_free_pinned_host / flame_cuda_memcpy_async / flame_cuda_host_register / flame_cuda_host_unregister` (`:83-94`) — pinned memory + async copy
 - `flame_rope_apply_bf16_fp32` (`:225`) — RoPE kernel (legacy, used by training)
 - `flame_apply_causal_mask_fp32 / flame_apply_attn_mask_fp32` (`:238,249`) — SDPA mask kernels
@@ -880,16 +888,80 @@ Recently-added variants:
 - `OffloadedTapeEntry` — `autograd.rs:339` — tape entry with saved tensors
   replaced by `OffloadHandle`s + optional `resident_fallback` for non-BF16.
 
-### Block offloading (flame-diffusion)
-- `BlockOffloader` — `flame-diffusion/src/block_offload.rs` — double-buffered pinned CPU→GPU block offloader
-- `BlockFacilitator` trait — `flame-diffusion/src/block_offload.rs` — model geometry provider
-- `prefetch_block(idx)` — async H2D to non-active slot
-- `await_block(idx)` → `Arc<HashMap<String, Tensor>>` — wait + prepare
-- `ensure_block(idx)` — sync API (prefetch + await)
+### Block offloading — `offload::BlockOffloader` (moved into flame-core 2026-05-12, commit `df00c5f`)
+
+⭐ Sole block-offloading mechanism for both training and inference. Was at
+`flame-diffusion/src/block_offload.rs`; the entire ~1,579 LOC module is now
+re-rooted at `flame_core::offload`. Every trainer + every inference model
+that calls `prefetch_block` / `await_block` now imports from
+`flame_core::offload::*`. See [`FLAME_MODULES.md`](./FLAME_MODULES.md#-offload--blockoffloader--blockfacilitator-moved-into-flame-core-2026-05-12)
+for the module overview.
+
+| Symbol | File:line | Notes |
+|---|---|---|
+| ⭐ `offload::BlockOffloader` | `offload/mod.rs:331` | Double-buffered pinned-CPU → GPU offloader. Two GPU slots, one dedicated CUDA transfer stream, per-slot CUDA events (`h2d_done`, `compute_done`) for stream-stream waits — no host stalls on the hot path. |
+| ⭐ `offload::BlockFacilitator` trait | `offload/mod.rs:179` | Model-specific geometry provider. Two methods: `block_count(&self) -> usize`, `classify_key(&self, key: &str) -> Option<usize>`. Each trainer / inference model implements one. |
+| ⭐ `offload::BlockHandle` | `offload/mod.rs:1491` | Scoped handle returned by `await_block_handle`. Records `compute_done` on Drop; next prefetch reusing the slot does `cudaStreamWaitEvent` instead of host sync. `Deref<Target = HashMap<String, Tensor>>`. Methods: `.weights()`, `.get(key)`, `.arc()`. |
+| ⭐ `BlockOffloader::load(paths, facilitator, device)` | `offload/mod.rs:384` | Default ctor. Reads safetensors → pinned CPU memory, converts to BF16 at load. `BLOCKOFF_FP8_PINNED=1` keeps F8_E4M3 raw in pinned RAM, GPU-dequants in `prepare_weights`. |
+| ⭐ `BlockOffloader::load_fp8_stream(paths, facilitator, device)` | `offload/mod.rs:404` | Same as `load` but always treats F8_E4M3 as keep-raw-pinned + GPU-dequant. For LTX-2/Wan2.2 FP8 checkpoints; halves pinned RAM. |
+| ⭐ `BlockOffloader::load_streaming(paths, facilitator, device)` | `offload/mod.rs:680` | mmap-backed mode: pinned RAM = `2 × max_block_bf16_bytes` (typically <1.5 GB) instead of full-model. Two staging buffers fed from mmap on each prefetch. For Qwen-Image-2512-class models that don't fit in 62 GB pinned. F8_E4M3 not supported in this mode. |
+| ⭐ `BlockOffloader::with_native_layout(self, native: bool) -> Self` | `offload/mod.rs:822` | Builder. `true` disables the `[Cout,Cin] → [Cin,Cout]` pre-transpose in `prepare_weights`. Required when the caller's forward uses `ops::fused_inference::fused_linear3d_native` (cuBLASLt TRANSA=T). |
+| ⭐ `BlockOffloader::prefetch_block(&mut self, idx)` | `offload/mod.rs:835` | Start async H2D into the non-active slot. No-op if already resident. If a different prefetch is in flight, syncs it first (rare; usually waits on the slot's `compute_done` event so the next compute step's H2D can start without host stall). |
+| ⭐ `BlockOffloader::await_block(&mut self, idx)` | `offload/mod.rs:1227` | Returns `Arc<HashMap<String, Tensor>>`. Legacy API — no scoped handle, so the next slot-reusing `prefetch_block` falls back to host-side `cudaDeviceSynchronize`. Migrate hot paths to `await_block_handle`. |
+| ⭐ `BlockOffloader::await_block_handle(&mut self, idx)` | `offload/mod.rs:1337` | Returns a scoped [`BlockHandle`]. Slot reuse waits on the handle's `compute_done` event via `cudaStreamWaitEvent` instead of host sync. Preferred. |
+| ⭐ `BlockOffloader::ensure_block(&mut self, idx)` | `offload/mod.rs:1357` | Backward-compat: `prefetch_block` + `await_block` in one call. |
+| `BlockOffloader::evict_block(&mut self)` | `offload/mod.rs:1369` | Drop GPU tensors from both slots. Drains in-flight transfers and does a single host sync before freeing — pre-shutdown / mode-switch path, not hot loop. |
+| `BlockOffloader::block_count(&self)` | `offload/mod.rs:1387` | Accessor. |
+| `BlockOffloader::pinned_bytes(&self)` | `offload/mod.rs:1392` | Total pinned CPU bytes (excludes GPU slots). |
+
+Facilitator implementations live in trainer / inference-flame crates:
 - `KleinFacilitator` — `klein-trainer/src/facilitator.rs`
 - `ChromaFacilitator` — `chroma-trainer/src/facilitator.rs`
 - `WanFacilitator` — `wan-trainer/src/facilitator.rs`
-- `Wan22Dit::load_shared_only` — `inference-flame/src/models/wan22_dit.rs` — shared-only constructor (no block weights)
+- `Gemma3Facilitator`, `MistralFacilitator`, `Flux1Facilitator`, etc. — `inference-flame/src/models/*`
+- `Wan22Dit::load_shared_only` — `inference-flame/src/models/wan22_dit.rs` — shared-only constructor (no block weights) used alongside `BlockOffloader` for 14B+ Wan2.2 experts.
+
+### Block offload telemetry — `offload::telemetry` (Phase 1 FlexTensor port, 2026-05-12)
+
+⭐ Per-prefetch / per-step counters and an opt-in event ring buffer. Hooks
+into `prefetch_block` / `await_block` are cheap when disabled (single
+relaxed atomic load); enabled via env var `FLAME_OFFLOAD_TELEMETRY=on`
+(counters) / `=trace` (counters + ring buffer), or via
+`telemetry::global().set_enabled(true)`. See
+`offload/telemetry.rs` for the registry-style API and
+[`FLAME_MODULES.md`](./FLAME_MODULES.md#offload-telemetry--offloadtelemetry-phase-1-flextensor-port-2026-05-12)
+for the module overview.
+
+| Symbol | File:line | Notes |
+|---|---|---|
+| ⭐ `offload::telemetry::global()` | `offload/telemetry.rs:411` | Returns `&'static Telemetry`. Lazily initialized; environment defaults applied at first call. |
+| `offload::telemetry::Telemetry` | `offload/telemetry.rs:136` | Process-global atomic counter bag + bounded ring buffer. `Send + Sync`. |
+| `offload::telemetry::TelemetryCounters` | `offload/telemetry.rs:36` | Plain-data snapshot (`Clone`). Has `effective_h2d_bps()` and `await_hit_ratio()` accessors. |
+| `offload::telemetry::TelemetryEvent` / `TelemetryEventKind` | `offload/telemetry.rs:91` | Per-event trace record (only populated in trace mode). |
+| `Telemetry::is_enabled` / `is_trace_enabled` | `offload/telemetry.rs:177-181` | Cheap relaxed loads. |
+| `Telemetry::set_enabled` / `set_event_log_capacity` / `reset` / `snapshot` | `offload/telemetry.rs:185-249` | Mode + state controls. `snapshot` is 7 atomic loads. |
+| `Telemetry::record_prefetch_begin` / `record_prefetch_end` / `record_prefetch_already_resident` | `offload/telemetry.rs:268-302` | Hooks for `prefetch_block`. Pair: begin returns timer, end consumes it. |
+| `Telemetry::record_await_begin` / `record_await_end_hit` / `record_await_end_miss` | `offload/telemetry.rs:305-336` | Hooks for `await_block`. "Hit" = slot already had the block resident; "miss" = await had to issue its own H2D. |
+| `offload::telemetry::format_counters` | `offload/telemetry.rs:380` | Stable diagnostic string for `eprintln!` / log output. |
+
+### Block offload transfer benchmark — `offload::transfer_benchmark` (Phase 1 FlexTensor port, 2026-05-12)
+
+⭐ One-time PCIe H2D/D2H bandwidth sweep at process init. Builds a
+log-log interpolator usable for future strategy code (Phase 2). Init-only,
+not on the per-step path — uses `cudaEventSynchronize` for device-observed
+wall time, which is exempt under clause 1 of `SPEED_CONTRACT.md` for init
+time. See `offload/transfer_benchmark.rs` and
+[`FLAME_MODULES.md`](./FLAME_MODULES.md#offload-transfer-benchmark--offloadtransfer_benchmark-phase-1-flextensor-port-2026-05-12)
+for the module overview.
+
+| Symbol | File:line | Notes |
+|---|---|---|
+| `offload::transfer_benchmark::run_benchmark(device, cfg)` | `offload/transfer_benchmark.rs:295` | Run the sweep. Allocates one pinned host buffer + one GPU buffer at `cfg.max_bytes`, reused across all samples. Returns `TransferBandwidthProfile`. |
+| `offload::transfer_benchmark::BenchmarkConfig` | `offload/transfer_benchmark.rs:138` | Knobs: `min_bytes`, `max_bytes` (default 1 KiB → 256 MiB), `samples`, `trials`, `warmup_trials`, `measure_d2h`. |
+| `offload::transfer_benchmark::TransferBandwidthProfile` | `offload/transfer_benchmark.rs:176` | Holds measured H2D/D2H curves and peak bandwidth fields. `Clone`. |
+| `TransferBandwidthProfile::predict_h2d` / `predict_d2h` | `offload/transfer_benchmark.rs:198,205` | Log-log interpolation, byte size → `Duration`. Linear extrapolation beyond range using endpoint slope. |
+| `TransferBandwidthProfile::format_table` | `offload/transfer_benchmark.rs:213` | Diagnostic table matching FlexTensor's `format_memory_transfer_table`. |
+| `offload::transfer_benchmark::TransferMeasurement` / `TransferDirection` | `offload/transfer_benchmark.rs:115,121` | Per-point result. |
 
 ### Gradient utilities
 - `gradient::GradientMap / TensorGradExt` — re-exported as `GradientMap`
@@ -952,7 +1024,10 @@ Recently-added variants:
 - `fp16::*` — F16 conversion helpers
 - `tensor_compute::*` — small compute helpers
 - `tensor_ext.rs` — `to_owning_fp32_strong / slice_channels / pad_channels`
-- `tensor_narrow.rs` — narrow helper
+- `tensor_narrow.rs` — narrow helper. Public methods on `Tensor`:
+  - `narrow_general_cuda(dim, start, length) -> Result<Tensor>` (`:10`) — strided narrow forward; invokes `flame_narrow_strided_launch` (kernel-arg meta, no host sync). Reference impl for SPEED_CONTRACT clause 1 — see `docs/SPEED_CONTRACT.md` "Two correct primitive patterns".
+  - `narrow_cuda(dim, start, length) -> Result<Tensor>` (`:119`) — narrow assuming contiguous input.
+  - ⭐ `Tensor::narrow_backward_scatter_add_cuda(grad_out, grad_in, dim, start, length) -> Result<()>` (`:169`) — scatter-add backward for narrow. **Post-Class-B (2026-05-12, commit `15d8ef8`)** the BF16 storage arm dispatches directly; pre-fix there was a BF16→F32→BF16 cast detour costing 3 extra kernel launches per call. F32 + BF16 are both first-class now (dtype-agnostic byte-copy kernel underneath). Used by every autograd backward that splits a tensor with `narrow` (concat backward, chunked attention backward, etc.).
 - `tensor_ops_extended.rs` — extra Tensor ops (57 pub fns)
 - `tensor_ops_missing.rs` — fill-ins for missing ops (`upsample_nearest2d`, `div_scalar`, etc.)
 - `ops_ext.rs` — small `OpResult`-typed helpers (`shape4 / matmul_tt / where_mask / mean_all_f32`)
@@ -1008,6 +1083,11 @@ by `.cu` file with launch configs and perf notes.
 - **"Where is the activation offload pool?"** → `activation_offload::ActivationOffloadPool` →
   autograd integration via `autograd::checkpoint_offload` + `Op::CheckpointOffload`.
   FP8 quant kernel: `src/cuda/fp8_quant.cu`. Trainer setup: `flame-diffusion/src/offload.rs`.
+- **"Where is the BLOCK offloader (not activation)?"** → `flame_core::offload::BlockOffloader`
+  in `src/offload/mod.rs`. Moved into flame-core 2026-05-12 (commit `df00c5f`).
+  Pair with a `BlockFacilitator` trait impl per model. Prefer
+  `await_block_handle` (scoped, event-driven) over `await_block` (host-sync).
+- **"Where is the speed-contract audit gate?"** → `docs/SPEED_CONTRACT.md`. Tenets it derives from: `../TENETS.md`. Reference impls for clause 1: `cuda/narrow_strided.cu` (inline meta) and `cuda/sdpa_stream_bf16.cu` (cached workspace).
 - **"Where is the BF16→FP8 quantize kernel?"** → `flame_bf16_to_fp8` →
   `src/cuda/fp8_quant.cu` (used by activation offload FP8 compression)
 - **"Where are the QwenImage trainer parity tests?"** →

@@ -986,30 +986,73 @@ The trainer-side setup helper is `flame-diffusion/src/offload.rs`:
 count + headroom, constructs the pool, and installs it via
 `set_activation_offload_pool`.
 
-## Block offloading (flame-diffusion)
+## `offload` — `BlockOffloader` + `BlockFacilitator` (moved into flame-core 2026-05-12)
 
-### `block_offload.rs` — BlockOffloader + BlockFacilitator
+### `offload/mod.rs` — block-level weight offloader
 
-Double-buffered sequential block offloader. Loads ALL block weights into
-`cudaMallocHost` pinned CPU memory at init (via safetensors mmap). Two GPU
-slots for prefetch overlap — prefetch block N+1 while computing block N.
-Sole block offloading mechanism across training and inference.
+⭐ Double-buffered sequential block offloader. Moved from
+`flame-diffusion/src/block_offload.rs` into flame-core (commit `df00c5f`,
+~1,579 LOC) so that any flame-core crate — trainers, inference-flame,
+parity tests — can use the same offloading primitive without a circular
+dep on flame-diffusion. The trainer-side `flame-diffusion/src/offload.rs`
+remains as the activation-offload pool installer; block offloading is now
+purely a flame-core concern.
 
-**Public API:**
-- `prefetch_block(idx)` — start async H2D into non-active slot (non-blocking)
-- `await_block(idx)` — wait for H2D, prepare weights, return `Arc<HashMap<String, Tensor>>`
-- `ensure_block(idx)` — sync API: `prefetch_block + await_block` (backward-compat)
-- `evict_block()` — drop GPU tensors from both slots
-- `block_count()` / `pinned_bytes()` — accessors
+**What it does.** Loads ALL block weights from safetensors into
+`cudaMallocHost` pinned CPU memory at init (BF16-converted at load).
+Maintains TWO GPU buffer slots for prefetch / compute overlap: while
+compute runs on block N, block N+1 is being H2D-copied on a dedicated
+transfer stream. Per-slot CUDA events (`h2d_done`, `compute_done`)
+serialize stream-stream waits — no host-side `cudaStreamSynchronize` on
+the hot path (Phase 0 event-safety work).
 
-**`BlockFacilitator` trait**: model-specific geometry provider. Implementations:
-- `KleinFacilitator` (klein-trainer): `double_blocks.{i}.*` + `single_blocks.{i}.*`
-- `ChromaFacilitator` (chroma-trainer, inference): double + single offset
-- `WanFacilitator` (wan-trainer, inference): `blocks.{i}.*`
-- `Gemma3Facilitator`, `MistralFacilitator`, `Flux1Facilitator`, etc. (inference)
+**Three load modes:**
+- `BlockOffloader::load(paths, facilitator, device)` — default pinned
+  path. Pinned RAM ≈ full block-weight size. Fastest hot path.
+- `BlockOffloader::load_fp8_stream(paths, facilitator, device)` — same
+  shape, but keeps F8_E4M3 tensors as raw FP8 bytes pinned + GPU-dequants
+  to BF16 inside `prepare_weights`. Halves pinned RAM for FP8 checkpoints
+  (LTX-2 distilled-fp8, Wan2.2 14B experts).
+- `BlockOffloader::load_streaming(paths, facilitator, device)` — mmap
+  source files at init; pinned RAM = only `2 × max_block_bf16_bytes`
+  (typically <1.5 GB). Each `prefetch_block` copies that block's bytes
+  from mmap into one of two pinned staging buffers, then issues async H2D
+  from staging into a fresh GPU slot. For Qwen-Image-2512-class models
+  (≈39 GB block weights) that don't fit in 62 GB pinned. F8_E4M3 not
+  supported in this mode.
 
-**Used by:** all trainers (klein, chroma, wan, ltx, qwenimage, etc.) and all
-inference models (Klein, Chroma, Flux1, Wan22, LTX2, Gemma3, Mistral, etc.).
+**Public hot-path API.** Indented to match the call shape from a trainer
+or inference block loop:
+- `prefetch_block(idx)` — start async H2D into the non-active slot. No-op
+  if already resident.
+- `await_block_handle(idx) -> BlockHandle` — **preferred**. Returns a
+  scoped `BlockHandle` whose Drop records `compute_done` on the default
+  stream. The next prefetch reusing the slot waits on that event via
+  `cudaStreamWaitEvent` (stream-stream, GPU-side) — no host sync.
+- `await_block(idx) -> Arc<HashMap<String, Tensor>>` — legacy bare-Arc
+  API. Slot reuse falls back to host-side `cudaDeviceSynchronize`. Kept
+  for backward compatibility; migrate hot paths to `await_block_handle`.
+- `ensure_block(idx)` — `prefetch + await` in one call (sync). Used by
+  the inference loop when overlap isn't needed.
+
+**`BlockFacilitator` trait.** Model-specific geometry provider with just
+two methods: `block_count()` and `classify_key(name) -> Option<usize>`.
+Each trainer / inference model supplies its own.
+
+**Builder knob.** `with_native_layout(true)` disables the
+`[Cout,Cin] → [Cin,Cout]` pre-transpose that `prepare_weights` otherwise
+applies. Required when the caller's forward uses
+`ops::fused_inference::fused_linear3d_native` (cuBLASLt TRANSA=T).
+Pre-transposing in that case silently feeds the wrong layout to the GEMM.
+
+**Trainers using it:** klein, sdxl, flux, chroma, ernie, qwenimage,
+sensenova_u1, nucleus, ltx2, wan22, helios, hunyuan15, magihuman (DiT,
+MMDiT, MoE, and video-DiT trainers — see the `*-trainer` crates under
+`EriDiffusion-v2/`).
+
+**Inference-flame models using it:** Klein, Chroma, Flux1, Wan22, LTX2,
+Gemma3, Mistral, HiDream-O1, MagiHuman, plus every other model with a
+block-shaped weight layout (each defines its own `*Facilitator`).
 
 ### Remaining wiring (not yet done)
 

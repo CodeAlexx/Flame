@@ -525,12 +525,31 @@ the pool currently uses a fixed scale assuming activation range [-8, 8].
 | `fp8_dequant_transpose_kernel` | `:17` | Dequant + transpose in one kernel. Used by `fp8_resident.rs` for the on-the-fly weight unpack path. |
 | `flame_fused_dequant_transpose_bf16` | `:93` | C entry. |
 
-### `src/cuda/narrow_strided.cu` / `narrow_strided_backward.cu`
+### `cuda/narrow_strided.cu` — Reference impl for SPEED_CONTRACT clause 1 (Class-E fix, commit `b552f61`)
+
+The active narrow path. Rewritten 2026-05-12 to pass shape + strides
+**inline as a kernel-arg struct** (`NarrowMeta`, sized
+`FLAME_NARROW_MAX_RANK = 8`). Replaces the pre-fix shape of "per-call
+`cudaMalloc + cudaMemcpyAsync + cudaStreamSynchronize + cudaFree` for the
+metadata buffers" — Class E. Micro-bench: 1000 `cudaStreamSynchronize` →
+0. Real-trainer (klein 9B): 268/step → 0/step. This is **Reference
+Implementation #1** for the "small/fixed metadata fits in kernel-arg
+space" pattern documented in
+[`SPEED_CONTRACT.md`](./SPEED_CONTRACT.md) ("Two correct primitive
+patterns").
 
 | Symbol | Line | Notes |
 |---|---|---|
-| `flame_narrow_strided_launch` | `:58` | Generic narrow op with stride support. |
-| `flame_narrow_backward_scatter_add_launch` | various | Scatter-add backward for narrow. ⚠️ Training only. |
+| `struct NarrowMeta` | `:17` | `int64_t shape[8]` + `int64_t strides[8]`. Passed by value through kernel-arg space — no allocation, no copy, no sync. |
+| `narrow_strided_kernel` | `:33` | Byte-copy gather; reads `meta.shape` / `meta.strides` from the inline struct. Block 256, grid `ceil(n_elements / 256)`. |
+| `flame_narrow_strided_launch` | `:65` | C entry. Fills `NarrowMeta` on host, launches kernel, returns `cudaGetLastError()`. No `cudaMalloc` / `cudaMemcpyAsync` / `cudaStreamSynchronize` / `cudaFree`. |
+| `narrow_backward_scatter_add_kernel` | `:105` | Inverse of the gather — byte-copy scatter from `grad_out` into `grad_in` at the narrow slice. Dtype-agnostic via `elem_size`. |
+| `flame_narrow_backward_scatter_add_launch` | `:137` | C entry, same inline-meta pattern. Post-Class-B (`15d8ef8`) is called directly for BF16 + F32 — no more F32 cast detour. |
+
+The matching `src/cuda/narrow_strided.cu` and
+`src/cuda/narrow_strided_backward.cu` files are older alternative builds;
+the active path is the build-time `cuda/narrow_strided.cu` listed above
+(declared in `cuda/ffi.rs`, linked via `build.rs`).
 
 ### `src/cuda/pinned_host.cu` — pinned memory + async copy
 
@@ -732,10 +751,14 @@ dtype-dispatch wrapper in `src/cuda_kernels.rs:1810`), which is what
 | `launch_permute10_{bf16,f32}` | `:412/:427` | **Rank-2 `[1,0]` matrix transpose entry points** (2026-05-12). Internally `launch_permute021_dispatch` with `N=1`. Covers the 840 calls/step of `permute_generic` `(rank=2, perm=[1,0])` in zimage backward (matmul weight-grad). Micro-bench: 3.4× faster than the generic scatter kernel on `[8, 3840]`/`[3840, 8]`/`[10240, 8]`/`[8, 10240]` shapes (8.98 → 2.62 µs/call). |
 | `launch_permute0132_{bf16,f32}` | `:455/:481` | **Rank-4 `[0,1,3,2]` inner-2 swap entry points** (2026-05-12). Collapses to rank-3 `[0,2,1]` with `N' = N*A` (the outer two dims are contiguous so the flatten is exact). Covers 120 calls/step in zimage backward (`[1,30,1536,128]` QK^T transpose and `[1,30,1536,1536]` attention-weights transpose). Micro-bench: 1.63× faster on `[1, 30, 1536, 128]` (97.3 → 59.4 µs), 1.69× on `[1, 30, 1536, 1536]` (1241 → 732 µs). |
 
-### `cuda/sdpa_stream_bf16.cu` — chunked SDPA (legacy)
+### `cuda/sdpa_stream_bf16.cu` — chunked SDPA (legacy) + cached workspace (Class-E fix, commit `542c531`)
 
-The streaming SDPA path used by `sdpa_stream_bf16`. ⚠️ This is the
-catastrophically slow path for d=64 and causal — see PERF_SDPA_FLASH_KERNEL.md.
+The streaming SDPA path used by `sdpa_stream_bf16`. ⚠️ Still the
+catastrophically slow attention path for d=64 and causal — see
+PERF_SDPA_FLASH_KERNEL.md — but as of 2026-05-12 the *launch wrapper*
+no longer allocates per call. Reference impl for SPEED_CONTRACT clause 1's
+**"variable/large workspace, cached per-device buffer"** pattern (mirrors
+`gemm_bf16_cublaslt.cu`'s cuBLASLt workspace cache).
 
 | Symbol | Line | Notes |
 |---|---|---|
@@ -747,6 +770,11 @@ catastrophically slow path for d=64 and causal — see PERF_SDPA_FLASH_KERNEL.md
 | `ker_row_normalize` | `:137` | Normalize scores by 1/l. |
 | `ker_scale_O_by_beta` | `:149` | Scale running O by beta. |
 | `ker_fill_constant` | `:157` | Fill helper. |
+| `struct SdpaStreamWorkspace` | `:197` | Per-device cache: device id + shape `(q_t, k_b, d)` + single fused buffer holding all 11 sub-allocations (`scores`, `row_sums`, `m_prev/curr`, `l_prev/curr`, `inv_l_new`, `beta`, `O_accum`, `scores_T`, `scores_norm_bf16`). 256-byte aligned per slice. |
+| `sdpa_ws_layout` | `:228` | Computes total fused-buffer size + 11 sub-buffer offsets. Used both for grow-decision and pointer fixup after alloc. |
+| `sdpa_ws_acquire` | `:253` | Lookup-or-grow the per-device entry under `std::mutex`. On shape grow: one `cudaMalloc(needed)`, one `cudaFree` of prior buffer. Steady state: zero allocations. |
+| `sdpa_ws_get_cublas_handle` | `:319` | Process-singleton `cublasHandle_t` per device. `cublasCreate` is ~ms; called once per attention forward across every transformer block, that's real wall time. Now created once, reused. Freed only at process exit. |
+| `sdpa_stream_bf16_launch` | `:345` | C entry. Acquires workspace, gets cached handle, runs the chunked online-softmax loop. **Was**: 11 `cudaMalloc` + 11 `cudaFree` + 1 `cublasCreate` per call. **Is**: zero allocations on the hot path. |
 
 ### `cuda/streaming_attn_bf16.cu`
 Older streaming attention scaffolding.

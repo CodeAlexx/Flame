@@ -1063,20 +1063,117 @@ check survives `AutogradContext::clear()`'s flush of the table.
 
 ---
 
+## Launch-wrapper pattern (SPEED_CONTRACT clause 1)
+
+Every C-side `flame_*_launch` wrapper that runs inside a training step MUST
+avoid per-call `cudaMalloc` / `cudaFree` / `cudaStreamSynchronize` /
+`cudaDeviceSynchronize`. See [`SPEED_CONTRACT.md`](./SPEED_CONTRACT.md)
+clause 1 for the full rule.
+
+Two correct shapes — pick the one that matches your metadata size:
+
+### 1. Inline kernel-arg struct (small, fixed metadata ≤ 4 KB)
+
+Pack shape / strides / small parameters into a `struct` and pass it **by
+value** through CUDA's kernel-argument space. No allocation, no copy, no
+sync. Use when rank / size bounds are known and the struct fits.
+
+Reference: `cuda/narrow_strided.cu`.
+
+```cuda
+#define FLAME_NARROW_MAX_RANK 8
+
+struct NarrowMeta {
+    int64_t shape[FLAME_NARROW_MAX_RANK];
+    int64_t strides[FLAME_NARROW_MAX_RANK];
+};
+
+extern "C" __global__
+void narrow_strided_kernel(
+    const uint8_t* src, uint8_t* dst,
+    int rank, NarrowMeta meta,   // passed by value
+    int dim, int64_t start, int64_t elem_size, int64_t n_elements) { ... }
+
+extern "C" int flame_narrow_strided_launch(...) {
+    NarrowMeta meta = {};
+    for (int i = 0; i < rank; ++i) {
+        meta.shape[i]   = out_shape_host[i];
+        meta.strides[i] = src_strides_host[i];
+    }
+    narrow_strided_kernel<<<blocks, threads, 0, stream>>>(
+        ..., rank, meta, ...);
+    return (int)cudaGetLastError();
+}
+```
+
+This pattern fixed Class E (narrow ops, klein 9B 268 `cudaStreamSynchronize`/step → 0).
+
+### 2. Cached per-device workspace (variable / large metadata or scratch)
+
+When you need a real device-side workspace (scratch buffers, multiple
+intermediate tensors, anything > a few KB), allocate **once on first call**
+into a per-device cache, grow only on shape change, never free on the hot
+path. Lifecycle owned by the primitive; freed at process exit.
+
+Reference: `cuda/sdpa_stream_bf16.cu` (11-buffer fused workspace), and
+`cuda/gemm_bf16_cublaslt.cu` / `cuda/gemm_bf16_fp32acc.cu` (cuBLASLt
+workspace cache).
+
+```cuda
+struct SdpaStreamWorkspace {
+    int device = -1;
+    int q_t = 0, k_b = 0, d = 0;
+    void*  base        = nullptr;
+    size_t total_bytes = 0;
+    float* scores      = nullptr;      // offsets into `base`
+    // ... 10 more sub-buffer pointers
+};
+
+static SdpaStreamWorkspace* sdpa_ws_acquire(int device, int q_t, int k_b, int d, ...) {
+    static std::mutex ws_mutex;
+    static std::vector<SdpaStreamWorkspace> ws_cache;
+    std::lock_guard<std::mutex> lock(ws_mutex);
+    // ... lookup / grow / fixup pointers from base + offsets
+}
+```
+
+Same shape for the cached cuBLAS handle in `sdpa_ws_get_cublas_handle`
+(`cublasCreate` is ~ms; do it once per device, reuse forever).
+
+### Forbidden pattern
+
+"alloc → async copy → launch → sync → free" inside the launch wrapper.
+This was the narrow pre-fix shape, the current legacy paths in some `.cu`
+files, and is the first thing to look for when investigating a per-step
+`cudaStreamSynchronize` count > 8 (PyTorch eager's baseline).
+
+When auditing a `.cu` file, grep the launch wrapper for `cudaMalloc`,
+`cudaMemcpyAsync`, `cudaStreamSynchronize`, `cudaDeviceSynchronize`,
+`cudaFree`. Hits must be justified per SPEED_CONTRACT clause 1.
+
+---
+
 ## Block offloading conventions
 
 FlameSwap is deleted. All block offloading uses `BlockOffloader` with
 `prefetch_block`/`await_block` for transfer-compute overlap. No exceptions.
 
-- **`BlockOffloader`** (`flame-diffusion::block_offload`): sole mechanism for
-  both training and inference. Double-buffered GPU slots, dedicated transfer
-  stream, pinned CPU storage for all block weights.
+- **`BlockOffloader`** (`flame_core::offload`, moved into flame-core 2026-05-12
+  commit `df00c5f`): sole mechanism for both training and inference.
+  Double-buffered GPU slots, dedicated transfer stream, pinned CPU storage
+  for all block weights. Was at `flame-diffusion/src/block_offload.rs`; now
+  imported as `use flame_core::offload::{BlockOffloader, BlockFacilitator, BlockHandle}`.
 - **klein-trainer**: `--block-swap` flag triggers BlockOffloader.
 - **chroma-trainer**: `--block-swap` flag triggers BlockOffloader.
 - **wan-trainer**: 14B+ (dim > 4096) automatically uses BlockOffloader +
   `Wan22Dit::load_shared_only`. 5B preloads all blocks resident.
 - **Inference models**: each implements `BlockFacilitator` and creates a
   `BlockOffloader` at load time. Forward loops use prefetch/await pattern.
+- **`await_block_handle` over `await_block`**: prefer the scoped-handle API
+  on the hot path. `await_block` falls back to host-side
+  `cudaDeviceSynchronize` for slot reuse; the handle's Drop records a
+  `compute_done` event and the next prefetch does `cudaStreamWaitEvent`
+  instead — GPU-side, no host stall.
 
 ---
 
