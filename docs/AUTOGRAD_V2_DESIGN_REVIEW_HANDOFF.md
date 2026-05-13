@@ -479,7 +479,12 @@ Long-tail unary ops:
 
 ### Phase 5: Parity Gate
 
-**Status (2026-05-13)**: Phase 3 (3a/3b/3c1/3c2) + Phase 4 (4a/4b) complete. v2 surface inside flame-core ready for parity work. Estimate REVISED below.
+**Status (2026-05-13)**: Phase 3 (3a/3b/3c1/3c2) + Phase 4 (4a/4b) + **Phase 5a (Deliverables A + B + LN JVP)** complete. v2 surface inside flame-core ready for model-parity work. Estimate REVISED below.
+
+**Phase 5a shipped** (this commit; see `tests/autograd_v2_parity.rs`):
+- Deliverable A (per-op backward fixture parity): 13/13 ops pass against PyTorch fixtures via `flame_core::parity::ParityHarness`.
+- Deliverable B (forward-mode AD parity): 13/13 ops pass; **layer_norm JVP shipped here** (was the Phase 3c2 deferral). LN JVP formula was rederived during Phase 5a — the per-row variance derivative collapses to a per-row scalar (sum-reduction over normalized axes), not the per-element form in the original Phase 5 stub below. F64 bit-equal to `torch.autograd.functional.jvp(layer_norm, ...)`.
+- Fixture generator at `tests/fixtures/gen_v2_parity.py` (seed=42, ≤512-element shapes per op).
 
 **Scope estimate**:
 - **Route (i) — port missing forward-graph ops**: ~6-8 DiT primitive families currently missing in v2 (per Phase 4b skeptic's recalibrated audit of `train_zimage.rs`): `primitive_rms_norm` (8 call sites), `flame_core::attention::sdpa`, RoPE-apply (`build_3d_rope` / `build_1d_rope`), `chunk` (5 sites), `broadcast_to` (2 sites), `fused_linear3d_native` / `Op::Linear`, residual `Tensor::add`. Note: `conv2d`, `gelu`, `group_norm` initially listed by Phase 4b port agent are VAE/encoder ops, NOT in the LoRA-trained DiT — agent's "~20+ ops" framing was ~3× inflated. **Real estimate: 6-10 weeks.**
@@ -488,29 +493,36 @@ Long-tail unary ops:
 
 Do not retire v1/v3/v4 until ALL of these gates pass:
 
-**Deliverable A — per-op backward fixture parity** (~1 week if ParityHarness reused):
+**Deliverable A — per-op backward fixture parity** [SHIPPED Phase 5a] (~1 week if ParityHarness reused):
 - For each of the 13 v2 ops (12 + layer_norm), generate a PyTorch reference fixture (`.safetensors` of inputs + `torch.autograd.grad` outputs) at non-trivial shapes (matching `tests/autograd_v2_ops.rs` fixture shapes).
 - Use fixed seed 42.
 - Use the existing `flame_core::parity::ParityHarness` (shipped 2026-05-09).
 - Tolerance: bit-equal at F32, BF16-noise-bounded at BF16.
 - Cite PyTorch source by `file:line` in commit comments.
 
-**Deliverable B — forward-mode AD parity** (~3-4 days; Phase 3c2 unblocked this):
+**Deliverable B — forward-mode AD parity** [SHIPPED Phase 5a] (~3-4 days; Phase 3c2 unblocked this):
 - For each of the 13 ops, generate `torch.autograd.functional.jvp(op, primals, tangents)` reference.
 - Test against v2: `Tensor::set_fw_grad(...)` → `op_v2(...)` → `out.fw_grad()`.
-- **Includes layer_norm**: ship the LN JVP formula here (deferred from Phase 3c2):
+- **Includes layer_norm**: LN JVP shipped (was deferred from Phase 3c2). Kernel-truthful formula (verified bit-equal to `torch.autograd.functional.jvp` in F64; see `tests/fixtures/gen_v2_parity.py`):
   ```
-  out_fw = (x_fw - mean_fw)*rstd*w + x_hat*d_rstd_dx*w + x_hat*rstd*w_fw + b_fw
+  centered    = x - mean(x, normalized_axes)
+  centered_fw = x_fw - mean(x_fw, normalized_axes)
+  var_fw      = (2/N) * sum(centered * centered_fw, normalized_axes)
+  rstd_fw     = -0.5 * rstd^3 * var_fw                       # per-row scalar
+  out_fw = centered_fw * rstd * w
+         + centered    * rstd_fw * w
+         + x_hat       * rstd * w_fw
+         + b_fw
   ```
-  Needs `mean_fw` and `d_rstd_dx` recomputed in Rust (BF16 fused kernel returns `out` only, not intermediates). Estimate: 80-100 LOC + 1 test.
+  Implementation note: the per-element `d_rstd_dx = -rstd^3 * (x - mean) * (x_fw - mean_fw)` shorthand previously in this section is **not** the correct formula. The variance derivative reduces to a per-row scalar (sum over normalized axes) — see `src/autograd_v2/ops/layer_norm.rs::layer_norm_jvp` for the bit-equal F32 implementation. Final cast to BF16 for storage on the output `fw_grad`. ~150 LOC + 1 test, F32 internal compute.
 
-**Deliverable C — model parity** (estimate depends on route picked above):
+**Deliverable C — model parity** [OPEN — Phase 5b] (estimate depends on route picked above):
 - One-step parity on klein / zimage / ernie / qwen / chroma (the 5 production trainers).
 - Either route (i) full port or route (ii) bridge — decide first.
 - Klein crashes on this box per Phase 0 skeptic (`CUDA_ERROR_INVALID_VALUE` at smoke startup); Phase 5 needs to either fix that infra issue or run on a different machine.
 - Tolerance: ≤1% relative loss diff (loose; BF16 grad path is non-bit-equal vs v3 by construction).
 
-**Deliverable D — no ms/step regression** (~2-3 days):
+**Deliverable D — no ms/step regression** [OPEN — Phase 5c] (~2-3 days):
 - Bench v2 backward vs v3 on klein 4B / 9B.
 - Hold at ±1%.
 - Baseline: flame-core's documented klein-4B-perf is 1.12× vs PyTorch (`reference_klein_perf_baseline` memory).

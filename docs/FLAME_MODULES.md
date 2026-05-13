@@ -629,7 +629,7 @@ A newer experimental engine with explicit `Gradients` and `graph` types.
 Off by default. The SDPA backward in `autograd_v4/ops/sdpa.rs` is more
 correct than the v3 one in some edge cases.
 
-### `autograd_v2/` (feature `autograd_v2`, Phases 1 + 2 + 3a + 3b + 3c1 + 3c2 + 4a + 4b)
+### `autograd_v2/` (feature `autograd_v2`, Phases 1 + 2 + 3a + 3b + 3c1 + 3c2 + 4a + 4b + 5a)
 Clean-sheet PyTorch-style DAG autograd engine. Designed to replace v1/v3/v4
 once Phase 5 parity gates pass. Phase 1 ships the foundational types
 and traits; Phase 2 ships the engine driver, dependency counting, ready
@@ -643,7 +643,9 @@ and the `CheckpointGradFn` skeleton. Phase 3a wires the recording surface
 every Phase 3a/3b op's forward wrapper: 11 ops × JVP formulas
 (`add`/`mul`/`sum`/`matmul`/`silu`/`reshape`/`view`/`transpose`/
 `narrow`/`squeeze`/`unsqueeze`/`permute`); `layer_norm` forward-mode
-AD deferred to Phase 5 parity gate. `Tensor::fw_grad` /
+AD was deferred to the Phase 5a parity gate and **shipped there**
+(per-row reductions in F32; bit-equal to `torch.autograd.functional.jvp`
+in F64). `Tensor::fw_grad` /
 `Tensor::set_fw_grad` accessors land on the public surface (`src/tensor.rs`);
 shared JVP helpers (`any_fw_grad`, `tangent_or_zero`) live at
 `src/autograd_v2/ops/fw_mode.rs`. `set_fw_grad` implicitly allocates
@@ -863,10 +865,33 @@ Phase 4a: 5 Parameter v2, 3 Adam BF16-grad, 2 multi_tensor BF16,
 2 AdamWV2 trait surface) +
 `tests/autograd_v2_gradientmap_v2.rs` (17 tests, Phase 4b) +
 `tests/autograd_v2_fw_mode.rs` (13 tests, Phase 3c2: one JVP per
-non-LN op + `set_fw_grad_implicitly_allocates_meta` regression).
-All green (modulo a known parallel-CUDA-context flake in
-autograd_v2_ops / autograd_v2_engine / inplace_version_bump_audit
-pre-existing — re-run individually to confirm).
+non-LN op + `set_fw_grad_implicitly_allocates_meta` regression) +
+`tests/autograd_v2_parity.rs` (26 tests, Phase 5a: 13 backward vs
+PyTorch + 13 forward-mode vs PyTorch). All green (modulo a known
+parallel-CUDA-context flake in autograd_v2_ops / autograd_v2_engine /
+inplace_version_bump_audit pre-existing — re-run individually to confirm).
+
+Phase 5a additions (Deliverables A + B from
+`docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` §Phase 5; **Phase 5b
+model parity** and **Phase 5c perf bench** remain open):
+- **`layer_norm_jvp`** — `src/autograd_v2/ops/layer_norm.rs:329`. The
+  LN JVP formula deferred from Phase 3c2 ships here. F32-internal
+  compute through per-row `mean`/`var`/`rstd`/`rstd_fw`; cast back to
+  the primal's BF16 dtype before storage. Bit-equal to
+  `torch.autograd.functional.jvp(layer_norm, ...)` in F64 (verified
+  in `tests/fixtures/gen_v2_parity.py`).
+- **`tests/fixtures/gen_v2_parity.py`** — PyTorch fixture generator
+  at fixed seed 42. Emits 26 `.safetensors` files
+  (`<op>_{backward,jvp}.safetensors`) used by the parity tests. ≤512
+  elements per op so each file stays a few KB; total fixture footprint
+  ~104 KB. Regenerate with `python3 tests/fixtures/gen_v2_parity.py`
+  from `flame-core/` root.
+- **`tests/autograd_v2_parity.rs`** — 26 PyTorch-parity tests driven
+  by `flame_core::parity::ParityHarness`. Tolerance bands: tight F32
+  (`min_cos=0.99999`, `max_abs_ratio=1e-4`) for view + add/mul/sum/silu
+  outside matmul; loose F32 (`min_cos=0.9999`, `max_abs_ratio=5e-3`)
+  for matmul + scalar-reductions through cuBLAS; BF16-LN
+  (`min_cos=0.999`, `max_abs_ratio=5e-2`) for layer_norm.
 
 ### ⚠️ `autograd_simple.rs / autograd_engine.rs / autograd_ops.rs / autograd_ops_complete.rs / autograd_debug.rs`
 Older autograd attempts. Dead code; kept for reference.

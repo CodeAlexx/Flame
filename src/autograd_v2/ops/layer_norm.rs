@@ -32,7 +32,7 @@
 use std::sync::Arc;
 
 use crate::tensor::Tensor;
-use crate::Result;
+use crate::{Result, Shape};
 
 use super::super::dispatch::DispatchCtx;
 use super::super::error::AutogradV2Error;
@@ -41,6 +41,7 @@ use super::super::recording::{
     gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
 };
 use super::super::saved_tensor::SavedTensor;
+use super::fw_mode::any_fw_grad;
 
 #[derive(Debug)]
 pub struct LayerNormGradFn {
@@ -269,11 +270,189 @@ pub fn layer_norm_v2(
         grad_inputs.push(b);
     }
 
-    if needs_grad(&grad_inputs) {
+    let any_fw = any_fw_grad(&grad_inputs);
+
+    let mut result = if needs_grad(&grad_inputs) {
         let grad_fn = LayerNormGradFn::new(x, weight, bias, normalized_shape.to_vec(), eps);
         let recorded = record_v2(grad_fn, vec![out], ctx);
-        Ok(recorded.into_iter().next().unwrap())
+        recorded.into_iter().next().unwrap()
     } else {
-        Ok(out)
+        out
+    };
+
+    // Phase 5a: forward-mode AD (JVP). Deferred from Phase 3c2.
+    //
+    // Derivation, with `centered = x - mean`, `x_hat = centered * rstd`,
+    // `N = prod(normalized_shape)` (the per-row feature count):
+    //
+    //   out = x_hat * w + b
+    //
+    // Chain rule with tangents `(x_fw, w_fw, b_fw)`:
+    //
+    //   mean_fw  = mean(x_fw, normalized_axes, keepdim)              (per-row scalar)
+    //   centered_fw = x_fw - mean_fw                                 (per-element)
+    //   var_fw   = (2/N) * sum(centered * centered_fw,
+    //                          normalized_axes, keepdim)             (per-row scalar)
+    //   rstd_fw  = -0.5 * rstd^3 * var_fw                            (per-row scalar)
+    //
+    //   out_fw = centered_fw * rstd * w           ← first term (x_fw via centering)
+    //          + centered    * rstd_fw * w        ← second term (x_fw via rstd)
+    //          + x_hat       * rstd   * w_fw      ← third term (weight tangent)
+    //          + b_fw                              ← fourth term (bias tangent)
+    //
+    // PyTorch reference: aten/src/ATen/native/layer_norm.cpp computes the
+    // backward via the same per-row reductions; the JVP is the forward
+    // analogue. Verified against `torch.autograd.functional.jvp` in
+    // tests/fixtures/gen_v2_parity.py.
+    //
+    // Computed in F32 for numerical stability (BF16 stats compound noise
+    // quickly through the `rstd^3 * var_fw` cube). Cast back to the
+    // primal's BF16 dtype before installing the output tangent.
+    //
+    // NOTE: the design-review handoff (§Phase 5 deliverable B) wrote
+    //   d_rstd_dx = -rstd^3 * (x - mean) * (x_fw - mean_fw)
+    // which is a per-element shorthand. The kernel-truthful form needs
+    // the per-row sum reduction shown above (verified bit-equal to
+    // torch.autograd.functional.jvp in F64; see gen_v2_parity.py).
+    if any_fw {
+        let out_fw = layer_norm_jvp(x, weight, bias, normalized_shape, eps)?;
+        result.set_fw_grad(out_fw);
+    }
+
+    Ok(result)
+}
+
+/// Compute the LN JVP in F32, cast back to the primal's dtype.
+///
+/// All inputs are BF16 per the LN op contract. Outputs the
+/// tangent-of-output at the primal's dtype.
+fn layer_norm_jvp(
+    x: &Tensor,
+    weight: Option<&Tensor>,
+    bias: Option<&Tensor>,
+    normalized_shape: &[usize],
+    eps: f32,
+) -> Result<Tensor> {
+    use crate::DType;
+
+    let dtype = x.dtype();
+    let x_shape = x.shape().dims().to_vec();
+
+    // Read tangents (default to zero with matching dtype).
+    let x_fw = match x.fw_grad() {
+        Some(g) => g.to_dtype(DType::F32)?,
+        None => x.zeros_like_with_dtype(DType::F32)?,
+    };
+    let w_fw = match weight.and_then(|w| w.fw_grad()) {
+        Some(g) => Some(g.to_dtype(DType::F32)?),
+        None => None,
+    };
+    let b_fw = match bias.and_then(|b| b.fw_grad()) {
+        Some(g) => Some(g.to_dtype(DType::F32)?),
+        None => None,
+    };
+
+    let x32 = x.to_dtype(DType::F32)?;
+
+    // Reshape (x, x_fw) to 2D [outer, inner] where inner = prod(normalized_shape).
+    let inner: usize = normalized_shape.iter().product();
+    if inner == 0 {
+        return Err(crate::Error::InvalidInput(
+            "layer_norm_jvp: empty normalized_shape".into(),
+        ));
+    }
+    let total: usize = x_shape.iter().product();
+    if total % inner != 0 {
+        return Err(crate::Error::InvalidInput(format!(
+            "layer_norm_jvp: input numel {} not divisible by inner {}",
+            total, inner
+        )));
+    }
+    let outer = total / inner;
+    let two_d = Shape::from_dims(&[outer, inner]);
+    let x2 = x32.reshape(two_d.dims())?;
+    let xfw2 = x_fw.reshape(two_d.dims())?;
+
+    // Per-row stats on x.
+    let n_f = inner as f32;
+    let sum_x = crate::cuda_ops::GpuOps::sum_dim_keepdim(&x2, 1)?; // [outer, 1]
+    let mean = sum_x.mul_scalar(1.0 / n_f)?; // [outer, 1]
+    let mean_b = mean.broadcast_to(&two_d)?;
+    let centered = x2.sub(&mean_b)?; // [outer, inner]
+    let centered_sq = centered.square()?;
+    let var_sum = crate::cuda_ops::GpuOps::sum_dim_keepdim(&centered_sq, 1)?; // [outer, 1]
+    let var = var_sum.mul_scalar(1.0 / n_f)?;
+    let var_eps = var.add_scalar(eps)?;
+    let rstd = var_eps.rsqrt()?; // [outer, 1]
+    let rstd_b = rstd.broadcast_to(&two_d)?;
+
+    // mean_fw, centered_fw.
+    let sum_xfw = crate::cuda_ops::GpuOps::sum_dim_keepdim(&xfw2, 1)?;
+    let mean_fw = sum_xfw.mul_scalar(1.0 / n_f)?;
+    let mean_fw_b = mean_fw.broadcast_to(&two_d)?;
+    let centered_fw = xfw2.sub(&mean_fw_b)?;
+
+    // var_fw = (2/N) * sum(centered * centered_fw, dim=1, keepdim)
+    let prod_cc = centered.mul(&centered_fw)?;
+    let sum_cc = crate::cuda_ops::GpuOps::sum_dim_keepdim(&prod_cc, 1)?;
+    let var_fw = sum_cc.mul_scalar(2.0 / n_f)?;
+
+    // rstd_fw = -0.5 * rstd^3 * var_fw.
+    let rstd_sq = rstd.square()?;
+    let rstd_cu = rstd_sq.mul(&rstd)?;
+    let rstd_fw = rstd_cu.mul(&var_fw)?.mul_scalar(-0.5)?;
+    let rstd_fw_b = rstd_fw.broadcast_to(&two_d)?;
+
+    // x_hat = centered * rstd_b.
+    let x_hat = centered.mul(&rstd_b)?;
+
+    // Apply weight to (rstd_b, rstd_fw_b) if present. Weight broadcasts
+    // from `normalized_shape` to `[outer, inner]` (the trailing axes
+    // already match by construction; pad leading 1s via broadcast_to).
+    let w_b_opt: Option<Tensor> = if let Some(w) = weight {
+        let w32 = w.to_dtype(DType::F32)?.reshape(&[inner])?;
+        Some(w32.broadcast_to(&two_d)?)
+    } else {
+        None
+    };
+
+    // term1 = centered_fw * rstd_b [* w]
+    let t1_pre = centered_fw.mul(&rstd_b)?;
+    let term1 = if let Some(wb) = &w_b_opt {
+        t1_pre.mul(wb)?
+    } else {
+        t1_pre
+    };
+
+    // term2 = centered * rstd_fw_b [* w]
+    let t2_pre = centered.mul(&rstd_fw_b)?;
+    let term2 = if let Some(wb) = &w_b_opt {
+        t2_pre.mul(wb)?
+    } else {
+        t2_pre
+    };
+
+    // term3 = x_hat * w_fw  (only when weight had a fw_grad)
+    let mut acc = term1.add(&term2)?;
+    if let Some(wfw) = &w_fw {
+        let wfw32 = wfw.reshape(&[inner])?;
+        let wfw_b = wfw32.broadcast_to(&two_d)?;
+        let t3 = x_hat.mul(&wfw_b)?;
+        acc = acc.add(&t3)?;
+    }
+
+    // term4 = b_fw broadcast
+    if let Some(bfw) = &b_fw {
+        let bfw32 = bfw.reshape(&[inner])?;
+        let bfw_b = bfw32.broadcast_to(&two_d)?;
+        acc = acc.add(&bfw_b)?;
+    }
+
+    let acc_orig_shape = acc.reshape(&x_shape)?;
+    // Cast to primal dtype for storage on the BF16 result.
+    if dtype == DType::F32 {
+        Ok(acc_orig_shape)
+    } else {
+        acc_orig_shape.to_dtype(dtype)
     }
 }

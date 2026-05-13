@@ -1329,6 +1329,36 @@ section. Tests: `tests/autograd_v2_gradientmap_v2.rs` (17 tests).
   upcast behavior; `accumulate_v2` keeps the storage dtype and errs on
   dtype mismatch.
 
+### Autograd v2 (Phase 5a — per-op PyTorch parity tests)
+
+Phase 5a ships Deliverables A + B from `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md`
+§Phase 5 and closes Phase 3c2's deferred `layer_norm` JVP. 26 tests:
+13 ops × backward parity + 13 ops × forward-mode AD parity against
+PyTorch-generated fixtures. Phase 5b (model parity) and 5c (perf
+bench) remain open.
+
+- `layer_norm_v2` — `src/autograd_v2/ops/layer_norm.rs:250` — forward
+  wrapper now installs an output `fw_grad` when any of `x`/`weight`/`bias`
+  carries an input tangent. Backward path is unchanged.
+- `layer_norm_jvp` (private) — `src/autograd_v2/ops/layer_norm.rs:329` —
+  the F32-internal LN JVP. Per-row reductions reproduce
+  `torch.autograd.functional.jvp(layer_norm, ...)` bit-equal in F64.
+  Final cast back to the primal's BF16 dtype before storage.
+- `tests/autograd_v2_parity.rs` — 26 parity tests. Each loads a
+  `.safetensors` fixture from `tests/fixtures/<op>_{backward,jvp}.safetensors`,
+  runs the v2 op via `Engine::execute`, and compares against the
+  fixture's `grad_input_*` / `out_fw` keys via
+  `flame_core::parity::ParityHarness`. Tolerance bands by op family
+  documented at the file header.
+- `tests/fixtures/gen_v2_parity.py` — fixture generator. PyTorch
+  reference at fixed seed 42, per-op section. Run from `flame-core/`
+  root with `python3 tests/fixtures/gen_v2_parity.py`. Layer-norm
+  fixtures use BF16 storage; other ops F32.
+- `tests/fixtures/<op>_backward.safetensors` (13 files) — inputs +
+  all-ones `grad_output` + per-input reference grads.
+- `tests/fixtures/<op>_jvp.safetensors` (13 files) — inputs +
+  per-input tangents + reference `out_fw`.
+
 ### Legacy / dead
 - ⚠️ `autograd.rs` (top-level) — types still re-exported
 - ⚠️ `autograd_simple.rs` — early stub
