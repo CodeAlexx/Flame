@@ -298,6 +298,8 @@ impl Tensor {
                 code
             )));
         }
+        // Autograd v2 prereq: scatter-add mutates `grad_in` in place.
+        grad_in.storage_ref().bump_version();
         Ok(())
     }
 }

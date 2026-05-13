@@ -3683,5 +3683,9 @@ pub fn gate_add_bf16_inplace(dst: &Tensor, gate: &Tensor) -> Result<()> {
     }
     .map_err(|e| Error::Cuda(format!("gate_add_bf16_inplace launch failed: {:?}", e)))?;
 
+    // Autograd v2 prereq: bump version on in-place mutation of `dst`.
+    // Note: dst is `&Tensor` (not `&mut`) — the kernel writes through the
+    // FFI boundary regardless.
+    dst.storage.bump_version();
     Ok(())
 }

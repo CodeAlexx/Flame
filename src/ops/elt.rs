@@ -71,6 +71,10 @@ pub fn add_inplace_same_dtype(dst: &mut Tensor, src: &Tensor) -> Result<()> {
             }
         }
     }
+    // Autograd v2 prereq: any in-place mutation bumps the storage version so
+    // that `SavedTensor::unpack` can detect mutation-through-saved-ref at
+    // unpack time. See `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` §5.
+    dst.storage_ref().bump_version();
     Ok(())
 }
 
@@ -203,6 +207,8 @@ pub fn mul_inplace_same_dtype(dst: &mut Tensor, src: &Tensor) -> Result<()> {
             }
         }
     }
+    // Autograd v2 prereq: bump storage version on every in-place mutation.
+    dst.storage_ref().bump_version();
     Ok(())
 }
 
@@ -294,6 +300,8 @@ pub fn gate_mul_bf16_inplace(dst: &mut Tensor, gate: &Tensor) -> Result<()> {
             dst.device().cuda_stream_raw_ptr(),
         );
     }
+    // Autograd v2 prereq: bump storage version on every in-place mutation.
+    dst.storage_ref().bump_version();
     Ok(())
 }
 

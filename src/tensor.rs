@@ -196,6 +196,16 @@ impl Tensor {
         &mut self.storage
     }
 
+    /// Current version counter for the underlying storage.
+    ///
+    /// Public accessor for autograd v2 + in-place version-bump tests.
+    /// In-place mutators call `TensorStorage::bump_version()` after writing;
+    /// `SavedTensor::unpack` (Phase 1+) compares against this to detect
+    /// mutation-through-saved-ref.
+    pub fn storage_version(&self) -> u32 {
+        self.storage.version()
+    }
+
     // Mixed-precision policy (reminder):
     // - Parameters and activations: store as BF16; do math in FP32 inside kernels.
     // - Intermediates/temps/activations created here (zeros/new outputs): prefer BF16 storage directly.
@@ -670,11 +680,16 @@ extern "C" __global__ void masked_fill_kernel(
         }
 
         let device = self.device.clone();
-        let dst_slice = self.as_mut_slice_f32("copy_f32_from.dst")?;
-        let src_slice = src.as_slice_f32("copy_f32_from.src")?;
-        device
-            .dtod_copy(src_slice, dst_slice)
-            .map_err(|e| Error::Cuda(format!("copy_f32_from failed: {e:?}")))
+        {
+            let dst_slice = self.as_mut_slice_f32("copy_f32_from.dst")?;
+            let src_slice = src.as_slice_f32("copy_f32_from.src")?;
+            device
+                .dtod_copy(src_slice, dst_slice)
+                .map_err(|e| Error::Cuda(format!("copy_f32_from failed: {e:?}")))?;
+        }
+        // Autograd v2 prereq: bump storage version on in-place mutation.
+        self.storage.bump_version();
+        Ok(())
     }
 
     /// Returns the mutable BF16 device pointer if BF16(u16) storage is enabled.
@@ -763,6 +778,8 @@ extern "C" __global__ void masked_fill_kernel(
         device
             .dtod_copy(&src_view, &mut dst_view)
             .map_err(|e| Error::Cuda(format!("bf16 region copy failed: {e:?}")))?;
+        // Autograd v2 prereq: bump storage version on in-place mutation.
+        self.storage.bump_version();
         Ok(())
     }
 
@@ -4056,6 +4073,11 @@ extern "C" __global__ void f32_to_bool_kernel(
             });
         }
         self.storage = other.storage.clone();
+        // Autograd v2 prereq: bump storage version on in-place mutation.
+        // NOTE: `copy_` here rebinds `self.storage` (clones the Arc / pointer
+        // from `other`). For SavedTensor purposes that still counts as a
+        // mutation of the destination tensor's logical content, so we bump.
+        self.storage.bump_version();
         Ok(())
     }
 }
@@ -4178,7 +4200,7 @@ impl Tensor {
         }
 
         let device = self.device.clone();
-        match self.storage_mut() {
+        let result: Result<()> = match self.storage_mut() {
             #[cfg(feature = "bf16_u16")]
             TensorStorage::BF16 {
                 data: device_data, ..
@@ -4225,7 +4247,11 @@ impl Tensor {
             _ => Err(Error::InvalidOperation(
                 "copy_from_bf16_slice: storage mismatch".into(),
             )),
-        }
+        };
+        result?;
+        // Autograd v2 prereq: bump storage version on in-place mutation.
+        self.storage.bump_version();
+        Ok(())
     }
 
     /// Create a new BF16 tensor from a host slice of u16 (BF16 bits).

@@ -89,6 +89,8 @@ mod fused_bf16 {
                 stream,
             );
         }
+        // Autograd v2 prereq: bump version on in-place mutation.
+        x.storage_ref().bump_version();
         Ok(())
     }
 
@@ -134,6 +136,8 @@ mod fused_bf16 {
                 stream,
             );
         }
+        // Autograd v2 prereq: bump version on in-place mutation.
+        x.storage_ref().bump_version();
         Ok(())
     }
 }

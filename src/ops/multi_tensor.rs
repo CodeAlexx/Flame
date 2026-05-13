@@ -478,6 +478,13 @@ fn ensure_scale_kernel_bf16(device: &Arc<CudaDevice>) -> Result<()> {
 /// **Memory:** no allocations beyond the cache's metadata buffer (reused
 /// across calls when `n` is stable). Tensors are modified in place; their
 /// device pointers must remain valid for the kernel's lifetime.
+///
+/// **Autograd v2 prereq**: this function only sees packed raw device
+/// pointers — it has no `Tensor` handles to bump. Callers that pack
+/// trainable tensor storages into `packed` MUST call
+/// `tensor.storage_ref().bump_version()` (or equivalent) on each tensor
+/// after the kernel returns. See `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md`
+/// §5.
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 pub fn multi_tensor_scale_inplace_packed(
     cache: &mut MultiTensorMetaCache,

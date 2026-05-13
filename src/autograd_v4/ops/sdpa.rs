@@ -594,6 +594,8 @@ fn apply_mask_tile_inplace(
             "flame_sdpa_add_mask_tile_fp32 failed with status {status}"
         )));
     }
+    // Autograd v2 prereq: bump version on in-place mutation of `logits`.
+    logits.storage_ref().bump_version();
     Ok(())
 }
 
@@ -820,6 +822,8 @@ fn apply_causal_mask_inplace(
             status
         )));
     }
+    // Autograd v2 prereq: bump version on in-place mutation of `logits`.
+    logits.storage_ref().bump_version();
     Ok(())
 }
 

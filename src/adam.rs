@@ -696,6 +696,11 @@ mod fused {
             f.launch(cfg, &mut params)
                 .map_err(|e| Error::Cuda(format!("adam_fused launch: {e:?}")))?;
         }
+        // Autograd v2 prereq: bump version on in-place mutation.
+        // Adam writes param (BF16), m (F32), and v (F32) in-place.
+        param.storage_ref().bump_version();
+        m.storage_ref().bump_version();
+        v.storage_ref().bump_version();
         Ok(())
     }
 
@@ -795,6 +800,10 @@ mod fused {
             f.launch(cfg, &mut params)
                 .map_err(|e| Error::Cuda(format!("adam_fused_f32 launch: {e:?}")))?;
         }
+        // Autograd v2 prereq: bump version on in-place mutation.
+        param.storage_ref().bump_version();
+        m.storage_ref().bump_version();
+        v.storage_ref().bump_version();
         Ok(())
     }
 
@@ -1211,6 +1220,21 @@ impl Adam {
                     bias_correction2,
                     seed,
                 )?;
+                // Autograd v2 prereq: bump version on each in-place tensor
+                // touched by the multi-tensor kernel (param, m, v per id).
+                // The kernel sees raw u64 pointers and can't bump itself.
+                for param in parameters {
+                    param.with_data_mut(|t| {
+                        t.storage_ref().bump_version();
+                        Ok(())
+                    })?;
+                    if let Some(m_t) = self.m.get(&param.id()) {
+                        m_t.storage_ref().bump_version();
+                    }
+                    if let Some(v_t) = self.v.get(&param.id()) {
+                        v_t.storage_ref().bump_version();
+                    }
+                }
                 return Ok(());
             }
         }
