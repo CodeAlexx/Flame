@@ -250,8 +250,8 @@ What stays omitted (different reason — flame-core lacks the underlying infrast
 - **Sparse / nested tensors** — flame-core has no sparse or nested *storage* today. v2 cannot add autograd surface for storage that doesn't exist. If/when sparse storage is added in a separate workstream, v2's surface will extend trivially.
 - **Compiled autograd / TorchScript / dynamo** — PyTorch's analog requires their entire compiler stack (TorchInductor, dynamo, FX). flame-core has a different architecture (NVRTC + WMMA + fused C kernels). No surface to add — the equivalent functionality already exists via different machinery.
 
-What needs an explicit charter call:
-- **Multi-device threading** — `flame-core/CLAUDE.md` says single-GPU. Both OneTrainer and SimpleTuner use `torch.distributed` for DDP. If multi-device is on flame-core's long-term roadmap, v0's engine must not assume single-stream/single-device internally (~1 week of surface design in Phase 1). Pending project-level decision.
+Charter decisions:
+- **Multi-device threading** — DECIDED 2026-05-13: build the **surface** in v0, defer feature-complete plumbing. Both OneTrainer and SimpleTuner use `torch.distributed` for DDP; flame-core will eventually need the same capability ("we will need ... not now -- multi gpu fyi"). Phase 1's `Engine` and `InputBuffer` design takes device + stream as explicit parameters at every dispatch point so DDP / NCCL plumbing can land later without engine rework. Surface cost: ~5 days inside Phase 1. Feature-complete (actual NCCL bindings, `all_reduce` for gradient sync, distributed sampler) is a separate ~3-week flame-core workstream not part of v2.
 
 ### 9. Migration Plan Understates Existing Recording Surface
 
@@ -319,7 +319,7 @@ Revise the design doc with these concrete changes:
 13. **Build in hook surface**: `Hooks` struct with pre/post/tensor-callback vecs, exposed by `GradFn::hooks()` and a registration API on `Tensor`. Default empty. Used by future BlockOffloader integration patterns and by users wanting introspection.
 14. **Build in view-autograd surface**: per-view-op `GradFn` impls for `view`, `reshape`, `squeeze`, `unsqueeze`, `transpose`, `permute`. Backed by the version-counter prereq in clause 9.
 15. **Build in forward-mode AD surface**: `SavedTensor::fw_grad_` field, each P0/P1 op records a forward formula alongside backward. Plumbing per op — no engine redesign required.
-16. **Multi-device surface**: pending project-level decision. If yes, Phase 1's `Engine` and `InputBuffer` design must avoid hardcoded single-stream / single-device assumptions (~5 days of surface design); if no, ignore.
+16. **Multi-device surface**: DECIDED 2026-05-13 — build it in. Phase 1's `Engine` and `InputBuffer` design must avoid hardcoded single-stream / single-device assumptions; stream and device are explicit parameters at every dispatch point (~5 days of surface design within Phase 1). Feature-complete (NCCL bindings, DDP gradient sync, distributed sampler) is a separate workstream after v2 lands.
 
 ## Suggested Implementation Order
 
