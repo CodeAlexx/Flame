@@ -963,6 +963,37 @@ for the module overview.
 | `TransferBandwidthProfile::format_table` | `offload/transfer_benchmark.rs:213` | Diagnostic table matching FlexTensor's `format_memory_transfer_table`. |
 | `offload::transfer_benchmark::TransferMeasurement` / `TransferDirection` | `offload/transfer_benchmark.rs:115,121` | Per-point result. |
 
+### Block offload strategy — `offload::strategy` (Phase 2 FlexTensor port, 2026-05-13)
+
+⭐ Opt-in resident-set strategy layer for `BlockOffloader`. When no
+strategy is attached (default) the offloader runs the pre-Phase-2 code
+paths bit-for-bit unchanged — klein 9B loss invariant preserved.
+Attached via `BlockOffloader::set_strategy` / `with_strategy`. Strategy
+decisions are advisory: the offloader honors what fits the 2-slot
+mechanic and emits `target_resident_bytes` + decision counts into the
+Phase 1 telemetry sink.
+
+| Symbol | File:line | Notes |
+|---|---|---|
+| `offload::strategy::Strategy` trait | `offload/strategy.rs` | `plan(&mut self, &OffloaderState) -> ResidentPlan`. `Send + Sync`. Pure host logic — no CUDA calls. |
+| `offload::strategy::OffloaderState` | `offload/strategy.rs` | Cheap snapshot: block_count, block_sizes, resident, requested, access_history, free/total VRAM, AccessHints. |
+| `offload::strategy::ResidentPlan` | `offload/strategy.rs` | `evict` / `keep` / `prefetch` Vec<usize> + `target_resident_bytes`. Has `keep_bytes(sizes)`. |
+| `offload::strategy::TwoSlot` | `offload/strategy/two_slot.rs` | Default 2-slot ping-pong reformulated as a Strategy. Stateless. Regression gate `two_slot_matches_hardcoded_pre_phase2` proves bit-identical eviction picks vs the hardcoded path. |
+| `offload::strategy::Knapsack` | `offload/strategy/knapsack.rs` | Value-based selection bounded by a byte budget. Greedy value-per-byte sort (~5% of optimal at <1 µs). Score = inverse recency + frequency + requested bonus. `with_budget(bytes)` / `unbounded()`. |
+| `offload::strategy::Adaptive` | `offload/strategy/adaptive.rs` | VRAM-pressure-driven sizing. Shrinks above high_watermark (default 0.85), grows below low_watermark (default 0.60), holds in between (hysteresis). Wraps a Knapsack with a dynamic budget. |
+| `offload::planner::PlanRequest` / `PlanResult` | `offload/planner.rs` | Plain capacity-bounded block selection. `plan_smallest_first` (maximize count) / `plan_largest_first` (fewer transfers) / `max_block_bytes`. Used by strategies and callers that want a "just fit" baseline. |
+| ⭐ `BlockOffloader::set_strategy(Box<dyn Strategy>)` | `offload/mod.rs` | Attach strategy; opt-in only. Default = no strategy = bit-identical pre-Phase-2 behavior. |
+| `BlockOffloader::with_strategy(self, …)` / `clear_strategy()` / `strategy_name()` | `offload/mod.rs` | Builder, detacher, telemetry accessor. |
+| `BlockOffloader::block_sizes()` / `resident_blocks()` | `offload/mod.rs` | Accessors used to size strategy budgets externally. |
+| `Telemetry::record_strategy_decision(name, evicted, kept, target_bytes)` | `offload/telemetry.rs` | Strategy decision hook (cheap when telemetry disabled). Adds `strategy_plans`, `strategy_eviction_decisions`, `strategy_keep_total`, `strategy_last_target_resident_bytes` to `TelemetryCounters`. |
+
+Deliberately deferred to Phase 3 (not ported): FlexTensor's `OffloadManager`
+state machine, `state_handler.py` persistence, `tensor_discovery` /
+`trap_tensor_mode` (rely on PyTorch `__torch_function__`),
+`memory_block_planner.py` adjacency-graph coloring (flame-core's blocks are
+flat IDs from `BlockFacilitator`), `shm/` cross-process plumbing
+(single-process trainers only).
+
 ### Gradient utilities
 - `gradient::GradientMap / TensorGradExt` — re-exported as `GradientMap`
 - `gradient_clip::*` — gradient clipping

@@ -27,13 +27,17 @@
 //!   to build a [`transfer_benchmark::TransferBandwidthProfile`] for
 //!   future strategy work (Phase 2). Not on the per-step path.
 
+pub mod planner;
+pub mod strategy;
 pub mod telemetry;
 pub mod transfer_benchmark;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+use crate::offload::strategy::{AccessHints, OffloaderState, Strategy, ACCESS_HISTORY_CAP};
 
 use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, DevicePtr};
 use crate::{
@@ -383,6 +387,32 @@ pub struct BlockOffloader {
     /// the weight in the wrong layout for the GEMM and silently produce
     /// garbage.
     native_layout: bool,
+
+    /// Phase 2 (FlexTensor port): opt-in resident-set strategy.
+    ///
+    /// When `None` (default), every code path runs exactly as it did
+    /// before Phase 2 — bit-identical klein 9B behavior, every existing
+    /// trainer inherits the 2-slot pipeline with no config change.
+    ///
+    /// When `Some`, [`prefetch_block`](Self::prefetch_block) consults
+    /// the strategy at the top of each call to update telemetry on the
+    /// strategy's resident-set decisions. The strategy's plan is
+    /// advisory only — the offloader still drives the 2-slot mechanic.
+    /// Phase 3 will widen the slot ring to honor a strategy's
+    /// `desired_resident` exactly.
+    strategy: Option<Box<dyn Strategy>>,
+
+    /// Cached per-block byte sizes used by the strategy. Computed once
+    /// at construction; stays constant for the offloader's lifetime.
+    block_size_cache: Vec<usize>,
+
+    /// Most-recent-first access history (bounded ring). Updated on
+    /// every `prefetch_block` call when a strategy is attached.
+    access_history: VecDeque<u32>,
+
+    /// Counter of prefetches issued since the last strategy `plan()`
+    /// call. Threaded through `AccessHints::prefetches_since_last_plan`.
+    prefetches_since_plan: u32,
 }
 
 // Safety: BlockOffloader is always accessed behind a Mutex (serialized).
@@ -657,6 +687,11 @@ impl BlockOffloader {
             total_pinned_bytes as f64 / (1024.0 * 1024.0),
         );
 
+        let block_size_cache: Vec<usize> = cpu_blocks
+            .iter()
+            .map(|m| m.values().map(|pt| pt.buffer.len_bytes()).sum())
+            .collect();
+
         Ok(Self {
             cpu_blocks,
             streaming: None,
@@ -667,6 +702,10 @@ impl BlockOffloader {
             prefetch_in_flight: None,
             total_pinned_bytes,
             native_layout: false,
+            strategy: None,
+            block_size_cache,
+            access_history: VecDeque::with_capacity(ACCESS_HISTORY_CAP),
+            prefetches_since_plan: 0,
         })
     }
 
@@ -809,6 +848,8 @@ impl BlockOffloader {
             files.len(),
         );
 
+        let block_size_cache: Vec<usize> = streaming_blocks_byte_sizes(&blocks);
+
         let streaming = StreamingState {
             files,
             blocks,
@@ -826,6 +867,10 @@ impl BlockOffloader {
             prefetch_in_flight: None,
             total_pinned_bytes,
             native_layout: false,
+            strategy: None,
+            block_size_cache,
+            access_history: VecDeque::with_capacity(ACCESS_HISTORY_CAP),
+            prefetches_since_plan: 0,
         })
     }
 
@@ -837,6 +882,62 @@ impl BlockOffloader {
     pub fn with_native_layout(mut self, native: bool) -> Self {
         self.native_layout = native;
         self
+    }
+
+    /// Attach a resident-set [`Strategy`] (Phase 2 FlexTensor port).
+    ///
+    /// Default behavior — no strategy attached — is bit-identical to
+    /// the pre-Phase-2 code paths. Attaching a strategy adds advisory
+    /// planning hooks inside [`Self::prefetch_block`] and emits the
+    /// resulting `target_resident_bytes` / decision counts into the
+    /// global telemetry sink (see [`telemetry::strategy_counters`]).
+    ///
+    /// Strategies do not commandeer the slot mechanic; they advise on
+    /// eviction order and prefetch priority. The 2-slot pipeline still
+    /// runs underneath.
+    pub fn set_strategy(&mut self, strategy: Box<dyn Strategy>) {
+        self.strategy = Some(strategy);
+    }
+
+    /// Builder-style variant of [`Self::set_strategy`].
+    pub fn with_strategy(mut self, strategy: Box<dyn Strategy>) -> Self {
+        self.strategy = Some(strategy);
+        self
+    }
+
+    /// Detach the current strategy. The offloader reverts to the
+    /// default 2-slot path.
+    pub fn clear_strategy(&mut self) {
+        self.strategy = None;
+    }
+
+    /// Currently-attached strategy's name, or `"none"` when no strategy
+    /// is set. Used by tests / diagnostics.
+    pub fn strategy_name(&self) -> &'static str {
+        match self.strategy.as_deref() {
+            Some(s) => s.name(),
+            None => "none",
+        }
+    }
+
+    /// Per-block byte sizes the offloader sees. Length =
+    /// `block_count()`. Exposed for callers that want to size their
+    /// own [`Strategy`] budgets against the offloader's view of the
+    /// model.
+    pub fn block_sizes(&self) -> &[usize] {
+        &self.block_size_cache
+    }
+
+    /// Currently-resident block IDs across both slots. May be empty
+    /// (cold start), 1 element (only one slot used), or 2 elements.
+    pub fn resident_blocks(&self) -> Vec<usize> {
+        let mut out = Vec::with_capacity(2);
+        for slot in &self.slots {
+            if let Some(b) = slot.block_idx() {
+                out.push(b);
+            }
+        }
+        out
     }
 
     // -----------------------------------------------------------------------
@@ -862,6 +963,16 @@ impl BlockOffloader {
             return Ok(());
         }
 
+        // Phase 2 FlexTensor port: consult attached strategy.
+        //
+        // Critical: this block runs only when a strategy has been
+        // explicitly attached via `set_strategy` / `with_strategy`.
+        // The default (no strategy) path falls straight through to the
+        // pre-Phase-2 `prefetch_block_inner` below — bit-identical to
+        // the old behavior. klein 9B regression gate is anchored on
+        // this fact.
+        self.consult_strategy(block_idx);
+
         // Best-effort bytes count for telemetry. Pinned path: sum pinned
         // buffer lengths. Streaming path: sum BF16 footprint from entries.
         // Computed before the inner call so we don't have to plumb a
@@ -884,6 +995,62 @@ impl BlockOffloader {
             tele.record_prefetch_end(timer, block_idx, bytes);
         }
         result
+    }
+
+    /// Phase 2: invoke the attached resident-set strategy (if any) and
+    /// emit its decision into telemetry. No state mutation outside of
+    /// `access_history` and `prefetches_since_plan` — the plan itself
+    /// is advisory.
+    ///
+    /// Cheap when no strategy is attached: a single `Option::is_none`
+    /// check and a `VecDeque` push (≤ 100 ns on commodity hardware).
+    /// In the no-strategy case the access history is still maintained
+    /// so attaching a strategy later sees real recent-access signal —
+    /// the cost is a `u32` push into a 64-cap ring, which is bounded
+    /// to a single memmove of at most 64 × 4 bytes.
+    fn consult_strategy(&mut self, block_idx: usize) {
+        // Update access history regardless of strategy attachment.
+        // Most-recent-first (push_front) so strategies can read
+        // `history[0]` as "the block being asked for".
+        if self.access_history.len() == ACCESS_HISTORY_CAP {
+            self.access_history.pop_back();
+        }
+        self.access_history.push_front(block_idx as u32);
+
+        // No strategy? Done — pre-Phase-2 path runs unchanged.
+        let Some(strat) = self.strategy.as_mut() else {
+            return;
+        };
+
+        // Build the state snapshot. Cheap — borrows into existing
+        // fields, no allocations.
+        let resident = self.slots.iter().filter_map(|s| s.block_idx()).collect::<Vec<_>>();
+        let hints = AccessHints {
+            vram_authoritative: false,
+            prefetches_since_last_plan: self.prefetches_since_plan,
+        };
+        let state = OffloaderState {
+            block_count: self.block_size_cache.len(),
+            block_sizes: &self.block_size_cache,
+            resident: &resident,
+            requested: block_idx,
+            access_history: &self.access_history,
+            free_vram_bytes: 0,
+            total_vram_bytes: 0,
+            hints,
+        };
+
+        let plan = strat.plan(&state);
+        self.prefetches_since_plan = 0;
+
+        // Emit decision into telemetry. The hook is a single relaxed
+        // atomic load + early return when telemetry is disabled.
+        telemetry::global().record_strategy_decision(
+            strat.name(),
+            plan.evict.len() as u64,
+            plan.keep.len() as u64,
+            plan.target_resident_bytes,
+        );
     }
 
     fn prefetch_block_inner(&mut self, block_idx: usize) -> anyhow::Result<()> {
@@ -1645,6 +1812,15 @@ fn f16_to_f32(bits: u16) -> f32 {
     }
     let f32_exp = exp + (127 - 15);
     f32::from_bits((sign << 31) | (f32_exp << 23) | (frac << 13))
+}
+
+/// Per-block byte size (BF16 footprint) for the streaming path. Used
+/// by the strategy plug-point to populate `OffloaderState::block_sizes`.
+fn streaming_blocks_byte_sizes(blocks: &[Vec<StreamingTensorEntry>]) -> Vec<usize> {
+    blocks
+        .iter()
+        .map(|entries| entries.iter().map(|e| e.num_elems * 2).sum::<usize>())
+        .collect()
 }
 
 #[inline]

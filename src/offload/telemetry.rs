@@ -72,6 +72,24 @@ pub struct TelemetryCounters {
     /// Count of `prefetch_block` calls that were short-circuited because
     /// the block was already resident on one of the slots.
     pub prefetch_already_resident: u64,
+
+    // ──────────────────────────────────────────────────────────────
+    // Phase 2 (strategy) counters. All default to zero when no
+    // strategy is attached.
+    // ──────────────────────────────────────────────────────────────
+    /// Count of `Strategy::plan()` calls served (always one per
+    /// non-resident `prefetch_block` when a strategy is attached).
+    pub strategy_plans: u64,
+    /// Total eviction decisions strategies have issued. Each
+    /// `plan.evict.len()` accumulates here.
+    pub strategy_eviction_decisions: u64,
+    /// Sum of `plan.keep.len()` across every plan — the running total
+    /// of "resident-set size after plan". Divide by `strategy_plans`
+    /// for the average.
+    pub strategy_keep_total: u64,
+    /// Last reported `target_resident_bytes`. Strategies' adaptive
+    /// behavior shows up as this value moving over time.
+    pub strategy_last_target_resident_bytes: u64,
 }
 
 impl TelemetryCounters {
@@ -165,6 +183,12 @@ pub struct Telemetry {
     prefetch_issued: AtomicU64,
     prefetch_already_resident: AtomicU64,
 
+    // Phase 2: strategy decision counters.
+    strategy_plans: AtomicU64,
+    strategy_eviction_decisions: AtomicU64,
+    strategy_keep_total: AtomicU64,
+    strategy_last_target_resident_bytes: AtomicU64,
+
     event_log: Mutex<EventLog>,
 }
 
@@ -192,6 +216,10 @@ impl Telemetry {
             await_misses: AtomicU64::new(0),
             prefetch_issued: AtomicU64::new(0),
             prefetch_already_resident: AtomicU64::new(0),
+            strategy_plans: AtomicU64::new(0),
+            strategy_eviction_decisions: AtomicU64::new(0),
+            strategy_keep_total: AtomicU64::new(0),
+            strategy_last_target_resident_bytes: AtomicU64::new(0),
             event_log: Mutex::new(EventLog {
                 capacity,
                 events: Vec::with_capacity(capacity),
@@ -239,7 +267,7 @@ impl Telemetry {
         }
     }
 
-    /// Take a coherent counter snapshot. Cheap: 7 atomic loads.
+    /// Take a coherent counter snapshot. Cheap: 11 atomic loads.
     pub fn snapshot(&self) -> TelemetryCounters {
         TelemetryCounters {
             h2d_bytes_total: self.h2d_bytes_total.load(Ordering::Acquire),
@@ -250,6 +278,14 @@ impl Telemetry {
             prefetch_issued: self.prefetch_issued.load(Ordering::Acquire),
             prefetch_already_resident: self
                 .prefetch_already_resident
+                .load(Ordering::Acquire),
+            strategy_plans: self.strategy_plans.load(Ordering::Acquire),
+            strategy_eviction_decisions: self
+                .strategy_eviction_decisions
+                .load(Ordering::Acquire),
+            strategy_keep_total: self.strategy_keep_total.load(Ordering::Acquire),
+            strategy_last_target_resident_bytes: self
+                .strategy_last_target_resident_bytes
                 .load(Ordering::Acquire),
         }
     }
@@ -264,9 +300,40 @@ impl Telemetry {
         self.await_misses.store(0, Ordering::Release);
         self.prefetch_issued.store(0, Ordering::Release);
         self.prefetch_already_resident.store(0, Ordering::Release);
+        self.strategy_plans.store(0, Ordering::Release);
+        self.strategy_eviction_decisions.store(0, Ordering::Release);
+        self.strategy_keep_total.store(0, Ordering::Release);
+        self.strategy_last_target_resident_bytes
+            .store(0, Ordering::Release);
         let mut log = self.event_log.lock().unwrap();
         log.events.clear();
         log.total_seen = 0;
+    }
+
+    /// Hook: a [`Strategy`](super::strategy::Strategy) emitted a plan.
+    /// Cheap when telemetry is disabled (single relaxed load + early
+    /// return). Records an aggregate snapshot (no per-plan event in
+    /// the ring buffer — strategy plans run inside the offloader lock
+    /// and burn the event-log mutex unnecessarily).
+    ///
+    /// `_name` is the strategy's stable name; reserved for future
+    /// per-strategy counter splits.
+    pub fn record_strategy_decision(
+        &self,
+        _name: &'static str,
+        evicted: u64,
+        kept: u64,
+        target_bytes: u64,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.strategy_plans.fetch_add(1, Ordering::AcqRel);
+        self.strategy_eviction_decisions
+            .fetch_add(evicted, Ordering::AcqRel);
+        self.strategy_keep_total.fetch_add(kept, Ordering::AcqRel);
+        self.strategy_last_target_resident_bytes
+            .store(target_bytes, Ordering::Release);
     }
 
     /// Copy the current contents of the per-event ring buffer. Empty when
