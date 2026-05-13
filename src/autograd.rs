@@ -1318,6 +1318,25 @@ impl AutogradContext {
     /// when callers want a v2-policy `GradientMap` (e.g. for
     /// `Parameter::new_v2` + `AdamWV2`).
     ///
+    /// # End-to-end BF16-grad caveat
+    /// This bridge emits BF16 grads only *into the returned
+    /// `GradientMap`*. If the caller then assigns those grads to a
+    /// parameter built via the default [`crate::Parameter::new`]
+    /// (which uses
+    /// [`crate::parameter::GradDtypePolicy::CastToF32`]), `set_grad`
+    /// will upcast BF16 → F32 — silently nullifying the memory
+    /// savings. To realize the full Option-A path
+    /// (BF16-grad-end-to-end through the optimizer step) construct
+    /// parameters via [`crate::Parameter::new_v2`] (Phase 4a). See
+    /// `docs/BF16_GRAD_DECISION.md` §Phase 5b caveat.
+    ///
+    /// # CUDA Graph backward limitation
+    /// Under `FLAME_CUDA_GRAPH=1` the replay path pre-allocates grad
+    /// buffers at the warmup-recorded dtype (v3: F32) and bypasses the
+    /// per-op cast in `backward_impl`. v2 + cuda-graph backward is
+    /// therefore not yet supported; callers needing BF16 grads should
+    /// leave `FLAME_CUDA_GRAPH` unset (the default).
+    ///
     /// See `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` §Phase 5 Deliverable C
     /// Route (ii).
     #[cfg(feature = "autograd_v2")]
@@ -1521,18 +1540,22 @@ impl AutogradContext {
                 GradStorePolicy::InternalFP32_PublicBF16 => DType::F32,
                 GradStorePolicy::MatchInsertedDtype => loss.dtype(),
             };
-            match policy {
-                GradStorePolicy::InternalFP32_PublicBF16 => {
-                    gradients.set_ones(loss.id, loss.shape.clone())?;
-                }
-                GradStorePolicy::MatchInsertedDtype => {
-                    gradients.set_ones_dtype(
-                        loss.id,
-                        loss.shape.clone(),
-                        grad_target_dtype,
-                    )?;
-                }
-            }
+            // Seed the loss grad at F32 under BOTH policies. v3 op-dispatch
+            // kernels (compute_gradients) assume F32 output_grad — e.g.
+            // Op::Mean's backward calls `GpuOps::broadcast` over the
+            // 1.0/n-scaled seed; with a BF16 scalar seed several op
+            // kernels return CUDA_ERROR_INVALID_VALUE because they were
+            // never authored against BF16 scalars.
+            //
+            // The seed entry is `take`n on the first reverse step and
+            // never persists; what does land in the v2 GradientMap is
+            // the per-input-grad cast below (loop in the op-dispatch
+            // body), which downcasts each emitted F32 input-grad to
+            // `grad_target_dtype` (loss.dtype()) before
+            // `accumulate_v2`. So the BF16-grad-end-to-end story holds
+            // for the *stored* grads (the value the bridge promises);
+            // only the transient seed stays F32.
+            gradients.set_ones(loss.id, loss.shape.clone())?;
 
             // ── CUDA Graph replay path ──────────────────────────────
             if use_cuda_graph && graph_phase == crate::cuda_graph::BackwardPhase::Replay {
@@ -1681,24 +1704,25 @@ impl AutogradContext {
                         // Checkpoint backward returns ALL internal gradients (including
                         // LoRA params) that aren't in needed_grad_ids — always accept those.
                         //
-                        // Phase 5b bridge: under MatchInsertedDtype policy, cast every
-                        // emitted grad to grad_target_dtype (loss.dtype()) so the v2
-                        // accumulate contract (no dtype mismatch) is satisfied. v3 op
-                        // backwards typically emit F32 grads; the cast realizes the
-                        // BF16-grad-end-to-end story.
+                        // Phase 5b bridge: both policies accumulate at F32 internally
+                        // (v3 op kernels produce F32 grads). Under MatchInsertedDtype the
+                        // *persistent* leaf grads are downcast to `grad_target_dtype`
+                        // (loss.dtype()) in a post-loop pass below. Doing the cast at
+                        // insertion-time would propagate BF16 into the next reverse-tape
+                        // step's `output_grad`, and several v3 backward kernels are not
+                        // authored against BF16 scalar/non-leaf grads (observed:
+                        // `CUDA_ERROR_INVALID_VALUE` from Mean/Mul backwards with BF16
+                        // output_grad).
                         let is_checkpoint = matches!(&entry.op, Op::Checkpoint { .. } | Op::CheckpointOffload { .. });
                         let t_accum = std::time::Instant::now();
                         for (tensor_id, grad) in input_grads {
                             if is_checkpoint || needed_grad_ids.contains(&tensor_id) {
-                                let grad = match policy {
-                                    GradStorePolicy::InternalFP32_PublicBF16 => grad,
-                                    GradStorePolicy::MatchInsertedDtype => {
-                                        if grad.dtype() == grad_target_dtype {
-                                            grad
-                                        } else {
-                                            grad.to_dtype(grad_target_dtype)?
-                                        }
-                                    }
+                                // Both v3 and the bridge accumulate at F32. v2 will be
+                                // downcast in the post-loop pass.
+                                let grad = if grad.dtype() == DType::F32 {
+                                    grad
+                                } else {
+                                    grad.to_dtype(DType::F32)?
                                 };
                                 gradients.accumulate(tensor_id, grad)?;
                             }
@@ -1871,6 +1895,20 @@ impl AutogradContext {
                 ctx.enabled = prev_enabled;
                 AUTOGRAD_ENABLED.store(prev_enabled, Ordering::Relaxed);
                 ctx.checkpoint_fns.clear();
+            }
+
+            // Phase 5b bridge post-loop pass: under MatchInsertedDtype,
+            // downcast every persistent leaf grad to `grad_target_dtype`
+            // (the loss tensor's dtype). The backward loop above ran at
+            // F32 internally (v3 op kernels expect F32 output_grad);
+            // intermediate grads were drained by `take()` and only leaf
+            // grads remain. Walking those entries here realizes the
+            // BF16-end-to-end storage promised by the v2 policy without
+            // perturbing the v3 backward-kernel contract.
+            if matches!(policy, GradStorePolicy::MatchInsertedDtype)
+                && grad_target_dtype != DType::F32
+            {
+                gradients.cast_all_to_dtype(grad_target_dtype)?;
             }
 
             gradients

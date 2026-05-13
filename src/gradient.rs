@@ -452,6 +452,32 @@ impl GradientMap {
         vec_count + self.overflow.len()
     }
 
+    /// Cast every stored gradient to `dtype` in place.
+    ///
+    /// Used by the Phase 5b `backward_v2` bridge as a post-loop pass to
+    /// realize the BF16-end-to-end storage promise without forcing the
+    /// v3 backward kernels to handle BF16 `output_grad`. Cheap when the
+    /// stored grad already has the target dtype.
+    pub fn cast_all_to_dtype(&mut self, dtype: DType) -> Result<()> {
+        for slot in self.vec_store.iter_mut() {
+            if let Some(g) = slot.as_ref() {
+                if g.dtype() != dtype {
+                    *slot = Some(g.to_dtype(dtype)?);
+                }
+            }
+        }
+        let ids: Vec<TensorId> = self.overflow.keys().copied().collect();
+        for id in ids {
+            if let Some(g) = self.overflow.get(&id) {
+                if g.dtype() != dtype {
+                    let casted = g.to_dtype(dtype)?;
+                    self.overflow.insert(id, casted);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.vec_store.iter().all(|s| s.is_none()) && self.overflow.is_empty()
