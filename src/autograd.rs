@@ -99,6 +99,33 @@ pub fn clear_activation_offload_pool() {
     }
 }
 
+/// Global grow-on-demand activation cache (Phase 1 of OFFLOAD_NEXT_GEN_DESIGN).
+/// Parallel to `ACTIVATION_POOL` but uses the new dynamic-slab cache and
+/// the `checkpoint_offload_boundary` API shape (closure takes &[Tensor]).
+/// None by default; trainers that want narrow-scope boundary offload call
+/// `set_grow_activation_cache` at setup.
+static GROW_CACHE: std::sync::RwLock<
+    Option<Arc<Mutex<crate::activation_offload::GrowOnDemandActivationCache>>>,
+> = std::sync::RwLock::new(None);
+
+/// Install the grow-on-demand activation cache for `checkpoint_offload_boundary`.
+pub fn set_grow_activation_cache(
+    cache: Arc<Mutex<crate::activation_offload::GrowOnDemandActivationCache>>,
+) -> Result<()> {
+    let mut g = GROW_CACHE
+        .write()
+        .map_err(|_| Error::InvalidOperation("grow cache RwLock poisoned".into()))?;
+    *g = Some(cache);
+    Ok(())
+}
+
+/// Drop the global grow-on-demand activation cache.
+pub fn clear_grow_activation_cache() {
+    if let Ok(mut g) = GROW_CACHE.write() {
+        *g = None;
+    }
+}
+
 /// Operation types for autograd
 #[derive(Debug, Clone)]
 pub enum Op {
@@ -2001,6 +2028,42 @@ impl AutogradContext {
         }
 
         Ok(out_with_grad)
+    }
+
+    /// Phase 2a (OFFLOAD_NEXT_GEN_DESIGN): narrow-scope checkpoint with
+    /// closure-input-passing semantics. The closure takes `&[Tensor]` so
+    /// it does NOT capture inputs by reference — Phase 2b will swap input
+    /// storage between forward and backward (push to grow cache after fwd,
+    /// pull before bwd recompute), achieving the OneTrainer "save block I/O
+    /// only, recompute internal" memory win.
+    ///
+    /// Phase 2a behavior: equivalent to `checkpoint(inputs, || f(inputs))`.
+    /// Establishes the API surface that trainers can wire against now;
+    /// Phase 2b will swap the body without changing the signature.
+    pub fn checkpoint_offload_boundary<F>(inputs: &[Tensor], f: F) -> Result<Tensor>
+    where
+        F: Fn(&[Tensor]) -> Result<Tensor> + Send + Sync + 'static,
+    {
+        // Fast path: autograd off → just run f and return.
+        let was_enabled = {
+            let ctx = AUTOGRAD_CONTEXT.lock()
+                .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+            ctx.enabled
+        };
+        if !was_enabled {
+            return f(inputs);
+        }
+
+        // Phase 2a: wrap the input-passing closure as a zero-arg closure
+        // that owns clones of the inputs, then delegate to plain checkpoint.
+        // The memory-freeing path (push to grow cache + no-strong-ref tape
+        // entry) is Phase 2b.
+        let inputs_owned: Vec<Tensor> = inputs.to_vec();
+        let f_arc = Arc::new(f);
+        Self::checkpoint(inputs, move || {
+            let f = Arc::clone(&f_arc);
+            f(&inputs_owned)
+        })
     }
 
     /// Level 2 activation offload checkpoint. Runs `f()` ONCE with autograd
