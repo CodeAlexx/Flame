@@ -2054,3 +2054,21 @@ opt.step(&mut params);                                         // ← unchanged
 Three call-sites changed. `set_grad` and `opt.step` interfaces are unchanged
 (the 4-way Adam dispatch + the dtype-preserving `set_grad` handle the
 difference internally).
+
+### Validating the bridge against existing PyTorch fixtures
+
+When migrating a trainer or audit, the cheapest sanity check is to adapt
+its existing v3 backward-parity tests to also exercise `backward_v2()`
+against the **same** PyTorch fixtures. `tests/autograd_v2_klein_parity.rs`
+demonstrates the pattern: six Klein component scenarios (rms_norm,
+apply_rope, attn_chain, …) reuse the v3 fixtures in
+`tests/pytorch_fixtures/patterns/klein_ext_*.safetensors` and a 7th
+reconstructs a small Klein double-block from `klein_block_backward.safetensors`
+(qkv linear → narrow chunks → reshape/permute → SDPA → permute back →
+out linear → gated residual → MLP (up linear → silu*chunk → down linear)
+→ gated residual). All scenarios consolidate into a single `#[test]`
+driver to dodge the `AUTOGRAD_CONTEXT` parallel-mode race (CONCERN #3).
+Tolerance `min_cos=0.99 / max_abs_ratio=5e-2` matches the v3 Klein gate;
+the bridge lands at max abs_ratio 0.0093 across the chain (well inside
+the band). Use `flame_core::parity::ParityHarness` for the actual
+compare so the `dx`/`dweight` keys match the fixture naming convention.

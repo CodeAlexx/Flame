@@ -1392,6 +1392,15 @@ policy + the dtype-unification cast.
 - `tests/autograd_v2_bridge.rs` — 3 tests: BF16-grads-emitted, F32
   parity vs v3 (cos≥1-1e-6, max_abs_ratio≤1e-5), BF16 tolerance vs v3
   (cos≥0.999, max_abs_ratio≤5e-3 per `BF16_GRAD_DECISION.md`).
+- `tests/autograd_v2_klein_parity.rs` — Phase 5b follow-up. 1 `#[test]`
+  driver (`klein_parity_v2_scenarios`) running 7 scenarios sequentially
+  to avoid the `AUTOGRAD_CONTEXT` parallel-mode race: 6 Klein component
+  parity v2 (head_rms_norm toy/prod, apply_rope_prod, rms_norm_direct_4d,
+  rms_norm_contig_prod, attn_chain_prod) + 1 full-block parity from
+  `klein_block_backward.safetensors` (Deliverable B, new fixture
+  consumer). Tolerance band: `min_cos=0.99`, `max_abs_ratio=5e-2` —
+  matches the v3 Klein test gate (cos > 0.99). All 7 pass; max observed
+  abs_ratio 0.0093 on `dw_qkv` in attn_chain.
 - EriDiffusion-v2 `train_zimage.rs` ships an opt-in `--use-autograd-v2`
   flag plumbed through a new `autograd_v2` feature on `eridiffusion-cli`.
   Default OFF — v3 path is byte-equivalent to pre-flag behavior.

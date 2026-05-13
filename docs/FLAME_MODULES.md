@@ -682,6 +682,20 @@ OFF; new `autograd_v2` feature on `eridiffusion-cli`). Tests:
 `tests/autograd_v2_bridge.rs` (3 tests — BF16 emit, F32 parity,
 BF16 tolerance per `BF16_GRAD_DECISION.md`).
 
+**Phase 5b follow-up — Klein backward parity v2 vs PyTorch.**
+`tests/autograd_v2_klein_parity.rs` adapts the six existing v3 Klein
+component backward parity tests (`tests/pytorch_parity.rs:1008-1424`)
+to exercise `AutogradContext::backward_v2()` against the same PyTorch
+fixtures, plus a 7th scenario reconstructing the small-shape Klein
+double-block from the previously-unused `klein_block_backward.safetensors`
+fixture (qkv linear → narrow chunks → reshape/permute → SDPA → permute
+back → out linear → gated residual → MLP (up linear → silu*chunk → down
+linear) → gated residual). Single `#[test] fn klein_parity_v2_scenarios`
+driver runs all 7 sequentially to dodge the `AUTOGRAD_CONTEXT` global
+parallel-mode race (Phase 5b skeptic CONCERN #3 carryforward). Tolerance
+`min_cos=0.99 / max_abs_ratio=5e-2` matches the v3 Klein gate; max
+observed `abs_ratio` 0.0093 on `dw_qkv` in attn_chain.
+
 Key Phase 1 design points:
 - **Weak accumulator cycle break (§1):** `AutogradMetaV2::grad_accumulator`
   and `AccumulateGrad::variable` are both `Weak`, so a leaf with
