@@ -427,3 +427,28 @@ Acceptable "go" condition:
 - In-place version bump audit is tracked as prerequisite work.
 - v0 explicitly rejects unsupported higher-order behavior.
 - Implementation starts with a tiny graph and parity harness, not the full op table.
+
+## Phase 0 (2026-05-13) — shipped
+
+1. **In-place version-bump audit** — every in-place mutator in flame-core
+   now calls `TensorStorage::bump_version()` after writing. Coverage:
+   `ops::elt::{add,mul,gate_mul}_inplace_*`, `Tensor::copy_*`,
+   `tensor_narrow::narrow_backward_scatter_add_cuda`, Adam fused single
+   + multi-tensor paths, SDPA mask helpers, BF16 layernorm/AdaLN
+   affine. `multi_tensor_scale_inplace_packed` is documented as
+   caller-bumps (no Tensor handle inside the function). Tests live in
+   `tests/inplace_version_bump_audit.rs` (13 cases, green).
+2. **BF16-grad decision (Option A)** — recorded in
+   `docs/BF16_GRAD_DECISION.md` with the full F32-coercion audit of
+   `GradientMap` / `Parameter` / `Adam` / `grad_norm`. No behavior
+   change in Phase 0; full rewrite lands in Phase 4.
+3. **Feature flag** — `autograd_v2 = []` added to `Cargo.toml`;
+   `#[cfg(feature = "autograd_v2")] pub mod autograd_v2;` added in
+   `lib.rs`. The module is empty (one doc comment); Phases 1-5 fill it.
+
+No behavior change. Klein 9B 8-step smoke (`train_klein --config
+configs/klein9b_alina.json --rank 4 --steps 8`) produces bit-identical
+step-1 loss `1.1217` with and without the Phase 0 changes (verified
+2026-05-13 via stash/unstash A/B). Step 2+ hits a pre-existing
+`CUDA_ERROR_INVALID_VALUE` on the smoke config — reproducible on
+the Phase-0-pre baseline, so not introduced here.
