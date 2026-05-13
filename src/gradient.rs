@@ -452,12 +452,13 @@ impl GradientMap {
         vec_count + self.overflow.len()
     }
 
-    /// Cast every stored gradient to `dtype` in place.
+    /// Cast every stored gradient to `dtype`. Reassigns each slot via a
+    /// fresh `Tensor::to_dtype` allocation (NOT in-place storage mutation);
+    /// cheap fast-path when the stored grad already matches `dtype`.
     ///
-    /// Used by the Phase 5b `backward_v2` bridge as a post-loop pass to
-    /// realize the BF16-end-to-end storage promise without forcing the
-    /// v3 backward kernels to handle BF16 `output_grad`. Cheap when the
-    /// stored grad already has the target dtype.
+    /// Used by the Phase 5b `backward_v2` bridge as a single post-loop pass
+    /// to realize the BF16-end-to-end storage promise without forcing the
+    /// v3 backward kernels to handle BF16 `output_grad`.
     pub fn cast_all_to_dtype(&mut self, dtype: DType) -> Result<()> {
         for slot in self.vec_store.iter_mut() {
             if let Some(g) = slot.as_ref() {

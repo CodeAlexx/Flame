@@ -1318,6 +1318,13 @@ section. Tests: `tests/autograd_v2_gradientmap_v2.rs` (17 tests).
 - `gradient::GradientMap::get_or_create_dtype(id, shape, dtype)` —
   `src/gradient.rs:403` — v2-friendly zero-pre-allocate at explicit
   dtype. Under v1 forces F32.
+- `gradient::GradientMap::cast_all_to_dtype(dtype)` —
+  `src/gradient.rs:461` — **Phase 5b bug-fix** (`a5da3d5`). Walks both
+  `vec_store` and `overflow`, casts every stored gradient to `dtype` via
+  fresh `to_dtype` (reassigns slot — NOT in-place despite the doc-comment
+  wording). Fast-paths when the stored grad already matches. Used by
+  `backward_v2` as a single post-loop pass to realize BF16-end-to-end
+  without forcing v3 backward kernels to handle BF16 non-leaf grads.
 - `gradient::GradientMap::get_public_grad` / `take_public_grads` —
   `src/gradient.rs:215, 234` — both now branch on policy; v2 returns
   native-dtype grads (no BF16 cast), v1 returns the BF16-cast output

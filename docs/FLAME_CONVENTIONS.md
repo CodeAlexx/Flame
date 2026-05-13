@@ -1964,3 +1964,93 @@ profile. **Don't widen `tol_bf16_ln` to make a new BF16 op pass** —
 investigate. Same for `tol_f32_loose` on a non-matmul op: a divergence
 above 5e-3 in F32 is almost certainly a real bug, not a tolerance
 issue.
+
+## Autograd v2 (Phase 5b) — trainer migration guide
+
+The v2 stack is **strictly additive over v3**. Default behavior is unchanged.
+Opt into v2 surfaces at the granularity you want.
+
+### When to use which entry point
+
+| Want | Use | Result |
+|---|---|---|
+| F32 grads everywhere (v3 status quo) | `Parameter::new(...)` + `loss.backward()` | Zero change from pre-v2 trainers |
+| BF16 model, F32 grads (memory-safe mixed) | `Parameter::new(...)` with BF16 weights | `set_grad` upcasts to F32, Adam runs `(BF16, F32)` arm |
+| F32 model, BF16 grads (rare; some mixed-precision setups) | `Parameter::new_v2(...)` + `loss.backward_v2()` | Routes through `adam_fused_f32param_bf16grad_kernel` |
+| BF16 model, BF16 grads end-to-end (Class A) | `Parameter::new_v2(...)` + `loss.backward_v2()` + `AdamWV2` | `adam_fused_multi_bf16_bf16grad_kernel` fires |
+| Per-tensor F32 compute when needed | `tensor.to_dtype(DType::F32)?` works in any path | One-shot upcast |
+| F32 loss reduction on a BF16 model | `loss.to_dtype(DType::F32)?.backward()` | Upcasts loss before backward; grads are F32 |
+
+The 4-way Adam classifier at `src/adam.rs:1107-1144` picks the right kernel
+for **any** `(param_dtype, grad_dtype)` combination — no all-or-nothing decision.
+
+### Per-parameter mix-and-match
+
+```rust
+let lora_a = Parameter::new_v2(weights_a);       // BF16 grads on this
+let critical_param = Parameter::new(weights_b);  // F32 grads on this
+```
+
+The Adam classifier dispatches on each param's grad dtype independently.
+
+### Orthogonal axes
+
+Three independent dtype knobs:
+
+| Axis | Default | v2 override | Set via |
+|---|---|---|---|
+| Parameter storage dtype | inferred from input | inferred from input | `Tensor::to_dtype` before `Parameter::new_v2` |
+| Gradient storage dtype | F32 (v3) | matches param dtype | `Parameter::new` vs `Parameter::new_v2` |
+| Optimizer moment dtype (m, v) | F32 regardless | F32 regardless (BF16 supported) | `flame_core::config::set_optimizer_moment_dtype` |
+| GradientMap policy | `InternalFP32_PublicBF16` | `MatchInsertedDtype` | `GradientMap::new` vs `new_v2` |
+
+### Phase 5b limitations (carried into Phase 5c)
+
+1. **End-to-end BF16 needs BOTH the bridge AND `Parameter::new_v2`**.
+   `loss.backward_v2()` alone produces BF16 grads in the GradientMap, but
+   the trainer's call to `param.set_grad(g)` under `Parameter::new` (default
+   `CastToF32` policy) upcasts the grad back to F32 before AdamW. Migrate
+   LoRA params (or any params you want BF16 grads on) to `Parameter::new_v2`.
+
+2. **`FLAME_CUDA_GRAPH=1 + --use-autograd-v2` is unsupported**. The replay
+   path pre-allocates grad buffers at the warmup-recorded F32 dtype, bypassing
+   the post-loop cast. Bench / training with both flags simultaneously =
+   undefined behavior. Disable cuda-graph if using `--use-autograd-v2`.
+
+3. **`FLAME_MT_SCALE` (multi-tensor scale fast path) asserts F32 grads**.
+   The trainer's `--use-autograd-v2` flag disables this fast path automatically;
+   if you build a custom trainer that uses both, gate `MT_SCALE` off when v2
+   is on.
+
+4. **`AUTOGRAD_CONTEXT` is process-global** (`src/autograd.rs:56`). Tests
+   that touch v3 backward (including the bridge) cannot run in parallel
+   with each other without state contamination. The bridge tests are
+   consolidated into one driver as a band-aid; the architectural fix is
+   to adopt `serial_test` or a global test-mutex for v3-backward-using tests.
+
+### Migration recipe for a typical trainer
+
+```rust
+// Before (v3):
+let mut params = vec![Parameter::new(weight_init)];
+let mut opt = AdamW::new(0.001, 0.9, 0.999, 1e-8, 0.01);
+// ... training loop ...
+let mut grads = loss.backward()?;
+for p in &mut params { p.set_grad(grads.get(p.id())?.clone()); }
+opt.step(&mut params);
+
+// After (v2, full BF16 end-to-end):
+#[cfg(feature = "autograd_v2")]
+let mut params = vec![Parameter::new_v2(weight_init)];        // ← changed
+let mut opt = AdamWV2::new(0.001, 0.9, 0.999, 1e-8, 0.01);    // ← changed
+// ... training loop ...
+let mut grads = AutogradContext::backward_v2(&loss)?;          // ← changed
+for p in &mut params {
+    p.set_grad(grads.get(p.id())?.clone());                    // ← unchanged
+}
+opt.step(&mut params);                                         // ← unchanged
+```
+
+Three call-sites changed. `set_grad` and `opt.step` interfaces are unchanged
+(the 4-way Adam dispatch + the dtype-preserving `set_grad` handle the
+difference internally).

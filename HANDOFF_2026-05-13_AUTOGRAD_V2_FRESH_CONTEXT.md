@@ -102,7 +102,7 @@ Then this file for the operational state. Then the task list for what's queued.
 |---|---|---|
 | **Builder** | PASS | Both feature builds clean; 37+ tests green across 8 files (inplace_version_bump_audit 13/13, offload_telemetry_export 1/1, offload_telemetry_smoke 1/1, offload_strategy_smoke 8/8, offload_manager_smoke 10/10, narrow_sync_microbench 1/1, sum_dim_keepdim_bf16_class_c 2/2, narrow_bf16_debug 1/1); train_klein + train_qwenimage build clean; klein step-1 loss `1.1217` reproduces bit-identical pre/post Phase 0 |
 | **Bug-fixer** | PASS-with-follow-up | 11 claimed bump sites verified PASS, 5 "don't need" exclusions verified PASS, feature flag wiring + BF16 grad doc clean PASS. Test coverage CONCERN (6/11 sites untested but SavedTensor pattern test covers failure mode in principle). **Area 2 FOUND 2 MISSED SITES** — sgd::step_inplace, rng::rand_fill_. **Both fixed in commit `1f5365c`** (+4 tests, 13 → 17 green) |
-| **Skeptic** | REPRODUCES | Both feature builds compile, 17/17 audit tests pass, 20 regression tests still pass. Klein parity NOT-RUN — pre and post Phase 0 BOTH crash with `CUDA_ERROR_INVALID_VALUE` at smoke startup, eliminating Phase 0 as the cause (pre-existing infrastructure issue). Working tree restored to main. |
+| **Skeptic** | REPRODUCES | Both feature builds compile, 17/17 audit tests pass, 20 regression tests still pass. Klein parity NOT-RUN — Skeptic note overstated the crash framing; per the Phase 0 shipped section (Phase 0 §1, lines 451-454 of `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md`): `train_klein --config configs/klein9b_alina.json --rank 4 --steps 1` produces bit-identical step-1 loss `1.1217` pre/post Phase 0, and **only step 2+** hits `CUDA_ERROR_INVALID_VALUE` (pre-existing infrastructure issue, not a Phase 0 defect). Working tree restored to main. |
 
 **Verdict: Phase 0 officially green. v2 implementation is unblocked.**
 
@@ -243,7 +243,16 @@ Phases 2-5 NOT in scope for this agent.
 
 Then verifier trio same shape as Phase 0's. The Phase-0 verifier prompts are good templates — adapt the file lists and test names.
 
-**One known cost:** klein parity may continue to be blocked by `CUDA_ERROR_INVALID_VALUE` on this box's smoke config. That's pre-Phase-0, not Phase-0's defect. Build + unit tests + autograd_v2 feature build are the meaningful gates.
+**One known cost:** klein **multi-step** parity is blocked by `CUDA_ERROR_INVALID_VALUE` at step 2+ on this box's smoke config. Klein step 1 is usable — produces deterministic loss `1.1217` — so single-step parity gates (Phase 5 Deliverable C model parity) ARE available on Klein. Multi-step smokes (loss curves over 100+ steps) need a workaround for the step-2 infra issue or a different model. That's pre-Phase-0, not any v2 phase's defect. Build + unit tests + autograd_v2 feature build remain the meaningful gates.
+
+**Known parallel-test flakes (verified pre-existing at parent commits)** — re-run individually under `--test-threads=1` if hit:
+- `tests/autograd_v2_bridge.rs::bridge_scenarios` (1 consolidated test post-`a5da3d5`; pre-fix split as 3 tests and flaked under default parallel mode due to global `AUTOGRAD_CONTEXT` mutex)
+- `tests/autograd_v2_engine.rs::single_leaf_sum`
+- `tests/autograd_v2_ops.rs::engine_rejects_mismatched_grad_output_shape`
+- `tests/autograd_v2_ops.rs::silu_v2_backward_at_zero` / `transpose_v2_backward` / `matmul_v2_backward_correct_shapes` / `sum_v2_backward_broadcasts`
+- `tests/inplace_version_bump_audit.rs::copy_underscore_bumps_version`
+
+All pass individually. Root cause: v3 `AUTOGRAD_CONTEXT` is process-global (`src/autograd.rs:56`); tests that touch v3 backward contaminate each other's tape state. Fix is structural (per-test reset already exists; consolidate into single drivers like Phase 5b's `bridge_scenarios`).
 
 ---
 

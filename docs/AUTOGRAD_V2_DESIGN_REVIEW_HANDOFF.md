@@ -534,13 +534,19 @@ Do not retire v1/v3/v4 until ALL of these gates pass:
   (`backward_v2_within_tolerance_at_bf16`) covers the bridge
   numerical-correctness target per the Phase 5b prompt's fallback
   spec.
-- Klein remains crashed on this box (`CUDA_ERROR_INVALID_VALUE`);
-  Phase 5c bench should run on Z-Image or synthetic.
+- Klein **multi-step** is blocked on this box (`CUDA_ERROR_INVALID_VALUE`
+  at step 2+); however Klein **step 1** is usable and produces
+  deterministic loss `1.1217` per Phase 0's smoke. Single-step model
+  parity (Klein backward grads v3 vs v2) IS available; multi-step
+  loss-curve smokes need Z-Image or synthetic.
 
 **Deliverable D — no ms/step regression** [OPEN — Phase 5c] (~2-3 days):
-- Bench v2 backward vs v3 on klein 4B / 9B.
+- Bench v2 backward vs v3 on klein 4B / Z-Image (klein 9B optional).
 - Hold at ±1%.
 - Baseline: flame-core's documented klein-4B-perf is 1.12× vs PyTorch (`reference_klein_perf_baseline` memory).
+- **Klein step-1 IS available** (produces deterministic loss `1.1217`). Multi-step bench needs Z-Image (step 2+ on Klein crashes with `CUDA_ERROR_INVALID_VALUE` — pre-existing infra issue).
+- **CUDA-graph caveat (Phase 5b skeptic CONCERN)**: `FLAME_CUDA_GRAPH=1 + --use-autograd-v2` is unsupported — replay-path pre-allocates grad buffers at the warmup-recorded F32 dtype, bypassing the post-loop cast (`src/autograd.rs:1547-1552`). Bench BOTH arms with cuda-graph disabled (apples-to-apples), or accept the cuda-graph gap as a tracked v2 cost. cuda-graph support is a Phase 6 deliverable.
+- **Parallel-test global-state race (Phase 5b skeptic CONCERN)**: `AUTOGRAD_CONTEXT: Mutex<...>` at `src/autograd.rs:56` is process-global. Bridge tests consolidated 3→1 as a band-aid; the race persists for any other v3-backward-using test added in parallel mode. Phase 5c should not introduce new parallel v3-backward tests OR should adopt `serial_test` for the whole v3-backward test suite.
 
 **Cross-cutting gates that must also pass**:
 - BF16 grad policy optimizer parity (Phase 4a/4b set up the kernels; Deliverable A/C exercise them in anger).

@@ -42,6 +42,28 @@ F32↔BF16 cast on every backward op.
   detours that need rewriting eventually. Doing it once with v2 is
   cheaper than doing it twice.
 
+### Concrete memory savings (Klein 9B reference)
+
+These are the order-of-magnitude wins from full migration (`Parameter::new_v2`
++ `backward_v2` + `MatchInsertedDtype` GradientMap + AdamW BF16-grad arm):
+
+| Scenario | v3 grad memory | v2 grad memory | Savings |
+|---|---|---|---|
+| Klein 9B LoRA (rank=32) | ~280 MB | ~140 MB | 140 MB |
+| Klein 9B full fine-tune | ~36 GB | ~18 GB | 18 GB (= "fits / doesn't fit" on 24 GB) |
+| Activation grads peak (klein 9B backward) | ~12-15 GB | ~6-8 GB | ~half |
+
+Kernel launches eliminated per step on Klein 9B (from nsys profile prior session):
+- ~9,500 `bf16_to_f32` casts (upcast at GradientMap insert/accumulate)
+- ~9,700 `f32_to_bf16` casts (downcast at get_public_grad)
+- Total: **~19,200 cast kernels per step** disappear under v2 policy
+- Cost saved: ~135 ms/step launch overhead + ~50-100 ms/step memory-bandwidth
+  cost = **~4-6% of klein 9B's 5.4s step time** from the F32 round-trip alone
+
+Note: LoRA training realizes only a small portion of these savings (LoRA grads
+are O(rank/d_model) of full grads). Full fine-tune and activation-grad savings
+are the big ones.
+
 ## Scope of cross-cutting changes (Phase 4)
 
 These are the F32-coercion sites that Phase 4 must rewrite to preserve
@@ -201,11 +223,28 @@ is described below.
 
 The trainer now ships `--use-autograd-v2` (default OFF). When ON, the
 `loss.backward()` call routes through `AutogradContext::backward_v2`,
-which builds a `MatchInsertedDtype` `GradientMap` and casts each
-v3-backward-emitted gradient to `loss.dtype()` at accumulate time. The
-v3 op-dispatch is unchanged; the bridge is a ~30-line surgery on
-`src/autograd.rs:1297` (split into `pub fn backward`,
-`pub fn backward_v2`, and `fn backward_impl(loss, policy)`).
+which builds a `MatchInsertedDtype` `GradientMap`. The v3 op-dispatch
+is unchanged; the bridge is a 42-line surgery on `src/autograd.rs:1297`
+(split into `pub fn backward`, `pub fn backward_v2`, and
+`fn backward_impl(loss, policy)`).
+
+**Architecture (post-bug-fix `a5da3d5`)**: the bridge accumulates F32
+internally throughout the backward loop (preserving v3 op behavior —
+v3 kernels are authored for F32 non-leaf grads), then runs a single
+`GradientMap::cast_all_to_dtype(loss.dtype())` post-pass that converts
+all final grads to the target dtype at once. **The original `ad781bf`
+attempted per-op cast at insertion-time; that was structurally wrong**
+— after the first cast, the next reverse-step's `take()` returned
+BF16 and fed it back into v3 kernels not authored for BF16 non-leaf
+grads, producing `CUDA_ERROR_INVALID_VALUE` on real BF16 MLP backward.
+Bug-fixer commit `a5da3d5` corrected this with the F32-internal +
+post-loop downcast pattern.
+
+**Known limitation**: `FLAME_CUDA_GRAPH=1 + --use-autograd-v2` is
+unsupported. The replay path bypasses the post-loop cast
+(`src/autograd.rs:1547-1552` allocates from `grad_recipe` at the
+warmup-recorded F32 dtype). Perf bench (Phase 5c) should leave
+cuda-graph backward unset when measuring v2.
 
 Default OFF preserves byte-equivalent v3 behavior. Existing
 `Parameter::set_grad` continues to upcast the v2-emitted BF16 grads to
