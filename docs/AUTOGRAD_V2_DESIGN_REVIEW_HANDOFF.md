@@ -477,17 +477,50 @@ Long-tail unary ops:
 - Run one-step model parity before long parity runs.
 - Verify `flame_core::autograd::checkpoint` semantics preserved on v2.
 
-### Phase 5: Parity Gate (~1 week)
+### Phase 5: Parity Gate
 
-Do not retire v1 until:
-- per-op **backward** fixture parity passes for all P0/P1 ops
-- per-op **forward-mode AD** fixture parity passes for all P0/P1 ops
-- model parity passes for the target model table (klein, zimage, ernie, qwen, chroma — bit-equal loss)
-- no ms/step regression on klein 4B / 9B
-- BF16 grad policy has optimizer parity
-- in-place mutation tests are green
-- **reentrant test**: training run that uses `enable_checkpointing` matches v1 bit-equal at step 1+
-- **hooks test**: simple forward and backward hook fires expected callback count per training step
+**Status (2026-05-13)**: Phase 3 (3a/3b/3c1/3c2) + Phase 4 (4a/4b) complete. v2 surface inside flame-core ready for parity work. Estimate REVISED below.
+
+**Scope estimate**:
+- **Route (i) — port missing forward-graph ops**: ~6-8 DiT primitive families currently missing in v2 (per Phase 4b skeptic's recalibrated audit of `train_zimage.rs`): `primitive_rms_norm` (8 call sites), `flame_core::attention::sdpa`, RoPE-apply (`build_3d_rope` / `build_1d_rope`), `chunk` (5 sites), `broadcast_to` (2 sites), `fused_linear3d_native` / `Op::Linear`, residual `Tensor::add`. Note: `conv2d`, `gelu`, `group_norm` initially listed by Phase 4b port agent are VAE/encoder ops, NOT in the LoRA-trained DiT — agent's "~20+ ops" framing was ~3× inflated. **Real estimate: 6-10 weeks.**
+- **Route (ii) — `loss.backward_v2()` bridge**: ~30-line flag-switch on `AutogradContext::backward` (`src/autograd.rs:1297-1820`, ~520 lines total) that constructs `GradientMap::new_v2()` and routes v3 backward through it for params marked `Parameter::new_v2`. Lossy parity (BF16 grad path is non-bit-equal vs v3 by construction — per `BF16_GRAD_DECISION.md`). **Estimate: 2-3 weeks** including parity-harness wiring.
+- **Phase 5 first action**: re-audit the routes before committing. Phase 4b skeptic flagged that the "200-line duplication" estimate for route (ii) was an upper bound not measured against minimum-viable surgery.
+
+Do not retire v1/v3/v4 until ALL of these gates pass:
+
+**Deliverable A — per-op backward fixture parity** (~1 week if ParityHarness reused):
+- For each of the 13 v2 ops (12 + layer_norm), generate a PyTorch reference fixture (`.safetensors` of inputs + `torch.autograd.grad` outputs) at non-trivial shapes (matching `tests/autograd_v2_ops.rs` fixture shapes).
+- Use fixed seed 42.
+- Use the existing `flame_core::parity::ParityHarness` (shipped 2026-05-09).
+- Tolerance: bit-equal at F32, BF16-noise-bounded at BF16.
+- Cite PyTorch source by `file:line` in commit comments.
+
+**Deliverable B — forward-mode AD parity** (~3-4 days; Phase 3c2 unblocked this):
+- For each of the 13 ops, generate `torch.autograd.functional.jvp(op, primals, tangents)` reference.
+- Test against v2: `Tensor::set_fw_grad(...)` → `op_v2(...)` → `out.fw_grad()`.
+- **Includes layer_norm**: ship the LN JVP formula here (deferred from Phase 3c2):
+  ```
+  out_fw = (x_fw - mean_fw)*rstd*w + x_hat*d_rstd_dx*w + x_hat*rstd*w_fw + b_fw
+  ```
+  Needs `mean_fw` and `d_rstd_dx` recomputed in Rust (BF16 fused kernel returns `out` only, not intermediates). Estimate: 80-100 LOC + 1 test.
+
+**Deliverable C — model parity** (estimate depends on route picked above):
+- One-step parity on klein / zimage / ernie / qwen / chroma (the 5 production trainers).
+- Either route (i) full port or route (ii) bridge — decide first.
+- Klein crashes on this box per Phase 0 skeptic (`CUDA_ERROR_INVALID_VALUE` at smoke startup); Phase 5 needs to either fix that infra issue or run on a different machine.
+- Tolerance: ≤1% relative loss diff (loose; BF16 grad path is non-bit-equal vs v3 by construction).
+
+**Deliverable D — no ms/step regression** (~2-3 days):
+- Bench v2 backward vs v3 on klein 4B / 9B.
+- Hold at ±1%.
+- Baseline: flame-core's documented klein-4B-perf is 1.12× vs PyTorch (`reference_klein_perf_baseline` memory).
+
+**Cross-cutting gates that must also pass**:
+- BF16 grad policy optimizer parity (Phase 4a/4b set up the kernels; Deliverable A/C exercise them in anger).
+- In-place mutation tests stay green (17 Phase 0 audit tests + view-autograd from Phase 3b).
+- **Reentrant test**: training run using `enable_checkpointing` matches v1 bit-equal at step 1+ (Phase 3c1 shipped CheckpointGradFn; Deliverable C exercises it on a real model).
+- **Hooks test**: simple forward and backward hook fires expected callback count per training step.
+- HAZARD-2026-05-13-1: characterization test (Phase 3b) stays green OR the underlying flame-core base bug is fixed and the negative test is converted to a positive one.
 
 ## High-Risk Areas To Watch
 
