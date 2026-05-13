@@ -171,6 +171,8 @@ pub mod attention;
 pub mod autograd_v3; // Primary autograd engine
 #[cfg(feature = "autograd_v4")]
 pub mod autograd_v4;
+#[cfg(feature = "autograd_v2")]
+pub mod autograd_v2;
 pub mod image_ops_nhwc;
 pub mod mixed_precision;
 pub mod perf_telemetry;

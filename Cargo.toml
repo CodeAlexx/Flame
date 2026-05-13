@@ -66,6 +66,10 @@ true_bf16_optimizer_states = []
 borrowed_weights = ["cuda", "bf16_u16"]
 strict_bf16 = []         # Telemetry guards; safe to combine with or without CUDA/autograd features
 autograd_v4 = []
+# Experimental clean-sheet autograd v2 (PyTorch-style DAG). Off by default;
+# Phase 0 only adds the feature flag + an empty module. Phases 1-5 fill it.
+# See `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md`.
+autograd_v2 = []
 sdpa = []                # Optional gating for attention helpers; leave off for minimal builds
 sdpa_debug = []
 shared_storage = []
