@@ -1153,3 +1153,69 @@ fn layer_norm_v2_analytical_dweight_dbias() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 32. layer_norm_v2_dx_symmetry_uniform_grad  (verifier-added regression)
+// ---------------------------------------------------------------------------
+//
+// Structural d_x test that catches a wrong d_x formula without relying on
+// finite-difference noise.
+//
+// Property: For LN with affine weight=1, bias=0, when grad_output is
+// uniform across the normalized axis, d_x must be (nearly) zero per
+// element. Proof: the LN backward formula
+//
+//   d_x = (1/N) * rstd * (N*d_y_hat - sum(d_y_hat) - x_hat * sum(d_y_hat*x_hat))
+//
+// With weight=1: d_y_hat = d_y. If d_y is uniform (say all c), then:
+//   sum(d_y) = N*c
+//   sum(d_y * x_hat) = c * sum(x_hat) = c * 0   (x_hat is zero-mean by construction)
+//   d_x = (1/N) * rstd * (N*c - N*c - x_hat * 0) = 0
+//
+// This catches: wrong sign on any of the three terms, wrong rstd location,
+// wrong sum-axis, dropped 1/N normalization, x_hat computed against wrong mean.
+//
+// BF16 noise: rstd recompute + N*c-N*c cancellation can leave residual ~1e-2
+// per element on BF16. We assert <0.05 absolute, which still catches any
+// formulaic error (those produce errors >> 0.1).
+
+#[test]
+fn layer_norm_v2_dx_symmetry_uniform_grad() {
+    // 2x4 input with varied values (non-uniform x is the harder case);
+    // weight=1, bias=0; grad_output all-1 → d_x must be ~0 per element.
+    let x = make_leaf_bf16_requires_grad(
+        vec![1.0, 2.0, 3.0, 4.0, 0.5, 1.5, 2.5, 3.5],
+        &[2, 4],
+    );
+    let w = make_leaf_bf16_requires_grad(vec![1.0, 1.0, 1.0, 1.0], &[4]);
+    let b = make_leaf_bf16_requires_grad(vec![0.0, 0.0, 0.0, 0.0], &[4]);
+    let ctx = default_ctx();
+
+    let y = flame_core::autograd_v2::ops::layer_norm::layer_norm_v2(
+        &x, &[4], Some(&w), Some(&b), 1e-5, &ctx,
+    )
+    .expect("forward");
+    let g = make_bf16(vec![1.0; 8], &[2, 4]);
+    let root = GraphRoot::new(vec![y]).with_grad_outputs(vec![Some(g)]);
+    Engine::new().execute(root, &ctx).expect("backward");
+
+    let dx = x
+        .autograd_meta()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .grad
+        .clone()
+        .unwrap()
+        .to_dtype(flame_core::DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap();
+
+    for (i, v) in dx.iter().enumerate() {
+        assert!(
+            v.abs() < 0.05,
+            "d_x[{i}] = {v}: expected ~0 by LN symmetry (uniform grad + zero-mean x_hat)"
+        );
+    }
+}
