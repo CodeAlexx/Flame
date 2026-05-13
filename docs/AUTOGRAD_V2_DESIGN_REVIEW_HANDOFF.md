@@ -229,13 +229,29 @@ Possible staged path:
 3. Gate BF16-grad optimizer paths by feature/env.
 4. Run per-model parity before flipping default.
 
-### 8. `create_graph` Is Over-Promised
+### 8. `create_graph`, Reentrant Backward, and Hooks: Build-in From Day One
 
-The spec exposes `create_graph`, and `InputBuffer` has special handling for it, but the proposed v0 explicitly omits reentrant backward and higher-order complexity.
+Earlier revisions of this doc said v0 should reject `create_graph=true`, omit reentrant backward, and skip hooks. **Reversed.** Audit of OneTrainer and SimpleTuner (both production PyTorch reference trainers flame-core's trainers parity against) found:
+
+- **Reentrant backward** — used universally. OneTrainer wires `torch.utils.checkpoint` for FLUX / SDXL / Z-Image / Qwen / HiDream via `enable_checkpointing_for_*` helpers. SimpleTuner uses it for HiDream / LTX-Video / HunyuanVideo / SDXL controlnet / Kandinsky 5 / FLUX. Gradient checkpointing is the universal large-model OOM-prevention technique — exactly the scenario flame-core's BlockOffloader port also targets. flame-core's existing `flame_core::autograd::checkpoint` already exhibits reentrant-style behavior (disables autograd during forward, re-runs the closure with autograd re-enabled at backward time, mutating the tape). v2 must preserve this.
+- **Hooks** — SimpleTuner uses `register_full_backward_hook` in `helpers/musubi_block_swap.py:138` to drive offload coordination at backward time. `register_forward_hook` appears in `helpers/ramtorch_extensions.py:782` and `helpers/models/ace_step/pipeline.py` for attention-stat collection. These are production usages of hooks for memory/IO orchestration, which is the same domain flame-core's BlockOffloader serves.
+- **`create_graph=true`** — neither OneTrainer nor SimpleTuner uses higher-order grads. Could be deferred. But deferring leaves a retrofit cost (Engine + AccumulateGrad + InputBuffer all need out-of-place gating); building in the *surface* in v0 is cheap and removes the retrofit ever.
+
+Per user directive (2026-05-13): build the surface for these in v0. Don't retrofit later. Better to design the trait shapes and engine state model to accommodate them on day one than to redesign in 6-12 months.
 
 Required revision:
-- For v0, return `Unsupported` if `create_graph=true`.
-- Remove create-graph-specific behavior from the initial engine until there is a complete higher-order design.
+- **Reentrant**: v0 supports nested execute() via the inline-mini-execute pattern (`CheckpointGradFn` as a per-op `GradFn` whose `apply()` builds a sub-graph and runs a local mini-engine). Single-threaded only — no thread pool needed.
+- **Hooks**: `GradFn` trait has a `hooks() -> &Hooks` accessor; `Hooks` carries pre/post/tensor-callback `Vec<Box<dyn Fn>>`. Default impl is empty. Registration API on `Tensor` and on individual `GradFn` nodes.
+- **`create_graph=true`**: surface in v0 — `Engine::execute` accepts the flag, `InputBuffer::add` has both in-place (default) and out-of-place (`create_graph=true`) accumulation paths, `AccumulateGrad::apply` likewise. Recording during backward is permitted. v0 ships with the path exercised in tests but full higher-order op coverage can land in waves.
+- **View autograd**: per-view-op backward formulas (`view`, `reshape`, `squeeze`, `unsqueeze`, `transpose`, `permute`) in Phase 3 P0/P1. Version-counter coverage is already a Phase 0 prereq.
+- **Forward-mode AD**: `SavedTensor` carries an optional `fw_grad_` companion field. Each P0/P1 op records a forward-AD formula alongside its backward. Lots of per-op work but pure plumbing — no engine redesign.
+
+What stays omitted (different reason — flame-core lacks the underlying infrastructure):
+- **Sparse / nested tensors** — flame-core has no sparse or nested *storage* today. v2 cannot add autograd surface for storage that doesn't exist. If/when sparse storage is added in a separate workstream, v2's surface will extend trivially.
+- **Compiled autograd / TorchScript / dynamo** — PyTorch's analog requires their entire compiler stack (TorchInductor, dynamo, FX). flame-core has a different architecture (NVRTC + WMMA + fused C kernels). No surface to add — the equivalent functionality already exists via different machinery.
+
+What needs an explicit charter call:
+- **Multi-device threading** — `flame-core/CLAUDE.md` says single-GPU. Both OneTrainer and SimpleTuner use `torch.distributed` for DDP. If multi-device is on flame-core's long-term roadmap, v0's engine must not assume single-stream/single-device internally (~1 week of surface design in Phase 1). Pending project-level decision.
 
 ### 9. Migration Plan Understates Existing Recording Surface
 
@@ -290,15 +306,20 @@ Revise the design doc with these concrete changes:
 
 1. Replace strong `grad_accumulator` metadata with weak accumulator storage.
 2. Add a shared, interior-mutable autograd metadata design for `Tensor`.
-3. Change all engine and `GradFn::apply` APIs to return `Result`.
-4. Make `SavedTensor` hold a version-counter handle, not just a version integer.
+3. Change all engine and `GradFn::apply` APIs to return `Result<Vec<Option<Tensor>>>`.
+4. Make `SavedTensor` hold a version-counter handle, not just a version integer. Add an optional `fw_grad_` companion field for forward-mode AD.
 5. Make saved tensor release work from `&self`.
 6. Add `GradFn::num_inputs()`.
-7. Remove or reject `create_graph=true` in v0.
+7. **Build in `create_graph=true` surface** (was: reject). InputBuffer + AccumulateGrad get out-of-place paths gated on `create_graph`. Engine accepts the flag and permits recording during backward. Phase 5 parity covers the path, full higher-order op coverage can land in waves.
 8. Define BF16 grad migration across `GradientMap`, `Parameter`, Adam, SGD, grad norm, and trainer code.
 9. Make the in-place version-bump sweep a hard prerequisite.
 10. Add compile-time feature wiring and per-op forward migration rules.
 11. Carve Class B narrow-backward dtype work and Class E sync-site elimination out as separate performance workstreams.
+12. **Build in reentrant backward surface** via inline-mini-execute (`CheckpointGradFn` is a `GradFn` whose `apply` drives a local sub-graph through a mini-engine). Single-threaded only; no thread pool. Preserves the semantics of flame-core's existing `flame_core::autograd::checkpoint`.
+13. **Build in hook surface**: `Hooks` struct with pre/post/tensor-callback vecs, exposed by `GradFn::hooks()` and a registration API on `Tensor`. Default empty. Used by future BlockOffloader integration patterns and by users wanting introspection.
+14. **Build in view-autograd surface**: per-view-op `GradFn` impls for `view`, `reshape`, `squeeze`, `unsqueeze`, `transpose`, `permute`. Backed by the version-counter prereq in clause 9.
+15. **Build in forward-mode AD surface**: `SavedTensor::fw_grad_` field, each P0/P1 op records a forward formula alongside backward. Plumbing per op — no engine redesign required.
+16. **Multi-device surface**: pending project-level decision. If yes, Phase 1's `Engine` and `InputBuffer` design must avoid hardcoded single-stream / single-device assumptions (~5 days of surface design); if no, ignore.
 
 ## Suggested Implementation Order
 
@@ -309,23 +330,29 @@ Revise the design doc with these concrete changes:
 - Decide and document BF16-grad optimizer behavior.
 - Add `autograd_v2` feature flag only; no behavior change.
 
-### Phase 1: Metadata and Core Types
+Scope note: per directive 2026-05-13 ("if we come a day when we need it, i don't want to add it, i want it built in"), v0 ships with **surface** for reentrant backward, hooks, `create_graph=true`, view autograd, and forward-mode AD. Feature-complete coverage of each lands in waves after v0; the design contract doesn't change. Total v0 estimate: **7-9 weeks of focused work** (vs the 3-5 week minimal v0). Multi-device surface is *also* in v0 if/when the project-level multi-device decision lands.
 
-- Add shared `AutogradMetaV2`.
-- Add `Edge`, `GradFn`, `NodeId`, sequence number, topological number.
+### Phase 1: Metadata and Core Types (~2 weeks)
+
+- Add shared `AutogradMetaV2` (interior-mutable, weak accumulator).
+- Add `Edge`, `GradFn` trait, `NodeId`, sequence number, topological number (stored as fields, not recomputed).
+- `GradFn` trait surface includes `hooks() -> &Hooks` (default empty) AND `num_inputs()`.
 - Add weak leaf accumulator cache.
-- Add `SavedTensor` using the existing version-handle model.
-- Add `InputBuffer` with `Option<Tensor>` and `num_inputs`.
-- `InputBuffer::add` must keep PyTorch's in-place accumulation fast path: if `create_graph=false`, dtype/shape match, and the existing buffered grad has unique storage ownership, accumulate in-place. Otherwise accumulate out-of-place. Since v0 should reject `create_graph=true`, the first implementation can still carry the flag but should test the `false` fast path explicitly.
+- Add `SavedTensor` using the existing version-handle model + an optional `fw_grad_` companion field for forward-mode AD.
+- Add `InputBuffer` with `Option<Tensor>` + `num_inputs` + **both in-place AND out-of-place accumulation paths**. In-place is the default when `create_graph=false` AND dtype/shape match AND the buffered grad has unique storage ownership; out-of-place fires when `create_graph=true` or any in-place precondition fails.
+- Add `Hooks` struct: pre/post/tensor callback vecs.
+- (If multi-device is chartered) Engine and InputBuffer don't hardcode single-stream/single-device assumptions. Stream and device are explicit parameters at every dispatch point.
 
-### Phase 2: Engine Skeleton
+### Phase 2: Engine Skeleton (~1.5 weeks)
 
 - Implement `GraphRoot`.
-- Implement `AccumulateGrad`.
+- Implement `AccumulateGrad` (BF16-throughout per Class A; F32 only as opmath_t inside kernel). Out-of-place path gated on `create_graph=true`.
 - Implement dependency counting.
 - Implement ready queue.
-- Return `Result` everywhere.
-- Reject `create_graph=true` with a clear error.
+- Return `Result<Vec<Option<Tensor>>>` everywhere.
+- **Accept `create_graph=true`** — engine permits recording during backward, AccumulateGrad and InputBuffer use their out-of-place paths.
+- **Support nested execute()** via inline-mini-execute pattern. Single-threaded — Engine state save/restore on nested entry, no thread pool. `CheckpointGradFn` is the canonical user of this.
+- **Wire hook dispatch** at GradFn entry/exit. Default no-op when `Hooks` is empty.
 
 Toy tests:
 - single leaf sum
@@ -334,46 +361,50 @@ Toy tests:
 - undefined grad slots
 - released saved tensor error
 - version mismatch error
+- `create_graph=true`: backward-of-backward on a simple op produces correct second-order gradient
+- reentrant: nested `Engine::execute` inside a `GradFn::apply` returns cleanly (no deadlock, no state corruption)
+- hooks: pre/post/tensor hooks fire in expected order
 
-### Phase 3: First Real Ops
+### Phase 3: First Real Ops + View Backward + Forward-Mode (~3 weeks)
 
-Start with:
-- add
-- mul
-- sum
-- reshape
-- transpose
-- matmul/linear
-- silu
-- layer_norm
+P0/P1 ops:
+- add, mul, sum, reshape, transpose, matmul/linear, silu, layer_norm
+- **view, squeeze, unsqueeze, permute** (view-autograd surface — Phase 3 makes view ops first-class)
+- Checkpoint / CheckpointOffload (the reentrant users — preserve `flame_core::autograd::checkpoint` semantics bit-equal)
 
 Each op needs:
 - forward wiring under `autograd_v2`
-- backward struct
-- PyTorch fixture parity
+- backward struct (the `GradFn` impl)
+- **forward-mode AD formula** alongside backward — uses the `SavedTensor::fw_grad_` field
+- PyTorch fixture parity (backward direction)
+- forward-AD parity vs PT's `torch.autograd.functional.jvp`
 - dtype assertion
 - no unwanted `.to(F32)` in autograd_v2
 
 Long-tail unary ops:
 - Do not block v0 on a code generator.
-- Keep hand-written backward structs for the P0/P1 path.
-- Permit a later `derivatives!` proc macro for the long tail (`sin`, `cos`, `exp`, `log`, `sqrt`, `rsqrt`, `abs`, `neg`, `pow`, etc.) once the trait, saved tensor, and forward-wrapper patterns have stabilized.
+- Keep hand-written backward structs (+ forward-mode formulas) for the P0/P1 path.
+- Permit a later `derivatives!` proc macro for the long tail (`sin`, `cos`, `exp`, `log`, `sqrt`, `rsqrt`, `abs`, `neg`, `pow`, etc.) once the trait, saved tensor, and forward-wrapper patterns have stabilized. Proc macro emits both backward AND forward formulas from a single declarative entry.
 
-### Phase 4: Optimizer and Trainer Integration
+### Phase 4: Optimizer and Trainer Integration (~1 week)
 
-- Route v2 grads into parameters.
-- Ensure optimizer accepts the selected grad dtype.
+- Route v2 grads into parameters (BF16 end-to-end per Class A).
+- Ensure optimizer accepts param-dtype grads (BF16 for BF16 params).
 - Add grad-norm and clipping tests.
 - Run one-step model parity before long parity runs.
+- Verify `flame_core::autograd::checkpoint` semantics preserved on v2.
 
-### Phase 5: Parity Gate
+### Phase 5: Parity Gate (~1 week)
 
 Do not retire v1 until:
-- per-op fixture parity passes for all P0/P1 ops
-- model parity passes for the target model table
-- no ms/step regression on klein 4B
+- per-op **backward** fixture parity passes for all P0/P1 ops
+- per-op **forward-mode AD** fixture parity passes for all P0/P1 ops
+- model parity passes for the target model table (klein, zimage, ernie, qwen, chroma — bit-equal loss)
+- no ms/step regression on klein 4B / 9B
 - BF16 grad policy has optimizer parity
 - in-place mutation tests are green
+- **reentrant test**: training run that uses `enable_checkpointing` matches v1 bit-equal at step 1+
+- **hooks test**: simple forward and backward hook fires expected callback count per training step
 
 ## High-Risk Areas To Watch
 
