@@ -195,8 +195,10 @@ pub struct Telemetry {
     event_log: Mutex<EventLog>,
 
     // Phase 4 (telemetry export): periodic dump bookkeeping.
-    /// Cached value of `FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS`, read
-    /// once at first-use. `0` disables periodic dumps.
+    /// Cached value of `FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_EVENTS` (or
+    /// the legacy alias `_STEPS`), read once at first-use. `0` disables
+    /// periodic dumps. Counts EVENTS — every record_prefetch_end +
+    /// record_await_end_{hit,miss} ticks the counter, not training steps.
     periodic_interval: AtomicU64,
     /// Cumulative count of events seen across record_prefetch_end /
     /// record_await_end_{hit,miss}. Used to decide when the next periodic
@@ -220,11 +222,16 @@ impl Telemetry {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(if initial >= 2 { 4096 } else { 0 });
-        let periodic_interval =
-            std::env::var("FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
+        // Periodic dump interval. New name is `_EVENTS` because the counter
+        // ticks per record_prefetch_end / record_await_end_{hit,miss}, NOT
+        // per training step. The legacy `_STEPS` alias is kept so existing
+        // scripts and the OFFLOAD_GETTING_STARTED tutorial in `cde77a4`
+        // keep working. New name takes precedence if both are set.
+        let periodic_interval = std::env::var("FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_EVENTS")
+            .ok()
+            .or_else(|| std::env::var("FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS").ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
         Self {
             enabled: AtomicUsize::new(initial),
             h2d_bytes_total: AtomicU64::new(0),
@@ -602,7 +609,15 @@ pub const DUMP_DIR_ENV: &str = "FLAME_OFFLOAD_TELEMETRY_DUMP_DIR";
 /// `dump_all` to the configured directory. Read once at [`global`]
 /// initialization; runtime overrides go via
 /// [`Telemetry::set_periodic_dump_interval`].
-pub const DUMP_INTERVAL_ENV: &str = "FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS";
+/// Primary env var name for the periodic-dump interval (counts events, not
+/// training steps — see [`Telemetry::set_periodic_dump_interval`]). The
+/// legacy alias `FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS` is also
+/// recognized for back-compat with the v1 release of this module.
+pub const DUMP_INTERVAL_ENV: &str = "FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_EVENTS";
+/// Back-compat alias for [`DUMP_INTERVAL_ENV`]. Recognized but misleadingly
+/// named — counts events, not steps. New code should use `DUMP_INTERVAL_ENV`.
+#[deprecated(note = "use DUMP_INTERVAL_ENV instead; STEPS was a misnomer (counter is per-event)")]
+pub const DUMP_INTERVAL_ENV_LEGACY: &str = "FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS";
 
 /// Write `path` atomically. Serializes `value` to JSON in a sibling tmp
 /// file, then `rename`s into place. The rename is atomic on POSIX

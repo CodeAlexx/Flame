@@ -165,15 +165,25 @@ Files produced:
 **Continuous periodic dump** while training:
 
 ```
-FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS=1000
+FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_EVENTS=1000
 FLAME_OFFLOAD_TELEMETRY_DUMP_DIR=/tmp/offload_log
 ```
 
-Every 1000 recorded events (any kind), the global telemetry sink writes
-both files atomically (tmp file + rename). A monitor script can `cat
+The interval counts **events**, not training steps. Each
+`record_prefetch_end` / `record_await_end_hit` / `record_await_end_miss`
+call ticks the counter. On klein 9B that's roughly ~64 events per
+training step in `trace` mode, so `=1000` fires the dump every ~16
+training steps. Set the value with that ratio in mind for your model.
+
+Every N recorded events, the global telemetry sink writes both files
+atomically (tmp file + rename). A monitor script can `cat
 /tmp/offload_log/flame_offload_telemetry_snapshot.json` at any time;
 either it gets the previous good snapshot or the freshly-written one,
 never a partial write.
+
+(The legacy env var name `FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS`
+is still recognized for back-compat but is deprecated — its `STEPS`
+suffix was a misnomer.)
 
 ## 7. Transfer benchmark cache
 

@@ -988,7 +988,7 @@ Phase 1 telemetry sink.
 | `BlockOffloader::strategy_name()` | `offload/mod.rs:929` | `"none"` when unset, else the active strategy's `name()` (`"two_slot"`, `"knapsack"`, `"adaptive"`). |
 | `BlockOffloader::block_sizes()` | `offload/mod.rs:940` | Per-block BF16 footprint, for sizing strategy budgets externally. |
 | `BlockOffloader::resident_blocks()` | `offload/mod.rs:946` | Block IDs currently parked on a GPU slot. |
-| `Telemetry::record_strategy_decision(name, evicted, kept, target_bytes)` | `offload/telemetry.rs:321` | Strategy decision hook (cheap when telemetry disabled). Adds `strategy_plans`, `strategy_eviction_decisions`, `strategy_keep_total`, `strategy_last_target_resident_bytes` to `TelemetryCounters`. |
+| `Telemetry::record_strategy_decision(name, evicted, kept, target_bytes)` | `offload/telemetry.rs:383` | Strategy decision hook (cheap when telemetry disabled). Adds `strategy_plans`, `strategy_eviction_decisions`, `strategy_keep_total`, `strategy_last_target_resident_bytes` to `TelemetryCounters`. |
 
 ### Block offload manager — `offload::manager` (Phase 3 FlexTensor port, 2026-05-12)
 
@@ -1068,7 +1068,8 @@ calls. See [`OFFLOAD_GETTING_STARTED.md`](./OFFLOAD_GETTING_STARTED.md).
 | `offload::telemetry::DUMP_SNAPSHOT_FILENAME` | `offload/telemetry.rs` | `"flame_offload_telemetry_snapshot.json"`. |
 | `offload::telemetry::DUMP_EVENTS_FILENAME` | `offload/telemetry.rs` | `"flame_offload_telemetry_events.jsonl"`. |
 | `offload::telemetry::DUMP_DIR_ENV` | `offload/telemetry.rs` | `"FLAME_OFFLOAD_TELEMETRY_DUMP_DIR"`. |
-| `offload::telemetry::DUMP_INTERVAL_ENV` | `offload/telemetry.rs` | `"FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS"`. |
+| `offload::telemetry::DUMP_INTERVAL_ENV` | `offload/telemetry.rs` | `"FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_EVENTS"` — counter ticks per event (record_prefetch_end / record_await_end_{hit,miss}), NOT per training step. Legacy `_STEPS` alias still accepted but deprecated. |
+| `offload::telemetry::DUMP_INTERVAL_ENV_LEGACY` | `offload/telemetry.rs` | Deprecated alias `"FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS"`. Kept for back-compat. |
 | `TelemetryCounters` / `TelemetryEvent` / `TelemetryEventKind` | `offload/telemetry.rs` | All three now derive `Serialize` / `Deserialize`. |
 
 Deliberately *still* deferred (not in Phase 3 or 4): FlexTensor's

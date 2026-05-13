@@ -1195,12 +1195,17 @@ requiring source edits in every trainer. All export paths are atomic
   to `$FLAME_OFFLOAD_TELEMETRY_DUMP_DIR`, then to
   `std::env::temp_dir()`. Returns the directory actually used.
 
-**Periodic dump.** Set `FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS=N` (or
-call `Telemetry::set_periodic_dump_interval(N)` programmatically) and
+**Periodic dump.** Set `FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_EVENTS=N`
+(or call `Telemetry::set_periodic_dump_interval(N)` programmatically) and
 every Nth recorded prefetch / await event triggers a `dump_all` to the
-configured directory. Cheap when disabled — one relaxed atomic load
-per event. Failures are logged via `eprintln!` and swallowed so a
-missing dump dir cannot break training.
+configured directory. The interval counts **events**, not training
+steps — each `record_prefetch_end` / `record_await_end_{hit,miss}` ticks
+the counter (klein 9B emits ~64 events/step in trace mode, so `=1000`
+fires the dump every ~16 training steps). Legacy alias
+`FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS` is recognized but
+deprecated — its `STEPS` suffix was a misnomer. Cheap when disabled —
+one relaxed atomic load per event. Failures are logged via `eprintln!`
+and swallowed so a missing dump dir cannot break training.
 
 **Serde derive on the data types.** `TelemetryCounters`, `TelemetryEvent`,
 and `TelemetryEventKind` all `derive(Serialize, Deserialize)`. External
