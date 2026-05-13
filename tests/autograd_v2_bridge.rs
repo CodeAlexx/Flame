@@ -20,19 +20,19 @@
 //! the grad-map's policy + dtype-unification cast at accumulation time.
 //!
 //! NOTE on serialization: `AutogradContext` is process-global state
-//! (single `AUTOGRAD_CONTEXT: Mutex<...>` shared across threads).
-//! Running these tests in cargo's default parallel mode causes one
-//! test's `reset()` to wipe another test's tape entries mid-flight,
-//! producing empty grad maps and downstream `.expect()`/`.unwrap()`
-//! panics. To avoid taking a new dep on `serial_test`, all three
-//! scenarios are consolidated into a single `#[test]` function that
-//! drives them sequentially.
+//! (single `AUTOGRAD_CONTEXT: Mutex<...>` shared across threads). Running
+//! these tests in cargo's default parallel mode causes one test's
+//! `reset()` to wipe another test's tape entries mid-flight, producing
+//! empty grad maps and downstream `.expect()`/`.unwrap()` panics.
+//! As of 2026-05-13 the test suite uses `serial_test` to gate each test
+//! via `#[serial]` so per-scenario CI granularity is preserved.
 
 #![cfg(all(feature = "cuda", feature = "bf16_u16", feature = "autograd_v2"))]
 
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
+use serial_test::serial;
 
 use flame_core::autograd::policy::GradStorePolicy;
 use flame_core::autograd::AutogradContext;
@@ -84,19 +84,11 @@ fn mk_bf16(seed: u64, n: usize, scale: f32) -> Vec<f32> {
     v
 }
 
-/// Driver — runs all three bridge scenarios sequentially on this
-/// thread to avoid the parallel-mode global-tape race (see file
-/// header).
-#[test]
-fn bridge_scenarios() {
-    backward_v2_yields_bf16_grads_for_bf16_loss();
-    backward_v2_matches_v3_at_f32();
-    backward_v2_within_tolerance_at_bf16();
-}
-
 /// 2-op graph (mul + mul) over BF16 inputs. After `backward_v2`, all
 /// stored gradients must be BF16. Mul saves both operands so leaf grads
 /// stay in `needed_grad_ids`.
+#[test]
+#[serial]
 fn backward_v2_yields_bf16_grads_for_bf16_loss() {
     AutogradContext::reset();
     AutogradContext::set_enabled(true);
@@ -136,6 +128,8 @@ fn backward_v2_yields_bf16_grads_for_bf16_loss() {
 }
 
 /// F32 graph: backward_v2 result equals backward v3 result numerically.
+#[test]
+#[serial]
 fn backward_v2_matches_v3_at_f32() {
     let device = dev();
     let shape = Shape::from_dims(&[3, 4]);
@@ -195,6 +189,8 @@ fn backward_v2_matches_v3_at_f32() {
 
 /// BF16 MLP-like graph: backward_v2 vs backward must match within BF16
 /// tolerance per BF16_GRAD_DECISION.md.
+#[test]
+#[serial]
 fn backward_v2_within_tolerance_at_bf16() {
     let device = dev();
     let shape = Shape::from_dims(&[2, 8]);

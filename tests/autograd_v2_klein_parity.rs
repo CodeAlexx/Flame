@@ -14,15 +14,15 @@
 //! workloads — within BF16-noise bands, since the input fixtures are
 //! all BF16.
 //!
-//! ## Why a single `#[test]` driver
+//! ## Parallel-mode serialization
 //!
 //! `AUTOGRAD_CONTEXT` is process-global state (`src/autograd.rs:56`).
 //! Multiple `#[test]` functions that touch the v3 backward tape (which
 //! the bridge does) flake under cargo's default parallel mode — one
-//! test's `reset()` wipes another's tape mid-flight. To avoid a new
-//! dep on `serial_test`, all seven scenarios are consolidated into one
-//! `klein_parity_v2_scenarios` driver, mirroring the Phase 5b
-//! `bridge_scenarios` pattern at `tests/autograd_v2_bridge.rs:90-95`.
+//! test's `reset()` wipes another's tape mid-flight. As of 2026-05-13
+//! the suite uses `serial_test` to gate each scenario via `#[serial]`,
+//! preserving per-scenario CI granularity while serializing global-tape
+//! access. Same pattern in `tests/autograd_v2_bridge.rs`.
 //!
 //! See `docs/FLAME_CONVENTIONS.md` §"Autograd v2 (Phase 5b) — trainer
 //! migration guide" for the migration recipe this test exercises.
@@ -43,6 +43,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use serial_test::serial;
+
 use flame_core::autograd::policy::GradStorePolicy;
 use flame_core::autograd::AutogradContext;
 use flame_core::parity::{ParityHarness, ParityTolerance};
@@ -58,6 +60,10 @@ fn fixtures_dir() -> PathBuf {
     )
 }
 
+// Retained for potential future bulk-skip use; individual scenarios
+// each have their own `if !path.exists()` guard now that they're
+// `#[serial] #[test]` rather than driver-called.
+#[allow(dead_code)]
 fn skip_if_no_fixtures() -> bool {
     let dir = fixtures_dir();
     if !dir.exists() {
@@ -101,26 +107,12 @@ fn l2_norm(t: &Tensor) -> f32 {
         .sqrt()
 }
 
-/// Drive all seven scenarios on this thread sequentially. See file
-/// header for why we don't use multiple `#[test]` functions.
-#[test]
-fn klein_parity_v2_scenarios() {
-    if skip_if_no_fixtures() {
-        return;
-    }
-    scenario_head_rms_norm_toy();
-    scenario_head_rms_norm_prod();
-    scenario_apply_rope_prod();
-    scenario_rms_norm_direct_4d();
-    scenario_rms_norm_contig_prod();
-    scenario_attn_chain_prod();
-    scenario_klein_block_backward();
-}
-
 // ---------------------------------------------------------------------------
 // Scenario 1: head_rms_norm at toy shape (H=8, HD=32)
 // ---------------------------------------------------------------------------
 
+#[test]
+#[serial]
 fn scenario_head_rms_norm_toy() {
     let path = fixtures_dir()
         .join("patterns")
@@ -199,6 +191,8 @@ fn scenario_head_rms_norm_toy() {
 // Scenario 2: head_rms_norm at prod shape (H=24, HD=128)
 // ---------------------------------------------------------------------------
 
+#[test]
+#[serial]
 fn scenario_head_rms_norm_prod() {
     let path = fixtures_dir()
         .join("patterns")
@@ -256,6 +250,8 @@ fn scenario_head_rms_norm_prod() {
 // Scenario 3: apply_rope at prod shape (post-cat H=24, N=1536, HD=128)
 // ---------------------------------------------------------------------------
 
+#[test]
+#[serial]
 fn scenario_apply_rope_prod() {
     let path = fixtures_dir()
         .join("patterns")
@@ -319,6 +315,8 @@ fn scenario_apply_rope_prod() {
 // Scenario 4: rms_norm direct 4D (no reshape/permute autograd, only LN bwd)
 // ---------------------------------------------------------------------------
 
+#[test]
+#[serial]
 fn scenario_rms_norm_direct_4d() {
     let path = fixtures_dir()
         .join("patterns")
@@ -371,6 +369,8 @@ fn scenario_rms_norm_direct_4d() {
 // Scenario 5: rms_norm on contiguous 4D (no permute, dx-sanity only)
 // ---------------------------------------------------------------------------
 
+#[test]
+#[serial]
 fn scenario_rms_norm_contig_prod() {
     let path = fixtures_dir()
         .join("patterns")
@@ -416,6 +416,8 @@ fn scenario_rms_norm_contig_prod() {
 // Scenario 6: full attn chain at prod shape
 // ---------------------------------------------------------------------------
 
+#[test]
+#[serial]
 fn scenario_attn_chain_prod() {
     let path = fixtures_dir()
         .join("patterns")
@@ -591,6 +593,8 @@ fn scenario_attn_chain_prod() {
 //   out      = h + gate * mlp_out
 //   loss     = out.sum()
 
+#[test]
+#[serial]
 fn scenario_klein_block_backward() {
     let path = fixtures_dir()
         .join("patterns")

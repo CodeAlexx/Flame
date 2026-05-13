@@ -219,6 +219,13 @@ approx = "0.5"
 libm = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 2026-05-13 (Phase 5b follow-up): serialize tests that touch the v3
+# AUTOGRAD_CONTEXT process-global Mutex (src/autograd.rs:56). Replaces
+# the band-aid "single-test driver with N inner fns" pattern used in
+# tests/autograd_v2_bridge.rs and tests/autograd_v2_klein_parity.rs.
+# Per-test #[serial] attribute is one line and restores per-scenario
+# CI granularity. See HANDOFF_2026-05-13 §Known parallel-test flakes.
+serial_test = "3"
 
 # 2026-05-12 (launch-storm Phase 4): vendored cudarc 0.11.9 with the
 # bind_to_thread thread-local fast-path. Cuts cuCtxSetCurrent storm
