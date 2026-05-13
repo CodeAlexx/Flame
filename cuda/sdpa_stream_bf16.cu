@@ -12,6 +12,8 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <mutex>
+#include <vector>
 
 #ifndef CHECK_CUDA
 #define CHECK_CUDA(expr) do { \
@@ -177,6 +179,169 @@ static inline void write_reason(char* buf, int buflen, const char* msg) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Cached workspace for sdpa_stream_bf16_launch
+//
+// Pre-cache the 11 buffers the streaming SDPA kernel needs. Same shape
+// (Q_t, K_b, d) is used across every call within a training run, so we
+// allocate once on first call and reuse from the second call on. On a
+// shape grow we re-allocate the whole fused buffer.
+//
+// Single fused buffer holds all 11 sub-allocations at fixed offsets. One
+// cudaMalloc per shape grow, never per call. Mirrors the cuBLASLt workspace
+// cache pattern in gemm_bf16_cublaslt.cu.
+//
+// Per the flame-core speed contract (docs/SPEED_CONTRACT.md) clause 1:
+// launch wrappers do not call cudaMalloc/cudaFree per call.
+// ─────────────────────────────────────────────────────────────────────────────
+struct SdpaStreamWorkspace {
+    int device = -1;
+    int q_t = 0;
+    int k_b = 0;
+    int d = 0;
+    void* base = nullptr;
+    size_t total_bytes = 0;
+    // Offsets into base (filled by the layout helper).
+    float* scores = nullptr;
+    float* row_sums = nullptr;
+    float* m_prev = nullptr;
+    float* l_prev = nullptr;
+    float* m_curr = nullptr;
+    float* l_curr = nullptr;
+    float* inv_l_new = nullptr;
+    float* beta = nullptr;
+    float* O_accum = nullptr;
+    float* scores_T = nullptr;
+    __nv_bfloat16* scores_norm_bf16 = nullptr;
+};
+
+// 256-byte alignment for each sub-buffer — generous for all CUDA targets
+// and a power of two so cuBLAS internal alignment never trips.
+static constexpr size_t SDPA_WS_ALIGN = 256;
+
+static inline size_t round_up_align(size_t v) {
+    return (v + SDPA_WS_ALIGN - 1) & ~(SDPA_WS_ALIGN - 1);
+}
+
+// Compute the total fused-buffer size + sub-buffer offsets for shape (q_t, k_b, d).
+// Returns total bytes; out_offsets[0..11] are filled with byte offsets from base.
+static size_t sdpa_ws_layout(int q_t, int k_b, int d, size_t out_offsets[11]) {
+    size_t off = 0;
+    auto reserve = [&](size_t bytes) {
+        size_t pos = off;
+        off = round_up_align(off + bytes);
+        return pos;
+    };
+    out_offsets[0]  = reserve(sizeof(float) * (size_t)q_t * (size_t)k_b);     // scores
+    out_offsets[1]  = reserve(sizeof(float) * (size_t)q_t);                   // row_sums
+    out_offsets[2]  = reserve(sizeof(float) * (size_t)q_t);                   // m_prev
+    out_offsets[3]  = reserve(sizeof(float) * (size_t)q_t);                   // l_prev
+    out_offsets[4]  = reserve(sizeof(float) * (size_t)q_t);                   // m_curr
+    out_offsets[5]  = reserve(sizeof(float) * (size_t)q_t);                   // l_curr
+    out_offsets[6]  = reserve(sizeof(float) * (size_t)q_t);                   // inv_l_new
+    out_offsets[7]  = reserve(sizeof(float) * (size_t)q_t);                   // beta
+    out_offsets[8]  = reserve(sizeof(float) * (size_t)q_t * (size_t)d);       // O_accum
+    out_offsets[9]  = reserve(sizeof(float) * (size_t)q_t * (size_t)k_b);     // scores_T
+    out_offsets[10] = reserve(sizeof(__nv_bfloat16) * (size_t)q_t * (size_t)k_b); // scores_norm_bf16
+    return off;
+}
+
+// Acquire (or grow) the per-device workspace for the requested shape.
+// Returns nullptr on cudaMalloc failure; otherwise fills `out` with valid
+// pointers. On shape change to a larger requirement, frees old buffer and
+// reallocates; on equal-or-smaller, reuses.
+static SdpaStreamWorkspace* sdpa_ws_acquire(
+    int device, int q_t, int k_b, int d,
+    char* err_buf, int err_buflen
+) {
+    static std::mutex ws_mutex;
+    static std::vector<SdpaStreamWorkspace> ws_cache;
+
+    std::lock_guard<std::mutex> lock(ws_mutex);
+    SdpaStreamWorkspace* entry = nullptr;
+    for (auto& candidate : ws_cache) {
+        if (candidate.device == device) {
+            entry = &candidate;
+            break;
+        }
+    }
+    if (!entry) {
+        ws_cache.emplace_back();
+        entry = &ws_cache.back();
+        entry->device = device;
+    }
+
+    size_t offsets[11];
+    size_t needed = sdpa_ws_layout(q_t, k_b, d, offsets);
+
+    if (entry->total_bytes < needed || entry->base == nullptr) {
+        if (entry->base) {
+            cudaFree(entry->base);
+            entry->base = nullptr;
+            entry->total_bytes = 0;
+        }
+        cudaError_t status = cudaMalloc(&entry->base, needed);
+        if (status != cudaSuccess) {
+            entry->base = nullptr;
+            entry->total_bytes = 0;
+            if (err_buf && err_buflen > 0) {
+                snprintf(err_buf, err_buflen,
+                         "sdpa_stream workspace alloc failed (%zu B): %s",
+                         needed, cudaGetErrorString(status));
+            }
+            return nullptr;
+        }
+        entry->total_bytes = needed;
+    }
+
+    entry->q_t = q_t;
+    entry->k_b = k_b;
+    entry->d = d;
+    uint8_t* base = static_cast<uint8_t*>(entry->base);
+    entry->scores            = reinterpret_cast<float*>(base + offsets[0]);
+    entry->row_sums          = reinterpret_cast<float*>(base + offsets[1]);
+    entry->m_prev            = reinterpret_cast<float*>(base + offsets[2]);
+    entry->l_prev            = reinterpret_cast<float*>(base + offsets[3]);
+    entry->m_curr            = reinterpret_cast<float*>(base + offsets[4]);
+    entry->l_curr            = reinterpret_cast<float*>(base + offsets[5]);
+    entry->inv_l_new         = reinterpret_cast<float*>(base + offsets[6]);
+    entry->beta              = reinterpret_cast<float*>(base + offsets[7]);
+    entry->O_accum           = reinterpret_cast<float*>(base + offsets[8]);
+    entry->scores_T          = reinterpret_cast<float*>(base + offsets[9]);
+    entry->scores_norm_bf16  = reinterpret_cast<__nv_bfloat16*>(base + offsets[10]);
+    return entry;
+}
+
+// Cached cuBLAS handle per device. cublasCreate is heavy (~ms); calling
+// it once per attention forward across every transformer block burns
+// real wall time. One handle per device, lazily constructed, reused
+// across all sdpa_stream_bf16_launch calls.
+static cublasHandle_t sdpa_ws_get_cublas_handle(int device, cublasStatus_t* status) {
+    struct CublasEntry {
+        int device;
+        cublasHandle_t handle;
+    };
+    static std::mutex handle_mutex;
+    static std::vector<CublasEntry> handle_cache;
+
+    std::lock_guard<std::mutex> lock(handle_mutex);
+    for (auto& e : handle_cache) {
+        if (e.device == device) {
+            if (status) *status = CUBLAS_STATUS_SUCCESS;
+            return e.handle;
+        }
+    }
+    cublasHandle_t h;
+    cublasStatus_t st = cublasCreate(&h);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        if (status) *status = st;
+        return nullptr;
+    }
+    handle_cache.push_back(CublasEntry{device, h});
+    if (status) *status = CUBLAS_STATUS_SUCCESS;
+    return h;
+}
+
 bool sdpa_stream_bf16_launch(
     const void* dQv,
     const void* dKv,
@@ -210,9 +375,17 @@ bool sdpa_stream_bf16_launch(
     // Use default stream if none provided
     if (stream == nullptr) stream = 0;
 
-    // cuBLAS handle
-    cublasHandle_t handle;
-    CHECK_CUBLAS(cublasCreate(&handle));
+    // Cached cuBLAS handle — one per device, lazily created, reused across calls.
+    // (Pre-fix this was cublasCreate/cublasDestroy per call: ~ms per attention
+    // forward, multiplied across every transformer block per step.)
+    int cur_device = 0;
+    CHECK_CUDA(cudaGetDevice(&cur_device));
+    cublasStatus_t handle_status = CUBLAS_STATUS_SUCCESS;
+    cublasHandle_t handle = sdpa_ws_get_cublas_handle(cur_device, &handle_status);
+    if (handle == nullptr || handle_status != CUBLAS_STATUS_SUCCESS) {
+        write_reason(unsupported_reason, reason_buflen, "cublasCreate failed");
+        return false;
+    }
     CHECK_CUBLAS(cublasSetStream(handle, stream));
     CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
 
@@ -220,23 +393,24 @@ bool sdpa_stream_bf16_launch(
     const int Q_t = q_tile;
     const int K_b = K_len < 1024 ? K_len : 1024; // tuneable
 
-    // Buffers
-    float *scores = nullptr, *row_sums = nullptr;
-    float *m_prev = nullptr, *l_prev = nullptr, *m_curr = nullptr, *l_curr = nullptr, *inv_l_new = nullptr, *beta = nullptr;
-    float *O_accum = nullptr;
-    float *scores_T = nullptr;
-    __nv_bfloat16* scores_norm_bf16 = nullptr;
-    CHECK_CUDA(cudaMalloc(&scores,   sizeof(float)*Q_t*K_b));
-    CHECK_CUDA(cudaMalloc(&row_sums, sizeof(float)*Q_t));
-    CHECK_CUDA(cudaMalloc(&m_prev,   sizeof(float)*Q_t));
-    CHECK_CUDA(cudaMalloc(&l_prev,   sizeof(float)*Q_t));
-    CHECK_CUDA(cudaMalloc(&m_curr,   sizeof(float)*Q_t));
-    CHECK_CUDA(cudaMalloc(&l_curr,   sizeof(float)*Q_t));
-    CHECK_CUDA(cudaMalloc(&inv_l_new,sizeof(float)*Q_t));
-    CHECK_CUDA(cudaMalloc(&beta,     sizeof(float)*Q_t));
-    CHECK_CUDA(cudaMalloc(&O_accum,  sizeof(float)*Q_t*d));
-    CHECK_CUDA(cudaMalloc(&scores_T, sizeof(float)*Q_t*K_b));
-    CHECK_CUDA(cudaMalloc(&scores_norm_bf16, sizeof(__nv_bfloat16)*Q_t*K_b));
+    // Cached workspace — one fused buffer per (device, max-seen-shape).
+    // Allocated on first call, reused thereafter. Grows only on shape change.
+    SdpaStreamWorkspace* ws = sdpa_ws_acquire(
+        cur_device, Q_t, K_b, d, unsupported_reason, reason_buflen);
+    if (ws == nullptr) {
+        return false;
+    }
+    float* scores              = ws->scores;
+    float* row_sums            = ws->row_sums;
+    float* m_prev              = ws->m_prev;
+    float* l_prev              = ws->l_prev;
+    float* m_curr              = ws->m_curr;
+    float* l_curr              = ws->l_curr;
+    float* inv_l_new           = ws->inv_l_new;
+    float* beta                = ws->beta;
+    float* O_accum             = ws->O_accum;
+    float* scores_T            = ws->scores_T;
+    __nv_bfloat16* scores_norm_bf16 = ws->scores_norm_bf16;
 
     auto fill = [&](float* p, int n, float v){
         int tb = 128;
@@ -395,19 +569,8 @@ bool sdpa_stream_bf16_launch(
         } // heads
     } // batch
 
-    // Cleanup
-    cudaFree(scores);
-    cudaFree(row_sums);
-    cudaFree(m_prev);
-    cudaFree(l_prev);
-    cudaFree(m_curr);
-    cudaFree(l_curr);
-    cudaFree(inv_l_new);
-    cudaFree(beta);
-    cudaFree(scores_norm_bf16);
-    cudaFree(scores_T);
-    cudaFree(O_accum);
-
-    cublasDestroy(handle);
+    // No per-call cleanup. Workspace and cuBLAS handle are cached across
+    // calls (see sdpa_ws_acquire / sdpa_ws_get_cublas_handle). Process exit
+    // releases them implicitly when the static vectors are destroyed.
     return true;
 }
