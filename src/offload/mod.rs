@@ -14,6 +14,21 @@
 //! ~28 GB each to ~14 GB each, enough to fit both experts in 62 GB system
 //! RAM). GPU-side dequant happens inside `prepare_weights`, so the returned
 //! tensors are BF16 exactly as before — callers don't change.
+//!
+//! ## Submodules (Phase 1 FlexTensor port, 2026-05-12)
+//!
+//! * [`telemetry`] — per-prefetch / per-step counters and an opt-in event
+//!   ring buffer. Disabled-mode hooks are a single relaxed atomic load.
+//!   Lifted from the measurement-and-observation half of FlexTensor's
+//!   `instrumentation/` package. Activated via
+//!   `FLAME_OFFLOAD_TELEMETRY={on,trace}` env var, or by calling
+//!   [`telemetry::global()`].`set_enabled(true)`.
+//! * [`transfer_benchmark`] — one-time PCIe H2D/D2H bandwidth sweep used
+//!   to build a [`transfer_benchmark::TransferBandwidthProfile`] for
+//!   future strategy work (Phase 2). Not on the per-step path.
+
+pub mod telemetry;
+pub mod transfer_benchmark;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -833,12 +848,45 @@ impl BlockOffloader {
     /// If block_idx is already on either slot, this is a no-op.
     /// If a different prefetch is in flight, syncs it first.
     pub fn prefetch_block(&mut self, block_idx: usize) -> anyhow::Result<()> {
+        // Phase 1 FlexTensor port: telemetry. Disabled-mode is a relaxed
+        // atomic load and an Option<Instant>::None constructor — measured
+        // at <5 ns under perf, safe on the hot path.
+        let tele = telemetry::global();
+        let timer = tele.record_prefetch_begin();
+        let already_resident = self.slots[0].block_idx() == Some(block_idx)
+            || self.slots[1].block_idx() == Some(block_idx);
+
         // Already on a slot?
-        if self.slots[0].block_idx() == Some(block_idx)
-            || self.slots[1].block_idx() == Some(block_idx)
-        {
+        if already_resident {
+            tele.record_prefetch_already_resident(timer, block_idx);
             return Ok(());
         }
+
+        // Best-effort bytes count for telemetry. Pinned path: sum pinned
+        // buffer lengths. Streaming path: sum BF16 footprint from entries.
+        // Computed before the inner call so we don't have to plumb a
+        // return value through `prefetch_block_streaming_inner`.
+        let bytes = if let Some(stream_state) = self.streaming.as_ref() {
+            stream_state
+                .blocks
+                .get(block_idx)
+                .map(|entries| entries.iter().map(|e| e.num_elems * 2).sum::<usize>())
+                .unwrap_or(0) as u64
+        } else {
+            self.cpu_blocks
+                .get(block_idx)
+                .map(|m| m.values().map(|pt| pt.buffer.len_bytes()).sum::<usize>())
+                .unwrap_or(0) as u64
+        };
+
+        let result = self.prefetch_block_inner(block_idx);
+        if result.is_ok() {
+            tele.record_prefetch_end(timer, block_idx, bytes);
+        }
+        result
+    }
+
+    fn prefetch_block_inner(&mut self, block_idx: usize) -> anyhow::Result<()> {
 
         // Different prefetch in flight? Sync it first (wasteful but safe).
         if let Some(inflight) = self.prefetch_in_flight {
@@ -1228,6 +1276,29 @@ impl BlockOffloader {
         &mut self,
         block_idx: usize,
     ) -> anyhow::Result<Arc<HashMap<String, Tensor>>> {
+        // Phase 1 FlexTensor port: telemetry. "Hit" = slot already had
+        // the block resident (Raw or Prepared) — prefetch landed in time.
+        // "Miss" = await had to fall back to issuing its own H2D.
+        let tele = telemetry::global();
+        let timer = tele.record_await_begin();
+        let is_hit = self.slots[0].block_idx() == Some(block_idx)
+            || self.slots[1].block_idx() == Some(block_idx);
+
+        let result = self.await_block_inner(block_idx);
+        if result.is_ok() {
+            if is_hit {
+                tele.record_await_end_hit(timer, block_idx);
+            } else {
+                tele.record_await_end_miss(timer, block_idx);
+            }
+        }
+        result
+    }
+
+    fn await_block_inner(
+        &mut self,
+        block_idx: usize,
+    ) -> anyhow::Result<Arc<HashMap<String, Tensor>>> {
         // Check active slot — already prepared?
         if let SlotState::Prepared { block_idx: idx, ref tensors, .. } = self.slots[self.active] {
             if idx == block_idx {
@@ -1285,7 +1356,12 @@ impl BlockOffloader {
             self.sync_transfer_stream()?;
             self.prefetch_in_flight = None;
         }
-        self.prefetch_block(block_idx)?;
+        // Use the inner prefetch so the wrapping `await_block` (which is
+        // currently counting *this* call) doesn't also charge a second
+        // prefetch_issued event. Telemetry attributes the work to await's
+        // miss path; that is more useful for tuning prefetch-lead-time
+        // than double counting both sides.
+        self.prefetch_block_inner(block_idx)?;
 
         let target = 1 - self.active;
         // Gate default stream on the just-issued H2D via the slot's event,

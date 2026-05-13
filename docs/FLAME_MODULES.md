@@ -1054,6 +1054,85 @@ MMDiT, MoE, and video-DiT trainers — see the `*-trainer` crates under
 Gemma3, Mistral, HiDream-O1, MagiHuman, plus every other model with a
 block-shaped weight layout (each defines its own `*Facilitator`).
 
+### Offload telemetry — `offload::telemetry` (Phase 1 FlexTensor port, 2026-05-12)
+
+⭐ Port of the **measurement-and-observation** half of NVIDIA FlexTensor's
+`instrumentation/` package (registry + dumper) into a flame-core shape.
+Strategy / state-machine parts of FlexTensor stay out of scope for
+Phase 1 (see HANDOFF for Phase 2/3 plans).
+
+**What it provides.** A process-global, lock-free `Telemetry` sink with:
+- Atomic counters: `h2d_bytes_total`, `prefetch_wall_ns`, `await_wall_ns`,
+  `await_hits`/`misses`, `prefetch_issued`/`already_resident`.
+- An opt-in bounded ring buffer of per-event traces (block_idx, bytes,
+  duration_ns, kind).
+- `format_counters(&snapshot)` for `eprintln!` / log dumps.
+
+**Hot-path cost.** Disabled mode is a single relaxed atomic load on entry
+to `prefetch_block` / `await_block` plus a no-op `TelemetryTimer`. Enabled
+mode is one atomic load + an `Instant::now()` at begin/end + several
+relaxed atomic adds (≤ 100 ns total on commodity hardware). Trace mode
+adds a single `Mutex` push of a 24-byte record — only touched when trace
+is enabled.
+
+**Activation.** Three options:
+- Set `FLAME_OFFLOAD_TELEMETRY=on` (counters) or `=trace` (counters +
+  ring buffer) in the environment at process start.
+- Call `flame_core::offload::telemetry::global().set_enabled(true)` from
+  code; for trace mode, also call `set_event_log_capacity(N)`.
+- `FLAME_OFFLOAD_TELEMETRY_RING=N` overrides the ring buffer capacity.
+
+**Hooks already wired into `BlockOffloader`:**
+- `prefetch_block` start → `record_prefetch_begin`
+- `prefetch_block` end → `record_prefetch_end` (with byte count of the
+  block) or `record_prefetch_already_resident` (no-op fast path).
+- `await_block` start → `record_await_begin`
+- `await_block` end → `record_await_end_hit` (slot already had block) or
+  `record_await_end_miss` (await issued its own H2D).
+
+The "miss" branch deliberately calls a private `prefetch_block_inner` so
+the await-charged miss isn't *also* counted as a `prefetch_issued`.
+
+### Offload transfer benchmark — `offload::transfer_benchmark` (Phase 1 FlexTensor port, 2026-05-12)
+
+⭐ Port of `flextensor/memory_transfer_benchmark.py` +
+`memory_transfer_interpolator.py`. One-time PCIe H2D/D2H bandwidth sweep
+across a geometric range of transfer sizes, plus a log-log interpolator
+for `bytes → predicted Duration` (and inverse via a future overload).
+Result is a `TransferBandwidthProfile` cached for the process lifetime.
+
+**Why it lives in flame-core.** Bandwidth is hardware-specific, not
+model-specific. Every BlockOffloader caller on a given box sees the same
+PCIe bus — fix the measurement primitive once, every model can consult
+the same profile (tenet §1).
+
+**What it measures.** GPU-observed wall time via `cudaEvent` start/stop
+bracketed around one `memcpy_async`, with `cudaEventSynchronize` on the
+stop event. This is the standard CUDA timing pattern and is exempt under
+clause 1 of the speed contract for *init-time* code.
+
+**What it does NOT measure.** Per-step memory churn, prefetch overlap
+quality, or kernel launch cost. Those belong to `offload::telemetry`
+(host-observed) and Phase 2/3 work respectively.
+
+**Configuration knobs (`BenchmarkConfig`).** `min_bytes` / `max_bytes`
+(default 1 KiB → 256 MiB), geometric `samples` count, `trials` per point
+(median is reported), `warmup_trials`, `measure_d2h`.
+
+**Result accessors.** `profile.h2d()` / `profile.d2h()` — measurement
+slices, ordered by size. `profile.predict_h2d(bytes)` / `predict_d2h` —
+log-log interpolated `Duration` with endpoint-slope linear extrapolation.
+`profile.peak_h2d_bps` / `peak_d2h_bps` — measured peak at the top of
+the size range.
+
+**Diagnostic output.** `profile.format_table()` matches the layout of
+FlexTensor's `format_memory_transfer_table` (size, direction, duration
+ms, bandwidth GB/s).
+
+On a single 3090 Ti the smoke test (5 sizes, 64 KiB → 16 MiB) measured
+peak ≈26 GB/s H2D / D2H — close to PCIe 4.0 x16 theoretical max for
+unidirectional traffic.
+
 ### Remaining wiring (not yet done)
 
 Three things need to happen before activation offload is live in training:
