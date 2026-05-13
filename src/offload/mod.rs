@@ -480,6 +480,33 @@ impl BlockOffloader {
         let fp8_pinned_mode =
             force_fp8_pinned || std::env::var("BLOCKOFF_FP8_PINNED").is_ok();
 
+        // Pre-flight visibility: pinned-RAM allocation is a long synchronous
+        // operation (~60-90s for klein 9B's 16.6 GB on PCIe Gen4). If the
+        // process is killed during this window (agent timeout, OOM, SIGKILL)
+        // the last log line is otherwise just "starting load", with no signal
+        // that work is in progress. This block emits a "starting" line with
+        // size estimate so external observers can correlate timing and
+        // distinguish "still working" from "broken."
+        //
+        // Inspired by the SIGKILL-during-alloc incident 2026-05-13: builder
+        // sub-agent's klein 9B smoke was killed during pinned-RAM allocation
+        // with no obvious cause in dmesg (no kernel OOM, no rlimit_memlock
+        // hit). Root cause was agent harness timeout — but with the previous
+        // log surface there was no way to tell that from a real defect.
+        let estimated_mb = paths
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len() as usize)
+            .sum::<usize>()
+            / (1024 * 1024);
+        log::info!(
+            "BlockOffloader::load starting: {} block(s) across {} file(s), ~{} MB on-disk; \
+             pinned-RAM allocation may take 30-90s for large models, do not interrupt",
+            block_count,
+            paths.len(),
+            estimated_mb,
+        );
+
         for &path in paths {
             let (header, data_start, mmap) = Self::mmap_safetensors(path)?;
 
