@@ -35,11 +35,14 @@
 //! The hooks accept `&self` only; they take no offloader lock and do not
 //! interact with any CUDA stream.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
 
 /// Aggregate counters covering every offloader call since process start.
 ///
@@ -47,7 +50,7 @@ use once_cell::sync::OnceCell;
 /// safe to read concurrently with updates; callers that want a coherent
 /// snapshot use [`Telemetry::snapshot`], which reads all fields under a
 /// single ordering fence.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TelemetryCounters {
     /// Total H2D bytes the offloader has issued via prefetch.
     pub h2d_bytes_total: u64,
@@ -116,7 +119,7 @@ impl TelemetryCounters {
 
 /// One per-event trace record. Populated only when the ring buffer is
 /// enabled (see [`Telemetry::set_event_log_capacity`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct TelemetryEvent {
     pub kind: TelemetryEventKind,
     /// Block index this event refers to.
@@ -128,7 +131,7 @@ pub struct TelemetryEvent {
 }
 
 /// Kind of telemetry event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TelemetryEventKind {
     PrefetchIssued,
     PrefetchAlreadyResident,
@@ -190,6 +193,16 @@ pub struct Telemetry {
     strategy_last_target_resident_bytes: AtomicU64,
 
     event_log: Mutex<EventLog>,
+
+    // Phase 4 (telemetry export): periodic dump bookkeeping.
+    /// Cached value of `FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS`, read
+    /// once at first-use. `0` disables periodic dumps.
+    periodic_interval: AtomicU64,
+    /// Cumulative count of events seen across record_prefetch_end /
+    /// record_await_end_{hit,miss}. Used to decide when the next periodic
+    /// dump fires. Increments unconditionally (cheap) but the dump only
+    /// fires when interval > 0 and `events_since_dump % interval == 0`.
+    events_since_dump: AtomicU64,
 }
 
 impl Telemetry {
@@ -207,6 +220,11 @@ impl Telemetry {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(if initial >= 2 { 4096 } else { 0 });
+        let periodic_interval =
+            std::env::var("FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
         Self {
             enabled: AtomicUsize::new(initial),
             h2d_bytes_total: AtomicU64::new(0),
@@ -225,6 +243,50 @@ impl Telemetry {
                 events: Vec::with_capacity(capacity),
                 total_seen: 0,
             }),
+            periodic_interval: AtomicU64::new(periodic_interval),
+            events_since_dump: AtomicU64::new(0),
+        }
+    }
+
+    /// Configure periodic dump interval (in events). `0` disables. When
+    /// non-zero, `record_prefetch_end` / `record_await_end_*` will every
+    /// `N` events trigger an atomic JSON dump of the current snapshot +
+    /// event-log to the directory named by
+    /// `FLAME_OFFLOAD_TELEMETRY_DUMP_DIR` (or the platform tmpdir if
+    /// unset). The dump path itself is host-only I/O — no CUDA calls.
+    pub fn set_periodic_dump_interval(&self, every_n_events: u64) {
+        self.periodic_interval
+            .store(every_n_events, Ordering::Release);
+        self.events_since_dump.store(0, Ordering::Release);
+    }
+
+    /// Current periodic-dump interval. `0` means disabled.
+    pub fn periodic_dump_interval(&self) -> u64 {
+        self.periodic_interval.load(Ordering::Relaxed)
+    }
+
+    /// Check whether a periodic dump is due, and if so, perform it.
+    /// Cheap-by-default: one relaxed atomic load checks if the feature
+    /// is enabled at all; only on the every-N-events boundary does the
+    /// host actually write JSON to disk. Errors are swallowed (telemetry
+    /// is observe-only — a missing log file must not break training).
+    #[inline]
+    fn maybe_periodic_dump(&self) {
+        let interval = self.periodic_interval.load(Ordering::Relaxed);
+        if interval == 0 {
+            return;
+        }
+        // fetch_add returns the prior value; the (n+1)-th call (1-indexed)
+        // triggers at prior+1 == interval, then prior+1 == 2*interval, etc.
+        let prior = self.events_since_dump.fetch_add(1, Ordering::AcqRel);
+        let count = prior.wrapping_add(1);
+        if count == 0 || count % interval != 0 {
+            return;
+        }
+        // Best-effort dump — failures are logged via eprintln so a missing
+        // directory doesn't go silent, but never propagated.
+        if let Err(e) = dump_all_inner(self, None) {
+            eprintln!("[flame-core][telemetry] periodic dump failed: {e}");
         }
     }
 
@@ -382,6 +444,7 @@ impl Telemetry {
                 duration_ns: dur_ns,
             });
         }
+        self.maybe_periodic_dump();
     }
 
     /// Hook: end of `prefetch_block` when the block was already on a slot.
@@ -424,6 +487,7 @@ impl Telemetry {
                 duration_ns: dur_ns,
             });
         }
+        self.maybe_periodic_dump();
     }
 
     /// Hook: end of `await_block`, had to issue H2D internally (miss).
@@ -442,6 +506,7 @@ impl Telemetry {
                 duration_ns: dur_ns,
             });
         }
+        self.maybe_periodic_dump();
     }
 }
 
@@ -505,6 +570,143 @@ pub fn format_counters(counters: &TelemetryCounters) -> String {
         counters.await_hits,
         counters.await_misses,
     )
+}
+
+// ----------------------------------------------------------------------------
+// Telemetry export (Phase 4, 2026-05-12)
+// ----------------------------------------------------------------------------
+//
+// Make counters and event traces visible from outside the process without
+// requiring source edits in every trainer:
+//
+//  * `snapshot_to_file(path)`     — single JSON document, the counter snapshot.
+//  * `ring_buffer_to_file(path)`  — JSON-lines, one event per line.
+//  * `dump_all(dir)`              — convenience pair into one directory.
+//
+// All three are atomic: write-to-tmp-file + rename. A SIGKILL mid-write
+// leaves the previous file intact. No CUDA calls anywhere on the export
+// path (clause 1 of SPEED_CONTRACT — host I/O only).
+
+/// File name written by [`dump_all`] for the counter snapshot.
+pub const DUMP_SNAPSHOT_FILENAME: &str = "flame_offload_telemetry_snapshot.json";
+
+/// File name written by [`dump_all`] for the per-event ring buffer.
+pub const DUMP_EVENTS_FILENAME: &str = "flame_offload_telemetry_events.jsonl";
+
+/// Environment variable read by [`dump_all`] when the explicit directory is
+/// `None`. Falls back to the platform temp directory if also unset.
+pub const DUMP_DIR_ENV: &str = "FLAME_OFFLOAD_TELEMETRY_DUMP_DIR";
+
+/// Environment variable for the periodic-dump interval. When set to a
+/// positive integer, an end-of-event hook every Nth event will write
+/// `dump_all` to the configured directory. Read once at [`global`]
+/// initialization; runtime overrides go via
+/// [`Telemetry::set_periodic_dump_interval`].
+pub const DUMP_INTERVAL_ENV: &str = "FLAME_OFFLOAD_TELEMETRY_DUMP_INTERVAL_STEPS";
+
+/// Write `path` atomically. Serializes `value` to JSON in a sibling tmp
+/// file, then `rename`s into place. The rename is atomic on POSIX
+/// filesystems; on Windows it's a "best-effort replace".
+fn write_json_atomic<P: AsRef<Path>, T: Serialize>(path: P, value: &T) -> std::io::Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        let json = serde_json::to_vec_pretty(value).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("serde: {e}"))
+        })?;
+        f.write_all(&json)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Serialize the global telemetry counter snapshot to `path`. Atomic
+/// (tmp file + rename). Cheap — one snapshot read + one short JSON
+/// document. No GPU work.
+pub fn snapshot_to_file(path: &Path) -> std::io::Result<()> {
+    let snap = global().snapshot();
+    write_json_atomic(path, &snap)
+}
+
+/// Drain the per-event ring buffer to `path` as JSON-lines. Each line is
+/// one [`TelemetryEvent`]. Returns the number of events written; `0` when
+/// trace mode is off or the buffer is empty.
+///
+/// Atomic (tmp file + rename). The buffer itself is not cleared; the same
+/// events will appear again on the next call if no new events landed.
+pub fn ring_buffer_to_file(path: &Path) -> std::io::Result<usize> {
+    let events = global().event_log();
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        for ev in &events {
+            let line = serde_json::to_string(ev).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, format!("serde: {e}"))
+            })?;
+            f.write_all(line.as_bytes())?;
+            f.write_all(b"\n")?;
+        }
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(events.len())
+}
+
+/// Convenience end-of-run dump. Writes the counter snapshot
+/// (`flame_offload_telemetry_snapshot.json`) and the per-event ring
+/// buffer (`flame_offload_telemetry_events.jsonl`) into `dir`. When
+/// `dir` is `None`, falls back to `$FLAME_OFFLOAD_TELEMETRY_DUMP_DIR`,
+/// or the platform `std::env::temp_dir()` if that's unset too.
+///
+/// Returns the directory that was actually used. The directory is
+/// created if it does not exist.
+pub fn dump_all(dir: Option<&Path>) -> std::io::Result<PathBuf> {
+    dump_all_inner(global(), dir)
+}
+
+fn dump_all_inner(t: &Telemetry, dir: Option<&Path>) -> std::io::Result<PathBuf> {
+    let chosen: PathBuf = match dir {
+        Some(p) => p.to_path_buf(),
+        None => match std::env::var_os(DUMP_DIR_ENV) {
+            Some(v) => PathBuf::from(v),
+            None => std::env::temp_dir(),
+        },
+    };
+    std::fs::create_dir_all(&chosen)?;
+
+    let snap_path = chosen.join(DUMP_SNAPSHOT_FILENAME);
+    let snap = t.snapshot();
+    write_json_atomic(&snap_path, &snap)?;
+
+    let events_path = chosen.join(DUMP_EVENTS_FILENAME);
+    let events = t.event_log();
+    let tmp = events_path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        for ev in &events {
+            let line = serde_json::to_string(ev).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, format!("serde: {e}"))
+            })?;
+            f.write_all(line.as_bytes())?;
+            f.write_all(b"\n")?;
+        }
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &events_path)?;
+
+    Ok(chosen)
 }
 
 #[cfg(test)]
