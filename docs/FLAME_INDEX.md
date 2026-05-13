@@ -869,6 +869,57 @@ Recently-added variants:
 - `autograd_v4::*` — newer experimental engine. Off by default.
 - `autograd_v4::ops::sdpa` — SDPA backward via v4
 
+### Autograd v2 (Phase 1 — feature `autograd_v2`)
+
+Clean-sheet PyTorch-style DAG autograd. Phase 1 ships the foundational
+types/traits; engine wiring lands in Phase 2. See
+[`AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md`](./AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md).
+No live behavior change yet — module compiles, types compose, all 13
+Phase 1 tests pass under the `autograd_v2` feature.
+
+- `autograd_v2::AutogradMetaV2` — `src/autograd_v2/meta.rs:42` — shared,
+  interior-mutable per-tensor metadata. Holds `grad`, `grad_fn` (strong
+  `Arc<dyn GradFn>`), `grad_accumulator` (**Weak** to break cycle per §1),
+  `output_nr`, `requires_grad`, view-base slot, `hooks`.
+- `autograd_v2::AutogradMetaRef` — `src/autograd_v2/meta.rs:198` — type
+  alias `Arc<Mutex<AutogradMetaV2>>`.
+- `autograd_v2::new_meta_ref(meta)` — `src/autograd_v2/meta.rs:201` —
+  constructor for the canonical `Arc<Mutex<_>>` shape.
+- `autograd_v2::NodeId` — `src/autograd_v2/node.rs:33` — monotonic atomic
+  identifier.
+- `autograd_v2::Edge { function, input_nr }` — `src/autograd_v2/node.rs:52`
+  — `(grad_fn, input slot)` pair.
+- `autograd_v2::GradFn` trait — `src/autograd_v2/node.rs:98` —
+  `apply(grad_outputs, ctx) -> Result<Vec<Option<Tensor>>, AutogradV2Error>`,
+  `num_inputs()`, `next_edges()`, `sequence_nr()`, `topological_nr()`,
+  `node_id()`, `name()`, `hooks()` (default empty),
+  `release_variables(&self)` (default no-op). Stored sequence/topological
+  numbers (not recomputed walks).
+- `autograd_v2::SavedTensor` — `src/autograd_v2/saved_tensor.rs:29` —
+  `Arc<AtomicU32>` version handle + `expected_version` snapshot +
+  `Mutex<Option<Tensor>>` data + `fw_grad_` slot for forward-mode AD.
+  `save_named`, `unpack() -> Result<Tensor, AutogradV2Error>`,
+  `reset(&self)`, `set_fw_grad/fw_grad`.
+- `autograd_v2::InputBuffer` — `src/autograd_v2/input_buffer.rs:39` —
+  `num_inputs` slots with in-place AND out-of-place accumulation. In-place
+  fires when `create_graph=false` AND dtype/shape match.
+- `autograd_v2::Hooks` — `src/autograd_v2/hooks.rs:32` —
+  `pre_backward/post_backward/tensor_hooks` vecs. `Hooks::empty_ref()`
+  returns the `OnceLock` sentinel for the no-hook fast path.
+- `autograd_v2::AccumulateGrad` — `src/autograd_v2/accumulator.rs:25` —
+  leaf gradient sink. `Weak` handle to the variable's meta breaks the
+  cycle. `apply()` is Phase-1-placeholder (`NotImplementedYet`); Phase 2
+  implements actual accumulation.
+- `autograd_v2::DispatchCtx` / `DeviceStream` — `src/autograd_v2/dispatch.rs:39,73`
+  — multi-device surface (§16). `(device, raw_stream_ptr)` passed by `&`
+  to every `apply()` and `InputBuffer::add()`.
+- `autograd_v2::AutogradV2Error` — `src/autograd_v2/error.rs:17` —
+  `VersionMismatch / SavedTensorReleased / InputSlotOutOfBounds /
+  DtypeMismatch / NotImplementedYet / FlameCore(Error)`. Round-trips into
+  the crate's `Error::Autograd(String)` via `From`.
+- `autograd_v2::V2Result<T>` — `src/autograd_v2/error.rs:71` — alias for
+  `Result<T, AutogradV2Error>`.
+
 ### Legacy / dead
 - ⚠️ `autograd.rs` (top-level) — types still re-exported
 - ⚠️ `autograd_simple.rs` — early stub

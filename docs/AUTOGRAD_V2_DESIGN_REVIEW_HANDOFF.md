@@ -7,6 +7,62 @@ Scope reviewed:
 - Current flame-core repo at `/home/alex/EriDiffusion/flame-core`.
 - Local PyTorch reference at `/home/alex/pytorch`, commit `6a13735`.
 
+
+
+# Agents
+Three-agent CC workflow. One phase per prompt, serial on main, never parallel. All outputs as file artifacts. Each prompt names the active agent.
+Builder
+Implements per the revised spec. Scope is exactly one phase from the Suggested Implementation Order — no multi-phase prompts. Reads the design contract before writing any code, and treats clauses 1-16 in "Recommended Spec Changes" as hard constraints, not suggestions.
+Builder rules for v2:
+
+Every GradFn::apply returns Result<Vec<Option<Tensor>>>. No unwrap in autograd code.
+SavedTensor carries the Arc<AtomicU32> version handle from SavedRef, never just an integer.
+Weak accumulator storage in AutogradMeta. Never strong Arc<Tensor> through metadata.
+Hooks accessor exists from day one with default empty impl. Same for num_inputs, fw_grad_, out-of-place InputBuffer path.
+All new code under #[cfg(feature = "autograd_v2")]. No silent migration of v1 ops.
+PyTorch parity fixtures exist before the op is declared done — backward AND forward-mode AD.
+Reference open-source implementations (PyTorch at /home/alex/pytorch) by line number in comments. Never design from scratch where a reference exists.
+
+Builder output is the implemented phase plus a verification log (cargo build, cargo test, and the parity harness output for any ops in scope). No prose summary — the verification log IS the summary.
+Bug Fixer
+Activates after Builder ships a phase. Hunts for bugs the builder shipped, with priority on the High-Risk Areas list:
+
+Reference cycles through AutogradMeta and AccumulateGrad
+Version-counter coverage gaps (in-place mutators that don't bump)
+View metadata sharing across clone / detach / to_dtype / contiguous / narrow
+Checkpoint/offload interaction with v2 saved tensors
+SDPA backward saved-output mutation detection
+Multi-output ops and output_nr correctness
+Gradient accumulation across micro-batches
+Hook firing order and re-entry safety
+Inline-mini-execute state save/restore on nested Engine::execute
+
+Bug fixer writes failing tests first, then fixes. Each fix is one commit. Never bundles unrelated fixes. If a bug is in v1 code that v2 inherits (Class B narrow backward, Class E sync sites), the bug fixer escalates rather than patching — those are separate workstreams per clause 11.
+Bug fixer output is a list of test names added (one per bug), the fix commit hashes, and a verification log proving the prior phase's tests still pass.
+Skeptic
+Activates after Bug Fixer signs off. Challenges the phase's claims and tests edge cases that builder + bug fixer would not have written for themselves.
+Skeptic targets for v2 specifically:
+
+The BF16-grad claim. Run grad-norm, clipping, and Adam parity vs v1 at multiple scales. Compare loss curves over 100 steps, not just step 1.
+The reentrant claim. Construct a checkpoint-inside-checkpoint case (3 levels deep) and verify the mini-engine state stack unwinds correctly.
+The hooks claim. Register a hook that mutates a tensor it shouldn't, verify version-counter catches it on the next backward.
+The create_graph=true claim. Verify second-order gradients match PyTorch on a non-trivial graph (transformer block, not toy add).
+The view autograd claim. Run a model that uses view → matmul → view patterns and verify the backward produces the same grads as v1.
+The parity gate. Don't accept "passes on klein 4B" as proof — also run klein 9B, zimage, and at least one video model.
+The performance non-regression claim. Independent timing run on a fresh checkout. If ms/step regressed by even 1%, flag it. Don't average it away.
+
+Skeptic also reads the phase's diff for anti-patterns: silent F32 upcasts, unwrap calls, missing version bumps in new in-place paths, hardcoded single-stream assumptions, strong reference cycles, panic! where Err belongs.
+Skeptic output is a numbered findings list. Each finding is one of: BLOCKER (phase must not ship), CONCERN (track for next phase), or NOTE (resolved during review). Phase advances only when no BLOCKER remains.
+Hand-off rules
+
+Builder → Bug Fixer: when Builder's verification log is clean.
+Bug Fixer → Skeptic: when Bug Fixer reports no new failures and all phase tests pass.
+Skeptic → next phase Builder: when no BLOCKER remains AND user has reviewed the findings list.
+Never skip an agent. Never run two agents in the same prompt.
+If any agent finds the spec ambiguous, they stop and escalate — they do not improvise.
+
+
+
 ## Summary
 
 The proposed PyTorch-style DAG architecture is directionally sound: `GradFn`/`Edge`, dependency-counted scheduling, `InputBuffer`, saved tensor version checks, and a single-threaded engine are the right foundations for replacing the current global tape.
@@ -14,6 +70,7 @@ The proposed PyTorch-style DAG architecture is directionally sound: `GradFn`/`Ed
 Do not green-light implementation from the current spec as-is. Several details conflict with flame-core's current tensor/gradient ownership model and with PyTorch's actual lifetime rules. If implemented literally, v2 risks reference cycles, incomplete error propagation, broken multi-input node scheduling, missed in-place mutation detection, and optimizer-policy regressions.
 
 The design should be revised first, then implemented behind a feature flag.
+
 
 ## Current Flame-Core Reality
 

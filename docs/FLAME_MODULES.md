@@ -629,6 +629,46 @@ A newer experimental engine with explicit `Gradients` and `graph` types.
 Off by default. The SDPA backward in `autograd_v4/ops/sdpa.rs` is more
 correct than the v3 one in some edge cases.
 
+### `autograd_v2/` (feature `autograd_v2`, Phase 1)
+Clean-sheet PyTorch-style DAG autograd engine. Designed to replace v1/v3/v4
+once Phase 5 parity gates pass. Phase 1 (this commit) ships the foundational
+types and traits — there is no behavior change yet; no forward op records
+through v2 until Phase 3. See
+`docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` for the phase roadmap and
+`docs/BF16_GRAD_DECISION.md` for the dtype policy.
+
+Key Phase 1 design points:
+- **Weak accumulator cycle break (§1):** `AutogradMetaV2::grad_accumulator`
+  and `AccumulateGrad::variable` are both `Weak`, so a leaf with
+  `requires_grad=true` does not leak its storage.
+- **Result-typed `apply` (§3):** `GradFn::apply(grad_outputs, ctx) ->
+  Result<Vec<Option<Tensor>>, AutogradV2Error>`. Version mismatches and
+  released saved tensors are recoverable training errors, not panics.
+- **`SavedTensor` carries the version handle (§4):** `Arc<AtomicU32>`
+  clone of `TensorStorage::version_handle()`. Survives
+  `AutogradContext::clear()` / version-table flushes.
+- **`&self` release (§3):** `GradFn::release_variables(&self)` works
+  because `SavedTensor` holds data behind `Mutex<Option<Tensor>>`.
+- **`InputBuffer` in-place AND out-of-place (§Phase 1 clause 7):** in-place
+  is the default when `create_graph=false` AND dtype/shape match;
+  out-of-place when `create_graph=true` or the in-place predicate fails.
+  Phase 1's predicate is conservative — `BF16 | F32` same-shape only.
+- **Hooks surface from day one (§8 / clause 13):** `Hooks { pre/post/tensor }`
+  bundles + `GradFn::hooks()` accessor. `Hooks::empty_ref()` is the
+  OnceLock-backed singleton for the no-hook fast path. Phase 2 wires
+  dispatch.
+- **Forward-mode AD plumbing (§8 / clause 15):** `SavedTensor::fw_grad_`
+  slot is present. Phase 3 per-op forward formulas populate it.
+- **Multi-device surface (§16 / charter 2026-05-13):** `DispatchCtx`
+  parameter at every entry point. `(device, raw_stream_ptr)`. Phase 1's
+  only ctx today is `(global_cuda_device, default-stream)` but the trait
+  shape locks the parameter so non-default streams / multi-device land
+  without an ABI break.
+
+Files: `accumulator.rs`, `dispatch.rs`, `error.rs`, `hooks.rs`,
+`input_buffer.rs`, `meta.rs`, `mod.rs`, `node.rs`, `saved_tensor.rs`.
+Tests: `tests/autograd_v2_types.rs` (13 tests, all green).
+
 ### ⚠️ `autograd_simple.rs / autograd_engine.rs / autograd_ops.rs / autograd_ops_complete.rs / autograd_debug.rs`
 Older autograd attempts. Dead code; kept for reference.
 
