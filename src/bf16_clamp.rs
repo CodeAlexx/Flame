@@ -46,6 +46,8 @@ pub fn clamp_bf16(x: &Tensor, lo: f32, hi: f32) -> Result<Tensor> {
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
     if x.device

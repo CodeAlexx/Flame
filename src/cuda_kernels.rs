@@ -215,6 +215,8 @@ pub fn create_output_tensor(data: CudaSlice<f32>, shape: Shape, device: Arc<Cuda
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     }
 }
@@ -1114,6 +1116,8 @@ impl CudaKernels {
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         })
     }
@@ -2108,6 +2112,8 @@ extern "C" __global__ void upsample2d_nearest_backward_kernel(
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
         })
     }
 

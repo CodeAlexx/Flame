@@ -629,7 +629,7 @@ A newer experimental engine with explicit `Gradients` and `graph` types.
 Off by default. The SDPA backward in `autograd_v4/ops/sdpa.rs` is more
 correct than the v3 one in some edge cases.
 
-### `autograd_v2/` (feature `autograd_v2`, Phases 1 + 2)
+### `autograd_v2/` (feature `autograd_v2`, Phases 1 + 2 + 3a)
 Clean-sheet PyTorch-style DAG autograd engine. Designed to replace v1/v3/v4
 once Phase 5 parity gates pass. Phase 1 ships the foundational types
 and traits; Phase 2 ships the engine driver, dependency counting, ready
@@ -695,15 +695,45 @@ Phase 2 additions:
   Default returns a static no-op marker; `AccumulateGrad` overrides
   to return `&self` so the engine's `with_inputs` path can resolve
   leaf accumulators.
-- **`engine.rs::_v2_set_grad_fn / _v2_clear_tensor_meta`** —
-  test-only side-table backdoor. Phase 3 op migration replaces
-  this with a proper `Option<AutogradMetaRef>` field on `Tensor`.
+- ~~`engine.rs::_v2_set_grad_fn / _v2_clear_tensor_meta`~~ —
+  **REMOVED in Phase 3a.** The test-only side-table is gone;
+  `Tensor::autograd_meta` is now a real field and `record_v2` is the
+  canonical install entry. Phase 2 engine tests refactored to use
+  `record_v2`-style linking helpers.
+
+Phase 3a additions:
+- **`recording.rs`** — the public op-recording surface every Phase 3+
+  op uses. `record_v2(grad_fn, outputs, ctx)`, `gradient_edge_for_tensor(t)`,
+  `next_sequence_nr()`, `needs_grad(inputs)`. There is no global tape
+  — the recording is the per-output `Tensor::autograd_meta` slot,
+  populated by `record_v2`.
+- **`ops/`** — submodule with one file per op: `ops/add.rs`,
+  `ops/mul.rs`, `ops/sum.rs`, `ops/matmul.rs`, `ops/silu.rs`. Each
+  exports a `*GradFn` struct + `*_v2` forward wrapper. Forward
+  wrappers call the existing flame-core math op for the forward
+  (`Tensor::add`, `Tensor::mul`, `Tensor::sum`, `Tensor::matmul`,
+  `Tensor::silu`) and conditionally record onto v2 when
+  `needs_grad(inputs)` is true.
+- **`DispatchCtx::create_graph` field** — threaded by
+  `Engine::execute` from `GraphRoot::create_graph`. The
+  `AccumulateGrad::apply` and `InputBuffer::add_outofplace`
+  branches read it to pick recording vs in-place accumulation.
+- **`AutogradV2Error::GradOutputShapeMismatch`** — new error variant.
+  `Engine::execute` validates `grad_outputs[i].shape() ==
+  outputs[i].shape()` at entry.
+- **Non-leaf grad capture in `Engine::execute`** — per-call
+  `(NodeId, output_nr) -> Tensor` map populated at each node's
+  apply-time, read at the end for any `with_inputs` entry whose
+  grad_fn isn't an `AccumulateGrad`.
 
 Files: `accumulator.rs`, `checkpoint.rs`, `dispatch.rs`, `engine.rs`,
 `error.rs`, `hooks.rs`, `input_buffer.rs`, `meta.rs`, `mod.rs`,
-`node.rs`, `saved_tensor.rs`. Tests:
-`tests/autograd_v2_types.rs` (13 tests, Phase 1) +
-`tests/autograd_v2_engine.rs` (10 tests, Phase 2). All green.
+`node.rs`, `recording.rs`, `saved_tensor.rs`, `ops/mod.rs`,
+`ops/add.rs`, `ops/mul.rs`, `ops/sum.rs`, `ops/matmul.rs`,
+`ops/silu.rs`. Tests: `tests/autograd_v2_types.rs` (13 tests,
+Phase 1) + `tests/autograd_v2_engine.rs` (11 tests, Phase 2 — note
+`record_v2` refactor + the bug-fixer regression) +
+`tests/autograd_v2_ops.rs` (17 tests, Phase 3a). All green.
 
 ### ⚠️ `autograd_simple.rs / autograd_engine.rs / autograd_ops.rs / autograd_ops_complete.rs / autograd_debug.rs`
 Older autograd attempts. Dead code; kept for reference.

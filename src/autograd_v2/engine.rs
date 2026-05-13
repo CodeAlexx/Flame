@@ -43,6 +43,26 @@ use super::input_buffer::InputBuffer;
 use super::node::{GradFn, NodeId};
 use crate::tensor::Tensor;
 
+/// Phase 3a: read the `grad_fn` slot from a tensor's autograd_meta.
+///
+/// Replaces the Phase 2 test-only side-table (`TENSOR_META` /
+/// `_v2_set_grad_fn`). Now that `Tensor::autograd_meta` is a real
+/// field, every recorded op leaves a meta on its outputs and the
+/// engine reads through that.
+fn grad_fn_of(t: &Tensor) -> Option<Arc<dyn GradFn>> {
+    let meta = t.autograd_meta()?;
+    let guard = meta.lock().ok()?;
+    guard.grad_fn.clone()
+}
+
+/// Phase 3a: read the `output_nr` slot from a tensor's autograd_meta.
+fn output_nr_of(t: &Tensor) -> u32 {
+    match t.autograd_meta() {
+        None => 0,
+        Some(meta) => meta.lock().map(|m| m.output_nr).unwrap_or(0),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GraphRoot — backward entry-point builder
 // ---------------------------------------------------------------------------
@@ -173,6 +193,39 @@ impl Engine {
             });
         }
 
+        // Phase 3a: validate grad_outputs shapes before any DAG work.
+        // Bug-fixer flagged that the existing Phase 2 code accepted
+        // any shape and silently routed the mismatched grad through
+        // the downstream InputBuffer, masking the caller bug. The
+        // check is O(outputs) and pre-empts confusing failures later.
+        for (i, (out, g_opt)) in root
+            .outputs
+            .iter()
+            .zip(root.grad_outputs.iter())
+            .enumerate()
+        {
+            if let Some(g) = g_opt {
+                if g.shape() != out.shape() {
+                    return Err(AutogradV2Error::GradOutputShapeMismatch {
+                        index: i,
+                        out_shape: out.shape().dims().to_vec(),
+                        grad_shape: g.shape().dims().to_vec(),
+                    });
+                }
+            }
+        }
+
+        // Thread `create_graph` from the GraphRoot into the dispatch ctx
+        // so AccumulateGrad::apply / InputBuffer::add / op forward
+        // wrappers can pick recording vs in-place behavior off a single
+        // flag. Phase 3a default (`ctx.create_graph=false`) keeps the
+        // inference-fast in-place path.
+        let ctx_local = DispatchCtx {
+            stream: ctx.stream.clone(),
+            create_graph: root.create_graph,
+        };
+        let ctx = &ctx_local;
+
         // -----------------------------------------------------------------
         // Step 1: walk the DAG, build dependency counts.
         // -----------------------------------------------------------------
@@ -250,8 +303,11 @@ impl Engine {
         let mut buffers: HashMap<NodeId, InputBuffer> = HashMap::new();
 
         for (i, out) in root.outputs.iter().enumerate() {
+            // Re-fetch via the seed_nodes vec (parallel to outputs). The
+            // first pass already validated each output has a grad_fn and
+            // returned NoGradFnOnOutput on miss.
             let gf = nodes_by_id
-                .get(&grad_fn_of(out).unwrap().node_id())
+                .get(&seed_nodes[i].node_id())
                 .expect("seeded above")
                 .clone();
             let slot = output_nr_of(out) as usize;
@@ -300,8 +356,8 @@ impl Engine {
         {
             // First pass: bump dep_count by 1 for each output occurrence,
             // accounting for the user's grad_outputs as one contribution.
-            for out in &root.outputs {
-                let nid = grad_fn_of(out).unwrap().node_id();
+            for sn in &seed_nodes {
+                let nid = sn.node_id();
                 *dep_count.entry(nid).or_insert(0) += 1;
             }
             // Second pass: for each *unique* output node, decrement and
@@ -312,8 +368,8 @@ impl Engine {
             // *grad_output*; same here.
             let mut seen_outputs: std::collections::HashSet<NodeId> =
                 std::collections::HashSet::new();
-            for out in &root.outputs {
-                let nid = grad_fn_of(out).unwrap().node_id();
+            for sn in &seed_nodes {
+                let nid = sn.node_id();
                 // Always decrement (even for duplicates) since we
                 // bumped per-occurrence above.
                 let entry = dep_count.entry(nid).or_insert(0);
@@ -336,9 +392,16 @@ impl Engine {
         }
 
         // For `with_inputs` mode: remember which input-tensor maps to which
-        // (grad_fn node, input_nr-on-grad_fn or input_nr-on-accumulator).
-        // We collect by inspecting each input tensor's grad_fn and
-        // output_nr (mirror of how outputs are seeded above).
+        // (grad_fn node, output_nr-on-grad_fn).
+        //
+        // - If the grad_fn is an `AccumulateGrad`, the leaf's grad lives
+        //   in `meta.grad` after the engine finishes (sunk by the
+        //   accumulator). We read it back via the same `as_any`
+        //   downcast path as Phase 2.
+        // - Otherwise (non-leaf input), the grad we want is the value
+        //   routed INTO that grad_fn's InputBuffer at slot
+        //   `output_nr_of(input)`. Phase 3a captures it at apply-time
+        //   in `nonleaf_grads` (keyed on `(NodeId, output_nr)`).
         let want_input_grads = root.inputs.is_some();
         let input_targets: Vec<(NodeId, usize)> = if let Some(ref inputs) = root.inputs {
             inputs
@@ -351,6 +414,24 @@ impl Engine {
         } else {
             Vec::new()
         };
+        // Set of (node_id, output_nr) we want to capture in the
+        // ready-queue loop. Phase 3a: bug-fixer flagged that the Phase 2
+        // engine returned None for non-leaf inputs. Capture lives at the
+        // node's `apply()` entry point — the InputBuffer for that node
+        // holds the grad routed into slot `output_nr`.
+        let mut nonleaf_capture_keys: std::collections::HashSet<(NodeId, usize)> =
+            std::collections::HashSet::new();
+        if want_input_grads {
+            for (nid, slot) in &input_targets {
+                let node = nodes_by_id.get(nid).expect("with_inputs entry missing");
+                // Only capture non-leaf inputs. Leaf grads are sunk via
+                // AccumulateGrad → meta.grad and read back post-loop.
+                if node.as_any().downcast_ref::<AccumulateGrad>().is_none() {
+                    nonleaf_capture_keys.insert((*nid, *slot));
+                }
+            }
+        }
+        let mut nonleaf_grads: HashMap<(NodeId, usize), Tensor> = HashMap::new();
 
         // -----------------------------------------------------------------
         // Step 3: drive the queue.
@@ -371,6 +452,23 @@ impl Engine {
                 Some(buf) => buf.take(),
                 None => vec![None; node.num_inputs()],
             };
+
+            // Phase 3a non-leaf capture for `with_inputs`. If this
+            // node has any (NodeId, slot) keys we care about, snapshot
+            // the buffered grads at those slots before they're passed
+            // into `apply()`. Cloning here is cheap (single Arc bump on
+            // the storage) — this path only fires when the user
+            // explicitly asked for non-leaf grads via `with_inputs`.
+            if want_input_grads {
+                for slot in 0..input_grads.len() {
+                    let key = (node_id, slot);
+                    if nonleaf_capture_keys.contains(&key) {
+                        if let Some(g) = &input_grads[slot] {
+                            nonleaf_grads.insert(key, g.clone());
+                        }
+                    }
+                }
+            }
 
             // Run hooks. Fast path: pointer-compare against the empty
             // sentinel to skip the for-loops entirely in the common case.
@@ -473,26 +571,23 @@ impl Engine {
         // -----------------------------------------------------------------
         if want_input_grads {
             // For each requested input, look at its grad_fn:
-            //   - If grad_fn is an AccumulateGrad, the grad was sunk into
-            //     the leaf's meta.grad. Read it out.
-            //   - Otherwise (non-leaf with_inputs), the grad lived in the
-            //     buffer entry for that node at slot input_nr; but we've
-            //     already consumed buffers. The supported case in Phase 2
-            //     is leaf inputs (the common `grad(loss, [param0, param1])`
-            //     usage). Non-leaf input collection is a Phase 3+ concern.
+            //   - If grad_fn is an `AccumulateGrad`, the grad was sunk into
+            //     the leaf's `meta.grad`. Read it back via downcast.
+            //   - Otherwise (non-leaf), Phase 3a captured the grad at
+            //     apply-time into `nonleaf_grads[(node_id, output_nr)]`.
+            //     If no entry is present (the node never fired with a
+            //     contributing buffer), the requested grad is None.
             let mut out = Vec::with_capacity(input_targets.len());
-            for (nid, _slot) in input_targets.iter() {
+            for (nid, slot) in input_targets.iter() {
                 let node = nodes_by_id.get(nid).expect("with_inputs entry missing");
-                // Downcast through GradFn::as_any. AccumulateGrad
-                // overrides as_any to return &self, so this is the
-                // canonical leaf-grad lookup path.
                 if let Some(acc) = node.as_any().downcast_ref::<AccumulateGrad>() {
                     let meta = acc.upgrade_variable();
                     let g = meta.and_then(|m| m.lock().ok().and_then(|mg| mg.grad.clone()));
                     out.push(g);
                 } else {
-                    // Non-leaf inputs: Phase 3+ concern. Return None.
-                    out.push(None);
+                    // Phase 3a: look up the captured non-leaf grad.
+                    let g = nonleaf_grads.get(&(*nid, *slot)).cloned();
+                    out.push(g);
                 }
             }
             Ok(out)
@@ -544,71 +639,10 @@ fn decrement_and_maybe_enqueue(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tensor → AutogradMetaV2 bridge (Phase 2 stop-gap)
-// ---------------------------------------------------------------------------
+// Phase 3a: `grad_fn_of` / `output_nr_of` now live at the top of this
+// file and read from `Tensor::autograd_meta()`. The Phase 2 test-only
+// TENSOR_META side-table has been removed (DELETED).
 //
-// Phase 3 wires `Tensor` to carry an `Option<AutogradMetaRef>` field
-// directly. Phase 2 doesn't yet — forward op migration is the Phase 3
-// job. To make the engine testable, we expose a thread-local-shaped
-// side table that Phase 2 tests use to associate a Tensor with a
-// grad_fn at construction time of the test scenario.
-//
-// This is a TEST-ONLY backdoor; production op recording in Phase 3 will
-// replace it with proper per-tensor metadata. The functions are
-// `pub(crate)` so the engine module sees them, the test module exports
-// them through a re-export under `#[doc(hidden)]`.
-
-use std::sync::Mutex;
-
-/// `(grad_fn, output_nr)` slot in the test-only side table.
-type TensorMetaEntry = (Arc<dyn GradFn>, u32);
-
-thread_local! {
-    static TENSOR_META: Mutex<HashMap<crate::tensor::TensorId, TensorMetaEntry>> =
-        Mutex::new(HashMap::new());
-}
-
-/// Register a (grad_fn, output_nr) pair for a given tensor id. Used by
-/// Phase 2 tests to construct synthetic DAGs without yet wiring a
-/// per-tensor metadata field. Phase 3 op migration removes this in
-/// favor of `Tensor::autograd_meta`.
-#[doc(hidden)]
-pub fn _v2_set_grad_fn(tensor: &Tensor, grad_fn: Arc<dyn GradFn>, output_nr: u32) {
-    TENSOR_META.with(|m| {
-        m.lock()
-            .expect("autograd_v2: TENSOR_META poisoned")
-            .insert(tensor.id(), (grad_fn, output_nr));
-    });
-}
-
-/// Clear all registered associations. Test cleanup.
-#[doc(hidden)]
-pub fn _v2_clear_tensor_meta() {
-    TENSOR_META.with(|m| {
-        if let Ok(mut g) = m.lock() {
-            g.clear();
-        }
-    });
-}
-
-fn grad_fn_of(t: &Tensor) -> Option<Arc<dyn GradFn>> {
-    TENSOR_META.with(|m| {
-        m.lock()
-            .ok()
-            .and_then(|g| g.get(&t.id()).map(|(gf, _)| gf.clone()))
-    })
-}
-
-fn output_nr_of(t: &Tensor) -> u32 {
-    TENSOR_META.with(|m| {
-        m.lock()
-            .ok()
-            .and_then(|g| g.get(&t.id()).map(|(_, nr)| *nr))
-            .unwrap_or(0)
-    })
-}
-
 // `Any` is in the prelude of this module via the import at the top —
 // engine's `with_inputs` downcast uses `GradFn::as_any() → &dyn Any` →
 // `downcast_ref::<AccumulateGrad>()`. No separate downcast trait is

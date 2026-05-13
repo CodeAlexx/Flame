@@ -949,15 +949,103 @@ until Phase 3 wires forward op recording. Tests:
 - `autograd_v2::GradFn::as_any` — `src/autograd_v2/node.rs` —
   type-erased downcast helper. `AccumulateGrad` is the Phase 2 user
   (engine's `with_inputs` path needs the downcast).
-- `autograd_v2::_v2_set_grad_fn(tensor, gf, output_nr)` /
-  `_v2_clear_tensor_meta()` — `src/autograd_v2/engine.rs` —
-  **TEST-ONLY** thread-local side table that associates tensors with
-  grad_fns. Phase 3 op migration replaces this with a proper
-  `Option<AutogradMetaRef>` field on `Tensor`.
+- ~~`autograd_v2::_v2_set_grad_fn` / `_v2_clear_tensor_meta`~~ —
+  **REMOVED in Phase 3a.** The test-only thread-local side-table is
+  gone; `Tensor::autograd_meta` is now a real field (Phase 3a)
+  exposed via `Tensor::autograd_meta()` / `Tensor::set_autograd_meta()`.
 - New `AutogradV2Error` variants — `src/autograd_v2/error.rs`:
   `NoGradFnOnOutput { index }`,
   `OutputGradLenMismatch { outputs, grad_outputs }`,
   `ApplyArityMismatch { op, expected, got }`.
+
+### Autograd v2 (Phase 3a — recording surface + 5 math P0 ops)
+
+Phase 3a wires real forward-op recording on top of Phase 2's engine.
+- `Tensor::autograd_meta`: real field (cfg-gated on `autograd_v2`).
+- The `record_v2` surface every Phase 3+ op uses.
+- 5 P0 math ops: `add`, `mul`, `sum`, `matmul`, `silu`.
+- AccumulateGrad / InputBuffer threading `create_graph` via `DispatchCtx`.
+- Non-leaf grad collection in `Engine::with_inputs`.
+- Validation of `grad_outputs[i].shape() == outputs[i].shape()`.
+Tests: `tests/autograd_v2_ops.rs` (17 tests). Phase 2 engine tests
+(`tests/autograd_v2_engine.rs`) refactored to use `record_v2`-style
+linking; still 11 tests, all green.
+
+- `Tensor::autograd_meta` field — `src/tensor.rs:185` —
+  `Option<crate::autograd_v2::AutogradMetaRef>`, `cfg(feature =
+  "autograd_v2")`-gated so the default build pays zero.
+- `Tensor::autograd_meta()` accessor — `src/tensor.rs:236` — returns
+  `Option<&AutogradMetaRef>`.
+- `Tensor::set_autograd_meta(meta)` — `src/tensor.rs:246` — used by
+  `record_v2` to install a fresh meta on a recorded output.
+- `Tensor::detach_v2()` — `src/tensor.rs:261` — returns a fresh
+  `Tensor` with `autograd_meta = None`. PyTorch parity.
+- `autograd_v2::record_v2(grad_fn, outputs, ctx) -> Vec<Tensor>` —
+  `src/autograd_v2/recording.rs:113` — wires a freshly-built
+  `Arc<dyn GradFn>` to one or more output tensors by allocating an
+  `AutogradMetaRef` per output. The canonical op-recording entry.
+- `autograd_v2::gradient_edge_for_tensor(t) -> Edge` —
+  `src/autograd_v2/recording.rs:58` — `Tensor`-level wrapper around
+  `meta::gradient_edge`. Returns `Edge::null()` for no-meta /
+  no-requires_grad / no-grad_fn tensors.
+- `autograd_v2::next_sequence_nr() -> u64` —
+  `src/autograd_v2/recording.rs:42` — monotonic op-creation counter
+  used by every `*GradFn::new`.
+- `autograd_v2::needs_grad(inputs: &[&Tensor]) -> bool` —
+  `src/autograd_v2/recording.rs:87` — the gating predicate every
+  Phase 3+ op forward wrapper uses to skip recording on inference.
+
+Op modules (each in its own file under `src/autograd_v2/ops/`):
+
+- `autograd_v2::ops::add::AddGradFn` — `src/autograd_v2/ops/add.rs:24` —
+  backward: `(g, g)`. No saved tensors.
+- `autograd_v2::ops::add::add_v2(a, b, ctx)` —
+  `src/autograd_v2/ops/add.rs:91` — forward wrapper. Records iff any
+  input has `requires_grad=true` or a `grad_fn`.
+- `autograd_v2::ops::mul::MulGradFn` — `src/autograd_v2/ops/mul.rs:21`
+  — backward: `(g*b, g*a)`. Saves `a, b`.
+- `autograd_v2::ops::mul::mul_v2(a, b, ctx)` —
+  `src/autograd_v2/ops/mul.rs:97`.
+- `autograd_v2::ops::sum::SumGradFn` — `src/autograd_v2/ops/sum.rs:25`
+  — backward: `broadcast(g, input_shape)`. Saves input shape + dtype
+  only.
+- `autograd_v2::ops::sum::sum_v2(a, ctx)` —
+  `src/autograd_v2/ops/sum.rs:99`.
+- `autograd_v2::ops::matmul::MatMulGradFn` —
+  `src/autograd_v2/ops/matmul.rs:27` — backward: `(g @ b^T, a^T @ g)`
+  (2D). Saves `a, b`.
+- `autograd_v2::ops::matmul::matmul_v2(a, b, ctx)` —
+  `src/autograd_v2/ops/matmul.rs:105`.
+- `autograd_v2::ops::silu::SiLUGradFn` —
+  `src/autograd_v2/ops/silu.rs:31` — backward: `g * sigmoid(x) * (1 +
+  x * (1 - sigmoid(x)))`. Saves input.
+- `autograd_v2::ops::silu::silu_v2(x, ctx)` —
+  `src/autograd_v2/ops/silu.rs:111`.
+
+Plumbing changes (Phase 3a follow-ups to Phase 2 bug-fixer feedback):
+
+- `DispatchCtx::create_graph` field — `src/autograd_v2/dispatch.rs:84`
+  — threaded by `Engine::execute` from `GraphRoot::create_graph` so
+  per-node accumulation paths can pick recording vs in-place.
+- `DispatchCtx::with_create_graph(b)` builder —
+  `src/autograd_v2/dispatch.rs:104`.
+- `InputBuffer::add_outofplace` — `src/autograd_v2/input_buffer.rs:131`
+  — records the accumulation `+` as a v2 op when
+  `ctx.create_graph=true` (so higher-order grads differentiate through
+  the accumulation).
+- `AccumulateGrad::apply` — `src/autograd_v2/accumulator.rs:107` —
+  same `create_graph` threading; recording branch builds an
+  `AddGradFn` and routes through `record_v2` directly (the gradients
+  flowing through backward don't carry `requires_grad` themselves).
+- `AutogradV2Error::GradOutputShapeMismatch` —
+  `src/autograd_v2/error.rs:65` — `Engine::execute` validates
+  `grad_outputs[i].shape() == outputs[i].shape()` at entry, replacing
+  the Phase 2 silent broadcast.
+- Non-leaf grad capture in `Engine::execute` —
+  `src/autograd_v2/engine.rs` (search for `nonleaf_capture_keys`) —
+  per-call `(NodeId, output_nr) -> Tensor` map; populated at each
+  node's apply-time and read out at the end of execute for any
+  `with_inputs` entry whose grad_fn isn't an `AccumulateGrad`.
 
 ### Legacy / dead
 - ⚠️ `autograd.rs` (top-level) — types still re-exported

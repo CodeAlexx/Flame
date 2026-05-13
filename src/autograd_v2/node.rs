@@ -152,6 +152,15 @@ pub trait GradFn: Send + Sync + std::fmt::Debug {
 
     /// Hook bundle. Default returns the empty sentinel — the no-hook
     /// fast path is a `Hooks::empty_ref()` pointer comparison.
+    ///
+    /// **DO NOT** override this method unless your op actually carries
+    /// hooks. Overriding to return a non-sentinel `Hooks` reference
+    /// defeats the engine's pointer-compare fast-path (`std::ptr::eq`
+    /// in `engine::execute`) and forces the empty `for`-loops to run
+    /// for every backward step. Carry an `Option<Hooks>` slot on the
+    /// concrete op and only override when the slot is populated, if
+    /// you must support per-op hook registration without the fast-path
+    /// cost.
     fn hooks(&self) -> &Hooks {
         Hooks::empty_ref()
     }

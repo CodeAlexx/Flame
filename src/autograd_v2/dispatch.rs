@@ -64,24 +64,47 @@ impl DeviceStream {
 }
 
 /// Dispatch context passed to every `GradFn::apply` and every
-/// `InputBuffer::add`. Phase 1 carries only the active `DeviceStream`;
-/// future fields may include a workspace allocator handle, a graph
+/// `InputBuffer::add`. Phase 1 carried only the active `DeviceStream`;
+/// Phase 3a adds `create_graph` so per-node accumulation paths
+/// (`AccumulateGrad::apply`, `InputBuffer::add`) can pick recording vs
+/// in-place behavior off a single ctx-threaded flag. Engine populates
+/// `create_graph` from `GraphRoot::create_graph` at execute start.
+///
+/// Future fields may include a workspace allocator handle, a graph
 /// capture handle, or an NCCL communicator handle for DDP. Adding a
 /// field is non-breaking because the type is passed by `&` everywhere
 /// and is constructed at the engine boundary.
 #[derive(Clone, Debug)]
 pub struct DispatchCtx {
     pub stream: DeviceStream,
+    /// True iff backward should record its own ops onto the v2 tape
+    /// (i.e. higher-order gradients are wanted). When true,
+    /// `AccumulateGrad::apply` takes its recording out-of-place path
+    /// (so the new add itself becomes a v2-recorded op) instead of the
+    /// inference-fast in-place path; `InputBuffer::add` similarly.
+    ///
+    /// Phase 3a default: `false`. Phase 3a's `AccumulateGrad`
+    /// out-of-place branch routes through `ops::add::add_v2` so the
+    /// resulting compound graph is differentiable a second time.
+    pub create_graph: bool,
 }
 
 impl DispatchCtx {
     pub fn new(stream: DeviceStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            create_graph: false,
+        }
     }
 
     /// Convenience: build a ctx for `(device, default-stream)`.
     pub fn default_for(device: Device) -> Self {
         Self::new(DeviceStream::default_stream(device))
+    }
+
+    pub fn with_create_graph(mut self, b: bool) -> Self {
+        self.create_graph = b;
+        self
     }
 
     pub fn device(&self) -> &Device {

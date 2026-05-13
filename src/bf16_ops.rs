@@ -145,6 +145,8 @@ pub fn gelu_bf16(x: &Tensor) -> Result<Tensor> {
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
     ensure(&x.device, "gelu_bf16_kernel", CUDA_GELU)?;
@@ -182,6 +184,8 @@ pub fn square_bf16(x: &Tensor) -> Result<Tensor> {
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
     ensure(&x.device, "square_bf16_kernel", CUDA_SQUARE)?;
@@ -280,6 +284,8 @@ pub fn softmax_last_dim_bf16(x: &Tensor) -> Result<Tensor> {
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
     ensure(
@@ -334,6 +340,8 @@ pub fn silu_bf16(x: &Tensor) -> Result<Tensor> {
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
     ensure(&x.device, "silu_bf16_kernel", CUDA_SILU)?;
@@ -449,6 +457,8 @@ fn alloc_contig_bf16_like(t: &Tensor) -> Result<Tensor> {
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
     })
 }
 
@@ -847,6 +857,8 @@ pub fn rope_fused_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor>
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
 
@@ -970,6 +982,8 @@ pub fn rope_fused_bf16_f32pe(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<T
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
 
@@ -1093,6 +1107,8 @@ pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Ten
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
 
@@ -1533,6 +1549,8 @@ fn modulate_pre_fused_bf16_contig(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
 
@@ -1613,6 +1631,8 @@ fn modulate_pre_fused_bf16_strided(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
     };
 
     ensure(&device, "modulate_pre_strided_bf16_kernel", CUDA_MODULATE_PRE_STRIDED)?;
@@ -1732,6 +1752,8 @@ fn modulate_pre_split_apply_bf16_contig(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
     };
 
     ensure(
@@ -1818,6 +1840,8 @@ fn modulate_pre_split_apply_bf16_strided(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
     };
 
     ensure(
@@ -2032,6 +2056,8 @@ fn gate_residual_fused_bf16_contig(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
 
@@ -2106,6 +2132,8 @@ fn gate_residual_fused_bf16_strided(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
     };
 
     ensure(&device, "gate_residual_strided_bf16_kernel", CUDA_GATE_RESIDUAL_STRIDED)?;
@@ -2301,6 +2329,8 @@ fn swiglu_fused_bf16_contig(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
 
@@ -2374,6 +2404,8 @@ fn swiglu_fused_bf16_strided(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
     };
 
     ensure(&device, "swiglu_fused_strided_bf16_kernel", CUDA_SWIGLU_FUSED_STRIDED)?;
@@ -2524,6 +2556,8 @@ pub fn attn_split_txt_img_bf16(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
     let mut img = Tensor {
@@ -2534,6 +2568,8 @@ pub fn attn_split_txt_img_bf16(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
 
@@ -2741,6 +2777,8 @@ fn _qkv_rmsnorm_rope_cat_bf16_reserved(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
     let mut k = Tensor {
@@ -2751,6 +2789,8 @@ fn _qkv_rmsnorm_rope_cat_bf16_reserved(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
     let mut v = Tensor {
@@ -2761,6 +2801,8 @@ fn _qkv_rmsnorm_rope_cat_bf16_reserved(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
 
@@ -2992,6 +3034,8 @@ fn qkv_split_permute_bf16_contig(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
     let mut k = Tensor {
@@ -3002,6 +3046,8 @@ fn qkv_split_permute_bf16_contig(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
     let mut v = Tensor {
@@ -3012,6 +3058,8 @@ fn qkv_split_permute_bf16_contig(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
 
@@ -3060,6 +3108,8 @@ fn qkv_split_permute_bf16_strided(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
     };
     let mut k = Tensor {
         storage: TensorStorage::BF16 { data: k_data.into(), numel: out_numel },
@@ -3069,6 +3119,8 @@ fn qkv_split_permute_bf16_strided(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
     };
     let mut v = Tensor {
         storage: TensorStorage::BF16 { data: v_data.into(), numel: out_numel },
@@ -3078,6 +3130,8 @@ fn qkv_split_permute_bf16_strided(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
     };
 
     ensure(
@@ -3194,6 +3248,8 @@ pub fn stochastic_round_f32_to_bf16(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
     };
 
     ensure(&src.device, "bf16_stoch_round_kernel", CUDA_BF16_STOCH_ROUND)?;

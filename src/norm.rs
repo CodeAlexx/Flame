@@ -844,6 +844,8 @@ fn rms_norm_forward_bf16(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
 
@@ -948,6 +950,8 @@ pub(crate) fn rms_norm_backward(
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         };
         Some(grad_weight_f32_tensor.to_dtype(DType::BF16)?)
@@ -1105,6 +1109,8 @@ fn rms_norm_backward_bf16(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
 
@@ -1278,6 +1284,8 @@ pub fn rms_norm(
                 requires_grad: false,
                 custom_strides: None,
                 view_offset: 0,
+                #[cfg(feature = "autograd_v2")]
+                autograd_meta: None,
 
             };
             let inv_rms_id = inv_rms_tensor.id;

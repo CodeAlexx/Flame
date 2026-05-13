@@ -58,6 +58,20 @@ pub enum AutogradV2Error {
     #[error("autograd_v2: outputs.len()={outputs} != grad_outputs.len()={grad_outputs}")]
     OutputGradLenMismatch { outputs: usize, grad_outputs: usize },
 
+    /// `Engine::execute` got a user-supplied `grad_outputs[i]` whose
+    /// shape doesn't match `outputs[i]`. Phase 3a validates at entry —
+    /// the existing code path silently broadcast the size into the
+    /// downstream InputBuffer, masking the caller bug. Bug-fixer
+    /// audit flagged this; the validation lives at `Engine::execute`.
+    #[error(
+        "autograd_v2: grad_outputs[{index}] shape {grad_shape:?} != outputs[{index}] shape {out_shape:?}"
+    )]
+    GradOutputShapeMismatch {
+        index: usize,
+        out_shape: Vec<usize>,
+        grad_shape: Vec<usize>,
+    },
+
     /// A `GradFn::apply` returned a `Vec<Option<Tensor>>` whose length
     /// doesn't match its declared `num_inputs()`. Indicates a per-op
     /// implementation bug.

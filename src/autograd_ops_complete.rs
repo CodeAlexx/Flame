@@ -677,6 +677,8 @@ pub fn group_norm_backward(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
 
@@ -691,6 +693,8 @@ pub fn group_norm_backward(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     });
 
@@ -705,6 +709,8 @@ pub fn group_norm_backward(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     });
 

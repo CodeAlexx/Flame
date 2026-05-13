@@ -1651,3 +1651,87 @@ for reduction outputs). No exceptions.
 **Anti-pattern**: comparing flame-core against itself. The comparator is
 designed for `(got: flame_core, expected: pytorch_fixture)`. Never wire
 it to a flame-core-vs-flame-core regression test — that's a tautology.
+
+## Autograd v2 (Phase 3a) conventions
+
+These came up while writing the recording surface and the 5 P0 ops.
+They apply to every Phase 3+ op that lands afterwards.
+
+### Phase 3a op forward wrappers record only when at least one input is tracked
+
+Every Phase 3+ `*_v2` forward wrapper follows this skeleton:
+
+```rust
+pub fn add_v2(a: &Tensor, b: &Tensor, ctx: &DispatchCtx) -> Result<Tensor> {
+    let out = a.add(b)?;                           // use the existing flame-core forward
+    if needs_grad(&[a, b]) {                       // gating predicate from recording.rs
+        let grad_fn = AddGradFn::new(a, b);
+        let recorded = record_v2(grad_fn, vec![out], ctx);
+        Ok(recorded.into_iter().next().unwrap())
+    } else {
+        Ok(out)                                    // inference path: zero overhead
+    }
+}
+```
+
+Rule: **never call `record_v2` unconditionally.** Inference traffic
+(`requires_grad=false` everywhere) MUST pay zero v2 overhead. The
+`needs_grad` check is the gate; it's cheap (one mutex lock per input
+in the worst case, returning false early on the common no-meta
+tensors).
+
+### DO NOT override `GradFn::hooks()` unless your op carries hooks
+
+`GradFn::hooks()` has a default impl returning `Hooks::empty_ref()` —
+the engine's no-hook fast path is a `std::ptr::eq` comparison against
+this sentinel that skips the empty for-loops entirely. If your op
+overrides `hooks()` to return a non-sentinel reference (e.g. an empty
+`Hooks` struct embedded on the op), every backward step pays the
+empty-loop iteration overhead. Carry an `Option<Hooks>` slot on the
+op and only override `hooks()` when populated, if you must support
+per-op hook registration.
+
+### `Tensor::clone()` preserves `autograd_meta`; `detach_v2()` drops it
+
+Per PyTorch semantics. `clone()` (derive-generated) clones the
+`Option<Arc<Mutex<AutogradMetaV2>>>` field — both handles share
+metadata, gradients flow into the same slot. `detach_v2()` allocates
+a fresh handle with `autograd_meta = None`. Do not write code that
+expects `clone()` to drop history; use `detach_v2()` for that
+explicitly.
+
+### `Tensor::autograd_meta` field is `cfg(feature = "autograd_v2")`-gated
+
+The default flame-core build (no `autograd_v2` feature) does NOT have
+the field. Every internal Tensor constructor that uses the struct
+literal syntax cites the field under
+`#[cfg(feature = "autograd_v2")]`:
+
+```rust
+Tensor {
+    storage, shape, device, id, requires_grad,
+    custom_strides, view_offset,
+    #[cfg(feature = "autograd_v2")]
+    autograd_meta: None,
+}
+```
+
+96 such call sites exist across `tensor.rs` and 19 other files (BF16
+ops, conv2d, norm, etc.). A new Tensor constructor MUST add the
+cfg-gated field, otherwise the `autograd_v2` feature build breaks.
+The default build doesn't see the field at all and ignores the line.
+
+### Save tensors via `SavedTensor::save_named(t, "OpName:slot")`
+
+The named form attaches the op name + slot to the saved tensor so
+that the version-mismatch error message tells you which op failed
+and which input was mutated:
+
+```
+autograd_v2: saved tensor version mismatch in MatMulGradFn:b:
+expected v0, got v1
+```
+
+Use the literal `"OpName:slot"` form (e.g. `"MulGradFn:a"`,
+`"MatMulGradFn:b"`). Phase 3+ ops will pile up — readable error
+messages save real debugging time.

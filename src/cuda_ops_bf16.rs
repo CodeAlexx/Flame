@@ -1078,6 +1078,8 @@ pub fn gemm_bf16(x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> Result<Tensor
                         requires_grad: false,
                         custom_strides: None,
                         view_offset: 0,
+                        #[cfg(feature = "autograd_v2")]
+                        autograd_meta: None,
                     };
                     let x_3d = x.reshape(&[1, m, k])?;
                     let out_3d = crate::ops::fused_inference::fused_linear3d_native(

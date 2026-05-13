@@ -310,6 +310,8 @@ fn group_norm_forward_f32(
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     };
 
@@ -410,6 +412,8 @@ fn finalize_group_norm(
                 requires_grad: false,
                 custom_strides: None,
                 view_offset: 0,
+                #[cfg(feature = "autograd_v2")]
+                autograd_meta: None,
 
             };
             let var_tensor = Tensor {
@@ -423,6 +427,8 @@ fn finalize_group_norm(
                 requires_grad: false,
                 custom_strides: None,
                 view_offset: 0,
+                #[cfg(feature = "autograd_v2")]
+                autograd_meta: None,
 
             };
 

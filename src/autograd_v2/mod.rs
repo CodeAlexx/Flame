@@ -91,6 +91,8 @@ mod hooks;
 mod input_buffer;
 mod meta;
 mod node;
+pub mod ops;
+mod recording;
 mod saved_tensor;
 
 pub use accumulator::AccumulateGrad;
@@ -102,10 +104,5 @@ pub use hooks::{Hooks, PostBackwardHook, PreBackwardHook, TensorHook};
 pub use input_buffer::InputBuffer;
 pub use meta::{gradient_edge, new_meta_ref, AutogradMetaRef, AutogradMetaV2};
 pub use node::{Edge, GradFn, NodeId};
+pub use recording::{gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2};
 pub use saved_tensor::SavedTensor;
-
-/// Phase 2 test backdoor — register a (grad_fn, output_nr) association
-/// for a tensor. Test-only; Phase 3 op migration replaces this with a
-/// proper per-tensor `Option<AutogradMetaRef>` field.
-#[doc(hidden)]
-pub use engine::{_v2_clear_tensor_meta, _v2_set_grad_fn};

@@ -79,7 +79,8 @@ impl InputBuffer {
         grad: Tensor,
         ctx: &DispatchCtx,
     ) -> Result<(), AutogradV2Error> {
-        let _ = ctx; // Phase 1: ctx is surface-only.
+        // Phase 3a: ctx is now load-bearing — the out-of-place path
+        // routes through `add_v2` when `create_graph=true`.
 
         if slot >= self.buffer.len() {
             return Err(AutogradV2Error::InputSlotOutOfBounds {
@@ -108,7 +109,7 @@ impl InputBuffer {
         if !existing_shape_ok {
             // Shapes differ — out-of-place add is the only correct
             // behavior; the underlying op may broadcast.
-            return self.add_outofplace(slot, grad);
+            return self.add_outofplace(slot, grad, ctx);
         }
 
         // In-place is permitted iff create_graph=false AND
@@ -123,22 +124,32 @@ impl InputBuffer {
             return Ok(());
         }
 
-        self.add_outofplace(slot, grad)
+        self.add_outofplace(slot, grad, ctx)
     }
 
     fn add_outofplace(
         &mut self,
         slot: usize,
         grad: Tensor,
+        ctx: &DispatchCtx,
     ) -> Result<(), AutogradV2Error> {
         let existing = self.buffer[slot].take().unwrap();
-        // TODO(Phase 3): when create_graph=true, the `+` itself must be
-        // recorded under autograd_v2 so higher-order grads can
-        // differentiate through the accumulation. Phase 1 uses the
-        // existing operator unchanged; Phase 2's engine will not
-        // exercise this path with create_graph=true until Phase 3 ops
-        // are wired.
-        let summed = existing.add(&grad).map_err(AutogradV2Error::FlameCore)?;
+        // Phase 3a: when create_graph=true, record the `+` itself as
+        // a v2 op so higher-order grads can differentiate through the
+        // accumulation. We construct the AddGradFn unconditionally
+        // (the gradient tensors flowing through backward don't carry
+        // `requires_grad=true` metadata — they ARE gradients, not
+        // parameters; `create_graph` is the explicit signal that the
+        // user wants the accumulation recorded regardless).
+        let summed = if self.create_graph {
+            let summed = existing.add(&grad).map_err(AutogradV2Error::FlameCore)?;
+            let grad_fn = super::ops::add::AddGradFn::new(&existing, &grad);
+            let recorded = super::recording::record_v2(grad_fn, vec![summed], ctx);
+            recorded.into_iter().next().unwrap()
+        } else {
+            // Default (inference-fast) path: plain `+`, no recording.
+            existing.add(&grad).map_err(AutogradV2Error::FlameCore)?
+        };
         self.buffer[slot] = Some(summed);
         self.outofplace_count += 1;
         Ok(())

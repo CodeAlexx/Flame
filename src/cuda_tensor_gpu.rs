@@ -94,6 +94,8 @@ impl CudaTensor {
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         };
         let self_tensor = Tensor {
@@ -107,6 +109,8 @@ impl CudaTensor {
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         };
         let updated = kernels.update_weights(&self_tensor, &gradient_tensor, lr)?;
@@ -185,6 +189,8 @@ impl CudaTensor {
                 requires_grad: false,
                 custom_strides: None,
                 view_offset: 0,
+                #[cfg(feature = "autograd_v2")]
+                autograd_meta: None,
 
             };
             let other_tensor = Tensor {
@@ -198,6 +204,8 @@ impl CudaTensor {
                 requires_grad: false,
                 custom_strides: None,
                 view_offset: 0,
+                #[cfg(feature = "autograd_v2")]
+                autograd_meta: None,
 
             };
             let result = kernels.add(&self_tensor, &other_tensor)?;
@@ -237,6 +245,8 @@ impl CudaTensor {
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         };
         let other_tensor = Tensor {
@@ -250,6 +260,8 @@ impl CudaTensor {
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         };
         let result = kernels.mul(&self_tensor, &other_tensor)?;
@@ -277,6 +289,8 @@ impl CudaTensor {
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         };
         let result = kernels.mul_scalar(&self_tensor, scalar)?;
@@ -304,6 +318,8 @@ impl CudaTensor {
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         };
         let result = kernels.relu(&self_tensor)?;
@@ -357,6 +373,8 @@ impl CudaTensor {
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         };
         let sum_result = kernels.sum_kernel(&self_tensor)?;

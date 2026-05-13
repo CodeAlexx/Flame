@@ -94,15 +94,16 @@ impl GradFn for AccumulateGrad {
     /// - Shape mismatch → `Err(FlameCore(Error::ShapeMismatch))` via the
     ///   in-place op itself.
     ///
-    /// Phase 2 always takes the in-place path when dtypes/shapes match
-    /// because `create_graph=true` is not yet plumbed to per-node state
-    /// (it lives on `GraphRoot` and `InputBuffer`). When Phase 3 wires
-    /// recordable adds, AccumulateGrad will pick its path the same way
-    /// `InputBuffer::add` does today.
+    /// Phase 3a threads `create_graph` through `DispatchCtx`. When
+    /// `ctx.create_graph == true`, the accumulation path uses
+    /// `ops::add::add_v2` (which records itself onto the v2 tape) so
+    /// that higher-order grads can differentiate through the
+    /// accumulation. Default (`create_graph == false`) keeps the
+    /// inference-fast in-place path.
     fn apply(
         &self,
         grad_outputs: Vec<Option<Tensor>>,
-        _ctx: &DispatchCtx,
+        ctx: &DispatchCtx,
     ) -> Result<Vec<Option<Tensor>>, AutogradV2Error> {
         let g = match grad_outputs.into_iter().next().and_then(|opt| opt) {
             None => return Ok(Vec::new()),
@@ -133,20 +134,42 @@ impl GradFn for AccumulateGrad {
                         incoming: g.dtype(),
                     });
                 }
-                #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-                {
-                    let mut e = existing;
-                    crate::ops::elt::add_inplace_same_dtype(&mut e, &g)
-                        .map_err(AutogradV2Error::FlameCore)?;
-                    meta.grad = Some(e);
-                }
-                #[cfg(not(all(feature = "cuda", feature = "bf16_u16")))]
-                {
-                    let _ = existing;
-                    let _ = g;
-                    return Err(AutogradV2Error::NotImplementedYet(
-                        "AccumulateGrad::apply requires cuda+bf16_u16 features",
-                    ));
+                if ctx.create_graph {
+                    // Recording path: the add itself becomes a v2 op
+                    // so backward-of-backward differentiates through
+                    // the accumulation. Phase 3a builds the AddGradFn
+                    // directly here (rather than going through
+                    // `add_v2`'s `needs_grad` gate) because the
+                    // gradient tensors flowing through backward don't
+                    // carry `requires_grad=true` metadata — they ARE
+                    // the gradients, not parameters. The `create_graph`
+                    // flag is the explicit signal that the user wants
+                    // the accumulation recorded regardless.
+                    let summed = existing.add(&g).map_err(AutogradV2Error::FlameCore)?;
+                    let grad_fn = super::ops::add::AddGradFn::new(&existing, &g);
+                    let recorded = super::recording::record_v2(
+                        grad_fn,
+                        vec![summed],
+                        ctx,
+                    );
+                    let summed = recorded.into_iter().next().unwrap();
+                    meta.grad = Some(summed);
+                } else {
+                    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+                    {
+                        let mut e = existing;
+                        crate::ops::elt::add_inplace_same_dtype(&mut e, &g)
+                            .map_err(AutogradV2Error::FlameCore)?;
+                        meta.grad = Some(e);
+                    }
+                    #[cfg(not(all(feature = "cuda", feature = "bf16_u16")))]
+                    {
+                        let _ = existing;
+                        let _ = g;
+                        return Err(AutogradV2Error::NotImplementedYet(
+                            "AccumulateGrad::apply requires cuda+bf16_u16 features",
+                        ));
+                    }
                 }
             }
         }

@@ -163,6 +163,26 @@ pub struct Tensor {
     /// Element offset into the underlying storage. Non-zero only for
     /// narrow/chunk views. Default 0.
     pub(crate) view_offset: usize,
+
+    /// Autograd v2 metadata handle (Phase 3a). `Some` when the tensor is
+    /// being tracked through the v2 recording surface (Phase 3+ ops),
+    /// `None` for everything else.
+    ///
+    /// Field is `cfg`-gated to the `autograd_v2` feature so the default
+    /// build pays nothing — neither the discriminant byte nor the heap
+    /// pointer. Under the feature, a `None` adds one option discriminant
+    /// per Tensor and has no behavior impact on the non-v2 paths.
+    ///
+    /// Clone semantics: `#[derive(Clone)]` on `Tensor` clones this Arc
+    /// cheaply (single ref bump). Per the autograd_v2 mod-doc, this is
+    /// the PyTorch parity contract — the cloned handle shares metadata
+    /// with the original, gradients accumulate into the same slot,
+    /// `grad_fn` is the same node.
+    ///
+    /// Use `Tensor::detach_v2()` to obtain a fresh handle with `None`
+    /// metadata (drops history).
+    #[cfg(feature = "autograd_v2")]
+    pub(crate) autograd_meta: Option<crate::autograd_v2::AutogradMetaRef>,
 }
 
 impl AsRef<Tensor> for Tensor {
@@ -204,6 +224,51 @@ impl Tensor {
     /// mutation-through-saved-ref.
     pub fn storage_version(&self) -> u32 {
         self.storage.version()
+    }
+
+    /// Autograd v2 metadata accessor (Phase 3a). Returns the shared
+    /// `Arc<Mutex<AutogradMetaV2>>` handle, or `None` if this tensor is
+    /// not being tracked through the v2 surface.
+    ///
+    /// Gated on the `autograd_v2` feature so the default build doesn't
+    /// expose the type at all.
+    #[cfg(feature = "autograd_v2")]
+    pub fn autograd_meta(&self) -> Option<&crate::autograd_v2::AutogradMetaRef> {
+        self.autograd_meta.as_ref()
+    }
+
+    /// Autograd v2 metadata mutator (Phase 3a). Used by `record_v2` to
+    /// install a freshly-built meta after a recorded forward op.
+    /// `pub` for the same reason `autograd_meta` is — so external
+    /// callers (e.g. v2 op forward wrappers in this crate's
+    /// `autograd_v2::ops` submodule) can install / clear the slot.
+    #[cfg(feature = "autograd_v2")]
+    pub fn set_autograd_meta(&mut self, meta: Option<crate::autograd_v2::AutogradMetaRef>) {
+        self.autograd_meta = meta;
+    }
+
+    /// Return a fresh handle to this tensor's storage with
+    /// `autograd_meta = None`. PyTorch's `detach()` semantics — the
+    /// returned tensor shares the underlying storage / shape / dtype
+    /// but is disconnected from the autograd graph.
+    ///
+    /// Phase 3a: this is the v2-aware sibling of the existing
+    /// `narrow_owning`-style escape hatches. It allocates a fresh
+    /// `TensorId` so the returned tensor is identity-distinct from the
+    /// source (a separate graph node, even though the storage is
+    /// shared).
+    #[cfg(feature = "autograd_v2")]
+    pub fn detach_v2(&self) -> Tensor {
+        Tensor {
+            storage: self.storage.clone(),
+            shape: self.shape.clone(),
+            device: self.device.clone(),
+            id: TensorId::new(),
+            requires_grad: false,
+            custom_strides: self.custom_strides.clone(),
+            view_offset: self.view_offset,
+            autograd_meta: None,
+        }
     }
 
     // Mixed-precision policy (reminder):
@@ -322,6 +387,8 @@ extern "C" __global__ void masked_fill_kernel(
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         })
     }
@@ -366,6 +433,8 @@ extern "C" __global__ void masked_fill_kernel(
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         })
     }
@@ -396,6 +465,8 @@ extern "C" __global__ void masked_fill_kernel(
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         })
     }
@@ -435,6 +506,8 @@ extern "C" __global__ void masked_fill_kernel(
             requires_grad: self.requires_grad,
             custom_strides: self.custom_strides.clone(),
             view_offset: self.view_offset,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
         }
     }
 
@@ -470,6 +543,8 @@ extern "C" __global__ void masked_fill_kernel(
             requires_grad: false,
             custom_strides,
             view_offset,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
         }
     }
 
@@ -871,6 +946,8 @@ extern "C" __global__ void masked_fill_kernel(
                     requires_grad: false,
                     custom_strides: None,
                     view_offset: 0,
+                    #[cfg(feature = "autograd_v2")]
+                    autograd_meta: None,
                 });
             }
 
@@ -898,6 +975,8 @@ extern "C" __global__ void masked_fill_kernel(
                     requires_grad: false,
                     custom_strides: None,
                     view_offset: 0,
+                    #[cfg(feature = "autograd_v2")]
+                    autograd_meta: None,
                 });
             }
         }
@@ -978,6 +1057,8 @@ extern "C" __global__ void masked_fill_kernel(
             requires_grad: self.requires_grad,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         };
         if self.requires_grad && AutogradContext::is_recording() {
@@ -1088,6 +1169,8 @@ extern "C" __global__ void masked_fill_kernel(
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         })
     }
@@ -1176,6 +1259,8 @@ extern "C" __global__ void masked_fill_kernel(
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         })
     }
@@ -1204,6 +1289,8 @@ extern "C" __global__ void masked_fill_kernel(
             requires_grad,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         })
     }
@@ -1234,6 +1321,8 @@ extern "C" __global__ void masked_fill_kernel(
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         })
     }
@@ -1268,6 +1357,8 @@ extern "C" __global__ void masked_fill_kernel(
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         }
     }
@@ -1302,6 +1393,8 @@ extern "C" __global__ void masked_fill_kernel(
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         }
     }
@@ -1388,6 +1481,8 @@ extern "C" __global__ void masked_fill_kernel(
                 requires_grad: false,
                 custom_strides: None,
                 view_offset: 0,
+                #[cfg(feature = "autograd_v2")]
+                autograd_meta: None,
 
             })
         }
@@ -1408,6 +1503,8 @@ extern "C" __global__ void masked_fill_kernel(
                 requires_grad: false,
                 custom_strides: None,
                 view_offset: 0,
+                #[cfg(feature = "autograd_v2")]
+                autograd_meta: None,
 
             })
         }
@@ -1943,6 +2040,8 @@ extern "C" __global__ void slice_kernel(
             requires_grad: false,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         })
     }
@@ -2735,6 +2834,8 @@ extern "C" __global__ void f32_to_bool_kernel(
             requires_grad: base.requires_grad,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         };
         // Record autograd op so gradients flow through reshape
@@ -2875,6 +2976,8 @@ extern "C" __global__ void f32_to_bool_kernel(
             requires_grad: self.requires_grad,
             custom_strides: Some(new_strides),
             view_offset: self.view_offset,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
         };
 
         // AUTOGRAD: Record operation if needed
@@ -3110,6 +3213,8 @@ extern "C" __global__ void f32_to_bool_kernel(
             requires_grad: self.requires_grad,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
         };
         // Now apply the recorded permutation to materialize.
         //
@@ -3365,6 +3470,8 @@ extern "C" __global__ void f32_to_bool_kernel(
             requires_grad: self.requires_grad,
             custom_strides: None,
             view_offset: 0,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
 
         })
     }
@@ -3504,6 +3611,8 @@ extern "C" __global__ void f32_to_bool_kernel(
             requires_grad: false,
             custom_strides: Some(smallvec::SmallVec::from_slice(strides)),
             view_offset: offset,
+            #[cfg(feature = "autograd_v2")]
+            autograd_meta: None,
         })
     }
 
@@ -3553,6 +3662,8 @@ extern "C" __global__ void f32_to_bool_kernel(
                 requires_grad: self.requires_grad,
                 custom_strides: Some(new_strides),
                 view_offset: self.view_offset,
+                #[cfg(feature = "autograd_v2")]
+                autograd_meta: None,
             }
         };
 
@@ -3938,6 +4049,8 @@ extern "C" __global__ void f32_to_bool_kernel(
                 requires_grad: false,
                 custom_strides: Some(self_strides.clone()),
                 view_offset: new_offset,
+                #[cfg(feature = "autograd_v2")]
+                autograd_meta: None,
             };
             if self.requires_grad {
                 out.requires_grad = true;

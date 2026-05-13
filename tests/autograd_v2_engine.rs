@@ -32,9 +32,20 @@ use std::sync::{Arc, Mutex};
 use flame_core::autograd_v2::{
     gradient_edge, new_meta_ref, AutogradMetaRef, AutogradMetaV2,
     AutogradV2Error, DispatchCtx, Edge, Engine, GradFn, GraphRoot, Hooks, NodeId, SavedTensor,
-    _v2_clear_tensor_meta, _v2_set_grad_fn,
 };
 use flame_core::{global_cuda_device, Device, Shape, Tensor};
+
+/// Phase 3a test helper: link a `Tensor` to a `grad_fn` at `output_nr`
+/// by installing a fresh `AutogradMetaRef`. Replaces Phase 2's
+/// `_v2_set_grad_fn` test-only backdoor; the production op-recording
+/// path is `flame_core::autograd_v2::record_v2`, but the engine tests
+/// hand-roll synthetic `GradFn` impls that aren't shaped as
+/// `record_v2(grad_fn, vec![output], ctx)` (they build pre-linked
+/// graphs), so we install the meta directly here.
+fn link_tensor_to_grad_fn(t: &mut Tensor, gf: std::sync::Arc<dyn GradFn>, output_nr: u32) {
+    let meta = new_meta_ref(AutogradMetaV2::non_leaf(gf, output_nr));
+    t.set_autograd_meta(Some(meta));
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -318,8 +329,8 @@ impl GradFn for ReentrantGradFn {
         // `inner_leaf`. Drive it through a fresh Engine.
         let inner_edge = gradient_edge(&self.inner_leaf, next_seq());
         let inner_identity = IdentityGradFn::new(vec![inner_edge], 1, "InnerIdentity");
-        let inner_out = make_f32(vec![100.0, 200.0], &[2]);
-        _v2_set_grad_fn(&inner_out, inner_identity.clone() as Arc<dyn GradFn>, 0);
+        let mut inner_out = make_f32(vec![100.0, 200.0], &[2]);
+        link_tensor_to_grad_fn(&mut inner_out, inner_identity.clone() as Arc<dyn GradFn>, 0);
 
         let inner_root = GraphRoot::new(vec![inner_out]).with_grad_outputs(vec![Some(
             make_f32(vec![1.0, 1.0], &[2]),
@@ -423,8 +434,6 @@ impl GradFn for HookedGradFn {
 
 #[test]
 fn single_leaf_sum() {
-    _v2_clear_tensor_meta();
-
     // Leaf with requires_grad=true.
     let leaf_meta: AutogradMetaRef = new_meta_ref(AutogradMetaV2::leaf_requires_grad());
 
@@ -432,8 +441,8 @@ fn single_leaf_sum() {
     // a value; the graph topology lives in the side-table.
     let leaf_edge = gradient_edge(&leaf_meta, next_seq());
     let identity = IdentityGradFn::new(vec![leaf_edge], 1, "Identity");
-    let out = make_f32(vec![10.0, 20.0, 30.0, 40.0], &[2, 2]);
-    _v2_set_grad_fn(&out, identity.clone() as Arc<dyn GradFn>, 0);
+    let mut out = make_f32(vec![10.0, 20.0, 30.0, 40.0], &[2, 2]);
+    link_tensor_to_grad_fn(&mut out, identity.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
     let root = GraphRoot::new(vec![out])
@@ -452,8 +461,6 @@ fn single_leaf_sum() {
 
 #[test]
 fn two_branches_one_leaf() {
-    _v2_clear_tensor_meta();
-
     let leaf_meta: AutogradMetaRef = new_meta_ref(AutogradMetaV2::leaf_requires_grad());
 
     // Branch A and Branch B both feed into the same leaf accumulator.
@@ -470,10 +477,10 @@ fn two_branches_one_leaf() {
     let identity_a = IdentityGradFn::new(vec![edge_a], 1, "IdA");
     let identity_b = IdentityGradFn::new(vec![edge_b], 1, "IdB");
 
-    let out_a = make_f32(vec![1.0, 2.0], &[2]);
-    let out_b = make_f32(vec![3.0, 4.0], &[2]);
-    _v2_set_grad_fn(&out_a, identity_a.clone() as Arc<dyn GradFn>, 0);
-    _v2_set_grad_fn(&out_b, identity_b.clone() as Arc<dyn GradFn>, 0);
+    let mut out_a = make_f32(vec![1.0, 2.0], &[2]);
+    let mut out_b = make_f32(vec![3.0, 4.0], &[2]);
+    link_tensor_to_grad_fn(&mut out_a, identity_a.clone() as Arc<dyn GradFn>, 0);
+    link_tensor_to_grad_fn(&mut out_b, identity_b.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
     let root = GraphRoot::new(vec![out_a, out_b]).with_grad_outputs(vec![
@@ -499,8 +506,6 @@ fn two_branches_one_leaf() {
 
 #[test]
 fn diamond_accumulation() {
-    _v2_clear_tensor_meta();
-
     let leaf_meta: AutogradMetaRef = new_meta_ref(AutogradMetaV2::leaf_requires_grad());
 
     let leaf_edge_b = gradient_edge(&leaf_meta, next_seq());
@@ -522,8 +527,8 @@ fn diamond_accumulation() {
     // own num_inputs is 1 (one output of the diamond is summed up).
     let add = AddGradFn::new(vec![b_edge, c_edge], 2);
 
-    let out = make_f32(vec![1.0, 2.0], &[2]);
-    _v2_set_grad_fn(&out, add.clone() as Arc<dyn GradFn>, 0);
+    let mut out = make_f32(vec![1.0, 2.0], &[2]);
+    link_tensor_to_grad_fn(&mut out, add.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
     let root = GraphRoot::new(vec![out])
@@ -543,8 +548,6 @@ fn diamond_accumulation() {
 
 #[test]
 fn undefined_grad_slot() {
-    _v2_clear_tensor_meta();
-
     let leaf_meta: AutogradMetaRef = new_meta_ref(AutogradMetaV2::leaf_requires_grad());
     let leaf_edge = gradient_edge(&leaf_meta, next_seq());
 
@@ -553,8 +556,8 @@ fn undefined_grad_slot() {
     // with a Some grad, so meta.grad stays None.
     let none_op = NoneOutputGradFn::new(vec![leaf_edge], 1);
 
-    let out = make_f32(vec![0.0], &[1]);
-    _v2_set_grad_fn(&out, none_op.clone() as Arc<dyn GradFn>, 0);
+    let mut out = make_f32(vec![0.0], &[1]);
+    link_tensor_to_grad_fn(&mut out, none_op.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
     let root = GraphRoot::new(vec![out])
@@ -571,8 +574,6 @@ fn undefined_grad_slot() {
 
 #[test]
 fn released_saved_tensor_error() {
-    _v2_clear_tensor_meta();
-
     let leaf_meta: AutogradMetaRef = new_meta_ref(AutogradMetaV2::leaf_requires_grad());
     let leaf_edge = gradient_edge(&leaf_meta, next_seq());
 
@@ -582,8 +583,8 @@ fn released_saved_tensor_error() {
 
     let op = SavedTensorReadingGradFn::new(saved, vec![leaf_edge], 1);
 
-    let out = make_f32(vec![0.0, 0.0], &[2]);
-    _v2_set_grad_fn(&out, op.clone() as Arc<dyn GradFn>, 0);
+    let mut out = make_f32(vec![0.0, 0.0], &[2]);
+    link_tensor_to_grad_fn(&mut out, op.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
     let root = GraphRoot::new(vec![out])
@@ -605,8 +606,6 @@ fn released_saved_tensor_error() {
 
 #[test]
 fn version_mismatch_error() {
-    _v2_clear_tensor_meta();
-
     let leaf_meta: AutogradMetaRef = new_meta_ref(AutogradMetaV2::leaf_requires_grad());
     let leaf_edge = gradient_edge(&leaf_meta, next_seq());
 
@@ -616,8 +615,8 @@ fn version_mismatch_error() {
 
     let op = SavedTensorReadingGradFn::new(saved, vec![leaf_edge], 1);
 
-    let out = make_f32(vec![0.0, 0.0], &[2]);
-    _v2_set_grad_fn(&out, op.clone() as Arc<dyn GradFn>, 0);
+    let mut out = make_f32(vec![0.0, 0.0], &[2]);
+    link_tensor_to_grad_fn(&mut out, op.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
     let root = GraphRoot::new(vec![out])
@@ -647,14 +646,12 @@ fn version_mismatch_error() {
 
 #[test]
 fn create_graph_2nd_order_toy() {
-    _v2_clear_tensor_meta();
-
     let leaf_meta: AutogradMetaRef = new_meta_ref(AutogradMetaV2::leaf_requires_grad());
     let leaf_edge = gradient_edge(&leaf_meta, next_seq());
 
     let identity = IdentityGradFn::new(vec![leaf_edge], 1, "Identity2nd");
-    let out = make_f32(vec![1.0, 2.0], &[2]);
-    _v2_set_grad_fn(&out, identity.clone() as Arc<dyn GradFn>, 0);
+    let mut out = make_f32(vec![1.0, 2.0], &[2]);
+    link_tensor_to_grad_fn(&mut out, identity.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
     let root = GraphRoot::new(vec![out])
@@ -676,8 +673,6 @@ fn create_graph_2nd_order_toy() {
 
 #[test]
 fn reentrant_nested_execute() {
-    _v2_clear_tensor_meta();
-
     // Outer leaf and inner leaf are separate, so we can verify both
     // engines wrote to the correct meta.
     let outer_leaf: AutogradMetaRef = new_meta_ref(AutogradMetaV2::leaf_requires_grad());
@@ -695,8 +690,8 @@ fn reentrant_nested_execute() {
         inner_call_count.clone(),
     );
 
-    let out = make_f32(vec![1.0, 2.0], &[2]);
-    _v2_set_grad_fn(&out, reentrant.clone() as Arc<dyn GradFn>, 0);
+    let mut out = make_f32(vec![1.0, 2.0], &[2]);
+    link_tensor_to_grad_fn(&mut out, reentrant.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
     let root = GraphRoot::new(vec![out])
@@ -730,8 +725,6 @@ fn reentrant_nested_execute() {
 
 #[test]
 fn hooks_fire_in_order() {
-    _v2_clear_tensor_meta();
-
     let observed: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Pre-backward hook records "pre".
@@ -767,8 +760,8 @@ fn hooks_fire_in_order() {
 
     let hooked = HookedGradFn::new(vec![leaf_edge], hooks, 1);
 
-    let out = make_f32(vec![1.0, 2.0], &[2]);
-    _v2_set_grad_fn(&out, hooked.clone() as Arc<dyn GradFn>, 0);
+    let mut out = make_f32(vec![1.0, 2.0], &[2]);
+    link_tensor_to_grad_fn(&mut out, hooked.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
     let root = GraphRoot::new(vec![out])
@@ -789,8 +782,6 @@ fn hooks_fire_in_order() {
 
 #[test]
 fn engine_finishes_when_leaf_never_receives_grad() {
-    _v2_clear_tensor_meta();
-
     let leaf_meta: AutogradMetaRef = new_meta_ref(AutogradMetaV2::leaf_requires_grad());
 
     // Scope the strong Arcs holding the recording op + accumulator edge
@@ -805,8 +796,8 @@ fn engine_finishes_when_leaf_never_receives_grad() {
         // apply sees an empty buffer and does nothing.
         let none_op = NoneOutputGradFn::new(vec![leaf_edge], 1);
 
-        let out = make_f32(vec![0.0], &[1]);
-        _v2_set_grad_fn(&out, none_op.clone() as Arc<dyn GradFn>, 0);
+        let mut out = make_f32(vec![0.0], &[1]);
+        link_tensor_to_grad_fn(&mut out, none_op.clone() as Arc<dyn GradFn>, 0);
 
         let ctx = default_ctx();
         let root = GraphRoot::new(vec![out])
@@ -818,11 +809,11 @@ fn engine_finishes_when_leaf_never_receives_grad() {
         assert!(m.grad.is_none());
     }
 
-    // Drop the test-side-table entries (they held an Arc to the
-    // recording op, which transitively held the AccumulateGrad
-    // through its next_edges).
-    _v2_clear_tensor_meta();
-
+    // Phase 3a: the side-table is gone — `none_op`, `out`, and `root`
+    // were all dropped at end of the inner block (root was consumed by
+    // execute; the test-local `none_op` Arc went out of scope). The
+    // AccumulateGrad's only remaining handle is the Weak in
+    // `leaf_meta.grad_accumulator`, which fails to upgrade.
     let m = leaf_meta.lock().unwrap();
     assert!(
         m.grad_accumulator.upgrade().is_none(),
@@ -905,8 +896,6 @@ impl GradFn for CountingIdentityGradFn {
 
 #[test]
 fn output_node_is_descendant_of_another_output_no_double_fire() {
-    _v2_clear_tensor_meta();
-
     let leaf_meta: AutogradMetaRef = new_meta_ref(AutogradMetaV2::leaf_requires_grad());
     let leaf_edge = gradient_edge(&leaf_meta, next_seq());
 
@@ -919,10 +908,10 @@ fn output_node_is_descendant_of_another_output_no_double_fire() {
     let a_node = IdentityGradFn::new(vec![a_edge], 2, "A_above_B");
 
     // Both A and B are returned as outputs of the forward.
-    let out_a = make_f32(vec![1.0, 2.0], &[2]);
-    let out_b = make_f32(vec![10.0, 20.0], &[2]);
-    _v2_set_grad_fn(&out_a, a_node.clone() as Arc<dyn GradFn>, 0);
-    _v2_set_grad_fn(&out_b, b_node.clone() as Arc<dyn GradFn>, 0);
+    let mut out_a = make_f32(vec![1.0, 2.0], &[2]);
+    let mut out_b = make_f32(vec![10.0, 20.0], &[2]);
+    link_tensor_to_grad_fn(&mut out_a, a_node.clone() as Arc<dyn GradFn>, 0);
+    link_tensor_to_grad_fn(&mut out_b, b_node.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
     // grad seeds: A gets [3,5]; B gets [7,11]. Forward identities pass

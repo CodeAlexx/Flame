@@ -197,6 +197,8 @@ fn gemm_f32(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, Error> {
         requires_grad: false,
         custom_strides: None,
         view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
 
     })
 }
