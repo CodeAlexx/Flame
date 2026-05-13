@@ -82,21 +82,29 @@ fn tol_f32_tight() -> ParityTolerance {
     }
 }
 
-/// Relaxed F32 tolerance — arithmetic that compounds rounding (e.g.
-/// matmul, sum reductions through the GpuOps F32 path).
+/// "Loose" F32 tolerance — kept as a named bucket for ops that go
+/// through cuBLASLt / reduction kernels. Empirically (Phase 5a verifier)
+/// these ops still parity bit-near (max_ratio ≈ 1e-7), but we leave a
+/// `1e-5` ratio / `0.999999` cos ceiling to allow for future kernel
+/// algo-swaps without retest churn. If the band needs to widen again,
+/// that should be treated as a regression and audited.
 fn tol_f32_loose() -> ParityTolerance {
     ParityTolerance {
-        min_cos: 0.9999,
-        max_abs_ratio: 5e-3,
+        min_cos: 0.999999,
+        max_abs_ratio: 1e-5,
     }
 }
 
 /// BF16 tolerance — layer_norm specifically. BF16 stats kernels
-/// compound noise across the per-row reduction.
+/// compound noise across the per-row reduction; the LN backward gamma
+/// path tops out around 1.6e-2 max_ratio empirically (Phase 5a
+/// verifier on the 4×16 fixture). The LN JVP path is much tighter
+/// (≤5e-3) because the F32 internal compute path avoids BF16
+/// reduction noise.
 fn tol_bf16_ln() -> ParityTolerance {
     ParityTolerance {
         min_cos: 0.999,
-        max_abs_ratio: 5e-2,
+        max_abs_ratio: 2e-2,
     }
 }
 
