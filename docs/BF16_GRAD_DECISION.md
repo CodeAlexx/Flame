@@ -1,15 +1,17 @@
 # BF16 Gradient Storage Decision (autograd v2 Phase 0)
 
 **Date**: 2026-05-13 (Phase 0 decision); updated 2026-05-13 (Phase 4a
-partial); updated 2026-05-13 (Phase 4b).
+partial); updated 2026-05-13 (Phase 4b); updated 2026-05-13 (Phase 5b).
 **Scope**: flame-core autograd v2 cross-cutting policy for gradient dtype.
-**Status**: Phase 4b shipped — the `GradientMap` `MatchInsertedDtype`
-policy is wired alongside Phase 4a's `Parameter` / `Adam` / `grad_norm`
-infrastructure. The v2 grad-dtype surface inside flame-core is now
-complete. Trainer-side integration (flipping Z-Image to v2 grad-dtype
-end-to-end) is **not** done in Phase 4b — Z-Image's forward graph still
-relies on v3 ops, so `loss.backward()` is the v3 path. See "Deliverable
-C status" near the end of this file.
+**Status**: Phase 5b shipped — `AutogradContext::backward_v2(loss)` is
+the v2 grad-storage entry. It constructs a `GradientMap` under
+`MatchInsertedDtype`, seeds the loss at `loss.dtype()`, and casts each
+emitted v3-backward gradient to the loss dtype at accumulate time. This
+realizes BF16-grad-end-to-end **without requiring the forward graph to
+be authored in v2 ops** — the original gating concern from Phase 4b is
+resolved. EriDiffusion-v2 `train_zimage` ships an opt-in
+`--use-autograd-v2` flag (default OFF; new `autograd_v2` feature on
+`eridiffusion-cli`).
 
 ## Decision
 
@@ -193,16 +195,33 @@ shipped in Phase 4b is `flame_core::GradientMap::new_v2` /
 flame-core. Real-trainer integration (Phase 4b Deliverable C / Phase 5)
 is described below.
 
-## Phase 4b Deliverable C — trainer integration status
+## Phase 5b Deliverable C — `backward_v2()` bridge SHIPPED
 
 **Z-Image LoRA trainer (`EriDiffusion-v2/crates/eridiffusion-cli/src/bin/train_zimage.rs`)**
 
-The trainer uses `loss.backward()` (v3 path) at line 911. That entry
-point constructs a default-policy `GradientMap::with_index` and walks
-the v3 tape. The trainer then reads grads with `grads.get(param.id())`,
-multiplies by the clip scale, and feeds them to `param.set_grad(...)`.
+The trainer now ships `--use-autograd-v2` (default OFF). When ON, the
+`loss.backward()` call routes through `AutogradContext::backward_v2`,
+which builds a `MatchInsertedDtype` `GradientMap` and casts each
+v3-backward-emitted gradient to `loss.dtype()` at accumulate time. The
+v3 op-dispatch is unchanged; the bridge is a ~30-line surgery on
+`src/autograd.rs:1297` (split into `pub fn backward`,
+`pub fn backward_v2`, and `fn backward_impl(loss, policy)`).
 
-**Phase 4b did NOT flip the trainer to v2.** Two blockers:
+Default OFF preserves byte-equivalent v3 behavior. Existing
+`Parameter::set_grad` continues to upcast the v2-emitted BF16 grads to
+F32 (Parameter::new still uses CastToF32 policy), so the AdamW step
+side is unaffected — the bridge correctness is exercised but the
+BF16-end-to-end memory savings require additionally flipping LoRA
+params to `Parameter::new_v2`. Phase 5c will measure the perf impact.
+
+`FLAME_MT_SCALE`'s F32 fast path is skipped under `--use-autograd-v2`
+because v2 grads are BF16-stored; the per-param `mul_scalar` loop runs
+instead.
+
+## Phase 4b Deliverable C — earlier status (historical)
+
+The Phase 4b version of this section identified two blockers — both
+resolved by Phase 5b's bridge:
 
 1. Z-Image's model forward graph (in `eridiffusion-core`) is built on
    the v3 op set: `rms_norm`, `fused_linear3d_native`, `sdpa`, `rope`,

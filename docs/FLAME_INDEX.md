@@ -1359,6 +1359,36 @@ bench) remain open.
 - `tests/fixtures/<op>_jvp.safetensors` (13 files) — inputs +
   per-input tangents + reference `out_fw`.
 
+### Autograd v2 (Phase 5b — `backward_v2()` bridge for BF16 grads end-to-end)
+
+Phase 5b ships Deliverable C Route (ii) from `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md`
+§Phase 5 — a flag-switch on `AutogradContext::backward` that constructs
+a `GradientMap` under `GradStorePolicy::MatchInsertedDtype` and casts
+each emitted gradient to the loss tensor's dtype before accumulation.
+The v3 op-dispatch loop is unchanged; the only delta is the grad-map
+policy + the dtype-unification cast.
+
+- `AutogradContext::backward` — `src/autograd.rs:1297` — public v3 entry,
+  now a one-line wrapper around `backward_impl(loss, InternalFP32_PublicBF16)`.
+  Byte-equivalent to pre-Phase-5b behavior.
+- `AutogradContext::backward_v2` — `src/autograd.rs:1322` — public v2 entry
+  (gated on feature `autograd_v2`). Returns a `GradientMap` whose stored
+  gradients honor `loss.dtype()` end-to-end (BF16 preserved for BF16 loss,
+  per Option A of `docs/BF16_GRAD_DECISION.md`). Forward graph does NOT
+  need to be authored in v2 ops to use this entry.
+- `AutogradContext::backward_impl` (private) — `src/autograd.rs:1342` —
+  shared body, accepts a `GradStorePolicy`. Three sites differ from the
+  pre-Phase-5b body: (a) `GradientMap::with_index` vs `with_index_v2`,
+  (b) `set_ones` vs `set_ones_dtype(loss.id, loss.shape, loss.dtype())`,
+  (c) per-grad `to_dtype(loss.dtype())` cast at accumulate time under
+  `MatchInsertedDtype`.
+- `tests/autograd_v2_bridge.rs` — 3 tests: BF16-grads-emitted, F32
+  parity vs v3 (cos≥1-1e-6, max_abs_ratio≤1e-5), BF16 tolerance vs v3
+  (cos≥0.999, max_abs_ratio≤5e-3 per `BF16_GRAD_DECISION.md`).
+- EriDiffusion-v2 `train_zimage.rs` ships an opt-in `--use-autograd-v2`
+  flag plumbed through a new `autograd_v2` feature on `eridiffusion-cli`.
+  Default OFF — v3 path is byte-equivalent to pre-flag behavior.
+
 ### Legacy / dead
 - ⚠️ `autograd.rs` (top-level) — types still re-exported
 - ⚠️ `autograd_simple.rs` — early stub

@@ -12,6 +12,7 @@
 //! seamlessly with the Tensor API.
 pub mod policy;
 
+use crate::autograd::policy::GradStorePolicy;
 use crate::cuda::ffi;
 use crate::cuda_kernels_gpu::CudaKernels;
 use crate::cuda_ops::GpuOps;
@@ -1293,8 +1294,47 @@ impl AutogradContext {
         Ok(gradients)
     }
 
-    /// Compute gradients via backpropagation
+    /// Compute gradients via backpropagation (v3 default — F32 grad
+    /// storage policy). Public API; preserves all v3 behavior bit-equal
+    /// to pre-Phase-5b semantics.
     pub fn backward(loss: &Tensor) -> Result<GradientMap> {
+        Self::backward_impl(loss, GradStorePolicy::InternalFP32_PublicBF16)
+    }
+
+    /// Compute gradients via backpropagation, returning a v2-policy
+    /// [`GradientMap`] whose stored gradients honor the loss tensor's
+    /// dtype end-to-end (Option A of `docs/BF16_GRAD_DECISION.md`).
+    ///
+    /// Bridges the v3 op-dispatch backward into a v2-policy gradient
+    /// map. The v3 op kernels still compute their input gradients in
+    /// their native dtype (typically F32 today); the bridge unifies
+    /// dtypes by casting each emitted input-grad to the loss tensor's
+    /// dtype before accumulation. This is option (b) from the Phase 5b
+    /// design note — the grad-map-write-time cast — and is required
+    /// because the v2 `accumulate` contract errors on dtype mismatch.
+    ///
+    /// The forward graph does NOT need to be authored in v2 ops to use
+    /// this entry: it works as a drop-in replacement for `backward`
+    /// when callers want a v2-policy `GradientMap` (e.g. for
+    /// `Parameter::new_v2` + `AdamWV2`).
+    ///
+    /// See `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` §Phase 5 Deliverable C
+    /// Route (ii).
+    #[cfg(feature = "autograd_v2")]
+    pub fn backward_v2(loss: &Tensor) -> Result<GradientMap> {
+        Self::backward_impl(loss, GradStorePolicy::MatchInsertedDtype)
+    }
+
+    /// Shared backward body used by both [`AutogradContext::backward`]
+    /// (v3 / `InternalFP32_PublicBF16` policy) and the v2 bridge
+    /// [`AutogradContext::backward_v2`] (`MatchInsertedDtype` policy).
+    ///
+    /// When `policy == MatchInsertedDtype`, the loss seed and every
+    /// accumulated input gradient are cast to `loss.dtype()` before
+    /// being inserted into the grad map. This unifies the dtype across
+    /// the whole graph so `GradientMap::accumulate_v2`'s "no dtype
+    /// mismatch" contract is satisfied.
+    fn backward_impl(loss: &Tensor, policy: GradStorePolicy) -> Result<GradientMap> {
         // Cache profiling flag once (avoid syscall per-op)
         static PROFILE_CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let profile = *PROFILE_CACHED.get_or_init(|| {
@@ -1466,9 +1506,33 @@ impl AutogradContext {
                 (tape_entries, prev_enabled, compact_index, needed_grad_ids, use_cuda_graph, tape_len, graph_phase)
             }; // ← lock released here
 
-            // Initialize gradient storage with compact index for O(1) Vec-based access
-            let mut gradients = GradientMap::with_index(device.clone(), compact_index);
-            gradients.set_ones(loss.id, loss.shape.clone())?;
+            // Initialize gradient storage with compact index for O(1) Vec-based access.
+            // Phase 5b bridge: under MatchInsertedDtype policy construct a v2 grad map
+            // and seed the loss at its native dtype (BF16-preserving end-to-end).
+            let mut gradients = match policy {
+                GradStorePolicy::InternalFP32_PublicBF16 => {
+                    GradientMap::with_index(device.clone(), compact_index)
+                }
+                GradStorePolicy::MatchInsertedDtype => {
+                    GradientMap::with_index_v2(device.clone(), compact_index)
+                }
+            };
+            let grad_target_dtype = match policy {
+                GradStorePolicy::InternalFP32_PublicBF16 => DType::F32,
+                GradStorePolicy::MatchInsertedDtype => loss.dtype(),
+            };
+            match policy {
+                GradStorePolicy::InternalFP32_PublicBF16 => {
+                    gradients.set_ones(loss.id, loss.shape.clone())?;
+                }
+                GradStorePolicy::MatchInsertedDtype => {
+                    gradients.set_ones_dtype(
+                        loss.id,
+                        loss.shape.clone(),
+                        grad_target_dtype,
+                    )?;
+                }
+            }
 
             // ── CUDA Graph replay path ──────────────────────────────
             if use_cuda_graph && graph_phase == crate::cuda_graph::BackwardPhase::Replay {
@@ -1616,10 +1680,26 @@ impl AutogradContext {
                         // Accumulate gradients (skip frozen weight IDs to save memory).
                         // Checkpoint backward returns ALL internal gradients (including
                         // LoRA params) that aren't in needed_grad_ids — always accept those.
+                        //
+                        // Phase 5b bridge: under MatchInsertedDtype policy, cast every
+                        // emitted grad to grad_target_dtype (loss.dtype()) so the v2
+                        // accumulate contract (no dtype mismatch) is satisfied. v3 op
+                        // backwards typically emit F32 grads; the cast realizes the
+                        // BF16-grad-end-to-end story.
                         let is_checkpoint = matches!(&entry.op, Op::Checkpoint { .. } | Op::CheckpointOffload { .. });
                         let t_accum = std::time::Instant::now();
                         for (tensor_id, grad) in input_grads {
                             if is_checkpoint || needed_grad_ids.contains(&tensor_id) {
+                                let grad = match policy {
+                                    GradStorePolicy::InternalFP32_PublicBF16 => grad,
+                                    GradStorePolicy::MatchInsertedDtype => {
+                                        if grad.dtype() == grad_target_dtype {
+                                            grad
+                                        } else {
+                                            grad.to_dtype(grad_target_dtype)?
+                                        }
+                                    }
+                                };
                                 gradients.accumulate(tensor_id, grad)?;
                             }
                             // else: gradient for frozen weight — drop it

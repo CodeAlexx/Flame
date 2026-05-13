@@ -629,7 +629,7 @@ A newer experimental engine with explicit `Gradients` and `graph` types.
 Off by default. The SDPA backward in `autograd_v4/ops/sdpa.rs` is more
 correct than the v3 one in some edge cases.
 
-### `autograd_v2/` (feature `autograd_v2`, Phases 1 + 2 + 3a + 3b + 3c1 + 3c2 + 4a + 4b + 5a)
+### `autograd_v2/` (feature `autograd_v2`, Phases 1 + 2 + 3a + 3b + 3c1 + 3c2 + 4a + 4b + 5a + 5b)
 Clean-sheet PyTorch-style DAG autograd engine. Designed to replace v1/v3/v4
 once Phase 5 parity gates pass. Phase 1 ships the foundational types
 and traits; Phase 2 ships the engine driver, dependency counting, ready
@@ -667,6 +667,20 @@ is 13 ops; adding the missing ~20+ ops is Phase 5 work. See
 `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` for the phase roadmap and
 `docs/BF16_GRAD_DECISION.md` for the dtype policy (Deliverable C
 section explains the trainer-integration gap).
+
+Phase 5b (this milestone) ships Deliverable C Route (ii) — the
+`loss.backward_v2()` bridge. `AutogradContext::backward` is now a
+1-line wrapper around a private `backward_impl(loss, policy)`, and a
+new sibling `AutogradContext::backward_v2(loss)` calls
+`backward_impl(loss, MatchInsertedDtype)`. The bridge keeps the v3
+op-dispatch loop intact and adds a per-grad `to_dtype(loss.dtype())`
+cast at accumulation time so the v2 `accumulate` contract (no dtype
+mismatch) is satisfied. This realizes BF16-grad-end-to-end for any
+forward graph — the v2 op surface is **not** required. EriDiffusion-v2's
+`train_zimage` now ships an opt-in `--use-autograd-v2` flag (default
+OFF; new `autograd_v2` feature on `eridiffusion-cli`). Tests:
+`tests/autograd_v2_bridge.rs` (3 tests — BF16 emit, F32 parity,
+BF16 tolerance per `BF16_GRAD_DECISION.md`).
 
 Key Phase 1 design points:
 - **Weak accumulator cycle break (§1):** `AutogradMetaV2::grad_accumulator`
