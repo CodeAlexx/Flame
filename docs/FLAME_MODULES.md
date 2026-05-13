@@ -629,14 +629,18 @@ A newer experimental engine with explicit `Gradients` and `graph` types.
 Off by default. The SDPA backward in `autograd_v4/ops/sdpa.rs` is more
 correct than the v3 one in some edge cases.
 
-### `autograd_v2/` (feature `autograd_v2`, Phases 1 + 2 + 3a)
+### `autograd_v2/` (feature `autograd_v2`, Phases 1 + 2 + 3a + 3b + 3c1)
 Clean-sheet PyTorch-style DAG autograd engine. Designed to replace v1/v3/v4
 once Phase 5 parity gates pass. Phase 1 ships the foundational types
 and traits; Phase 2 ships the engine driver, dependency counting, ready
 queue, hook dispatch, real `AccumulateGrad::apply`, `gradient_edge()`,
-and the `CheckpointGradFn` skeleton. There is still no live behavior
-change in the rest of the crate — no forward op records through v2
-until Phase 3. See `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` for the
+and the `CheckpointGradFn` skeleton. Phase 3a wires the recording surface
+(`Tensor::autograd_meta`, `record_v2`) + 5 math P0 ops. Phase 3b adds
+6 view ops + HAZARD-2026-05-13-1 characterization. Phase 3c1 ships
+`layer_norm` + the full `CheckpointGradFn::apply` (no longer
+`NotImplementedYet`). Phase 3c2 (forward-mode AD across 11 ops) is
+deferred. Phase 4 (optimizer + trainer integration) does NOT depend on
+Phase 3c2. See `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` for the
 phase roadmap and `docs/BF16_GRAD_DECISION.md` for the dtype policy.
 
 Key Phase 1 design points:
@@ -678,10 +682,16 @@ Phase 2 additions:
   Returns `Result<Vec<Option<Tensor>>, AutogradV2Error>` — `Vec` is
   populated when `GraphRoot::with_inputs` is set (per-input grads in
   order via `AccumulateGrad` downcast), empty otherwise.
-- **`checkpoint.rs`** — `CheckpointGradFn` skeleton. Trait shape +
-  state save/restore boundaries wired; `apply()` is
-  `NotImplementedYet("CheckpointGradFn needs Phase 3 forward ops")` —
-  full implementation needs Phase 3 forward-op recording.
+- **`checkpoint.rs`** — `CheckpointGradFn` full implementation
+  (Phase 3c1, commit `2be9770`). `apply()` re-runs the saved forward
+  closure under v2 recording with detached input clones + fresh
+  `requires_grad=true` meta, drives a nested `Engine::execute(...)`
+  via the standard leaf-AccumulateGrad backward path, then harvests
+  per-leaf grads off each reattached leaf's `meta.grad`.
+  `checkpoint_v2(forward_fn, inputs, ctx)` is the user-facing entry —
+  detaches inputs before forward so inner ops skip recording (the
+  memory saving). Reentrant-nested-execute safe per the Phase 2
+  engine design.
 - **`accumulator.rs::AccumulateGrad::apply`** — real impl. Drops
   `None` grad silently, no-ops if the leaf meta is dropped, in-place
   accumulates same-dtype/same-shape into `meta.grad`, returns
@@ -763,13 +773,15 @@ Files: `accumulator.rs`, `checkpoint.rs`, `dispatch.rs`, `engine.rs`,
 `node.rs`, `recording.rs`, `saved_tensor.rs`, `ops/mod.rs`,
 `ops/add.rs`, `ops/mul.rs`, `ops/sum.rs`, `ops/matmul.rs`,
 `ops/silu.rs`, `ops/reshape.rs`, `ops/transpose.rs`, `ops/narrow.rs`,
-`ops/squeeze.rs`, `ops/unsqueeze.rs`, `ops/permute.rs`. Tests:
+`ops/squeeze.rs`, `ops/unsqueeze.rs`, `ops/permute.rs`,
+`ops/layer_norm.rs` (Phase 3c1). Tests:
 `tests/autograd_v2_types.rs` (13 tests, Phase 1) +
 `tests/autograd_v2_engine.rs` (12 tests, Phase 2 + Phase 3b
 `accumulate_grad_uses_empty_sentinel_when_no_hooks`) +
-`tests/autograd_v2_ops.rs` (28 tests = Phase 3a 18 + Phase 3b 10:
-6 view-op backwards + needs_grad-skip + reshape round-trip +
-HAZARD characterization). All green.
+`tests/autograd_v2_ops.rs` (33 tests = Phase 3a 18 + Phase 3b 10 +
+Phase 3c1 5 layer_norm) + `tests/autograd_v2_checkpoint.rs`
+(4 tests, Phase 3c1: same-grads / inference-skip / reentrant-nested
+/ multi-output). All green.
 
 ### ⚠️ `autograd_simple.rs / autograd_engine.rs / autograd_ops.rs / autograd_ops_complete.rs / autograd_debug.rs`
 Older autograd attempts. Dead code; kept for reference.

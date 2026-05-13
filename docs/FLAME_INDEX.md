@@ -1121,7 +1121,7 @@ across the 11 prior ops is deferred to Phase 3c2 — Phase 4 does not
 depend on forward-mode AD.
 
 - `autograd_v2::ops::layer_norm::LayerNormGradFn` —
-  `src/autograd_v2/ops/layer_norm.rs:48` — affine LN backward.
+  `src/autograd_v2/ops/layer_norm.rs:46` — affine LN backward.
   Saves `(x, weight?, bias?)` via `SavedTensor` + `(normalized_shape, eps)`.
   Forward delegates to `crate::cuda_ops_bf16::layer_norm_bf16`; backward to
   `crate::cuda_ops_bf16::layer_norm_backward_bf16` (kernel recomputes
@@ -1129,7 +1129,7 @@ depend on forward-mode AD.
   `next_edges` are sized 1 + has_weight + has_bias; `apply()` returns the
   matching `Vec<Option<Tensor>>` per input slot.
 - `autograd_v2::ops::layer_norm::layer_norm_v2(x, normalized_shape, weight, bias, eps, ctx)` —
-  `src/autograd_v2/ops/layer_norm.rs:241`. Wraps `cuda_ops_bf16::layer_norm_bf16`
+  `src/autograd_v2/ops/layer_norm.rs:249`. Wraps `cuda_ops_bf16::layer_norm_bf16`
   + conditional `record_v2` install.
 - `autograd_v2::CheckpointGradFn` — `src/autograd_v2/checkpoint.rs:79` —
   backward node for activation checkpointing. Carries
@@ -1142,7 +1142,7 @@ depend on forward-mode AD.
 - `autograd_v2::CheckpointForwardFn` — `src/autograd_v2/checkpoint.rs:63`
   — type alias: `dyn Fn(&[Tensor], &DispatchCtx) -> Result<Vec<Tensor>> + Send + Sync`.
 - `autograd_v2::checkpoint_v2(forward_fn, inputs, ctx)` —
-  `src/autograd_v2/checkpoint.rs:227` — user-facing entry. Runs
+  `src/autograd_v2/checkpoint.rs:281` — user-facing entry. Runs
   `forward_fn` with detached input clones (so inner ops see
   `needs_grad=false` and skip recording — that is the memory saving),
   builds a `CheckpointGradFn` with saved inputs + per-input
@@ -1162,6 +1162,7 @@ Tests (4 layer_norm + 4 checkpoint = 8 new):
   - `layer_norm_v2_no_grad_skips_recording`
   - `layer_norm_v2_weight_only`
   - `layer_norm_v2_analytical_dweight_dbias` — closed-form d_w/d_b parity
+  - `layer_norm_v2_dx_symmetry_uniform_grad` — bug-fixer-added (`2d9cd0d`): symmetry-based d_x correctness via "uniform grad + zero-mean residual → d_x = 0"
 - `tests/autograd_v2_checkpoint.rs` (new file):
   - `checkpoint_v2_same_grads_as_no_checkpoint` — bit-equal vs reference
   - `checkpoint_v2_skips_when_no_input_requires_grad` — inference path
