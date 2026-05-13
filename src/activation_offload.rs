@@ -977,3 +977,401 @@ mod tests {
         Ok(())
     }
 }
+
+// ===========================================================================
+// GrowOnDemandActivationCache — Phase 1 of OFFLOAD_NEXT_GEN_DESIGN
+// ===========================================================================
+//
+// Replaces the fixed-slot model above with a grow-on-demand slab list. Each
+// push allocates within the current slab; when the slab is full a new one
+// is appended. Pull reads back from the slab+offset stored in the handle.
+// `reset()` returns the cursor to the start of slab 0 and bumps the epoch
+// so stale handles fail loudly.
+//
+// Borrows the StaticActivationAllocator pattern from OneTrainer's
+// `LayerOffloadConductor.py:224-321`; improves with: (a) Rust handle epoch
+// invalidation, (b) per-handle pull event for HtoD ordering, (c) no
+// trainer-side reserve_cache call required (push handles growth itself).
+//
+// Why it exists: ActivationOffloadPool's fixed slot count × fixed max_bytes
+// cannot fit Klein 9B's per-block sub-tape (saved tensors up to 112 MB,
+// ~80 saves per block × 32 blocks = 2560 pushes/step). With grow-on-demand
+// the cache sizes itself to actual usage.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Default slab size — 256 MB. Each slab is one allocation; growth appends.
+const DEFAULT_SLAB_BYTES: usize = 256 * 1024 * 1024;
+
+/// Monotonic handle id allocator.
+static NEXT_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Handle returned by `push`. Carries the entry id and the cache epoch at
+/// push time so stale handles after `reset()` fail loudly.
+#[derive(Debug, Clone, Copy)]
+pub struct GrowHandle {
+    id: u64,
+    epoch: u64,
+}
+
+impl GrowHandle {
+    #[inline]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+/// Per-entry metadata kept by the cache between push and pull.
+struct GrowEntry {
+    slab_idx: usize,
+    offset: usize,
+    bytes: usize,
+    dtype: DType,
+    shape: Shape,
+    pull_event: CudaEvent,
+    // Keep the source tensor alive until pull drains, so the GPU allocator
+    // can't reuse its memory while the async DtoH is still in flight.
+    keep_alive: Option<Tensor>,
+}
+
+/// Grow-on-demand pinned-RAM cache for activations.
+///
+/// **Phase 1 surface — no FP8 path yet.** Adding FP8 follows the
+/// `ActivationOffloadPool` pattern; deferred to keep this PR scoped.
+pub struct GrowOnDemandActivationCache {
+    device: Arc<CudaDevice>,
+    slabs: Vec<PinnedHostBuffer<u8>>,
+    /// Bytes used in `slabs[cursor_slab]`. The next push lands at this offset.
+    cursor_offset: usize,
+    cursor_slab: usize,
+    /// Slab growth granularity. New slabs allocated at this size.
+    slab_bytes: usize,
+    /// Dedicated CUDA stream for DtoH and HtoD copies.
+    transfer: TransferStream,
+    /// Per-entry storage. Cleared on `reset()`.
+    entries: HashMap<u64, GrowEntry>,
+    /// Bumped on `reset()` to invalidate stale handles.
+    epoch: u64,
+}
+
+impl GrowOnDemandActivationCache {
+    /// Construct an empty cache. No host RAM allocated until first `push`.
+    ///
+    /// `slab_bytes` controls growth granularity. 0 means use the default
+    /// (256 MB). Pick a value ≥ the largest single tensor you expect to push.
+    pub fn new(device: Arc<CudaDevice>, slab_bytes: usize) -> Result<Self> {
+        let slab_bytes = if slab_bytes == 0 {
+            DEFAULT_SLAB_BYTES
+        } else {
+            slab_bytes
+        };
+        Ok(Self {
+            device,
+            slabs: Vec::new(),
+            cursor_offset: 0,
+            cursor_slab: 0,
+            slab_bytes,
+            transfer: TransferStream::new()?,
+            entries: HashMap::new(),
+            epoch: 0,
+        })
+    }
+
+    /// Total pinned-RAM bytes currently allocated across all slabs.
+    pub fn host_bytes(&self) -> usize {
+        self.slabs.iter().map(|s| s.capacity_bytes()).sum()
+    }
+
+    /// Number of slabs allocated so far. Useful for telemetry.
+    pub fn num_slabs(&self) -> usize {
+        self.slabs.len()
+    }
+
+    /// Number of in-flight entries (pushed but not yet pulled).
+    pub fn in_flight(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Reset cursors to slab 0 and bump epoch. Any outstanding handles
+    /// become invalid (pull will return an error). Call between
+    /// forward+backward passes.
+    pub fn reset(&mut self) {
+        self.entries.clear();
+        self.cursor_slab = 0;
+        self.cursor_offset = 0;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Hint: pre-allocate enough slabs to hold `total_bytes`. Saves growth
+    /// allocations during the first forward pass. Idempotent and safe to
+    /// call multiple times — only allocates what's missing.
+    pub fn reserve(&mut self, total_bytes: usize) -> Result<()> {
+        while self.host_bytes() < total_bytes {
+            self.grow_one_slab()?;
+        }
+        Ok(())
+    }
+
+    fn grow_one_slab(&mut self) -> Result<()> {
+        let buf = PinnedHostBuffer::<u8>::with_capacity_elems(
+            self.slab_bytes,
+            PinnedAllocFlags::DEFAULT,
+        )?;
+        self.slabs.push(buf);
+        Ok(())
+    }
+
+    /// Push a tensor to pinned RAM. Returns a handle for later pull.
+    ///
+    /// Grows the cache by appending a slab if the current slab can't fit
+    /// the tensor. If `tensor.bytes()` exceeds `slab_bytes`, returns an
+    /// error (we don't dynamically grow individual slabs).
+    pub fn push(&mut self, tensor: &Tensor) -> Result<GrowHandle> {
+        let dtype = tensor.dtype();
+        match dtype {
+            DType::BF16 | DType::F32 => {}
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "GrowOnDemandActivationCache::push: dtype {:?} not supported (BF16/F32 only)",
+                    other
+                )));
+            }
+        }
+        let numel = tensor.shape().elem_count();
+        let bytes = numel * dtype.size_in_bytes();
+        if bytes == 0 {
+            return Err(Error::InvalidInput(
+                "GrowOnDemandActivationCache::push: empty tensor".into(),
+            ));
+        }
+        if bytes > self.slab_bytes {
+            return Err(Error::InvalidInput(format!(
+                "GrowOnDemandActivationCache::push: tensor {} bytes exceeds slab size {} bytes \
+                 (construct with larger slab_bytes)",
+                bytes, self.slab_bytes
+            )));
+        }
+
+        // Ensure room. Grow until we have a slab with `bytes` free.
+        loop {
+            if self.slabs.is_empty() {
+                self.grow_one_slab()?;
+            }
+            let slab_cap = self.slabs[self.cursor_slab].capacity_bytes();
+            if self.cursor_offset + bytes <= slab_cap {
+                break;
+            }
+            // Move to next slab; grow if there isn't one.
+            self.cursor_slab += 1;
+            self.cursor_offset = 0;
+            if self.cursor_slab >= self.slabs.len() {
+                self.grow_one_slab()?;
+            }
+        }
+
+        let slab_idx = self.cursor_slab;
+        let offset = self.cursor_offset;
+        self.cursor_offset += bytes;
+
+        // Source device pointer.
+        let src_ptr = src_device_ptr(tensor.storage_ref())?;
+        // Destination host pointer.
+        let dst_ptr = unsafe {
+            self.slabs[slab_idx]
+                .as_ptr()
+                .add(offset) as *mut c_void
+        };
+
+        // Gate the transfer stream on the producer kernel's progress.
+        let push_event = CudaEvent::new()?;
+        push_event.record_default()?;
+        self.transfer.wait_event(&push_event)?;
+
+        // Enqueue DtoH.
+        let ret = unsafe {
+            flame_cuda_memcpy_async(
+                dst_ptr,
+                src_ptr as *const c_void,
+                bytes,
+                CUDA_MEMCPY_D2H,
+                self.transfer.as_raw(),
+            )
+        };
+        if ret != 0 {
+            return Err(Error::Cuda(format!(
+                "GrowOnDemandActivationCache push: DtoH failed ({ret})"
+            )));
+        }
+
+        // Per-entry pull event — recorded later on the transfer stream after
+        // the HtoD completes. We allocate it here so pull doesn't need to.
+        let pull_event = CudaEvent::new()?;
+
+        let id = NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
+        let entry = GrowEntry {
+            slab_idx,
+            offset,
+            bytes,
+            dtype,
+            shape: tensor.shape().clone(),
+            pull_event,
+            keep_alive: Some(tensor.clone()),
+        };
+        self.entries.insert(id, entry);
+
+        Ok(GrowHandle {
+            id,
+            epoch: self.epoch,
+        })
+    }
+
+    /// Pull a previously pushed tensor back to device. The returned tensor
+    /// is on the default stream; any consumer touching it will implicitly
+    /// wait on the HtoD via the recorded `pull_event`.
+    pub fn pull(&mut self, handle: GrowHandle) -> Result<Tensor> {
+        if handle.epoch != self.epoch {
+            return Err(Error::InvalidOperation(format!(
+                "GrowOnDemandActivationCache::pull: stale handle (epoch {} ≠ current {})",
+                handle.epoch, self.epoch
+            )));
+        }
+        let entry = self.entries.remove(&handle.id).ok_or_else(|| {
+            Error::InvalidOperation(format!(
+                "GrowOnDemandActivationCache::pull: handle {} not found (already pulled?)",
+                handle.id
+            ))
+        })?;
+
+        // Allocate a fresh device tensor.
+        let mut dst = Tensor::empty_dtype(
+            entry.shape.clone(),
+            entry.dtype,
+            self.device.clone(),
+        )?;
+
+        let src_ptr = unsafe {
+            self.slabs[entry.slab_idx]
+                .as_ptr()
+                .add(entry.offset) as *const c_void
+        };
+        let dst_ptr = dst_device_ptr(dst.storage_mut())? as *mut c_void;
+
+        // Enqueue HtoD on the same transfer stream — same-stream FIFO
+        // ordering naturally sequences this after the push's DtoH.
+        let ret = unsafe {
+            flame_cuda_memcpy_async(
+                dst_ptr,
+                src_ptr,
+                entry.bytes,
+                CUDA_MEMCPY_H2D,
+                self.transfer.as_raw(),
+            )
+        };
+        if ret != 0 {
+            return Err(Error::Cuda(format!(
+                "GrowOnDemandActivationCache pull: HtoD failed ({ret})"
+            )));
+        }
+
+        // Record the pull event on the transfer stream, then make the
+        // default stream wait on it so any subsequent default-stream op
+        // that touches `dst` is correctly ordered after the HtoD.
+        entry.pull_event.record_on(&self.transfer)?;
+        default_stream_wait_event(&entry.pull_event)?;
+
+        // keep_alive drops here — the GPU source memory can be reused now.
+        drop(entry.keep_alive);
+
+        Ok(dst)
+    }
+}
+
+#[cfg(test)]
+mod grow_on_demand_tests {
+    use super::*;
+    use crate::device::Device;
+
+    #[test]
+    fn grow_on_demand_push_pull_roundtrip() -> Result<()> {
+        let dev = match Device::cuda(0) {
+            Ok(d) => d,
+            Err(_) => return Ok(()),
+        };
+        let device = dev.cuda_device().clone();
+        // 1 MB slab so growth fires on the second push.
+        let mut cache = GrowOnDemandActivationCache::new(device.clone(), 1024 * 1024)?;
+
+        let a_data: Vec<f32> = (0..1024).map(|i| i as f32).collect();
+        let a = Tensor::from_vec_dtype(
+            a_data.clone(),
+            Shape::from_dims(&[1024]),
+            device.clone(),
+            DType::F32,
+        )?;
+        let h = cache.push(&a)?;
+        assert_eq!(cache.in_flight(), 1);
+        assert!(cache.num_slabs() >= 1);
+
+        let b = cache.pull(h)?;
+        assert_eq!(cache.in_flight(), 0);
+        let b_data: Vec<f32> = b.to_vec()?;
+        assert_eq!(a_data, b_data, "roundtrip must preserve values");
+        Ok(())
+    }
+
+    #[test]
+    fn grow_on_demand_grows_on_overflow() -> Result<()> {
+        let dev = match Device::cuda(0) {
+            Ok(d) => d,
+            Err(_) => return Ok(()),
+        };
+        let device = dev.cuda_device().clone();
+        // Slab sized for exactly 1 tensor at a time. Second push grows.
+        let slab = 4 * 1024;
+        let mut cache = GrowOnDemandActivationCache::new(device.clone(), slab)?;
+
+        let mk = |seed: f32| -> Result<Tensor> {
+            Tensor::from_vec_dtype(
+                vec![seed; 1024],
+                Shape::from_dims(&[1024]),
+                device.clone(),
+                DType::F32,
+            )
+        };
+        let h1 = cache.push(&mk(1.0)?)?;
+        let h2 = cache.push(&mk(2.0)?)?;
+        assert!(
+            cache.num_slabs() >= 2,
+            "expected growth; got {} slabs",
+            cache.num_slabs()
+        );
+
+        let t1: Vec<f32> = cache.pull(h1)?.to_vec()?;
+        let t2: Vec<f32> = cache.pull(h2)?.to_vec()?;
+        assert!(t1.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        assert!(t2.iter().all(|&v| (v - 2.0).abs() < 1e-6));
+        Ok(())
+    }
+
+    #[test]
+    fn grow_on_demand_reset_invalidates_handles() -> Result<()> {
+        let dev = match Device::cuda(0) {
+            Ok(d) => d,
+            Err(_) => return Ok(()),
+        };
+        let device = dev.cuda_device().clone();
+        let mut cache = GrowOnDemandActivationCache::new(device.clone(), 1024 * 1024)?;
+        let a = Tensor::from_vec_dtype(
+            vec![1.0f32; 16],
+            Shape::from_dims(&[16]),
+            device.clone(),
+            DType::F32,
+        )?;
+        let h = cache.push(&a)?;
+        cache.reset();
+        let err = cache.pull(h);
+        assert!(err.is_err(), "pull after reset must fail");
+        Ok(())
+    }
+}
