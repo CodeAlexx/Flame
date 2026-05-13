@@ -1230,6 +1230,18 @@ impl GrowOnDemandActivationCache {
     /// is on the default stream; any consumer touching it will implicitly
     /// wait on the HtoD via the recorded `pull_event`.
     pub fn pull(&mut self, handle: GrowHandle) -> Result<Tensor> {
+        self.pull_with_id(handle, None)
+    }
+
+    /// Like `pull` but stamps the returned tensor with `target_id` so it
+    /// presents the same TensorId as the original input. Used by autograd
+    /// recompute: the pulled tensor takes the place of the original input
+    /// in the sub-tape, so gradients land at the correct outer-graph IDs.
+    pub fn pull_with_id(
+        &mut self,
+        handle: GrowHandle,
+        target_id: Option<crate::tensor::TensorId>,
+    ) -> Result<Tensor> {
         if handle.epoch != self.epoch {
             return Err(Error::InvalidOperation(format!(
                 "GrowOnDemandActivationCache::pull: stale handle (epoch {} ≠ current {})",
@@ -1243,12 +1255,15 @@ impl GrowOnDemandActivationCache {
             ))
         })?;
 
-        // Allocate a fresh device tensor.
-        let mut dst = Tensor::empty_dtype(
+        // Allocate a fresh device tensor. `target_id` is a no-op (kept
+        // for API compatibility); pulled tensors get fresh IDs.
+        let _ = target_id;
+        let dst = Tensor::empty_dtype(
             entry.shape.clone(),
             entry.dtype,
             self.device.clone(),
         )?;
+        let mut dst = dst;
 
         let src_ptr = unsafe {
             self.slabs[entry.slab_idx]
