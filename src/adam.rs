@@ -630,8 +630,9 @@ mod fused {
 
         let grad_is_bf16 = grad.dtype() == DType::BF16;
         // Stochastic-rounding BF16 store is supported only for the F32-grad
-        // path (the BF16-grad kernel pipeline is currently unreachable via
-        // the public Parameter API which casts grads to F32). When stoch is
+        // path. The BF16-grad kernel pipeline became reachable in Phase 4a
+        // (commit 85d0542) via `Parameter::new_v2` with the `MatchParamDtype`
+        // policy — v1 `Parameter::new` still casts grads to F32. When stoch is
         // requested with a BF16 grad we silently fall back to round-to-nearest;
         // it is a no-op in practice.
         let stoch_active = stoch_seed.is_some() && !grad_is_bf16;
@@ -1330,14 +1331,14 @@ impl Adam {
 
                 // Fused path: F32 param with F32 state.
                 //
-                // Dispatch below routes BF16 grads to `adam_fused_f32param_bf16grad_kernel`,
-                // but that path is currently UNREACHABLE via the public API:
-                // `Parameter::set_grad` at `src/parameter.rs:90-94` unconditionally
-                // casts incoming grads to F32, so any F32 param here always sees an
-                // F32 grad. The BF16-grad kernel is validated in-crate by
-                // `adam::f32param_bf16grad_kernel_test` and kept as dead-ready code
-                // against a future change to `Parameter::set_grad` that preserves
-                // BF16 grads end-to-end (part of any genuine BF16 training pipeline).
+                // Dispatch below routes BF16 grads to `adam_fused_f32param_bf16grad_kernel`.
+                // This path became reachable in Phase 4a (commit 85d0542) via
+                // `Parameter::new_v2`, which uses the `MatchParamDtype` policy and
+                // preserves BF16 grad dtype on `set_grad`. v1 `Parameter::new` (and
+                // `set_grad` under `CastToF32`) still casts grads to F32, so v3
+                // trainers continue to take the F32-grad arm. The BF16-grad kernel
+                // is also exercised by `tests/autograd_v2_phase4a.rs::adam_step_f32_
+                // param_bf16_grad_no_panic`.
                 //
                 // Hardcoded `state_dtype = F32` below: the fused F32-param kernel
                 // requires F32 m/v. `config::select_optimizer_state_dtype` only ever
