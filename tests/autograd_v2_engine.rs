@@ -829,3 +829,123 @@ fn engine_finishes_when_leaf_never_receives_grad() {
         "accumulator should drop after all strong Arcs are released"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression: output_node_is_descendant_of_another_output_no_double_fire
+// ---------------------------------------------------------------------------
+//
+// BUG-FIX 2026-05-13 (bug-fixer audit on ee69d4a): when `outputs =
+// [A, B]` and A's next_edges include B, the original seed logic pushed
+// B into the ready queue unconditionally (dep_count was 1 from BFS but
+// the seed loop ignored dep_count). When A ran and decremented B's
+// dep_count 1→0, B was enqueued a SECOND time. The second pop saw an
+// empty buffer (already drained) and fired `apply()` again — a
+// correctness bug for ops with side effects (counters, hooks, saved
+// tensor accesses).
+//
+// This regression test installs a counting `apply` on the shared-output
+// node and asserts it fires exactly once.
+
+use std::sync::atomic::{AtomicUsize as AtomicU, Ordering as Ord_};
+
+#[derive(Debug)]
+struct CountingIdentityGradFn {
+    next_edges: Vec<Edge>,
+    sequence_nr: u64,
+    topological_nr: u64,
+    node_id: NodeId,
+    apply_count: Arc<AtomicU>,
+}
+
+impl CountingIdentityGradFn {
+    fn new(
+        next_edges: Vec<Edge>,
+        topological_nr: u64,
+        apply_count: Arc<AtomicU>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            next_edges,
+            sequence_nr: next_seq(),
+            topological_nr,
+            node_id: NodeId::new(),
+            apply_count,
+        })
+    }
+}
+
+impl GradFn for CountingIdentityGradFn {
+    fn apply(
+        &self,
+        grad_outputs: Vec<Option<Tensor>>,
+        _ctx: &DispatchCtx,
+    ) -> Result<Vec<Option<Tensor>>, AutogradV2Error> {
+        self.apply_count.fetch_add(1, Ord_::Relaxed);
+        let g = grad_outputs.into_iter().next().flatten();
+        Ok(vec![g])
+    }
+    fn num_inputs(&self) -> usize {
+        1
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.next_edges
+    }
+    fn sequence_nr(&self) -> u64 {
+        self.sequence_nr
+    }
+    fn topological_nr(&self) -> u64 {
+        self.topological_nr
+    }
+    fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+    fn name(&self) -> &'static str {
+        "CountingIdentity"
+    }
+}
+
+#[test]
+fn output_node_is_descendant_of_another_output_no_double_fire() {
+    _v2_clear_tensor_meta();
+
+    let leaf_meta: AutogradMetaRef = new_meta_ref(AutogradMetaV2::leaf_requires_grad());
+    let leaf_edge = gradient_edge(&leaf_meta, next_seq());
+
+    // B is the intermediate: identity feeding the leaf.
+    let b_apply_count = Arc::new(AtomicU::new(0));
+    let b_node = CountingIdentityGradFn::new(vec![leaf_edge], 1, b_apply_count.clone());
+
+    // A is the "above B" output: identity feeding B.
+    let a_edge = Edge::new(b_node.clone() as Arc<dyn GradFn>, 0);
+    let a_node = IdentityGradFn::new(vec![a_edge], 2, "A_above_B");
+
+    // Both A and B are returned as outputs of the forward.
+    let out_a = make_f32(vec![1.0, 2.0], &[2]);
+    let out_b = make_f32(vec![10.0, 20.0], &[2]);
+    _v2_set_grad_fn(&out_a, a_node.clone() as Arc<dyn GradFn>, 0);
+    _v2_set_grad_fn(&out_b, b_node.clone() as Arc<dyn GradFn>, 0);
+
+    let ctx = default_ctx();
+    // grad seeds: A gets [3,5]; B gets [7,11]. Forward identities pass
+    // them through. Total accumulation into leaf:
+    //   from A's path: [3,5] → B → leaf = [3,5]
+    //   from B's seed: [7,11] → leaf
+    //   sum: [10, 16].
+    let root = GraphRoot::new(vec![out_a, out_b]).with_grad_outputs(vec![
+        Some(make_f32(vec![3.0, 5.0], &[2])),
+        Some(make_f32(vec![7.0, 11.0], &[2])),
+    ]);
+    Engine::new().execute(root, &ctx).expect("execute");
+
+    // B must fire EXACTLY ONCE, even though it is both seeded and a
+    // descendant of A.
+    assert_eq!(
+        b_apply_count.load(Ord_::Relaxed),
+        1,
+        "B fired more than once — double-enqueue bug"
+    );
+
+    // Numerical accumulation must be correct.
+    let m = leaf_meta.lock().unwrap();
+    let g = m.grad.as_ref().expect("leaf grad populated");
+    assert_eq!(g.to_vec().unwrap(), vec![10.0, 16.0]);
+}

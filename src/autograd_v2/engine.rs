@@ -273,16 +273,54 @@ impl Engine {
             buf.add(slot, g, ctx)?;
         }
 
-        // Seed ready queue: every node referenced by an output goes in.
-        // (Output nodes have dep_count == 0 because no incoming next_edge
-        // walk reached them — they're roots of the backward DAG.)
+        // Seed ready queue: every output node goes in.
+        //
+        // BUG-FIX 2026-05-13 (bug-fixer audit): output nodes may ALSO
+        // appear as descendants of *other* outputs (consider `outputs =
+        // [loss, intermediate]` where `loss` flows through
+        // `intermediate`'s grad_fn). In that case `intermediate`'s
+        // dep_count was incremented by the BFS walk above. If we seed
+        // it at dep_count=0 (ready to fire immediately), and ALSO later
+        // decrement when its upstream output runs, the node fires twice
+        // — once with the user's grad_outputs[i] in its buffer, once
+        // with the upstream's contribution.
+        //
+        // Fix: the user-supplied grad_outputs IS a contribution. Account
+        // for it by initializing dep_count[output] to (BFS_count + 1),
+        // then decrementing on seed. Equivalently: add the user grad as
+        // if it came from a "virtual root" that has just fired. The
+        // implementation below adds 1 to each output's dep_count before
+        // the seed phase, then uses decrement_and_maybe_enqueue to push
+        // it. Outputs not referenced by other outputs go from
+        // (0+1)→0 and enqueue immediately; outputs that ARE referenced
+        // wait for their full contribution count.
         let mut ready: BinaryHeap<(ReadyKey, NodeId)> = BinaryHeap::new();
+        let mut in_queue: std::collections::HashSet<NodeId> =
+            std::collections::HashSet::new();
         {
-            let mut already_queued: std::collections::HashSet<NodeId> =
+            // First pass: bump dep_count by 1 for each output occurrence,
+            // accounting for the user's grad_outputs as one contribution.
+            for out in &root.outputs {
+                let nid = grad_fn_of(out).unwrap().node_id();
+                *dep_count.entry(nid).or_insert(0) += 1;
+            }
+            // Second pass: for each *unique* output node, decrement and
+            // (maybe) enqueue. If a node appears N times in `outputs`,
+            // we bumped its dep_count by N; we must decrement N times.
+            //
+            // PyTorch handles duplicates by counting once per
+            // *grad_output*; same here.
+            let mut seen_outputs: std::collections::HashSet<NodeId> =
                 std::collections::HashSet::new();
             for out in &root.outputs {
                 let nid = grad_fn_of(out).unwrap().node_id();
-                if already_queued.insert(nid) {
+                // Always decrement (even for duplicates) since we
+                // bumped per-occurrence above.
+                let entry = dep_count.entry(nid).or_insert(0);
+                if *entry > 0 {
+                    *entry -= 1;
+                }
+                if *entry == 0 && seen_outputs.insert(nid) {
                     let node = nodes_by_id.get(&nid).unwrap();
                     ready.push((
                         ReadyKey {
@@ -292,6 +330,7 @@ impl Engine {
                         },
                         nid,
                     ));
+                    in_queue.insert(nid);
                 }
             }
         }
@@ -403,6 +442,7 @@ impl Engine {
                         &mut dep_count,
                         &nodes_by_id,
                         &mut ready,
+                        &mut in_queue,
                     );
                     continue;
                 }
@@ -418,6 +458,7 @@ impl Engine {
                     &mut dep_count,
                     &nodes_by_id,
                     &mut ready,
+                    &mut in_queue,
                 );
             }
 
@@ -472,6 +513,7 @@ fn decrement_and_maybe_enqueue(
     dep_count: &mut HashMap<NodeId, usize>,
     nodes_by_id: &HashMap<NodeId, Arc<dyn GradFn>>,
     ready: &mut BinaryHeap<(ReadyKey, NodeId)>,
+    in_queue: &mut std::collections::HashSet<NodeId>,
 ) {
     let nid = child.node_id();
     let entry = dep_count.entry(nid).or_insert(0);
@@ -479,13 +521,16 @@ fn decrement_and_maybe_enqueue(
         *entry -= 1;
     }
     if *entry == 0 {
-        // Push only if not already in queue — BinaryHeap doesn't have
-        // a contains() check, but since each child is reached from
-        // each parent exactly once and we only enqueue when count hits
-        // 0, a node can be pushed at most once.
-        //
-        // Defense: nodes_by_id is the source of truth for the node;
-        // we still push from it to ensure the Arc reference is alive.
+        // Dedup against the in_queue set. BUG-FIX 2026-05-13: without
+        // this, a node that is BOTH a seed output AND a descendant of
+        // another seed output can be pushed twice (once at seed, once
+        // when its upstream-output's apply decrements its dep_count
+        // to zero). Second pop fires `apply()` on an empty buffer and
+        // wastes a call — for ops with side effects (counter bumps,
+        // hook fires) that is a correctness bug.
+        if !in_queue.insert(nid) {
+            return;
+        }
         if let Some(arc) = nodes_by_id.get(&nid) {
             ready.push((
                 ReadyKey {
