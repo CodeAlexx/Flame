@@ -34,10 +34,12 @@
 //!   permutation + `.contiguous()` (HAZARD-2026-05-13-1 + gemm-stride-
 //!   ignore).
 //!
-//! Phase 3c adds layer_norm, CheckpointGradFn::apply, and per-op
-//! forward-mode AD formulas.
+//! Phase 3c1 adds layer_norm + CheckpointGradFn::apply. Phase 3c2
+//! adds per-op forward-mode AD formulas (deferred — Phase 4 does not
+//! depend on forward-mode AD).
 
 pub mod add;
+pub mod layer_norm;
 pub mod matmul;
 pub mod mul;
 pub mod narrow;

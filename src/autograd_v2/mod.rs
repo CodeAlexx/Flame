@@ -96,7 +96,7 @@ mod recording;
 mod saved_tensor;
 
 pub use accumulator::AccumulateGrad;
-pub use checkpoint::CheckpointGradFn;
+pub use checkpoint::{checkpoint_v2, CheckpointForwardFn, CheckpointGradFn};
 pub use dispatch::{DeviceStream, DispatchCtx};
 pub use engine::{Engine, GraphRoot};
 pub use error::{AutogradV2Error, V2Result};

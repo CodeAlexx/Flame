@@ -1112,6 +1112,68 @@ Phase 2 carryover fix:
   (the `GradFn::hooks` impl in the `impl GradFn for AccumulateGrad`
   block) — `self.hooks.get().unwrap_or_else(|| Hooks::empty_ref())`.
 
+### Autograd v2 (Phase 3c1 — layer_norm + CheckpointGradFn)
+
+Phase 3c1 ships `layer_norm` (production op delegating to the BF16 fused
+forward + backward kernels) and the full `CheckpointGradFn::apply`
+implementation (was `NotImplementedYet` through Phase 2). Forward-mode AD
+across the 11 prior ops is deferred to Phase 3c2 — Phase 4 does not
+depend on forward-mode AD.
+
+- `autograd_v2::ops::layer_norm::LayerNormGradFn` —
+  `src/autograd_v2/ops/layer_norm.rs:48` — affine LN backward.
+  Saves `(x, weight?, bias?)` via `SavedTensor` + `(normalized_shape, eps)`.
+  Forward delegates to `crate::cuda_ops_bf16::layer_norm_bf16`; backward to
+  `crate::cuda_ops_bf16::layer_norm_backward_bf16` (kernel recomputes
+  per-feature mean/rstd internally). BF16-only at the public boundary.
+  `next_edges` are sized 1 + has_weight + has_bias; `apply()` returns the
+  matching `Vec<Option<Tensor>>` per input slot.
+- `autograd_v2::ops::layer_norm::layer_norm_v2(x, normalized_shape, weight, bias, eps, ctx)` —
+  `src/autograd_v2/ops/layer_norm.rs:241`. Wraps `cuda_ops_bf16::layer_norm_bf16`
+  + conditional `record_v2` install.
+- `autograd_v2::CheckpointGradFn` — `src/autograd_v2/checkpoint.rs:79` —
+  backward node for activation checkpointing. Carries
+  `Arc<CheckpointForwardFn>` + `Vec<SavedTensor>` for inputs +
+  per-input `next_edges`. `apply()` re-runs forward closure under v2
+  recording (after detach + fresh `requires_grad=true` meta on each
+  input clone), drives a nested `Engine::execute(...)` through the
+  standard backward path, then harvests per-leaf grads off each
+  reattached leaf's `meta.grad`. Reentrant-nested-execute safe.
+- `autograd_v2::CheckpointForwardFn` — `src/autograd_v2/checkpoint.rs:63`
+  — type alias: `dyn Fn(&[Tensor], &DispatchCtx) -> Result<Vec<Tensor>> + Send + Sync`.
+- `autograd_v2::checkpoint_v2(forward_fn, inputs, ctx)` —
+  `src/autograd_v2/checkpoint.rs:227` — user-facing entry. Runs
+  `forward_fn` with detached input clones (so inner ops see
+  `needs_grad=false` and skip recording — that is the memory saving),
+  builds a `CheckpointGradFn` with saved inputs + per-input
+  `next_edges`, installs it on every output via `record_v2`. Inference
+  path (no input requires_grad) returns outputs unchanged.
+
+Design choices documented in the module-level comment of
+`checkpoint.rs`: detach-clones replace what a "no-record" thread-local
+flag would have done; `Arc<dyn Fn>` allows reuse under
+`retain_graph=true`; the standard leaf-AccumulateGrad backward path
+inside `apply()` replaces `with_inputs` (which `expect`s a `grad_fn` on
+inputs — Phase 3a never wired the leaf path).
+
+Tests (4 layer_norm + 4 checkpoint = 8 new):
+- `tests/autograd_v2_ops.rs`:
+  - `layer_norm_v2_forward_backward_shapes`
+  - `layer_norm_v2_no_grad_skips_recording`
+  - `layer_norm_v2_weight_only`
+  - `layer_norm_v2_analytical_dweight_dbias` — closed-form d_w/d_b parity
+- `tests/autograd_v2_checkpoint.rs` (new file):
+  - `checkpoint_v2_same_grads_as_no_checkpoint` — bit-equal vs reference
+  - `checkpoint_v2_skips_when_no_input_requires_grad` — inference path
+  - `checkpoint_v2_reentrant_nested` — checkpoint-in-checkpoint, 2 nested engines
+  - `checkpoint_v2_multi_output` — multi-output forward, same node id on each
+
+Forward-mode AD population across the 11 prior ops (`SavedTensor::fw_grad_`
+JVP propagation per §clause 15) is **deferred to Phase 3c2**. The slot
+is wired (Phase 1) and tested (`saved_tensor_fw_grad_roundtrip` in
+`tests/autograd_v2_types.rs`); Phase 3c2 populates it inside each op's
+forward wrapper.
+
 ### Legacy / dead
 - ⚠️ `autograd.rs` (top-level) — types still re-exported
 - ⚠️ `autograd_simple.rs` — early stub
