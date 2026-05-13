@@ -550,6 +550,26 @@ Do not retire v1/v3/v4 until ALL of these gates pass:
 - **Reproduce**: `FLAME_CUDA_GRAPH=0 cargo test --release --features autograd_v2 --test autograd_v2_perf -- --nocapture --test-threads=1`.
 - **Not measured (out of scope)**: real-trainer Z-Image LoRA multi-step convergence (Klein step 2+ crash blocks); `AdamWV2::step` end-to-end optimizer perf (deferred to Phase 6 / v3 retirement).
 
+**Phase 5c trio verdict (post-ship audit)**:
+- **Bug-fixer**: **Floor-at-+2.18%, no win available within scope.** Bandwidth-bound, not launch-bound. 78 MB BF16 grad = 156 MB F32 source = 234 MB I/O / 0.22 ms = effective ~1.07 TB/s, **at the HBM ceiling on a 3090 Ti (~1.1 TB/s)**. Options A (fast-path skip — already present), B (multi-tensor batch cast, ~250 LOC, saves only ~0.3pp), C (pre-allocate destinations — `pool_alloc_u16` already serves from pre-warmed pool) all evaluated; net-zero or sub-percentage-point. Option D (avoid cast — typed v3 ops) requires multi-week kernel rewrite, deferred to Phase 6. **The +2.18% is fundamental given the architecture.**
+- **Skeptic**: REPRODUCES-with-flag. Standing rule streak resumed cleanly — verbatim git pre/post state + verbatim bench output present in commit body. 3 minor flags (none blocking): GPU stream not pinned in code (relies on `#[serial]` + `--test-threads=1`); Phase 5d planning under-specifies trainer migration + race fix (addressed in §Phase 5d below); v3 regression spot-check timing.
+- **Builder**: equivalent verification by parent assistant after agent rate-limit kill. 3/3 perf cells reproduce within noise (one cell came in `Δ-1.98%` on re-run vs `+2.18%` original — same magnitude, opposite sign, within measurement variance). 17/17 v3 regression tests pass. Memory savings exactly 50% across all 3 cells on independent re-run.
+
+**Verdict**: Phase 5c shipped. The trade is +2.18% backward time for 50% gradient memory — accepted per the standing contract that v2's win is correctness + memory, not speed. For memory-constrained training (Klein 9B full-FT on 24 GB; longer sequences without gradient checkpointing; larger batch sizes; higher LoRA ranks), "trains" beats "doesn't train" infinitely.
+
+## Phase 5d / pre-retirement work (open)
+
+Named action items per Phase 5c skeptic + bug-fixer feedback. Each is its own session:
+
+1. **Real-trainer Z-Image LoRA smoke (>100 steps)**. Run `train_zimage --use-autograd-v2 --max-steps 100+`; capture loss curve; compare to v3 baseline within 1% per `BF16_GRAD_DECISION.md`. Z-Image does NOT crash at step 2+ (Klein-specific infra issue). Required to claim v2 is "production-ready".
+2. **Trainer-side `Parameter::new_v2` migration**. EriDiffusion-v2 LoRA construction sites currently use `Parameter::new` (`CastToF32` policy). Audit LoRA crate, flip to `new_v2` under v2 feature gate. **Without this, the bench's 50% Class A memory savings never materializes in real runs.** This is the highest-value remaining item — the bench measured the potential; production needs the wiring.
+3. **Reentrant + hooks tests on a real trainer**. v2 supports both (Phase 3c1 CheckpointGradFn + Phase 1 Hooks); no integration test on a real trainer exists yet. Required cross-cutting gate per §Phase 5.
+4. **`AUTOGRAD_CONTEXT` race architectural fix**. `serial_test` (commit `2baa221`) is a band-aid. Real architectural fix options: (a) per-thread context via `thread_local!`, (b) cell-style ownership where each engine owns its own context, (c) accept the band-aid indefinitely. Decision needs to land before v1/v3/v4 deletion — without it, the global state is a hazard for any future v2-touching test that doesn't know to use `#[serial]`.
+5. **Pre-existing v2 test flakes** (`autograd_v2_ops::transpose_v2_backward` / `engine_rejects_mismatched_grad_output_shape`, `autograd_v2_engine::single_leaf_sum`). Verified pre-existing at baseline `2baa221` via git-stash. Diagnose before any "test-suite green-board" claim. Likely related to the global-tape race in item #4 — fixing #4 may resolve these.
+6. **v1/v3/v4 deletion** (the actual retirement). After 1–5 pass and the Z-Image LoRA smoke shows convergence, file the deprecation PR. `src/autograd.rs` (4547 lines), `src/autograd_v3.rs`, `src/autograd_v4/`, plus legacy `autograd_simple.rs` / `autograd_engine.rs` / `autograd_ops.rs` / `autograd_ops_complete.rs` / `autograd_debug.rs`.
+
+NCCL multi-device + inference-path migration are deferred indefinitely (single GPU + trainer focus per user direction).
+
 **Cross-cutting gates that must also pass**:
 - BF16 grad policy optimizer parity (Phase 4a/4b set up the kernels; Deliverable A/C exercise them in anger).
 - In-place mutation tests stay green (17 Phase 0 audit tests + view-autograd from Phase 3b).
