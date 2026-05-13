@@ -733,7 +733,7 @@ Files: `accumulator.rs`, `checkpoint.rs`, `dispatch.rs`, `engine.rs`,
 `ops/silu.rs`. Tests: `tests/autograd_v2_types.rs` (13 tests,
 Phase 1) + `tests/autograd_v2_engine.rs` (11 tests, Phase 2 — note
 `record_v2` refactor + the bug-fixer regression) +
-`tests/autograd_v2_ops.rs` (17 tests, Phase 3a). All green.
+`tests/autograd_v2_ops.rs` (18 tests, Phase 3a). All green.
 
 ### ⚠️ `autograd_simple.rs / autograd_engine.rs / autograd_ops.rs / autograd_ops_complete.rs / autograd_debug.rs`
 Older autograd attempts. Dead code; kept for reference.

@@ -967,7 +967,7 @@ Phase 3a wires real forward-op recording on top of Phase 2's engine.
 - AccumulateGrad / InputBuffer threading `create_graph` via `DispatchCtx`.
 - Non-leaf grad collection in `Engine::with_inputs`.
 - Validation of `grad_outputs[i].shape() == outputs[i].shape()`.
-Tests: `tests/autograd_v2_ops.rs` (17 tests). Phase 2 engine tests
+Tests: `tests/autograd_v2_ops.rs` (18 tests, incl. matmul per-element parity after bug-fixer follow-up `6ee385f`). Phase 2 engine tests
 (`tests/autograd_v2_engine.rs`) refactored to use `record_v2`-style
 linking; still 11 tests, all green.
 
@@ -1015,7 +1015,7 @@ Op modules (each in its own file under `src/autograd_v2/ops/`):
   `src/autograd_v2/ops/matmul.rs:27` — backward: `(g @ b^T, a^T @ g)`
   (2D). Saves `a, b`.
 - `autograd_v2::ops::matmul::matmul_v2(a, b, ctx)` —
-  `src/autograd_v2/ops/matmul.rs:105`.
+  `src/autograd_v2/ops/matmul.rs:122`.
 - `autograd_v2::ops::silu::SiLUGradFn` —
   `src/autograd_v2/ops/silu.rs:31` — backward: `g * sigmoid(x) * (1 +
   x * (1 - sigmoid(x)))`. Saves input.
