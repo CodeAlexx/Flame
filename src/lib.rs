@@ -97,6 +97,12 @@ pub use pinned::{
     unregister_pinned, PinnedAllocFlags, PinnedHostBuffer, PinnedHostBufferView,
     PinnedHostBufferViewMut, StagingDeviceBuf,
 };
+// BlockOffloader: framework memory/IO primitive for large-model weight
+// streaming. Lives here (not in trainer crates) because it's used by every
+// model family that needs to fit on commodity GPUs — DiT, MMDiT, MoE, video
+// DiT, multimodal. Per tenets §1: fix the primitive, ship every model.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub mod offload;
 pub mod cuda_alloc_pool;
 pub mod cuda_graph;
 pub mod device;
