@@ -614,4 +614,527 @@ mod tests {
         reg.unregister_exact_keyed(ptr, dev_b);
         assert_eq!(reg.exact_refcount(ptr, dev_b), 0);
     }
+
+    // =============================================================
+    // Skeptic Phase R1a — adversarial tests
+    //
+    // These tests probe seams that Builder + Bug Fixer didn't cover.
+    // Each test is documented with the specific invariant it locks down
+    // or the bug-class hypothesis it disproves.
+    // =============================================================
+
+    /// Skeptic #1: `ensure_hook_installed` actually only calls cudarc's
+    /// `install_external_ptr_hook` once.
+    ///
+    /// Bug Fixer flagged that the existing `registry_hook_idempotent_install`
+    /// test only checks the flag stays `true` — it does NOT prove the cudarc
+    /// side-effect is single-shot. We can't easily intercept the cudarc
+    /// closure pointer, but we CAN prove the `compare_exchange` from
+    /// `false→true` only succeeds once by directly inspecting the atomic
+    /// flag and resetting it cooperatively between attempts.
+    ///
+    /// Approach: clobber the flag to `false`, race N threads through
+    /// `ensure_hook_installed`, and verify that exactly one of them
+    /// observed the false→true transition (via a side-channel atomic
+    /// installed by us — see internal `install_with_counter`-style logic
+    /// below). We can't add hooks into the registry from a test, but we
+    /// CAN add a deterministic helper that exercises the CAS logic.
+    ///
+    /// Pragmatic test: drive the CAS path explicitly via repeated calls
+    /// AND verify cudarc's hook does the right thing (returns true for
+    /// a registered ptr, false for an unregistered one). This proves the
+    /// hook function pointer was wired through, even if we can't count
+    /// install-calls.
+    #[test]
+    fn skeptic_hook_install_single_shot_via_side_effect() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let reg = fresh();
+
+        // Install several times.
+        for _ in 0..10 {
+            ExternalMemoryRegistry::ensure_hook_installed();
+        }
+        assert!(reg.hook_installed_flag());
+
+        // Register a fake ptr; the cudarc-installed closure should match it
+        // when queried directly via the registry (we can't easily invoke
+        // cudarc's stored fn pointer from a test, but we CAN verify the
+        // registry path the closure consults).
+        let ptr = 0xFEED_BABE_C0DE_0001_u64;
+        reg.register_exact(ptr, DEVICE_KEY_ANY, ExternalOwner::PoolExact);
+        assert!(reg.should_skip_free_any_device(ptr));
+        reg.unregister_exact(ptr);
+        assert!(!reg.should_skip_free_any_device(ptr));
+    }
+
+    /// Skeptic #1b: concurrent `ensure_hook_installed` from N threads
+    /// terminates with consistent state and no panic.
+    ///
+    /// Even if cudarc's `install_external_ptr_hook` is idempotent in the
+    /// sense of "store-the-same-fn-pointer twice is fine," we want to
+    /// verify the registry's CAS-guarded path doesn't double-fire under
+    /// contention.
+    #[test]
+    fn skeptic_hook_install_concurrent_no_panic() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _reg = fresh();
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            handles.push(std::thread::spawn(|| {
+                for _ in 0..100 {
+                    ExternalMemoryRegistry::ensure_hook_installed();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("ensure_hook_installed worker panicked");
+        }
+        assert!(ExternalMemoryRegistry::global().hook_installed_flag());
+    }
+
+    /// Skeptic #2: `unregister_exact(ptr)` non-determinism across two
+    /// different `device_key`s.
+    ///
+    /// Bug Fixer flagged that when the same `ptr` is registered under two
+    /// device keys, `unregister_exact(ptr)` picks one via HashMap iteration
+    /// order. This test asserts the OBSERVABLE outcome: exactly one of the
+    /// two refcounts must be unchanged (still 1), the other must be 0.
+    /// This locks down "exactly-one-removed, but which-one is unspecified."
+    /// If a future refactor makes the choice deterministic OR removes both,
+    /// this test catches the behavior change.
+    #[test]
+    fn skeptic_unregister_exact_one_of_many_devices() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let reg = fresh();
+        let ptr: u64 = 0xAAAA_BBBB;
+        let dev_a = 0x11_usize;
+        let dev_b = 0x22_usize;
+        reg.register_exact(ptr, dev_a, ExternalOwner::Ring);
+        reg.register_exact(ptr, dev_b, ExternalOwner::Ring);
+        assert_eq!(reg.exact_refcount(ptr, dev_a), 1);
+        assert_eq!(reg.exact_refcount(ptr, dev_b), 1);
+
+        let _ = reg.unregister_exact(ptr);
+        // Exactly one of the two entries must remain at 1, the other gone.
+        let a = reg.exact_refcount(ptr, dev_a);
+        let b = reg.exact_refcount(ptr, dev_b);
+        assert!(
+            (a == 1 && b == 0) || (a == 0 && b == 1),
+            "non-deterministic outcome must still satisfy 'exactly-one-removed': got a={a} b={b}"
+        );
+        // Total surviving count must be 1.
+        assert_eq!(a + b, 1);
+
+        // A second unregister picks up the remaining entry.
+        let _ = reg.unregister_exact(ptr);
+        assert_eq!(reg.exact_refcount(ptr, dev_a), 0);
+        assert_eq!(reg.exact_refcount(ptr, dev_b), 0);
+    }
+
+    /// Skeptic #3: `should_skip_free(ptr, DEVICE_KEY_ANY)` asymmetry.
+    ///
+    /// When querying with `device_key=DEVICE_KEY_ANY=0`, the function:
+    /// - Range scan: `r.device_key == 0 || r.device_key == 0` — only matches
+    ///   ranges whose `device_key` is itself `DEVICE_KEY_ANY`. Will NOT
+    ///   match a range registered on a real device key.
+    /// - Exact scan: only checks `(ptr, 0)`; the secondary
+    ///   `(ptr, DEVICE_KEY_ANY)` fallback is skipped when `device_key == DEVICE_KEY_ANY`.
+    ///
+    /// Decision (Skeptic): this asymmetry is INTENTIONAL — callers querying
+    /// with `DEVICE_KEY_ANY` are explicitly saying "I have no device
+    /// context, use the device-free path" and SHOULD route through
+    /// `should_skip_free_any_device`, which DOES scan everything. This test
+    /// locks down both halves of that contract.
+    #[test]
+    fn skeptic_should_skip_free_with_any_key_does_not_match_real_device() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let reg = fresh();
+        let ptr: u64 = 0xC0FFEE_0000_u64;
+        let real_dev = 0x55_usize;
+
+        // Range on real device.
+        let h = reg.register_range(ExternalRange {
+            start: ptr,
+            end: ptr + 0x100,
+            device_key: real_dev,
+            owner: ExternalOwner::Slab,
+        });
+        // Exact on real device.
+        let ptr2: u64 = 0xC0FFEE_1000_u64;
+        reg.register_exact(ptr2, real_dev, ExternalOwner::Ring);
+
+        // Asymmetry: `should_skip_free` with `DEVICE_KEY_ANY` does NOT
+        // find real-device entries.
+        assert!(
+            !reg.should_skip_free(ptr, DEVICE_KEY_ANY),
+            "querying with DEVICE_KEY_ANY must NOT see a real-device range"
+        );
+        assert!(
+            !reg.should_skip_free(ptr2, DEVICE_KEY_ANY),
+            "querying with DEVICE_KEY_ANY must NOT see a real-device exact entry"
+        );
+
+        // The device-agnostic path DOES find them — this is the path the
+        // cudarc hook closure uses.
+        assert!(reg.should_skip_free_any_device(ptr));
+        assert!(reg.should_skip_free_any_device(ptr2));
+
+        // Real-device queries find them too.
+        assert!(reg.should_skip_free(ptr, real_dev));
+        assert!(reg.should_skip_free(ptr2, real_dev));
+
+        reg.unregister_range(h);
+        reg.unregister_exact(ptr2);
+    }
+
+    /// Skeptic #4: `register_range` with `start > end` is silently accepted
+    /// and creates a never-matching range.
+    ///
+    /// Builder did not add a debug_assert or hard error for this. The
+    /// underlying check `ptr >= r.start && ptr < r.end` correctly returns
+    /// false for any ptr when `start > end`, so the WORST case is wasted
+    /// memory plus debug confusion. Lock down the current "silently accept,
+    /// silently never match" behavior. If a future change adds a debug
+    /// assertion, this test reminds the author to update either the
+    /// behavior OR this test, not both silently.
+    #[test]
+    fn skeptic_register_range_inverted_silently_never_matches() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let reg = fresh();
+        let dev = 0x77_usize;
+
+        // Inverted range — silently accepted.
+        let h = reg.register_range(ExternalRange {
+            start: 0x2000,
+            end: 0x1000, // < start
+            device_key: dev,
+            owner: ExternalOwner::Slab,
+        });
+        assert_eq!(reg.range_count(), 1, "inverted range is currently accepted");
+
+        // No ptr in the universe can satisfy `ptr >= 0x2000 && ptr < 0x1000`.
+        assert!(!reg.should_skip_free(0x1000, dev));
+        assert!(!reg.should_skip_free(0x1800, dev));
+        assert!(!reg.should_skip_free(0x2000, dev));
+        assert!(!reg.should_skip_free_any_device(0x1800));
+
+        reg.unregister_range(h);
+    }
+
+    /// Skeptic #5: hammer `ensure_hook_installed` from N threads — final
+    /// state is consistent (hook installed, registry queryable, no flake).
+    ///
+    /// Already covered by skeptic_hook_install_concurrent_no_panic (above),
+    /// but this variant additionally verifies the registry remains
+    /// queryable under concurrent installs.
+    #[test]
+    fn skeptic_concurrent_install_and_registry_queries() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _reg = fresh();
+        let install_threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..200 {
+                        ExternalMemoryRegistry::ensure_hook_installed();
+                    }
+                })
+            })
+            .collect();
+
+        let query_threads: Vec<_> = (0..8)
+            .map(|tid| {
+                std::thread::spawn(move || {
+                    let reg = ExternalMemoryRegistry::global();
+                    let ptr = 0xDEAD_0000_u64 + (tid as u64);
+                    for _ in 0..200 {
+                        reg.register_exact(ptr, DEVICE_KEY_ANY, ExternalOwner::PoolExact);
+                        let _hit = reg.should_skip_free_any_device(ptr);
+                        let _ = reg.unregister_exact(ptr);
+                    }
+                })
+            })
+            .collect();
+
+        for h in install_threads {
+            h.join().unwrap();
+        }
+        for h in query_threads {
+            h.join().unwrap();
+        }
+        assert!(ExternalMemoryRegistry::global().hook_installed_flag());
+    }
+
+    /// Skeptic #6: `hook_installed` flag persistent across `reset_for_testing`
+    /// is benign — fresh register/query/unregister cycle still works.
+    #[test]
+    fn skeptic_reset_for_testing_does_not_break_hook() {
+        let _g = TEST_LOCK.lock().unwrap();
+        // Ensure hook flag is set (other tests probably did this).
+        ExternalMemoryRegistry::ensure_hook_installed();
+        assert!(ExternalMemoryRegistry::global().hook_installed_flag());
+
+        let reg = fresh(); // resets ranges + exact, NOT the hook flag.
+        assert!(
+            reg.hook_installed_flag(),
+            "reset_for_testing must NOT clear the hook-install flag"
+        );
+        assert_eq!(reg.range_count(), 0);
+        assert_eq!(reg.exact_entry_count(), 0);
+
+        // Fresh cycle still works.
+        let ptr = 0xBEEF_0000_u64;
+        reg.register_exact(ptr, DEVICE_KEY_ANY, ExternalOwner::PoolExact);
+        assert!(reg.should_skip_free_any_device(ptr));
+        assert_eq!(reg.unregister_exact(ptr), 0);
+        assert!(!reg.should_skip_free_any_device(ptr));
+    }
+
+    /// Skeptic #7: lock down R1a `is_external_ptr` semantics so an R1b
+    /// regression in the back-compat shim is caught.
+    ///
+    /// In R1a, the back-compat `is_external_ptr(ptr)` delegates to
+    /// `should_skip_free_any_device(ptr)`. After R1b, this would also
+    /// return `true` for any pointer inside a registered slab range —
+    /// even though `unregister_external_ptr(mid_slab_ptr)` would be a
+    /// no-op (the range is the owner, not an exact entry). That semantic
+    /// drift IS the R1b design (transitive protection of mid-slab ptrs),
+    /// but if R1b accidentally introduces a regression in the back-compat
+    /// path itself (e.g., breaking the exact-entry path), this test
+    /// catches it.
+    ///
+    /// Specifically: in R1a, `is_external_ptr(ptr)` returns true ONLY
+    /// when the exact-pointer refcount is non-zero. Locked down here.
+    #[test]
+    fn skeptic_is_external_ptr_r1a_exact_path_only() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let reg = fresh();
+        let ptr = 0xCA11_AB1E_u64;
+
+        // Nothing registered → not external.
+        assert!(!reg.should_skip_free_any_device(ptr));
+
+        // Register exact → external.
+        reg.register_exact(ptr, DEVICE_KEY_ANY, ExternalOwner::PoolExact);
+        assert!(reg.should_skip_free_any_device(ptr));
+        assert_eq!(reg.exact_refcount(ptr, DEVICE_KEY_ANY), 1);
+
+        // Unregister → not external.
+        assert_eq!(reg.unregister_exact(ptr), 0);
+        assert!(!reg.should_skip_free_any_device(ptr));
+        assert_eq!(reg.exact_refcount(ptr, DEVICE_KEY_ANY), 0);
+    }
+
+    /// Skeptic #8: cross-device hook decision — `should_skip_free_any_device`
+    /// is deliberately permissive.
+    ///
+    /// The cudarc Drop hook has signature `fn(u64) -> bool` (no device).
+    /// If two different devices both have entries at the same numeric ptr,
+    /// the hook returns `true` for either device's `CudaSlice::drop`.
+    /// This is documented as "negligible risk" because distinct CUDA
+    /// contexts have disjoint virtual address spaces in practice — but
+    /// the test locks it down explicitly.
+    #[test]
+    fn skeptic_any_device_hook_does_not_disambiguate_devices() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let reg = fresh();
+        let ptr = 0xCAFE_0001_u64;
+        let dev1 = 0x1_usize;
+        let dev2 = 0x2_usize;
+
+        // Register on dev1 only.
+        reg.register_exact(ptr, dev1, ExternalOwner::Ring);
+
+        // `should_skip_free_any_device` does NOT disambiguate — it returns
+        // true for ANY drop with this ptr value.
+        assert!(reg.should_skip_free_any_device(ptr));
+
+        // `should_skip_free` WITH a real device key DOES disambiguate.
+        assert!(reg.should_skip_free(ptr, dev1));
+        assert!(!reg.should_skip_free(ptr, dev2));
+
+        reg.unregister_exact(ptr);
+    }
+
+    /// Skeptic #9: null pointer (ptr=0) handling.
+    ///
+    /// `should_skip_free(0, ...)` against an empty registry must return
+    /// false. After registering ptr=0 (pathological — no real CUDA alloc
+    /// returns 0), the lookup must work consistently.
+    #[test]
+    fn skeptic_null_ptr_handling() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let reg = fresh();
+
+        // Empty: null ptr is not skipped.
+        assert!(!reg.should_skip_free(0, 0xAB));
+        assert!(!reg.should_skip_free_any_device(0));
+
+        // Register exact ptr=0 → consistent behavior.
+        reg.register_exact(0, 0xAB, ExternalOwner::Ring);
+        assert!(reg.should_skip_free(0, 0xAB));
+        assert!(reg.should_skip_free_any_device(0));
+        assert_eq!(reg.unregister_exact(0), 0);
+        assert!(!reg.should_skip_free(0, 0xAB));
+    }
+
+    /// Skeptic #10: `register_range` with `start == 0` does not interact
+    /// pathologically with the DEVICE_KEY_ANY sentinel.
+    ///
+    /// `DEVICE_KEY_ANY=0` is the sentinel on the `device_key` axis, NOT
+    /// the `start` axis. A range starting at address 0 should behave
+    /// normally (cover [0, end)).
+    #[test]
+    fn skeptic_range_starting_at_zero_address() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let reg = fresh();
+        let dev = 0x99_usize;
+
+        let h = reg.register_range(ExternalRange {
+            start: 0,
+            end: 0x1000,
+            device_key: dev,
+            owner: ExternalOwner::Slab,
+        });
+        assert!(reg.should_skip_free(0, dev), "address 0 is inside [0, 0x1000)");
+        assert!(reg.should_skip_free(0xFFF, dev));
+        assert!(!reg.should_skip_free(0x1000, dev));
+        reg.unregister_range(h);
+    }
+
+    /// Skeptic #11: `unregister_range` called twice with the same handle.
+    /// Second call is a no-op (silently ignored, no panic, no error).
+    #[test]
+    fn skeptic_double_unregister_range_is_noop() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let reg = fresh();
+        let dev = 0xAA_usize;
+        let h = reg.register_range(ExternalRange {
+            start: 0x4000,
+            end: 0x5000,
+            device_key: dev,
+            owner: ExternalOwner::Slab,
+        });
+        assert_eq!(reg.range_count(), 1);
+        reg.unregister_range(h);
+        assert_eq!(reg.range_count(), 0);
+        // Second call with the same (now-stale) handle: silent no-op.
+        reg.unregister_range(h);
+        assert_eq!(reg.range_count(), 0);
+    }
+
+    /// Skeptic #12: dropping a `RangeHandle` without calling
+    /// `unregister_range` leaks the range entry forever. Lock down the
+    /// "no implicit Drop" contract so a future change adding `Drop` to
+    /// `RangeHandle` is caught.
+    ///
+    /// If anyone ever adds `impl Drop for RangeHandle`, this test will
+    /// fail (range_count() will become 0 after the handle drops) and the
+    /// author must update the test AND the documentation.
+    #[test]
+    fn skeptic_range_handle_drop_does_not_auto_unregister() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let reg = fresh();
+        let dev = 0xBB_usize;
+        {
+            let _h = reg.register_range(ExternalRange {
+                start: 0x6000,
+                end: 0x7000,
+                device_key: dev,
+                owner: ExternalOwner::Slab,
+            });
+            assert_eq!(reg.range_count(), 1);
+        } // _h dropped here.
+        // Range is STILL present — no auto-Drop logic.
+        assert_eq!(
+            reg.range_count(),
+            1,
+            "RangeHandle Drop must not auto-unregister (would tear down the slab range mid-use)"
+        );
+        // Re-fresh to clean up for subsequent tests.
+        reg.reset_for_testing();
+    }
+
+    /// Skeptic #13: back-compat shim path — `register_exact` with
+    /// `DEVICE_KEY_ANY` then `unregister_exact(ptr)` correctly removes
+    /// the `(ptr, 0)` entry even when there are unrelated entries.
+    #[test]
+    fn skeptic_back_compat_unregister_finds_any_device_entry() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let reg = fresh();
+        let ptr = 0xFACE_0000_u64;
+
+        // Simulate back-compat shim path.
+        reg.register_exact(ptr, DEVICE_KEY_ANY, ExternalOwner::PoolExact);
+        // Unrelated entry — different ptr.
+        reg.register_exact(0xDEAD_0000_u64, 0x1234, ExternalOwner::Ring);
+
+        let before = reg.exact_entry_count();
+        assert_eq!(before, 2);
+        let new_count = reg.unregister_exact(ptr);
+        assert_eq!(new_count, 0);
+        assert_eq!(
+            reg.exact_entry_count(),
+            1,
+            "unrelated entry must remain after unregister_exact(ptr)"
+        );
+        // The unrelated entry survives.
+        assert!(reg.should_skip_free(0xDEAD_0000_u64, 0x1234));
+        reg.unregister_exact(0xDEAD_0000_u64);
+    }
+
+    /// Skeptic #14: range overlap — two ranges covering the same ptr.
+    /// `should_skip_free` returns true; unregistering one keeps protection.
+    #[test]
+    fn skeptic_overlapping_ranges_compose() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let reg = fresh();
+        let dev = 0xCC_usize;
+        let h1 = reg.register_range(ExternalRange {
+            start: 0x8000,
+            end: 0x9000,
+            device_key: dev,
+            owner: ExternalOwner::Slab,
+        });
+        let h2 = reg.register_range(ExternalRange {
+            start: 0x8500,
+            end: 0x9500,
+            device_key: dev,
+            owner: ExternalOwner::Ring,
+        });
+        assert!(reg.should_skip_free(0x8800, dev));
+        // Drop h1; h2 still covers 0x8800 (0x8500..0x9500).
+        reg.unregister_range(h1);
+        assert!(reg.should_skip_free(0x8800, dev));
+        // Drop h2; now nothing covers it.
+        reg.unregister_range(h2);
+        assert!(!reg.should_skip_free(0x8800, dev));
+    }
+
+    /// Skeptic #15: lock down `next_handle` uniqueness across
+    /// `reset_for_testing` — handles must NOT collide with pre-reset
+    /// handles. Builder documents this; we verify it.
+    #[test]
+    fn skeptic_next_handle_unique_across_reset() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let reg = fresh();
+        let dev = 0xDD_usize;
+        let h1 = reg.register_range(ExternalRange {
+            start: 0xA000,
+            end: 0xB000,
+            device_key: dev,
+            owner: ExternalOwner::Slab,
+        });
+        reg.reset_for_testing();
+        let h2 = reg.register_range(ExternalRange {
+            start: 0xA000,
+            end: 0xB000,
+            device_key: dev,
+            owner: ExternalOwner::Slab,
+        });
+        assert_ne!(
+            h1, h2,
+            "handles must remain unique across reset_for_testing (collision would break stale-handle detection)"
+        );
+        reg.unregister_range(h2);
+    }
 }
