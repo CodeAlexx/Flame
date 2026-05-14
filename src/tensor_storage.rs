@@ -840,10 +840,14 @@ impl Drop for TensorStorage {
         // so other clones still see consistent versioning. Side table is
         // also flushed at AutogradContext::clear() (per training step).
 
-        // Only intercept when the pool is enabled.
-        if crate::cuda_alloc_pool::pool_disabled() {
-            return;
-        }
+        // R1b-bf: do NOT short-circuit on `pool_disabled()` at the top level.
+        // The slab live-count decrement (`slab_v2_try_claim`) MUST run for
+        // slab-owned F32/BF16 tensors regardless of pool state — otherwise
+        // when `FLAME_ALLOC_POOL=0` is paired with `FLAME_USE_STATIC_SLAB=1`,
+        // `live_count` leaks 1 per drop and `StaticSlabAllocator::reset()`
+        // fails forever. The pool-return short-circuit is moved INTO each
+        // arm below, after the slab check.
+        let pool_off = crate::cuda_alloc_pool::pool_disabled();
 
         match self {
             TensorStorage::F32 { data, .. } => {
@@ -853,10 +857,13 @@ impl Drop for TensorStorage {
                     let dev = arc.device();
                     match Arc::try_unwrap(arc) {
                         Ok(slice) => {
-                            // R1b: if the slice is slab-owned, decrement
-                            // live_count and forget — skip pool_return.
+                            // R1b: slab claim ALWAYS runs (pool_off-agnostic).
                             if slab_v2_try_claim(&slice, false) {
                                 std::mem::forget(slice);
+                            } else if pool_off {
+                                // Not slab-owned + pool disabled: let
+                                // cudarc fire cudaFree naturally.
+                                drop(slice);
                             } else {
                                 crate::cuda_alloc_pool::pool_return_f32(slice);
                             }
@@ -869,10 +876,10 @@ impl Drop for TensorStorage {
                 {
                     let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
                     let dev = slice.device();
-                    // R1b: if the slice is slab-owned, decrement live_count
-                    // and forget — skip pool_return.
                     if slab_v2_try_claim(&slice, false) {
                         std::mem::forget(slice);
+                    } else if pool_off {
+                        drop(slice);
                     } else {
                         crate::cuda_alloc_pool::pool_return_f32(slice);
                     }
@@ -880,6 +887,8 @@ impl Drop for TensorStorage {
                 }
             }
             TensorStorage::F16 { data, .. } => {
+                // F16 has no slab path — preserve legacy pool_off short-circuit.
+                if pool_off { return; }
                 #[cfg(feature = "shared_storage")]
                 {
                     let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };
@@ -900,6 +909,8 @@ impl Drop for TensorStorage {
             }
             #[cfg(not(feature = "bf16_u16"))]
             TensorStorage::BF16 { data, .. } => {
+                // Legacy F32-backed BF16: no slab path (slab is bf16_u16-only).
+                if pool_off { return; }
                 #[cfg(feature = "shared_storage")]
                 {
                     let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };
@@ -926,9 +937,11 @@ impl Drop for TensorStorage {
                     let dev = arc.device();
                     match Arc::try_unwrap(arc) {
                         Ok(slice) => {
-                            // R1b: slab-claim path comes BEFORE pool_return.
+                            // R1b: slab claim ALWAYS runs (pool_off-agnostic).
                             if slab_v2_try_claim(&slice, true) {
                                 std::mem::forget(slice);
+                            } else if pool_off {
+                                drop(slice);
                             } else {
                                 crate::cuda_alloc_pool::pool_return_u16(slice);
                             }
@@ -941,9 +954,10 @@ impl Drop for TensorStorage {
                 {
                     let slice: CudaSlice<u16> = unsafe { std::ptr::read(data) };
                     let dev = slice.device();
-                    // R1b: slab-claim path comes BEFORE pool_return.
                     if slab_v2_try_claim(&slice, true) {
                         std::mem::forget(slice);
+                    } else if pool_off {
+                        drop(slice);
                     } else {
                         crate::cuda_alloc_pool::pool_return_u16(slice);
                     }
@@ -951,6 +965,7 @@ impl Drop for TensorStorage {
                 }
             }
             TensorStorage::I32 { data, .. } => {
+                if pool_off { return; }
                 #[cfg(feature = "shared_storage")]
                 {
                     let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };
@@ -970,6 +985,7 @@ impl Drop for TensorStorage {
                 }
             }
             TensorStorage::Bool { data, .. } => {
+                if pool_off { return; }
                 #[cfg(feature = "shared_storage")]
                 {
                     let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };
@@ -996,6 +1012,19 @@ impl Drop for TensorStorage {
 
 unsafe impl Send for TensorStorage {}
 unsafe impl Sync for TensorStorage {}
+
+/// Test-only: wrap a pre-built `CudaSlice<u16>` (e.g. from
+/// `StaticSlabAllocator::alloc_u16`) into a `TensorStorage::BF16`. Used by
+/// the R1b Drop-wiring regression test. Production code constructs
+/// `TensorStorage` via the safe `empty`/`zeros` constructors.
+#[doc(hidden)]
+#[cfg(feature = "bf16_u16")]
+pub fn wrap_slab_slice_for_test(slice: CudaSlice<u16>, numel: usize) -> TensorStorage {
+    TensorStorage::BF16 {
+        data: wrap_slice(slice),
+        numel,
+    }
+}
 
 // Note: F16/BF16 conversion kernels can be specialized further; current path stores as F32-backed buffers.
 // For now, we store everything as F32 but track the intended dtype for API compatibility

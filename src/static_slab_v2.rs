@@ -701,6 +701,30 @@ pub fn reset_device_map_for_testing() {
     }
 }
 
+/// Test-only: inject a slab into the device map under a given key.
+/// Used by integration tests that need to wire up
+/// `slab_v2_return_if_owned` to find a slab built by hand.
+///
+/// Returns `Ok(())` always; the previous entry (if any) is silently
+/// overwritten.
+#[doc(hidden)]
+pub fn __test_device_map_insert(key: usize, slab: &'static Mutex<StaticSlabAllocator>) {
+    let map = device_map();
+    if let Ok(mut g) = map.lock() {
+        g.insert(key, slab);
+    }
+}
+
+/// Test-only: remove a slab entry from the device map. Used by
+/// integration tests for cleanup.
+#[doc(hidden)]
+pub fn __test_device_map_remove(key: usize) {
+    let map = device_map();
+    if let Ok(mut g) = map.lock() {
+        g.remove(&key);
+    }
+}
+
 // ===========================================================================
 // Tests
 //
