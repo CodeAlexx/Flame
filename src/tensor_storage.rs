@@ -813,6 +813,23 @@ unsafe fn make_dummy_slice<T>(device: Arc<CudaDevice>) -> CudaSlice<T> {
     std::mem::transmute(mirror)
 }
 
+/// R1b integration: check whether a slice's ptr is owned by a slab
+/// (`static_slab_v2`). If so, decrement the slab's `live_count`, forget
+/// the slice (no cudaFree), and return `true` so the caller skips the
+/// rest of pool-return.
+///
+/// `is_u16` is currently unused (the function signature in static_slab_v2
+/// doesn't need the dtype — the slab tracks live_count irrespective of
+/// element type). We keep the param for documentation / future debug-log
+/// use; it costs nothing.
+#[cfg_attr(not(feature = "shared_storage"), inline)]
+fn slab_v2_try_claim<T>(slice: &CudaSlice<T>, _is_u16: bool) -> bool {
+    use cudarc::driver::DevicePtr;
+    let ptr = *slice.device_ptr();
+    let key = Arc::as_ptr(&slice.device()) as usize;
+    crate::static_slab_v2::slab_v2_return_if_owned(ptr, key)
+}
+
 impl Drop for TensorStorage {
     fn drop(&mut self) {
         // Phase 2: best-effort cleanup of the version-counter entry. We only
@@ -835,7 +852,15 @@ impl Drop for TensorStorage {
                     let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };
                     let dev = arc.device();
                     match Arc::try_unwrap(arc) {
-                        Ok(slice) => crate::cuda_alloc_pool::pool_return_f32(slice),
+                        Ok(slice) => {
+                            // R1b: if the slice is slab-owned, decrement
+                            // live_count and forget — skip pool_return.
+                            if slab_v2_try_claim(&slice, false) {
+                                std::mem::forget(slice);
+                            } else {
+                                crate::cuda_alloc_pool::pool_return_f32(slice);
+                            }
+                        },
                         Err(arc) => drop(arc),
                     }
                     unsafe { std::ptr::write(data, Arc::new(make_dummy_slice::<f32>(dev))) };
@@ -844,7 +869,13 @@ impl Drop for TensorStorage {
                 {
                     let slice: CudaSlice<f32> = unsafe { std::ptr::read(data) };
                     let dev = slice.device();
-                    crate::cuda_alloc_pool::pool_return_f32(slice);
+                    // R1b: if the slice is slab-owned, decrement live_count
+                    // and forget — skip pool_return.
+                    if slab_v2_try_claim(&slice, false) {
+                        std::mem::forget(slice);
+                    } else {
+                        crate::cuda_alloc_pool::pool_return_f32(slice);
+                    }
                     unsafe { std::ptr::write(data, make_dummy_slice::<f32>(dev)) };
                 }
             }
@@ -895,7 +926,12 @@ impl Drop for TensorStorage {
                     let dev = arc.device();
                     match Arc::try_unwrap(arc) {
                         Ok(slice) => {
-                            crate::cuda_alloc_pool::pool_return_u16(slice);
+                            // R1b: slab-claim path comes BEFORE pool_return.
+                            if slab_v2_try_claim(&slice, true) {
+                                std::mem::forget(slice);
+                            } else {
+                                crate::cuda_alloc_pool::pool_return_u16(slice);
+                            }
                         }
                         Err(arc) => drop(arc),
                     }
@@ -905,7 +941,12 @@ impl Drop for TensorStorage {
                 {
                     let slice: CudaSlice<u16> = unsafe { std::ptr::read(data) };
                     let dev = slice.device();
-                    crate::cuda_alloc_pool::pool_return_u16(slice);
+                    // R1b: slab-claim path comes BEFORE pool_return.
+                    if slab_v2_try_claim(&slice, true) {
+                        std::mem::forget(slice);
+                    } else {
+                        crate::cuda_alloc_pool::pool_return_u16(slice);
+                    }
                     unsafe { std::ptr::write(data, make_dummy_slice::<u16>(dev)) };
                 }
             }

@@ -620,8 +620,13 @@ pub fn slab_for_device(device: &Arc<CudaDevice>) -> &'static Mutex<StaticSlabAll
 // ---------------------------------------------------------------------------
 
 /// If `ptr` is owned by ANY slab on `device_key`, decrement that slab's
-/// `live_count`, forget the slice (no `cudaFree`), and return `true`. The
-/// caller MUST then skip the rest of pool-return logic.
+/// `live_count` and return `true`. The caller MUST then:
+/// 1. Skip the rest of pool-return logic (do NOT call `pool_return_*`).
+/// 2. `std::mem::forget` the `CudaSlice<T>` whose ptr we just claimed —
+///    its memory is owned by the slab, not the slice. Letting the slice
+///    drop normally is also OK (the cudarc hook will skip cudaFree
+///    because the slab range is registered), but it costs a hook lookup
+///    per drop. `forget` is the fast path.
 ///
 /// Returns `false` if `ptr` is not slab-owned; caller continues with the
 /// existing pool path.
@@ -629,17 +634,12 @@ pub fn slab_for_device(device: &Arc<CudaDevice>) -> &'static Mutex<StaticSlabAll
 /// # Arguments
 /// - `ptr`: the device pointer being dropped.
 /// - `device_key`: `Arc::as_ptr(&device) as usize` for the slice's device.
-/// - `is_u16`: `true` for BF16 (u16) slices, `false` for F32. Determines
-///   the type the synthesized `CudaSlice<T>` is forgotten as.
-/// - `len`: element count of the dropped slice.
-/// - `device`: the device Arc (cloned into the forget-mirror).
-pub fn slab_v2_return_if_owned(
-    ptr: u64,
-    device_key: usize,
-    is_u16: bool,
-    len: usize,
-    device: Arc<CudaDevice>,
-) -> bool {
+///
+/// # Concurrency
+/// Acquires the per-process device_map lock briefly, then the per-device
+/// slab lock briefly. Safe under contention from concurrent `alloc_*` /
+/// `slab_v2_return_if_owned` calls.
+pub fn slab_v2_return_if_owned(ptr: u64, device_key: usize) -> bool {
     // Look up the slab for this device_key. We can't take the device_map
     // lock while ALSO holding a slab lock, so we copy the slab pointer out
     // first.
@@ -655,45 +655,23 @@ pub fn slab_v2_return_if_owned(
     };
     // Lock the slab, check if the ptr falls in its range, decrement
     // live_count if so.
-    let owns = {
-        let g = match slab_mutex.lock() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
-        if g.ptr_in_slab(ptr) {
-            // SAFETY: live_count > 0 by construction (we incremented on
-            // alloc; if a slab-owned slice is being dropped, it MUST have
-            // come from an alloc that incremented). saturating_sub guards
-            // against logic bugs.
-            let prev = g.live_count.fetch_sub(1, Ordering::AcqRel);
-            if prev == 0 {
-                // Bug: drop without matching alloc. Restore and warn — we
-                // still want to skip cudaFree (the ptr is in the range).
-                g.live_count.fetch_add(1, Ordering::AcqRel);
-                log::warn!(
-                    "slab_v2_return_if_owned: ptr 0x{ptr:x} in slab range but live_count was 0; skipping decrement, still forgetting slice"
-                );
-            }
-            true
-        } else {
-            false
-        }
+    let g = match slab_mutex.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
     };
-    if owns {
-        // SAFETY: ptr is in `[slab_base, slab_base+capacity)`, the range is
-        // registered with ExternalMemoryRegistry, so the cudarc Drop hook
-        // would already skip cudaFree even if we let the slice drop normally.
-        // We explicitly `forget_slice` here to (a) make the contract obvious
-        // (the slab owns this memory, not the slice) and (b) avoid the
-        // hook lookup cost on the synthesized-slice's Drop.
-        unsafe {
-            if is_u16 {
-                let mirror: CudaSlice<u16> = synth_slice::<u16>(ptr, len, device);
-                forget_slice(mirror);
-            } else {
-                let mirror: CudaSlice<f32> = synth_slice::<f32>(ptr, len, device);
-                forget_slice(mirror);
-            }
+    if g.ptr_in_slab(ptr) {
+        // live_count > 0 by construction (we incremented on alloc; if a
+        // slab-owned slice is being dropped, it MUST have come from an
+        // alloc that incremented). Guard against logic bugs by clamping
+        // at zero.
+        let prev = g.live_count.fetch_sub(1, Ordering::AcqRel);
+        if prev == 0 {
+            // Drop without matching alloc. Restore and warn — caller
+            // still needs to skip cudaFree (ptr is in slab range).
+            g.live_count.fetch_add(1, Ordering::AcqRel);
+            log::warn!(
+                "slab_v2_return_if_owned: ptr 0x{ptr:x} in slab range but live_count was 0; skipping decrement"
+            );
         }
         true
     } else {
@@ -833,9 +811,11 @@ mod tests {
             g.insert(key, slab_static);
             g.insert(synth_key, slab_static); // dummy second insertion
         }
-        assert!(slab_v2_return_if_owned(p1, key, true, len1, dev.clone()));
-        assert!(slab_v2_return_if_owned(p2, key, true, len2, dev.clone()));
-        assert!(slab_v2_return_if_owned(p3, key, true, len3, dev.clone()));
+        // Suppress unused-len warnings — the new signature drops them.
+        let _ = (len1, len2, len3);
+        assert!(slab_v2_return_if_owned(p1, key));
+        assert!(slab_v2_return_if_owned(p2, key));
+        assert!(slab_v2_return_if_owned(p3, key));
         let final_live = {
             let g = slab_static.lock().unwrap();
             g.live_count()
@@ -1176,7 +1156,7 @@ mod tests {
         let key = Arc::as_ptr(&device) as usize;
         // Fresh map.
         reset_device_map_for_testing();
-        let owned = slab_v2_return_if_owned(0xDEAD_BEEF, key, true, 0, device);
+        let owned = slab_v2_return_if_owned(0xDEAD_BEEF, key);
         assert!(!owned);
     }
 }
