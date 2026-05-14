@@ -351,3 +351,357 @@ pub fn load_scratch_enabled() -> bool {
         )
     })
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// GradScratchSlab — global slab for backward-pass F32 grad accumulators
+// + transient F32 casts. Reset at end-of-step AFTER
+// `AutogradContext::clear()` (same rule as LoadScratch: tape
+// saved_tensors can hold references through backward).
+//
+// Initial size 1 GiB (Klein 9B's largest grad accumulator is ~256 MB
+// for the qkv-proj fused weight; 1 GiB carries ~4× headroom). Grows 2×
+// on overflow.
+//
+// This is the biggest Class-A win per `HEADTOHEAD_2026-05-12_ROOT_CAUSE.md`:
+// ~9,500 bf16_to_f32 + ~9,700 f32_to_bf16 launches per step on klein 9B,
+// each currently going through a fresh `pool_alloc_f32` → cudart mempool.
+// Routing all of them through one pre-allocated slab eliminates the
+// alloc/free churn entirely.
+// ─────────────────────────────────────────────────────────────────────
+
+static GRAD_SCRATCH: OnceLock<Mutex<Option<StaticSlab>>> = OnceLock::new();
+
+fn grad_scratch() -> &'static Mutex<Option<StaticSlab>> {
+    GRAD_SCRATCH.get_or_init(|| Mutex::new(None))
+}
+
+/// Initial size (bytes) for the GradScratch slab. Overridable via
+/// `FLAME_GRAD_SCRATCH_BYTES`. Default 4 GiB — Klein 9B's full backward
+/// fits comfortably under 2 GiB of transient F32 buffers; 4 GiB carries
+/// 2× headroom so no growth is needed during a single backward pass.
+///
+/// Growth during a backward scope is UB (would drop a slab while
+/// saved_tensors hold views into it). Sizing generously up-front is
+/// the simple solution; chained-slab growth is future work.
+fn grad_scratch_initial_bytes() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FLAME_GRAD_SCRATCH_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4 * 1024 * 1024 * 1024)
+    })
+}
+
+/// Bump-allocate `n` `f32` elements out of the global grad-scratch slab.
+///
+/// Pre-sized to `FLAME_GRAD_SCRATCH_BYTES` (default 4 GiB). Errors with
+/// a clear message on overflow — DO NOT grow during a scope (would
+/// dangle saved tensor views). Drop of the returned slice does NOT
+/// free; the slab is reset at end-of-step via [`reset_grad_scratch`].
+pub fn bump_grad_scratch_f32(
+    device: &Arc<CudaDevice>,
+    n: usize,
+) -> Result<CudaSlice<f32>> {
+    install_slab_drop_hook();
+    let bytes_needed = n * std::mem::size_of::<f32>();
+    let aligned = align_up(bytes_needed, 16);
+
+    let mut guard = grad_scratch()
+        .lock()
+        .map_err(|_| Error::Training("grad_scratch mutex poisoned".into()))?;
+
+    if guard.is_none() {
+        let initial = grad_scratch_initial_bytes().max(bytes_needed);
+        *guard = Some(StaticSlab::new(device.clone(), initial)?);
+    }
+
+    {
+        let slab = guard.as_ref().unwrap();
+        if slab.cursor + aligned > slab.capacity {
+            return Err(Error::InvalidInput(format!(
+                "GradScratch slab overflow: cursor={} + {} bytes > capacity={}. \
+                 Raise FLAME_GRAD_SCRATCH_BYTES (current={}). Growth during a \
+                 backward scope is unsafe — see static_slab.rs for rationale.",
+                slab.cursor, aligned, slab.capacity, grad_scratch_initial_bytes(),
+            )));
+        }
+    }
+
+    let slab = guard.as_mut().unwrap();
+    let slice = slab.bump_f32(n)?;
+    crate::cuda_alloc_pool::global_pool()
+        .register_external_ptr(*cudarc::driver::DevicePtr::device_ptr(&slice));
+    Ok(slice)
+}
+
+/// Reset the grad-scratch slab's bump cursor. Call at training step
+/// boundary AFTER `AutogradContext::clear()` so the tape's saved_tensors
+/// have been released first.
+pub fn reset_grad_scratch() {
+    if let Ok(mut guard) = grad_scratch().lock() {
+        if let Some(slab) = guard.as_mut() {
+            slab.reset();
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// ActivationSlab — forward-pass intermediates (inter-layer tensors).
+// Reset at end-of-step AFTER backward consumes them. Initial size 2 GiB
+// (klein 9B's largest activation is ~1.2 GB at 1024² — headroom for
+// re-use during recompute).
+// ─────────────────────────────────────────────────────────────────────
+
+static ACTIVATION_SLAB: OnceLock<Mutex<Option<StaticSlab>>> = OnceLock::new();
+
+fn activation_slab() -> &'static Mutex<Option<StaticSlab>> {
+    ACTIVATION_SLAB.get_or_init(|| Mutex::new(None))
+}
+
+fn activation_slab_initial_bytes() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FLAME_ACTIVATION_SLAB_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4 * 1024 * 1024 * 1024)
+    })
+}
+
+pub fn bump_activation_f32(
+    device: &Arc<CudaDevice>,
+    n: usize,
+) -> Result<CudaSlice<f32>> {
+    install_slab_drop_hook();
+    let bytes_needed = n * std::mem::size_of::<f32>();
+    let aligned = align_up(bytes_needed, 16);
+
+    let mut guard = activation_slab()
+        .lock()
+        .map_err(|_| Error::Training("activation_slab mutex poisoned".into()))?;
+
+    if guard.is_none() {
+        let initial = activation_slab_initial_bytes().max(bytes_needed);
+        *guard = Some(StaticSlab::new(device.clone(), initial)?);
+    }
+
+    {
+        let slab = guard.as_ref().unwrap();
+        if slab.cursor + aligned > slab.capacity {
+            return Err(Error::InvalidInput(format!(
+                "Activation slab overflow: cursor={} + {} bytes > capacity={}. \
+                 Raise FLAME_ACTIVATION_SLAB_BYTES (current={}).",
+                slab.cursor, aligned, slab.capacity, activation_slab_initial_bytes(),
+            )));
+        }
+    }
+
+    let slab = guard.as_mut().unwrap();
+    let slice = slab.bump_f32(n)?;
+    crate::cuda_alloc_pool::global_pool()
+        .register_external_ptr(*cudarc::driver::DevicePtr::device_ptr(&slice));
+    Ok(slice)
+}
+
+pub fn reset_activation_slab() {
+    if let Ok(mut guard) = activation_slab().lock() {
+        if let Some(slab) = guard.as_mut() {
+            slab.reset();
+        }
+    }
+}
+
+/// Reset ALL Phase B slabs in one call. Use at training step boundary
+/// AFTER `AutogradContext::clear()`. Convenience wrapper.
+pub fn reset_all_slabs() {
+    reset_load_scratch();
+    reset_grad_scratch();
+    reset_activation_slab();
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase B-1: Region enum + thread-local routing
+//
+// OneTrainer's LayerOffloadConductor carries an implicit "which layer/
+// direction am I in" context — its allocator (`StaticLayerAllocator`)
+// reads that context to pick the right cache_tensor. flame-core has no
+// conductor object yet; we approximate the same effect by tagging hot-
+// path callers with a `Region` via a thread-local + scope helper, and
+// dispatching `pool_alloc_f32` to the matching slab.
+//
+// The five regions correspond to the OT pattern:
+//   * LoadScratch  — sample-load + serialization F32 buffers (Phase A)
+//   * Activation   — forward-pass intermediates (inter-layer tensors)
+//   * GradScratch  — backward-pass grad accumulators + transient F32
+//                    casts (the biggest Class-A win per HEADTOHEAD root
+//                    cause: ~1.5 s/step of grad-storage F32 roundtrips
+//                    + cast pairs on klein 9B)
+//   * Layer        — bump-allocated layer weight scratch (matches OT's
+//                    StaticLayerAllocator)
+//   * None         — no scope set; legacy pool path
+//
+// Status: scaffolding only. The Region thread-local is here so that
+// callers can opt in via `with_region(...)` scopes; `pool_alloc_f32`
+// reads it via `try_bump_region_f32`. Default behavior is unchanged
+// when `FLAME_REGION_DISPATCH` is unset OR no scope is active — the
+// thread-local is `Region::None` everywhere, and `try_bump_region_f32`
+// returns `Ok(None)` so the pool falls through to its legacy path.
+// ─────────────────────────────────────────────────────────────────────
+
+use std::cell::Cell;
+
+/// Alloc region for routing F32 allocations to per-region slabs.
+///
+/// The order of variants matches the OT pattern's logical phases:
+/// load → forward → backward → layer-weights → unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Region {
+    /// No region set — `pool_alloc_f32` falls through to the legacy
+    /// `cuda_alloc_pool` path. This is the default.
+    None,
+    /// Sample-load + serialization F32 buffers. Reset between steps via
+    /// `reset_load_scratch`. Already wired via [`bump_load_scratch_f32`].
+    LoadScratch,
+    /// Forward-pass intermediates (activation tensors between layers).
+    /// Reset between steps via `reset_activation_slab`.
+    Activation,
+    /// Backward-pass grad accumulators + transient F32 casts. Reset
+    /// between steps via `reset_grad_scratch_slab`.
+    GradScratch,
+    /// Layer-weight scratch (matches OT's StaticLayerAllocator).
+    /// Reset per-layer-direction (forward/backward bidir cursors).
+    Layer,
+}
+
+thread_local! {
+    /// Per-thread current region for F32 alloc routing.
+    static CURRENT_REGION: Cell<Region> = const { Cell::new(Region::None) };
+}
+
+/// Read the current thread's alloc region. Default `Region::None`.
+#[inline]
+pub fn current_region() -> Region {
+    CURRENT_REGION.with(|r| r.get())
+}
+
+/// Run `body` with the current thread's alloc region set to `region`.
+/// On scope exit (normal return OR panic via the Drop guard), the prior
+/// region is restored. Nested scopes save/restore the inner→outer chain.
+///
+/// Caller-side pattern (OT-equivalent of entering a layer's allocation
+/// context):
+/// ```ignore
+/// with_region(Region::Activation, || {
+///     // any pool_alloc_f32 inside here routes to the Activation slab
+///     // (when FLAME_REGION_DISPATCH=1 + slab is initialized)
+///     primitive_forward(...)
+/// })
+/// ```
+pub fn with_region<R>(region: Region, body: impl FnOnce() -> R) -> R {
+    struct Guard {
+        prior: Region,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CURRENT_REGION.with(|c| c.set(self.prior));
+        }
+    }
+    let prior = CURRENT_REGION.with(|c| c.replace(region));
+    let _guard = Guard { prior };
+    body()
+}
+
+/// Master switch for the Phase B region-dispatch path. Default OFF.
+/// When unset, [`try_bump_region_f32`] is a no-op (`Ok(None)`) — the
+/// thread-local is consulted but no slab is created or used.
+///
+/// Setting `FLAME_REGION_DISPATCH=1` enables routing F32 allocs from
+/// `pool_alloc_f32` into the matching region slab IF a `with_region`
+/// scope is active AND that region has a slab wired.
+#[inline]
+pub fn region_dispatch_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        matches!(
+            std::env::var("FLAME_REGION_DISPATCH").ok().as_deref(),
+            Some("1") | Some("true") | Some("on")
+        )
+    })
+}
+
+/// Dispatch entry called from `pool_alloc_f32`. Returns:
+/// * `Ok(Some(slice))` — routed to a region slab.
+/// * `Ok(None)`        — region routing not applicable (master switch
+///                       off, no scope active, or region has no slab
+///                       wired yet). Caller falls through to legacy
+///                       pool path.
+/// * `Err(...)`        — slab routing was attempted but failed (e.g.
+///                       OOM during slab growth). Caller may surface
+///                       or fall through depending on policy; current
+///                       policy is to fall through (slab errors should
+///                       not crash a trainer that would otherwise work
+///                       on the legacy path).
+pub fn try_bump_region_f32(
+    device: &Arc<CudaDevice>,
+    size: usize,
+) -> Result<Option<CudaSlice<f32>>> {
+    if !region_dispatch_enabled() {
+        return Ok(None);
+    }
+    match current_region() {
+        Region::None => Ok(None),
+        // Phase A handles LoadScratch separately via Tensor::from_vec.
+        // If a caller explicitly enters a LoadScratch scope, route here
+        // for consistency.
+        Region::LoadScratch => bump_load_scratch_f32(device, size).map(Some),
+        Region::Activation => bump_activation_f32(device, size).map(Some),
+        Region::GradScratch => bump_grad_scratch_f32(device, size).map(Some),
+        // Layer slab is OT's StaticLayerAllocator analog — not yet
+        // implemented because the BlockOffloader already has its own
+        // 2-slot ping-pong path that mostly fills this role.
+        Region::Layer => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+
+    #[test]
+    fn current_region_defaults_to_none() {
+        assert_eq!(current_region(), Region::None);
+    }
+
+    #[test]
+    fn with_region_sets_and_restores() {
+        assert_eq!(current_region(), Region::None);
+        with_region(Region::GradScratch, || {
+            assert_eq!(current_region(), Region::GradScratch);
+        });
+        assert_eq!(current_region(), Region::None);
+    }
+
+    #[test]
+    fn with_region_nests_correctly() {
+        with_region(Region::Activation, || {
+            assert_eq!(current_region(), Region::Activation);
+            with_region(Region::GradScratch, || {
+                assert_eq!(current_region(), Region::GradScratch);
+            });
+            assert_eq!(current_region(), Region::Activation);
+        });
+        assert_eq!(current_region(), Region::None);
+    }
+
+    #[test]
+    fn with_region_restores_on_panic() {
+        let _ = std::panic::catch_unwind(|| {
+            with_region(Region::GradScratch, || {
+                assert_eq!(current_region(), Region::GradScratch);
+                panic!("test panic");
+            });
+        });
+        assert_eq!(current_region(), Region::None);
+    }
+}

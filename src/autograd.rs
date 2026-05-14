@@ -1401,6 +1401,25 @@ impl AutogradContext {
     /// the whole graph so `GradientMap::accumulate_v2`'s "no dtype
     /// mismatch" contract is satisfied.
     fn backward_impl(loss: &Tensor, policy: GradStorePolicy) -> Result<GradientMap> {
+        // Phase B-3: route every F32 alloc that fires during this backward
+        // pass through the GradScratch slab (when FLAME_REGION_DISPATCH=1
+        // is set). Wrapping the whole `backward_impl_inner` body in a
+        // `with_region(GradScratch, ...)` scope means every transient F32
+        // buffer — bf16_to_f32 casts, grad accumulators, scratch reduces —
+        // bumps from the pre-allocated GradScratch slab instead of cudart's
+        // mempool. This is the Class-A win path: ~9,500 + ~9,700 cast pairs
+        // per step on klein 9B now share one allocation.
+        //
+        // The scope is restored on Drop (panic-safe). Default behavior is
+        // unchanged when FLAME_REGION_DISPATCH is unset: try_bump_region_f32
+        // returns Ok(None) and the pool's legacy path runs.
+        crate::static_slab::with_region(
+            crate::static_slab::Region::GradScratch,
+            || Self::backward_impl_inner(loss, policy),
+        )
+    }
+
+    fn backward_impl_inner(loss: &Tensor, policy: GradStorePolicy) -> Result<GradientMap> {
         // Cache profiling flag once (avoid syscall per-op)
         static PROFILE_CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let profile = *PROFILE_CACHED.get_or_init(|| {

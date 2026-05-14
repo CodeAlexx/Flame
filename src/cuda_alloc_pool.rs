@@ -899,6 +899,29 @@ pub fn global_pool() -> &'static CudaAllocPool {
 /// `FLAME_F32_ZERO_INIT=1` to revert to the legacy zero-on-miss behavior
 /// if a hidden caller is discovered.
 pub fn pool_alloc_f32(device: &Arc<CudaDevice>, size: usize) -> crate::Result<CudaSlice<f32>> {
+    // Phase B-3: region-dispatch hook. When the current thread has a
+    // `with_region(...)` scope active AND the matching slab is wired
+    // AND `FLAME_REGION_DISPATCH=1`, route this F32 alloc to the slab
+    // and skip cudart's mempool entirely (Clause 1 — no per-call
+    // cudaMallocAsync, no per-drop cudaFreeAsync, no mempool churn).
+    //
+    // Returning `Ok(None)` from `try_bump_region_f32` means "not
+    // applicable" — fall through to the legacy pool path. Returning
+    // `Err(...)` is treated as non-fatal here: if the slab can't fit,
+    // we fall back rather than crashing a trainer that would have
+    // worked on the pool path.
+    if size > 0 {
+        match crate::static_slab::try_bump_region_f32(device, size) {
+            Ok(Some(slice)) => return Ok(slice),
+            Ok(None) => { /* fall through */ }
+            Err(e) => {
+                log::warn!(
+                    "pool: region-dispatch slab alloc failed ({e:?}) — falling back to pool path"
+                );
+            }
+        }
+    }
+
     if pool_disabled() || size == 0 {
         // Non-pool path unchanged: legacy callers expect zero-init.
         return device
