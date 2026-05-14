@@ -1401,13 +1401,6 @@ impl AutogradContext {
     /// the whole graph so `GradientMap::accumulate_v2`'s "no dtype
     /// mismatch" contract is satisfied.
     fn backward_impl(loss: &Tensor, policy: GradStorePolicy) -> Result<GradientMap> {
-        // Phase B note: the GradScratch with_region wrap that lived here
-        // was reverted 2026-05-15 after smoke showed it doesn't deliver
-        // measurable speed (slab overflows on every backward, falls
-        // through to pool, adds dispatch overhead with no benefit). The
-        // slab primitives remain in `static_slab.rs` for future wiring
-        // at finer-grained scopes (per-block, per-op). The legacy
-        // backward path is the only path again.
         // Cache profiling flag once (avoid syscall per-op)
         static PROFILE_CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let profile = *PROFILE_CACHED.get_or_init(|| {

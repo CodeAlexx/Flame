@@ -1182,59 +1182,24 @@ extern "C" __global__ void masked_fill_kernel(
                 got: Shape::from_dims(&[data.len()]),
             });
         }
-        // 2026-05-14 redesign Phase A Option 1: when the load-scratch slab
-        // is enabled, do the H2D into a transient slab view (the slab is
-        // pre-allocated, so this H2D doesn't go through cudart's mempool —
-        // it bypasses the step-2 `CUDA_ERROR_INVALID_VALUE` crash class).
-        // Then allocate a regular pool tensor and copy slab→pool on the
-        // device. The slab view is dropped here, so the Tensor we return
-        // owns its memory independently of the slab — it can flow through
-        // autograd's saved_tensors and survive the next step's slab reset
-        // without aliasing the next step's data.
+        // Allocate from memory pool
         let numel = data.len();
-        let mut cuda_data = if crate::static_slab::load_scratch_enabled() {
-            // ── Phase A: slab-owned result tensor ──────────────────────
-            // Both the H2D destination AND the result Tensor's backing
-            // storage come from the pre-allocated slab. No cudart-mempool
-            // allocations at all on this hot path → the step-2
-            // `CUDA_ERROR_INVALID_VALUE` crash class is bypassed entirely.
-            //
-            // The slab view is wrapped directly into TensorStorage::F32;
-            // when the Tensor drops (after autograd tape clear), the slab
-            // hook + pool external_ptrs refcount ensure the slice's drop
-            // is a no-op (no cudaFree). The trainer resets the slab
-            // cursor at end-of-step (AFTER `AutogradContext::clear()`)
-            // via `flame_core::static_slab::reset_load_scratch()`.
-            let mut slab_view = crate::static_slab::bump_load_scratch_f32(&device, numel)?;
-            if slab_view.len() > numel {
-                let mut padded = data;
-                padded.resize(slab_view.len(), 0.0);
-                device
-                    .htod_copy_into(padded, &mut slab_view)
-                    .map_err(|e| Error::CudaDriver(format!("slab htod (padded): {e:?}")))?;
-            } else {
-                device
-                    .htod_copy_into(data, &mut slab_view)
-                    .map_err(|e| Error::CudaDriver(format!("slab htod: {e:?}")))?;
-            }
-            slab_view
+        let mut cuda_data = alloc_from_pool(&device, numel)?;
+
+        // If the allocated size is larger than our data, we need to handle it carefully
+        if cuda_data.len() > numel {
+            // Pad the data to match the allocated size
+            let mut padded_data = data;
+            padded_data.resize(cuda_data.len(), 0.0);
+            device
+                .htod_copy_into(padded_data, &mut cuda_data)
+                .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         } else {
-            // ── Legacy path: direct pool alloc + H2D ────────────────────
-            let mut cuda_data = alloc_from_pool(&device, numel)?;
-            if cuda_data.len() > numel {
-                let mut padded_data = data;
-                padded_data.resize(cuda_data.len(), 0.0);
-                device
-                    .htod_copy_into(padded_data, &mut cuda_data)
-                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
-            } else {
-                device
-                    .htod_copy_into(data, &mut cuda_data)
-                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
-            }
-            cuda_data
-        };
-        let _ = &mut cuda_data; // silence unused-mut on the slab-path branch
+            // Normal case - sizes match
+            device
+                .htod_copy_into(data, &mut cuda_data)
+                .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
+        }
         Ok(Self {
             storage: TensorStorage::F32 {
                 data: cuda_data.into(),
