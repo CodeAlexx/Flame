@@ -83,6 +83,21 @@ fn f32_zero_init_enabled() -> bool {
     *CACHED.get_or_init(|| std::env::var("FLAME_F32_ZERO_INIT").ok().as_deref() == Some("1"))
 }
 
+/// Cached env check for `FLAME_F32_POOL_CACHE=1` (opt-in: enable the F32
+/// free-list caching path in `pool_alloc_f32`).
+///
+/// **Default = OFF.** The F32 free-list has a documented stale-ptr re-use
+/// bug across alloc generations that crashes Klein 9B + --offload at step
+/// 2-13 with `CUDA_ERROR_INVALID_VALUE` (see Skeptic Phase 2c diagnosis).
+/// Disabling the cache routes F32 allocs directly to cudart `device.alloc`
+/// and `cudaFree` on drop, bypassing the free-list entirely. The BF16
+/// path (`pool_alloc_u16`) is unaffected and continues to cache.
+#[inline]
+fn f32_pool_cache_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("FLAME_F32_POOL_CACHE").ok().as_deref() == Some("1"))
+}
+
 // ---------------------------------------------------------------------------
 // Pool statistics
 // ---------------------------------------------------------------------------
@@ -906,6 +921,30 @@ pub fn pool_alloc_f32(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
             .map_err(|e| crate::Error::CudaDriver(format!("{e:?}")));
     }
 
+    // 2026-05-15: F32 free-list caching is OPT-IN via FLAME_F32_POOL_CACHE=1.
+    //
+    // The F32 caching path has a stale-ptr re-use bug across alloc generations
+    // (see HANDOFF_2026-05-14_F32_MEMPOOL_BUG_OPEN.md + Skeptic Phase 2c). The
+    // crash manifests as CUDA_ERROR_INVALID_VALUE on a later cuMemcpy/cuMemset
+    // call targeting a ptr the cudart driver later rejects as invalid.
+    //
+    // The BF16 caching path (`pool_alloc_u16`) is unaffected — same code shape,
+    // different free-list, no reported crash. BF16 is also the dominant
+    // allocation volume (model weights, activations) so the perf delta from
+    // disabling F32 caching is small.
+    //
+    // Default OFF removes the workaround tax (~0.7-1.0 s/step) by keeping
+    // `FLAME_ALLOC_POOL=1` viable: BF16 caching delivers most of the perf,
+    // F32 goes direct to cudart (same as the old `FLAME_ALLOC_POOL=0`
+    // workaround did for ALL allocations).
+    //
+    // Set `FLAME_F32_POOL_CACHE=1` to re-enable the (buggy) F32 free-list
+    // for experimentation. Default OFF.
+    if !f32_pool_cache_enabled() {
+        return unsafe { device.alloc::<f32>(size) }
+            .map_err(|e| crate::Error::CudaDriver(format!("alloc::<f32>({size}): {e:?}")));
+    }
+
     let pool = global_pool();
     let bucket = round_elems_up::<f32>(size);
 
@@ -1019,16 +1058,17 @@ pub fn pool_alloc_f32(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
 /// `device.alloc_zeros`. After this call, `slice` is consumed and the
 /// caller must not use it.
 pub fn pool_return_f32(slice: CudaSlice<f32>) {
-    if pool_disabled() {
-        // If the slice's pointer is external (slab-owned), do NOT cudaFree
-        // it. The slab Arc keeps it alive. This is the rare case where
-        // `pool_disabled()` flipped between alloc and return — under
-        // normal flow pool_disabled is constant for a run. Be defensive.
+    // 2026-05-15: when pool is disabled OR F32 caching is opt-out (default),
+    // drop directly. Symmetric with `pool_alloc_f32`'s opt-out check.
+    if pool_disabled() || !f32_pool_cache_enabled() {
+        // If the slice's pointer is external (slab-owned or ring-owned), do
+        // NOT cudaFree it. The owning allocator keeps it alive.
         let ptr = *slice.device_ptr();
         if global_pool().is_external_ptr(ptr) {
             let len = DeviceSlice::len(&slice);
             let (p, _, dev) = unsafe { decompose_slice(slice) };
             unsafe { reconstruct_and_forget::<f32>(p, len, dev) };
+            global_pool().unregister_external_ptr(ptr);
         } else {
             drop(slice); // normal cudaFree
         }
