@@ -1160,6 +1160,16 @@ pub fn global_pool() -> &'static CudaAllocPool {
 /// `FLAME_F32_ZERO_INIT=1` to revert to the legacy zero-on-miss behavior
 /// if a hidden caller is discovered.
 pub fn pool_alloc_f32(device: &Arc<CudaDevice>, size: usize) -> crate::Result<CudaSlice<f32>> {
+    // R2a: transient-scope slab dispatch. Routes to `StaticSlabAllocator`
+    // when `FLAME_USE_STATIC_SLAB=1` AND a `StepSlabGuard` is active on the
+    // current thread. Outside any guard or with the env unset, falls
+    // through to the existing pool path unchanged. The slab helper returns
+    // `None` (not Err) on any failure mode (overflow, poisoned mutex, no
+    // active guard) — the legacy path is the safety net.
+    if let Some(slice) = crate::static_slab_v2::pool_alloc_f32_via_slab(size) {
+        return Ok(slice);
+    }
+
     if pool_disabled() || size == 0 {
         // Non-pool path unchanged: legacy callers expect zero-init.
         return device
@@ -1363,6 +1373,11 @@ pub fn pool_return_f32(slice: CudaSlice<f32>) {
 ///
 /// Always returns uninitialized memory (matches PT BFCAllocator semantics).
 pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<CudaSlice<u16>> {
+    // R2a: transient-scope slab dispatch. See `pool_alloc_f32` for rationale.
+    if let Some(slice) = crate::static_slab_v2::pool_alloc_u16_via_slab(size) {
+        return Ok(slice);
+    }
+
     if pool_disabled() || size == 0 {
         return unsafe {
             device

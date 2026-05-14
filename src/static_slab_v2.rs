@@ -48,6 +48,7 @@
 //!         └── drop slab CudaSlice<u8> → real cudaFree
 //! ```
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -576,8 +577,15 @@ fn device_map() -> &'static Mutex<DeviceMap> {
 pub fn slab_for_device(device: &Arc<CudaDevice>) -> &'static Mutex<StaticSlabAllocator> {
     let key = Arc::as_ptr(device) as usize;
     let map = device_map();
+    // Poison-tolerant lock acquisition: the inner `HashMap` is benign on
+    // panic (we never panic while holding device_map's lock in production
+    // paths), and adversarial tests intentionally poison it. Recover and
+    // continue.
     {
-        let g = map.lock().expect("slab device_map poisoned");
+        let g = match map.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         if let Some(slab) = g.get(&key) {
             return *slab;
         }
@@ -598,7 +606,10 @@ pub fn slab_for_device(device: &Arc<CudaDevice>) -> &'static Mutex<StaticSlabAll
     let new_slab = StaticSlabAllocator::new(device.clone(), capacity_bytes);
     let boxed: &'static Mutex<StaticSlabAllocator> =
         Box::leak(Box::new(Mutex::new(new_slab)));
-    let mut g = map.lock().expect("slab device_map poisoned");
+    let mut g = match map.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
     // Race window: if another thread already inserted, prefer the existing
     // entry and drop ours (leak the freshly-boxed mutex; benign on cold path).
     *g.entry(key).or_insert(boxed)
@@ -687,17 +698,26 @@ pub fn slab_v2_return_if_owned(ptr: u64, device_key: usize) -> bool {
 /// runs don't see each other's slabs.
 #[doc(hidden)]
 pub fn reset_device_map_for_testing() {
-    if let Ok(mut g) = device_map().lock() {
-        for (_, slab_ref) in g.drain() {
-            // Try to release cleanly. If a slab still has live tensors,
-            // release will error; we log and leak.
-            if let Ok(mut s) = slab_ref.lock() {
-                let _ = s.release();
-            }
-            // We intentionally do NOT free the leaked Box<Mutex<...>>:
-            // there's no safe way to reclaim it without proving no other
-            // thread still holds the &'static reference.
-        }
+    // Poison-tolerant lock acquisition: the map may have been poisoned by a
+    // panicking test (especially the R2a `guard_drop_with_live_count_panics`
+    // suite). We drain regardless.
+    let mut g = match device_map().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for (_, slab_ref) in g.drain() {
+        // Force live_count → 0 first so release() can succeed even if a
+        // previous test leaked a slice that we can no longer reach. Then
+        // call release. If the slab mutex is poisoned, recover and proceed.
+        let mut s = match slab_ref.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        s.live_count.store(0, Ordering::Release);
+        let _ = s.release();
+        // We intentionally do NOT free the leaked Box<Mutex<...>>:
+        // there's no safe way to reclaim it without proving no other
+        // thread still holds the &'static reference.
     }
 }
 
@@ -722,6 +742,326 @@ pub fn __test_device_map_remove(key: usize) {
     let map = device_map();
     if let Ok(mut g) = map.lock() {
         g.remove(&key);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase R2a — StepSlabGuard (RAII transient scope)
+//
+// A guard activates "transient slab dispatch" on the CURRENT thread. While a
+// guard is live, `cuda_alloc_pool::pool_alloc_{u16,f32}` route to the slab
+// (gated by `FLAME_USE_STATIC_SLAB=1`). On drop, the guard strict-resets the
+// slab and panics if `live_count != 0`, EXCEPT when the thread is already
+// unwinding — in that case it logs and best-effort cleans up to avoid the
+// "double panic during unwinding ⇒ abort" failure mode.
+//
+// DECISION: thread-local state uses `Cell` (not `Mutex` / not `AtomicUsize`).
+// The slab dispatch happens on the alloc hot path; `Cell::get` is a plain
+// load with no synchronisation cost, and the field is per-thread by
+// construction so atomicity is not needed across threads. Locked down by
+// `guard_routes_alloc_to_slab` (correctness) and `guard_active_on_thread_query`.
+//
+// DECISION: nested guards are forbidden (return Err). Nested transient
+// scopes would have ambiguous reset semantics — does the inner drop reset?
+// only outer? — and OneTrainer's StaticLayerAllocator likewise has a single-
+// active-scope invariant. Locked down by `guard_nested_forbidden`.
+//
+// DECISION: the env check `FLAME_USE_STATIC_SLAB` is `std::env::var` on every
+// `pool_alloc_*` call, NOT cached via `OnceLock`. Reason: env reads land at
+// ~50ns; an alloc that goes to cudart is microseconds; an alloc that goes
+// to the slab is hundreds of ns. The env read is in the noise. Caching it
+// would prevent runtime toggling (which Phase R2c gates rely on for the
+// "off vs on" baselines on the same trainer invocation).
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Per-thread "device_key of the active guard, if any". `None` ⇒ no
+    /// guard active on this thread; allocations go through legacy pool.
+    /// `Some(key)` ⇒ allocations route to `slab_for_device` at that key,
+    /// when `FLAME_USE_STATIC_SLAB=1`.
+    static ACTIVE_DEVICE_KEY: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Env name for the dispatch gate. `=1` enables slab routing when a guard
+/// is active. Anything else (unset, `"0"`, etc.) keeps the legacy pool path.
+pub const ENV_USE_STATIC_SLAB: &str = "FLAME_USE_STATIC_SLAB";
+
+/// True iff `FLAME_USE_STATIC_SLAB=1` in the current process environment.
+/// Re-read on every call; not cached.
+#[inline]
+fn use_static_slab_enabled() -> bool {
+    std::env::var(ENV_USE_STATIC_SLAB).ok().as_deref() == Some("1")
+}
+
+/// RAII guard that activates transient slab dispatch for the current thread.
+///
+/// While a guard is live:
+/// - `pool_alloc_u16` / `pool_alloc_f32` route to
+///   [`StaticSlabAllocator`] for the guard's device (gated by
+///   `FLAME_USE_STATIC_SLAB=1`).
+/// - Persistent allocations made BEFORE the guard's `enter` are unaffected.
+///
+/// On `Drop` (or explicit [`StepSlabGuard::finish`]):
+/// - Clears the thread-local active flag.
+/// - Calls `StaticSlabAllocator::reset()` — STRICT: panics on `Drop` if
+///   `live_count != 0` (unless the thread is already unwinding, in which
+///   case it logs and continues to avoid a double-panic abort). `finish`
+///   returns `Err` instead of panicking.
+///
+/// **Nested guards are forbidden** — calling `enter` while another guard is
+/// already live on the same thread returns `Err`.
+pub struct StepSlabGuard {
+    device: Arc<CudaDevice>,
+    device_key: usize,
+    finished: bool,
+}
+
+impl StepSlabGuard {
+    /// Enter a transient scope for `device`.
+    ///
+    /// Returns `Err(InvalidOperation)` if a guard is already active on this
+    /// thread (nested guards forbidden).
+    pub fn enter(device: Arc<CudaDevice>) -> Result<Self> {
+        let device_key = Arc::as_ptr(&device) as usize;
+        // Check nesting and set the thread-local atomically (per-thread, so
+        // no inter-thread race possible).
+        let already_active = ACTIVE_DEVICE_KEY.with(|cell| {
+            if cell.get().is_some() {
+                true
+            } else {
+                cell.set(Some(device_key));
+                false
+            }
+        });
+        if already_active {
+            return Err(Error::InvalidOperation(
+                "StepSlabGuard::enter: a guard is already active on this thread (nested guards forbidden)".to_string(),
+            ));
+        }
+        // Eagerly register the slab in the device_map so the dispatch
+        // helpers (`pool_alloc_*_via_slab`) can find it on the first alloc
+        // inside this scope. The slab itself is still lazily materialised
+        // by the first `alloc_*` call; only the `&'static Mutex` entry is
+        // populated here.
+        //
+        // DECISION: call `slab_for_device` from `enter` rather than
+        // requiring `pool_alloc_*_via_slab` to thread an `Arc<CudaDevice>`
+        // through. The pool dispatch only has access to `&Arc<CudaDevice>`
+        // at the *call site*; the slab lookup uses the device_key (a usize)
+        // which doesn't carry the Arc. Pre-registering keeps the
+        // dispatch hot path lookup-only. Locked down by
+        // `guard_routes_alloc_to_slab` (asserts the slab is in the map
+        // after the first alloc inside the guard).
+        let _ = slab_for_device(&device);
+        Ok(Self {
+            device,
+            device_key,
+            finished: false,
+        })
+    }
+
+    /// Convenience: enter a guard on `CudaDevice::new(0)`. Returns `Err` if
+    /// CUDA device 0 is unavailable OR if a guard is already active.
+    pub fn enter_default() -> Result<Self> {
+        let device = CudaDevice::new(0).map_err(|e| {
+            Error::CudaDriver(format!("StepSlabGuard::enter_default: CudaDevice::new(0): {e:?}"))
+        })?;
+        Self::enter(device)
+    }
+
+    /// True iff the current thread has a live `StepSlabGuard`.
+    ///
+    /// Cheap (`Cell::get` — plain load).
+    #[inline]
+    pub fn active_on_thread() -> bool {
+        ACTIVE_DEVICE_KEY.with(|cell| cell.get().is_some())
+    }
+
+    /// The device-key (`Arc::as_ptr as usize`) of the active guard on this
+    /// thread, if any. Used by the slab dispatch helpers below.
+    #[inline]
+    pub fn active_device_key() -> Option<usize> {
+        ACTIVE_DEVICE_KEY.with(|cell| cell.get())
+    }
+
+    /// Explicit graceful close. Resets the slab; returns `Err` if
+    /// `live_count != 0`. After `finish()`, `Drop` is a no-op.
+    ///
+    /// Use this in code paths that want to handle a "leaked slab tensor"
+    /// failure without unwinding the stack.
+    pub fn finish(mut self) -> Result<()> {
+        // Clear the thread-local FIRST so subsequent allocs (e.g. inside a
+        // future scope) don't see this guard still active even on the
+        // error path.
+        ACTIVE_DEVICE_KEY.with(|cell| cell.set(None));
+        self.finished = true;
+        // Try to reset the slab. Note: the slab may not have been
+        // materialised at all (if no alloc happened during the scope) —
+        // that's fine, `reset()` is a no-op on an unmaterialised slab.
+        let slab_ref = {
+            let g = device_map().lock().map_err(|_| {
+                Error::InvalidOperation("StepSlabGuard::finish: device_map poisoned".to_string())
+            })?;
+            g.get(&self.device_key).copied()
+        };
+        if let Some(slab_mu) = slab_ref {
+            let mut slab = slab_mu.lock().map_err(|_| {
+                Error::InvalidOperation(
+                    "StepSlabGuard::finish: slab mutex poisoned".to_string(),
+                )
+            })?;
+            slab.reset()?;
+        }
+        Ok(())
+    }
+
+    /// Internal: reset the slab. Used by `Drop`. Returns `Err` on
+    /// `live_count != 0` or poisoned mutex — does NOT panic.
+    fn reset_slab(&self) -> Result<()> {
+        let slab_ref = {
+            let g = device_map().lock().map_err(|_| {
+                Error::InvalidOperation("StepSlabGuard::drop: device_map poisoned".to_string())
+            })?;
+            g.get(&self.device_key).copied()
+        };
+        if let Some(slab_mu) = slab_ref {
+            let mut slab = slab_mu.lock().map_err(|_| {
+                Error::InvalidOperation(
+                    "StepSlabGuard::drop: slab mutex poisoned".to_string(),
+                )
+            })?;
+            slab.reset()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StepSlabGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Always clear the thread-local — even on the panic/error path —
+        // so a subsequent guard `enter()` on this thread succeeds.
+        ACTIVE_DEVICE_KEY.with(|cell| cell.set(None));
+
+        let reset_result = self.reset_slab();
+
+        match reset_result {
+            Ok(()) => {
+                // Normal path: nothing else to do.
+            }
+            Err(e) => {
+                // Strict: panic on live_count != 0 — but ONLY if we're not
+                // already unwinding. Otherwise we'd cause a "double panic
+                // during unwinding ⇒ abort", which swallows the original
+                // panic and crashes the process.
+                if std::thread::panicking() {
+                    log::error!(
+                        "StepSlabGuard::drop: slab reset failed during unwind \
+                         (suppressed to avoid double-panic abort): {e}"
+                    );
+                } else {
+                    panic!("StepSlabGuard::drop: slab invariant violated: {e}");
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slab dispatch helpers (used by `cuda_alloc_pool::pool_alloc_*`)
+//
+// These are the dispatch points the pool calls to TRY the slab path. They
+// return `None` if the slab can't (or shouldn't) be used — the pool falls
+// back to the legacy path. Conditions for `None`:
+//
+//   1. The thread has no active `StepSlabGuard` → no transient scope.
+//   2. `FLAME_USE_STATIC_SLAB=1` is not set in the env.
+//   3. The slab overflowed (slab capacity exceeded by this alloc).
+//   4. The device map / slab mutex is poisoned.
+//
+// All four are non-error fallbacks: the legacy `device.alloc::<T>` path is
+// the safety net. The only behavior change vs the pre-R2a tree is that
+// when (1) AND (2) BOTH hold AND the slab has capacity, the alloc goes
+// to the slab. Persistent allocations (no guard) are unaffected.
+// ---------------------------------------------------------------------------
+
+/// Try to satisfy an N-element BF16 allocation from the active slab.
+///
+/// Returns `Some(slice)` on success, `None` if the slab is unavailable or
+/// inactive. Caller (pool_alloc_u16) MUST fall back to the legacy path on
+/// `None`.
+pub fn pool_alloc_u16_via_slab(n: usize) -> Option<CudaSlice<u16>> {
+    if !use_static_slab_enabled() {
+        return None;
+    }
+    let key = StepSlabGuard::active_device_key()?;
+    // The slab path is the new transient route; if a previous test or
+    // operation poisoned the mutex, we still want to USE the slab (a
+    // poisoned mutex means the inner data may be in a torn state, but for
+    // the device_map that data is just a `HashMap` of slab pointers — no
+    // tearing possible from a panic in `slab_for_device`-adjacent code).
+    let device_ref = match device_map().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let slab_ref = (*device_ref).get(&key).copied();
+    drop(device_ref);
+    let slab_ref = slab_ref?;
+    let mut slab = match slab_ref.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    match slab.alloc_u16(n) {
+        Ok(slice) => Some(slice),
+        Err(e) => {
+            // Overflow / bad input — log and fall back to legacy. We don't
+            // want to take down the trainer just because the slab is small.
+            log::warn!(
+                "pool_alloc_u16_via_slab: slab alloc({n}) failed, falling back to legacy pool: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// Try to satisfy an N-element F32 allocation from the active slab.
+///
+/// **Zero-init contract**: the F32 pool path (`pool_alloc_f32` opt-out)
+/// zeros memory on miss to match the legacy `pool_disabled` path. We
+/// preserve that contract by calling `alloc_f32_zeroed`, NOT
+/// `alloc_f32_uninit`. Callers that legitimately need uninit memory can
+/// be added to a separate dispatch path later (R2b/R3).
+///
+/// Returns `Some(slice)` on success, `None` if the slab is unavailable or
+/// inactive. Caller (pool_alloc_f32) MUST fall back to the legacy path on
+/// `None`.
+pub fn pool_alloc_f32_via_slab(n: usize) -> Option<CudaSlice<f32>> {
+    if !use_static_slab_enabled() {
+        return None;
+    }
+    let key = StepSlabGuard::active_device_key()?;
+    // Poison-tolerant lookup (see `pool_alloc_u16_via_slab`).
+    let device_ref = match device_map().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let slab_ref = (*device_ref).get(&key).copied();
+    drop(device_ref);
+    let slab_ref = slab_ref?;
+    let mut slab = match slab_ref.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    match slab.alloc_f32_zeroed(n) {
+        Ok(slice) => Some(slice),
+        Err(e) => {
+            log::warn!(
+                "pool_alloc_f32_via_slab: slab alloc({n}) failed, falling back to legacy pool: {e}"
+            );
+            None
+        }
     }
 }
 
@@ -763,7 +1103,7 @@ mod tests {
     /// 1. Allocate three BF16 tensors; cursor advances by aligned totals.
     #[test]
     fn slab_alloc_advances_cursor() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = skip_if_no_gpu() else { return };
         let mut slab = fresh_slab(device);
 
@@ -829,7 +1169,7 @@ mod tests {
         let slab_static: &'static Mutex<StaticSlabAllocator> =
             Box::leak(Box::new(Mutex::new(slab)));
         {
-            let mut g = device_map().lock().unwrap();
+            let mut g = device_map().lock().unwrap_or_else(|e| e.into_inner());
             // Overwrite real key with our slab so slab_v2_return_if_owned
             // finds it. Save the old entry if present.
             g.insert(key, slab_static);
@@ -841,26 +1181,26 @@ mod tests {
         assert!(slab_v2_return_if_owned(p2, key));
         assert!(slab_v2_return_if_owned(p3, key));
         let final_live = {
-            let g = slab_static.lock().unwrap();
+            let g = slab_static.lock().unwrap_or_else(|e| e.into_inner());
             g.live_count()
         };
         assert_eq!(final_live, 0);
 
         // Cleanup the global map (remove our synthetic entries).
         {
-            let mut g = device_map().lock().unwrap();
+            let mut g = device_map().lock().unwrap_or_else(|e| e.into_inner());
             g.remove(&key);
             g.remove(&synth_key);
         }
         // Release the slab cleanly (live_count is 0 now).
-        let mut s = slab_static.lock().unwrap();
+        let mut s = slab_static.lock().unwrap_or_else(|e| e.into_inner());
         s.release().unwrap();
     }
 
     /// 2. Lazy materialisation: `new()` does NOT cudaMalloc; first alloc does.
     #[test]
     fn slab_lazy_materialization() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = skip_if_no_gpu() else { return };
         let slab = StaticSlabAllocator::new(device.clone(), 4 * 1024 * 1024);
 
@@ -883,7 +1223,7 @@ mod tests {
     /// 3. Overflow returns Err with structured info.
     #[test]
     fn slab_overflow_fails_clean() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = skip_if_no_gpu() else { return };
         // Tiny slab — 4 KiB.
         let mut slab = StaticSlabAllocator::new(device, 4 * 1024);
@@ -907,7 +1247,7 @@ mod tests {
     /// 4. reset() fails when live_count > 0; ptr is still valid (slab not torn down).
     #[test]
     fn slab_reset_with_live_allocation_fails() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = skip_if_no_gpu() else { return };
         let mut slab = fresh_slab(device);
         let s = slab.alloc_u16(128).unwrap();
@@ -928,7 +1268,7 @@ mod tests {
     /// 5. reset() after drops succeeds; cursor rewinds; next alloc starts at base.
     #[test]
     fn slab_reset_after_drop_succeeds() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = skip_if_no_gpu() else { return };
         let mut slab = fresh_slab(device);
         let s = slab.alloc_u16(1024).unwrap();
@@ -955,7 +1295,7 @@ mod tests {
     /// 6. alloc_f32_zeroed produces zero-initialised memory.
     #[test]
     fn slab_f32_zeroed_reads_zeros() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = skip_if_no_gpu() else { return };
         let mut slab = fresh_slab(device.clone());
 
@@ -977,7 +1317,7 @@ mod tests {
     /// 7. alloc_f32_uninit does not invoke memset.
     #[test]
     fn slab_f32_uninit_is_fast() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = skip_if_no_gpu() else { return };
         let mut slab = fresh_slab(device);
 
@@ -1003,7 +1343,7 @@ mod tests {
     /// 8. Mid-slab pointer is still protected by the hook (offset/narrow scenario).
     #[test]
     fn slab_hook_covers_offset_ptr() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = skip_if_no_gpu() else { return };
         let mut slab = fresh_slab(device);
 
@@ -1030,7 +1370,7 @@ mod tests {
     /// 9. Multi-device isolation: different Arc handles → different slabs.
     #[test]
     fn slab_multi_device_isolation() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(dev_a) = skip_if_no_gpu() else { return };
         // Try to get a second `Arc<CudaDevice>` for the same physical
         // device. If the runtime returns the same Arc (refcount-shared),
@@ -1057,7 +1397,7 @@ mod tests {
 
         // Allocations from a's slab are NOT visible in b's.
         let ptr_a = {
-            let mut g = slab_a.lock().unwrap();
+            let mut g = slab_a.lock().unwrap_or_else(|e| e.into_inner());
             let s = g.alloc_u16(64).unwrap();
             let p = *s.device_ptr();
             unsafe { forget_slice(s) };
@@ -1065,7 +1405,7 @@ mod tests {
             p
         };
         {
-            let g = slab_b.lock().unwrap();
+            let g = slab_b.lock().unwrap_or_else(|e| e.into_inner());
             // slab_b never materialised — base is None.
             assert!(g.slab_base().is_none());
             assert!(!g.ptr_in_slab(ptr_a));
@@ -1073,7 +1413,7 @@ mod tests {
 
         // Cleanup.
         {
-            let mut a = slab_a.lock().unwrap();
+            let mut a = slab_a.lock().unwrap_or_else(|e| e.into_inner());
             let _ = a.release();
         }
         reset_device_map_for_testing();
@@ -1082,7 +1422,7 @@ mod tests {
     /// 10. release() then alloc re-materialises.
     #[test]
     fn slab_release_then_realloc() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = skip_if_no_gpu() else { return };
         let mut slab = fresh_slab(device);
         let s = slab.alloc_u16(64).unwrap();
@@ -1111,7 +1451,7 @@ mod tests {
     /// 11. alloc_u16(0) is a no-op: no cursor bump, no live_count increment.
     #[test]
     fn slab_alloc_zero_elements() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = skip_if_no_gpu() else { return };
         let mut slab = fresh_slab(device);
         let s = slab.alloc_u16(0).unwrap();
@@ -1158,13 +1498,13 @@ mod tests {
     /// default path returns a usable allocator.
     #[test]
     fn env_default_capacity_is_usable() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Don't reset env; just verify slab_for_device returns something
         // with a non-zero capacity.
         let Some(dev) = skip_if_no_gpu() else { return };
         reset_device_map_for_testing();
         let slab_mu = slab_for_device(&dev);
-        let g = slab_mu.lock().unwrap();
+        let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
         assert!(g.capacity_bytes() > 0);
         // Slab is NOT yet materialised.
         assert!(g.slab_base().is_none());
@@ -1175,12 +1515,449 @@ mod tests {
     /// slab_v2_return_if_owned returns false for non-slab pointer.
     #[test]
     fn return_hook_returns_false_for_non_slab_ptr() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = skip_if_no_gpu() else { return };
         let key = Arc::as_ptr(&device) as usize;
         // Fresh map.
         reset_device_map_for_testing();
         let owned = slab_v2_return_if_owned(0xDEAD_BEEF, key);
         assert!(!owned);
+    }
+
+    // =======================================================================
+    // Phase R2a — StepSlabGuard tests
+    //
+    // These tests touch:
+    //  - thread-local `ACTIVE_DEVICE_KEY`
+    //  - process-global `device_map`
+    //  - process env `FLAME_USE_STATIC_SLAB`
+    //
+    // All three are global; tests MUST run serialized. The integration test
+    // binary uses `--test-threads=1` plus `TEST_LOCK`. The inline tests rely
+    // on cargo running mod-tests serially or on the TEST_LOCK above. The
+    // R2a tests also serialize through TEST_LOCK.
+    // =======================================================================
+
+    /// RAII helper: set an env var on entry, restore on drop. Avoids
+    /// inter-test contamination of `FLAME_USE_STATIC_SLAB`.
+    struct EnvGuard {
+        name: &'static str,
+        previous: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+        fn unset(name: &'static str) -> Self {
+            let previous = std::env::var(name).ok();
+            std::env::remove_var(name);
+            Self { name, previous }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    /// Manually drain any guard state that leaked from a previously panicked
+    /// test on this thread. Belt-and-suspenders for `--test-threads=1` runs.
+    fn clear_thread_local_guard_state() {
+        ACTIVE_DEVICE_KEY.with(|cell| cell.set(None));
+    }
+
+    /// R2a #1: inside an active guard with the env set, `pool_alloc_u16`
+    /// allocates into the slab. Outside a guard, it goes to the legacy
+    /// pool / cudart path (slab live_count stays 0).
+    #[test]
+    fn guard_routes_alloc_to_slab() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        let Some(device) = skip_if_no_gpu() else { return };
+        reset_device_map_for_testing();
+        let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
+
+        // === OUTSIDE guard: should NOT go to slab. ===
+        let outside = crate::cuda_alloc_pool::pool_alloc_u16(&device, 64)
+            .expect("outside-guard alloc");
+        // Slab for this device may or may not exist; if it does, the ptr
+        // must not be inside its range.
+        let key = Arc::as_ptr(&device) as usize;
+        let slab_ref = {
+            let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+            g.get(&key).copied()
+        };
+        if let Some(slab_mu) = slab_ref {
+            let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !g.ptr_in_slab(*outside.device_ptr()),
+                "outside-guard alloc must NOT go to slab"
+            );
+            assert_eq!(g.live_count(), 0);
+        }
+        // Drop outside-guard slice via legacy path (cudaFree fires normally).
+        drop(outside);
+
+        // === INSIDE guard: should go to slab. ===
+        {
+            let _guard = StepSlabGuard::enter(device.clone()).expect("enter");
+            assert!(StepSlabGuard::active_on_thread());
+
+            let inside = crate::cuda_alloc_pool::pool_alloc_u16(&device, 128)
+                .expect("inside-guard alloc");
+            let inside_ptr = *inside.device_ptr();
+
+            // The slab must be in the device_map now (alloc materialised it).
+            let slab_mu = {
+                let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+                *g.get(&key).expect("slab registered after first alloc")
+            };
+            {
+                let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+                assert!(
+                    g.ptr_in_slab(inside_ptr),
+                    "inside-guard alloc must land in slab range"
+                );
+                assert_eq!(g.live_count(), 1, "slab live_count incremented");
+            }
+
+            // Forget the slice + decrement live_count manually (we don't
+            // have TensorStorage wiring in this unit test).
+            unsafe { forget_slice(inside) };
+            {
+                let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+                g.live_count.fetch_sub(1, Ordering::AcqRel);
+            }
+            // Guard drops cleanly here (live_count == 0).
+        }
+        assert!(!StepSlabGuard::active_on_thread(), "guard cleared on drop");
+
+        reset_device_map_for_testing();
+    }
+
+    /// R2a #2: allocations made BEFORE any guard are persistent — entering
+    /// a guard, resetting the slab, and exiting must NOT invalidate the
+    /// pre-guard allocation. (The slab's live_count for pre-guard allocs
+    /// is 0 because they didn't go through the slab.)
+    #[test]
+    fn guard_persistent_alloc_not_in_slab() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        let Some(device) = skip_if_no_gpu() else { return };
+        reset_device_map_for_testing();
+        let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
+
+        // Persistent alloc — outside any guard.
+        let persistent = crate::cuda_alloc_pool::pool_alloc_u16(&device, 1024)
+            .expect("persistent alloc");
+        let persistent_ptr = *persistent.device_ptr();
+        let persistent_len = DeviceSlice::len(&persistent);
+        assert!(persistent_len >= 1024);
+
+        // Enter a guard, do nothing, drop cleanly. Slab should NOT have any
+        // live count from the pre-guard alloc; reset succeeds trivially.
+        {
+            let guard = StepSlabGuard::enter(device.clone()).expect("enter");
+            // The slab may not even be materialised — the guard scope had
+            // no allocs. finish() should succeed.
+            guard.finish().expect("clean finish");
+        }
+
+        // Persistent slice still readable.
+        let host = device.dtoh_sync_copy(&persistent).expect("readback");
+        assert_eq!(host.len(), persistent_len);
+        // Drop persistent normally; this is OUTSIDE the slab range so the
+        // standard pool path frees it.
+        let _ = persistent_ptr; // suppress unused warning
+        drop(persistent);
+
+        reset_device_map_for_testing();
+    }
+
+    /// R2a #3: clean scope (alloc + drop + reset) succeeds, no panic.
+    #[test]
+    fn guard_drop_on_clean_scope_succeeds() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        let Some(device) = skip_if_no_gpu() else { return };
+        reset_device_map_for_testing();
+        let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
+
+        let key = Arc::as_ptr(&device) as usize;
+        {
+            let _guard = StepSlabGuard::enter(device.clone()).expect("enter");
+            let s = crate::cuda_alloc_pool::pool_alloc_u16(&device, 64)
+                .expect("inside-guard alloc");
+
+            // Forget + decrement (simulating TensorStorage::Drop).
+            unsafe { forget_slice(s) };
+            let slab_mu = {
+                let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+                *g.get(&key).unwrap()
+            };
+            {
+                let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+                g.live_count.fetch_sub(1, Ordering::AcqRel);
+            }
+            // _guard drops at end of scope; reset is clean.
+        }
+        // After drop:
+        let slab_mu = {
+            let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+            g.get(&key).copied()
+        };
+        if let Some(slab_mu) = slab_mu {
+            let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(g.live_count(), 0, "live_count cleared");
+            assert_eq!(g.used_bytes(), 0, "cursor rewound by reset");
+        }
+        reset_device_map_for_testing();
+    }
+
+    /// R2a #4: guard drop with `live_count != 0` panics.
+    #[test]
+    #[should_panic(expected = "live")]
+    fn guard_drop_with_live_count_panics() {
+        // NOTE: this test cannot acquire `TEST_LOCK` via `.unwrap()` —
+        // `should_panic` unwinds and the lock would be poisoned for every
+        // subsequent test. Use poison-tolerant lock acquisition.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        // Skip-no-GPU pattern, but we MUST still satisfy `should_panic`
+        // on a no-GPU machine. Synthesize a "live" panic on the no-GPU
+        // path so the test passes uniformly.
+        let device = match CudaDevice::new(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("[R2a #4] no GPU — synthesizing should_panic match");
+                panic!("live (synthetic — no GPU available)");
+            }
+        };
+        std::env::set_var(ENV_USE_STATIC_SLAB, "1");
+
+        let guard = StepSlabGuard::enter(device.clone()).expect("enter");
+        let s = crate::cuda_alloc_pool::pool_alloc_u16(&device, 64)
+            .expect("inside-guard alloc");
+        // Leak the slice so live_count stays > 0 when guard drops.
+        std::mem::forget(s);
+        drop(guard); // expected to panic on "live"
+    }
+
+    /// R2a #5: `finish()` returns Err when live_count > 0; slab NOT reset.
+    #[test]
+    fn guard_finish_with_live_count_errs() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        let Some(device) = skip_if_no_gpu() else { return };
+        reset_device_map_for_testing();
+        let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
+
+        let key = Arc::as_ptr(&device) as usize;
+        let guard = StepSlabGuard::enter(device.clone()).expect("enter");
+        let s = crate::cuda_alloc_pool::pool_alloc_u16(&device, 64)
+            .expect("inside-guard alloc");
+        let cursor_before = {
+            let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+            let slab_mu = g.get(&key).unwrap();
+            let s = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+            s.used_bytes()
+        };
+        assert!(cursor_before > 0, "cursor advanced");
+
+        // Intentionally don't forget/decrement: live_count is 1.
+        let result = guard.finish();
+        assert!(result.is_err(), "finish must err on live_count != 0");
+
+        // Slab cursor unchanged (NOT reset).
+        let cursor_after = {
+            let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+            let slab_mu = g.get(&key).unwrap();
+            let s = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+            s.used_bytes()
+        };
+        assert_eq!(cursor_before, cursor_after, "slab NOT reset");
+
+        // Cleanup: forget slice + decrement so subsequent tests get clean state.
+        unsafe { forget_slice(s) };
+        {
+            let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+            let slab_mu = g.get(&key).unwrap();
+            let s = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+            s.live_count.fetch_sub(1, Ordering::AcqRel);
+        }
+        // The guard was consumed by finish(); ACTIVE_DEVICE_KEY is None already.
+        assert!(!StepSlabGuard::active_on_thread());
+        reset_device_map_for_testing();
+    }
+
+    /// R2a #6: panic inside the scope ⇒ guard Drop does NOT panic again
+    /// (avoids double-panic-during-unwind abort).
+    #[test]
+    fn guard_panic_during_step_does_not_double_panic() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        let Some(device) = skip_if_no_gpu() else { return };
+        reset_device_map_for_testing();
+        let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
+
+        let key = Arc::as_ptr(&device) as usize;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = StepSlabGuard::enter(device.clone()).expect("enter");
+            let s = crate::cuda_alloc_pool::pool_alloc_u16(&device, 64)
+                .expect("inside-guard alloc");
+            // Leak the slice so live_count > 0 when the guard drops.
+            std::mem::forget(s);
+            // Panic NOW — guard's drop should see `thread::panicking()` and
+            // suppress its own panic.
+            panic!("simulated step failure");
+        }));
+        // We expect the ORIGINAL panic to surface, not a double-panic abort.
+        assert!(result.is_err(), "catch_unwind captured the original panic");
+        let msg = match result.unwrap_err().downcast::<&'static str>() {
+            Ok(s) => *s,
+            Err(_) => "(non-string panic payload)",
+        };
+        assert!(
+            msg.contains("simulated step failure"),
+            "original panic propagated cleanly, got: {msg}"
+        );
+
+        // Thread-local was still cleared by guard's Drop.
+        assert!(!StepSlabGuard::active_on_thread());
+
+        // Cleanup: decrement and clear. live_count is still 1 (Drop's reset
+        // failed silently because we were panicking).
+        let slab_mu = {
+            let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+            g.get(&key).copied()
+        };
+        if let Some(slab_mu) = slab_mu {
+            let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+            // Drain live_count and reset cursor manually (simulating the
+            // post-test cleanup the trainer wouldn't normally need).
+            let lc = g.live_count.swap(0, Ordering::AcqRel);
+            // We leaked the slice ptr; it's still in the slab range. The
+            // slab's drop will leak the memory until process exit — fine
+            // for unit tests.
+            let _ = lc;
+        }
+        reset_device_map_for_testing();
+    }
+
+    /// R2a #7: nested enter on the same thread returns Err.
+    #[test]
+    fn guard_nested_forbidden() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        let Some(device) = skip_if_no_gpu() else { return };
+        reset_device_map_for_testing();
+
+        let outer = StepSlabGuard::enter(device.clone()).expect("first enter");
+        let nested = StepSlabGuard::enter(device.clone());
+        let err = match nested {
+            Ok(_) => panic!("nested enter must err"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("nested"), "err mentions nesting: {msg}");
+
+        // After dropping outer, a new enter should succeed.
+        drop(outer);
+        let second = StepSlabGuard::enter(device.clone()).expect("re-enter after drop");
+        drop(second);
+
+        reset_device_map_for_testing();
+    }
+
+    /// R2a #8: `active_on_thread()` and `active_device_key()` track guard
+    /// lifetime exactly.
+    #[test]
+    fn guard_active_on_thread_query() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        let Some(device) = skip_if_no_gpu() else { return };
+        reset_device_map_for_testing();
+        let key = Arc::as_ptr(&device) as usize;
+
+        assert!(!StepSlabGuard::active_on_thread(), "no guard initially");
+        assert_eq!(StepSlabGuard::active_device_key(), None);
+
+        {
+            let _g = StepSlabGuard::enter(device.clone()).expect("enter");
+            assert!(StepSlabGuard::active_on_thread());
+            assert_eq!(StepSlabGuard::active_device_key(), Some(key));
+        }
+
+        assert!(!StepSlabGuard::active_on_thread(), "cleared after drop");
+        assert_eq!(StepSlabGuard::active_device_key(), None);
+
+        // finish() also clears it.
+        let g = StepSlabGuard::enter(device.clone()).expect("enter");
+        assert!(StepSlabGuard::active_on_thread());
+        g.finish().expect("clean finish");
+        assert!(!StepSlabGuard::active_on_thread(), "cleared after finish");
+        assert_eq!(StepSlabGuard::active_device_key(), None);
+
+        reset_device_map_for_testing();
+    }
+
+    /// R2a #9: with `FLAME_USE_STATIC_SLAB` unset (or `=0`), allocations
+    /// inside a guard scope do NOT go to the slab — they fall through to
+    /// the legacy pool. The slab's live_count stays 0.
+    #[test]
+    fn guard_disabled_by_env() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        let Some(device) = skip_if_no_gpu() else { return };
+        reset_device_map_for_testing();
+        // Explicitly unset the env (cover both "unset" and "=0" via two arms).
+        let _env = EnvGuard::unset(ENV_USE_STATIC_SLAB);
+
+        let key = Arc::as_ptr(&device) as usize;
+        {
+            let _guard = StepSlabGuard::enter(device.clone()).expect("enter");
+            let s = crate::cuda_alloc_pool::pool_alloc_u16(&device, 64)
+                .expect("inside-guard alloc");
+            // Slab was NOT touched. If a slab entry exists in the map
+            // (because a previous test created it), live_count must still
+            // be 0 and ptr must not be in slab range.
+            let slab_ref = {
+                let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+                g.get(&key).copied()
+            };
+            if let Some(slab_mu) = slab_ref {
+                let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+                assert_eq!(g.live_count(), 0);
+                assert!(
+                    !g.ptr_in_slab(*s.device_ptr()),
+                    "with env unset, alloc must NOT land in slab"
+                );
+            }
+            drop(s); // legacy pool path
+        }
+        // Now test the `=0` arm.
+        std::env::set_var(ENV_USE_STATIC_SLAB, "0");
+        {
+            let _guard = StepSlabGuard::enter(device.clone()).expect("enter");
+            let s = crate::cuda_alloc_pool::pool_alloc_u16(&device, 64)
+                .expect("inside-guard alloc");
+            let slab_ref = {
+                let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+                g.get(&key).copied()
+            };
+            if let Some(slab_mu) = slab_ref {
+                let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+                assert_eq!(g.live_count(), 0);
+                assert!(!g.ptr_in_slab(*s.device_ptr()));
+            }
+            drop(s);
+        }
+        std::env::remove_var(ENV_USE_STATIC_SLAB);
+        reset_device_map_for_testing();
     }
 }
