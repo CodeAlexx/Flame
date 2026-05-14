@@ -47,7 +47,7 @@
 //! Today this allocator is unused by trainer code — it ships as a
 //! library type that Phase 6/7 trainers can adopt opt-in.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 
@@ -192,6 +192,7 @@ impl RingSlabAllocator {
                     bytes: num_bytes,
                     direction: AutogradDirection::Forward,
                     base_ptr: self.slab_ptr(slab_idx),
+                    allocator: None,
                 })
             }
             AutogradDirection::Backward => {
@@ -203,9 +204,26 @@ impl RingSlabAllocator {
                     bytes: num_bytes,
                     direction: AutogradDirection::Backward,
                     base_ptr: self.slab_ptr(slab_idx),
+                    allocator: None,
                 })
             }
         }
+    }
+
+    /// Allocate via an `Arc<Mutex<Self>>`. The returned `DeviceSlab`'s
+    /// Drop auto-retires the range to this allocator. Use this when the
+    /// allocation isn't manually retired by the caller.
+    pub fn alloc_handle(
+        this: &Arc<Mutex<Self>>,
+        num_bytes: usize,
+    ) -> Result<DeviceSlab> {
+        let weak = Arc::downgrade(this);
+        let mut guard = this
+            .lock()
+            .map_err(|_| Error::InvalidOperation("RingSlabAllocator mutex poisoned".into()))?;
+        let mut slab = guard.alloc(num_bytes)?;
+        slab.allocator = Some(weak);
+        Ok(slab)
     }
 
     fn alloc_forward(&mut self, n: usize) -> Result<(usize, usize)> {
@@ -254,47 +272,54 @@ impl RingSlabAllocator {
         *self.slabs[slab_idx].device_ptr()
     }
 
-    /// Internal — retire a forward allocation. Called by `DeviceSlab::drop`.
-    /// LIFO only in Phase 4: the dropped slab must be the most recent
-    /// forward alloc. Phase 4b: any-order with coalescing pass.
-    fn retire_forward(&mut self, bytes: usize) {
-        if let Some(top) = self.forward_stack.last().copied() {
-            if top == bytes {
-                self.forward_stack.pop();
-                if self.forward_offset >= bytes {
-                    self.forward_offset -= bytes;
-                } else {
-                    // Wrapped to this slab — Phase 4b coalesces back
-                    // across the boundary; today we just clamp.
-                    self.forward_offset = 0;
-                }
-                return;
+    /// Internal — retire a forward allocation. Called by
+    /// `DeviceSlab::drop` (when allocated via `alloc_handle`) or by
+    /// tests directly. LIFO-fast path advances the cursor back;
+    /// out-of-order drops drop the matching stack entry but don't
+    /// advance the cursor (leaks until the stack drains, then the
+    /// cursor resets — see below).
+    ///
+    /// **Cursor reset on empty stack**: when the last forward
+    /// allocation retires, both `forward_slab` and `forward_offset`
+    /// reset to 0. This makes practical workloads possible without
+    /// infinite slab growth — BlockOffloader-style code drops a whole
+    /// batch of tensors at once (in HashMap iteration order, not
+    /// reverse-alloc order), and we want the next batch to start fresh.
+    pub(crate) fn retire_forward(&mut self, bytes: usize) {
+        let fast = self.forward_stack.last().copied() == Some(bytes);
+        if fast {
+            self.forward_stack.pop();
+            if self.forward_offset >= bytes {
+                self.forward_offset -= bytes;
+            } else {
+                self.forward_offset = 0;
             }
-        }
-        // Out-of-order drop — record the freed range for Phase 4b
-        // coalescing. Today we leak the slot. The drop stack still
-        // tracks the byte count for `bytes_in_use` accounting.
-        // Best-effort: pop the matching slot if present (O(n)).
-        if let Some(pos) = self.forward_stack.iter().rposition(|&b| b == bytes) {
+        } else if let Some(pos) = self.forward_stack.iter().rposition(|&b| b == bytes) {
             self.forward_stack.remove(pos);
+        }
+        if self.forward_stack.is_empty() {
+            self.forward_offset = 0;
+            self.forward_slab = 0;
         }
     }
 
-    /// Internal — retire a backward allocation.
-    fn retire_backward(&mut self, bytes: usize) {
-        if let Some(top) = self.backward_stack.last().copied() {
-            if top == bytes {
-                self.backward_stack.pop();
-                if self.backward_offset >= bytes {
-                    self.backward_offset -= bytes;
-                } else {
-                    self.backward_offset = 0;
-                }
-                return;
+    /// Internal — retire a backward allocation. Same shape as
+    /// `retire_forward`.
+    pub(crate) fn retire_backward(&mut self, bytes: usize) {
+        let fast = self.backward_stack.last().copied() == Some(bytes);
+        if fast {
+            self.backward_stack.pop();
+            if self.backward_offset >= bytes {
+                self.backward_offset -= bytes;
+            } else {
+                self.backward_offset = 0;
             }
-        }
-        if let Some(pos) = self.backward_stack.iter().rposition(|&b| b == bytes) {
+        } else if let Some(pos) = self.backward_stack.iter().rposition(|&b| b == bytes) {
             self.backward_stack.remove(pos);
+        }
+        if self.backward_stack.is_empty() {
+            self.backward_offset = 0;
+            self.backward_slab = 0;
         }
     }
 }
@@ -318,11 +343,18 @@ pub struct DeviceSlab {
     pub(crate) offset: usize,
     /// Size of the allocation in bytes.
     pub(crate) bytes: usize,
-    /// Direction the allocation was made in. Phase 4b: needed to route
-    /// the drop to the correct retire path.
+    /// Direction the allocation was made in. Drives whether `Drop`
+    /// retires forward or backward.
     pub(crate) direction: AutogradDirection,
     /// Raw device pointer of the slab's base.
     pub(crate) base_ptr: u64,
+    /// Weak reference to the owning allocator. When the slab's Drop
+    /// runs, it upgrades and calls the appropriate retire. `None`
+    /// means "the slab was constructed without an Arc-owned allocator"
+    /// (legacy `RingSlabAllocator::alloc(&mut self)` path used by
+    /// pre-Phase-4b tests); in that case Drop is a no-op and callers
+    /// must retire manually.
+    pub(crate) allocator: Option<std::sync::Weak<std::sync::Mutex<RingSlabAllocator>>>,
 }
 
 impl DeviceSlab {
@@ -360,11 +392,21 @@ impl DeviceSlab {
 
 impl Drop for DeviceSlab {
     fn drop(&mut self) {
-        // Phase 4b wires this to retire the range back to the allocator
-        // via a weak Arc + interior mutability. Today the drop is a
-        // no-op — allocator retirement happens by the
-        // `retire_forward`/`retire_backward` methods being called
-        // directly by tests.
+        // Auto-retire when constructed via the Arc-aware path
+        // (`alloc_handle` or `alloc_with_registry`). When constructed
+        // via the bare `RingSlabAllocator::alloc(&mut self)` path,
+        // `allocator` is `None` and Drop is a no-op — those tests
+        // call `retire_forward`/`retire_backward` manually.
+        if let Some(weak) = self.allocator.take() {
+            if let Some(arc) = weak.upgrade() {
+                if let Ok(mut a) = arc.lock() {
+                    match self.direction {
+                        AutogradDirection::Forward => a.retire_forward(self.bytes),
+                        AutogradDirection::Backward => a.retire_backward(self.bytes),
+                    }
+                }
+            }
+        }
     }
 }
 
