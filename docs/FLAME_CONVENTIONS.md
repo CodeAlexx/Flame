@@ -1288,6 +1288,26 @@ using this surface:
   `alloc_forward`. The bidirectional invariant from Phase 1 is unused
   here. Phase 2b can wire `AutogradContext::is_backward()` into the
   adapter for direction-typed allocs.
+- **f32 routing is DISABLED in 2a (post-Builder bug-fix, 2026-05-14).**
+  The Builder's first commit (`f82ab9b`) routed f32 misses through the
+  ring, made safe via a `cudarc-pinctx::install_external_ptr_hook` that
+  consulted `external_ptrs` to skip `cudaFree` on ring pointers. The
+  Klein 9B 5-step smoke FALSIFIED that approach: backward-graph
+  teardown panicked with `CUDA_ERROR_INVALID_VALUE` inside
+  `CudaSlice<f32>::drop` at `pool_return_f32`-driven drops
+  (`/tmp/klein9b_phase2a_5step.log`). Root cause: derived
+  `CudaSlice<f32>` values produced by flame-core's many F32
+  intermediaries (autograd_v3 gradient bufs, fused_linear3d_native
+  workspaces, broadcast metadata buffers, sliced views) escape the
+  `external_ptrs` registration window — their `cu_device_ptr` is an
+  offset into the same slab but is NOT in the set. Drop then calls
+  `cudaFree` on a mid-slab offset. The fix
+  (`pool_adapter.rs::alloc_f32` returns `Err`) realigns the code with
+  the Builder's commit-message intent. u16 routing stays ON because
+  all `pool_alloc_u16` callers wrap the slice in
+  `TensorStorage::BF16 { data: Arc<CudaSlice<u16>> }` and
+  `TensorStorage::Drop` routes through `pool_return_u16`. No derived
+  `CudaSlice<u16>` path exists.
 
 ---
 

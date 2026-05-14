@@ -125,14 +125,17 @@ fn fallback_when_no_allocator_installed() {
 
 #[test]
 fn alloc_f32_falls_back_to_device_alloc() {
-    // Phase 2a deliberately disables f32 routing through the ring —
-    // many flame-core f32 callers let `CudaSlice<f32>` drop directly
-    // (no `pool_return_f32`), which would `cudaFree` a ring-owned ptr
-    // and panic. See `RingPoolAdapter::alloc_f32` for context.
+    // Phase 2a bug-fix (post-Builder): f32 routing through the ring is
+    // DISABLED. The Builder's hook-based f32 routing falsified the Klein 9B
+    // 5-step smoke at backward-graph teardown — derived `CudaSlice<f32>`
+    // values escape the `external_ptrs` registration window and call
+    // `cudaFree` on mid-slab offsets. `RingPoolAdapter::alloc_f32` now
+    // returns `Err` and `pool_alloc_f32` falls back to
+    // `device.alloc::<f32>` — same as the no-allocator-installed path.
     //
-    // This test verifies the fallback: f32 misses go to `device.alloc`,
-    // the external counter does NOT bump, and the slice can be freed
-    // normally via `pool_return_f32`.
+    // This test verifies the f32 miss path: external_miss_count does NOT
+    // bump (the ring is not used), a subsequent direct-drop does NOT
+    // panic (the slice came from `device.alloc` and `cudaFree` is valid).
     let Some(device) = skip_if_no_cuda() else { return };
 
     let ring = RingAllocator::new(device.clone(), 4, 4 * 1024 * 1024).unwrap();
@@ -147,15 +150,18 @@ fn alloc_f32_falls_back_to_device_alloc() {
         .expect("pool_alloc_f32");
     assert_eq!(cudarc::driver::DeviceSlice::len(&slice), 1024);
 
-    // f32 path returns Err from the adapter → pool falls back to
-    // device.alloc → external_miss_count does NOT bump.
+    // f32 path does NOT route through the ring (adapter returns Err).
     assert_eq!(
         pool.external_miss_count(),
         ext_before,
-        "f32 routing is disabled in Phase 2a; external counter must not bump"
+        "f32 routing disabled: external_miss_count must NOT bump"
     );
 
-    flame_core::cuda_alloc_pool::pool_return_f32(slice);
+    // Drop the slice directly. Because the underlying ptr came from
+    // `device.alloc::<f32>` (not the ring), `cudaFree` is the correct
+    // operation. No panic expected.
+    drop(slice);
+
     clear_pool_cache();
     adapter.reset();
     let _ = uninstall_miss_allocator();

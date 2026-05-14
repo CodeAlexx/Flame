@@ -182,27 +182,43 @@ impl PoolMissAllocator for RingPoolAdapter {
     fn alloc_f32(
         &self,
         _device: &Arc<CudaDevice>,
-        bucket_elems: usize,
+        _bucket_elems: usize,
     ) -> Result<CudaSlice<f32>> {
-        // Phase 2a — f32 routing enabled. The cudarc-pinctx
-        // `install_external_ptr_hook` (wired by
-        // `cuda_alloc_pool::install_miss_allocator`) makes
-        // `CudaSlice<f32>::drop` skip `cudaFree` for pointers in the
-        // pool's `external_ptrs` set, so direct-drop sites (e.g. `mul_bc`'s
-        // metadata buffers) are safe with ring-backed pointers.
-        let bytes = bucket_elems
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| Error::InvalidInput(
-                "RingPoolAdapter::alloc_f32: bucket_elems * 4 overflows".into(),
-            ))?;
-        let mut ring = self.ring.lock().map_err(|_| {
-            Error::Cuda("RingPoolAdapter: ring mutex poisoned".into())
-        })?;
-        let RingPtr { device_ptr, .. } = ring.alloc_forward(bytes)?;
-        let dev = ring.device().clone();
-        // SAFETY: `device_ptr` points into a ring slab valid until the
-        // next `reset()`. Drop is safe via the cudarc-pinctx hook.
-        let slice = unsafe { synth_slice::<f32>(device_ptr, bucket_elems, dev) };
-        Ok(slice)
+        // Phase 2a bug-fix (post-Builder): f32 routing DISABLED.
+        //
+        // The Builder's first commit (f82ab9b) attempted f32 routing through
+        // the ring, made safe via a `cudarc-pinctx::install_external_ptr_hook`
+        // that consults the pool's `external_ptrs` set to skip `cudaFree`
+        // on ring-owned pointers. The 5-step Klein 9B smoke FALSIFIED that
+        // approach: backward-graph teardown panics with
+        // `CUDA_ERROR_INVALID_VALUE` inside `CudaSlice<f32>::drop`
+        // (`/tmp/klein9b_phase2a_5step.log`).
+        //
+        // Root cause hypothesis: f32 cache-MISS slices that get sliced /
+        // narrowed / cloned through flame-core's many `CudaSlice<f32>`
+        // intermediaries (autograd_v3 gradient bufs, fused_linear3d_native
+        // workspaces, broadcast metadata buffers, etc.) escape the
+        // `external_ptrs` registration window — the slice's ptr is in the
+        // set only when reconstructed from `decompose_slice` in
+        // `pool_alloc_f32`, but cudarc internals may produce derived
+        // `CudaSlice<f32>` values whose `cu_device_ptr` is an offset into
+        // the same slab and is NOT in the set. Those derived slices then
+        // call `cudaFree` on a mid-slab offset at drop time.
+        //
+        // The Builder's commit message documented the SAFE behavior
+        // ("alloc_f32 deliberately returns Err and falls back to
+        // device.alloc::<f32>"); the code shipped the unsafe behavior.
+        // This is the alignment between commit-message intent and code.
+        //
+        // u16 routing stays ON: all `pool_alloc_u16` callers wrap the
+        // slice in `TensorStorage::BF16 { data: Arc<CudaSlice<u16>> }`
+        // and `TensorStorage::Drop` routes through `pool_return_u16`,
+        // which respects the external tag. No derived-slice path exists.
+        Err(Error::Cuda(
+            "RingPoolAdapter::alloc_f32: f32 routing disabled (Phase 2a \
+             smoke gate falsified ring-backed f32; fall back to \
+             device.alloc::<f32>). See pool_adapter.rs for details."
+                .into(),
+        ))
     }
 }
