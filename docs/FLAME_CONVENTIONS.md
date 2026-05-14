@@ -1309,6 +1309,34 @@ using this surface:
   `TensorStorage::Drop` routes through `pool_return_u16`. No derived
   `CudaSlice<u16>` path exists.
 
+### External-ptr entries in `cuda_alloc_pool` (Phase 2 post-reboot, 2026-05-13)
+
+`FreeEntry::is_external = true` indicates the entry's backing bytes are
+owned by an external allocator (currently `RingAllocator` slabs handed
+out by `BlockOffloader::alloc_bf16_via_ring`). The contract:
+
+- **External entries NEVER enter the active free list.** Both
+  `push_f32` and `push_u16` carry a guard immediately before
+  `list.push(entry)`: if `entry.is_external`, call
+  `reconstruct_and_forget::<T>(entry.ptr, entry.len, entry.device)`
+  (mirror is destroyed without `cudaFree`; slab `Arc` retains
+  ownership), then `unregister_external_ptr(entry.ptr)`, then `return`.
+  Caching them would alias: the same bytes are handed out by the next
+  `ring_alloc::forward_handle(0).alloc(...)`, so a subsequent
+  `try_pop` would silently re-use live ring memory and corrupt
+  training.
+- **Mirror-layout invariant must hold across reconstruct + forget.**
+  `reconstruct_and_forget::<T>` rebuilds a `CudaSlice<T>` via the
+  pinned cudarc 0.11.x mirror layout (see `cuda_alloc_pool.rs` top
+  comment). Same layout as `ring_alloc/pool_adapter::synth_slice`.
+- **`unregister_external_ptr` MUST follow every `is_external`
+  reconstruct.** Otherwise the `external_ptrs` `HashSet` grows
+  unbounded across steps and tagged-pointer lookups slow down.
+- **The bypass path also fires when the pool is inactive or the
+  bucket cap is exceeded.** Pre-existing `is_external` branches at
+  the top of `push_*` already use `reconstruct_and_forget`; the new
+  Phase 2 guard is the *successful* path's variant of the same logic.
+
 ---
 
 ## Quick "where do I X" reference

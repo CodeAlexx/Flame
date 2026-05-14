@@ -426,6 +426,17 @@ pub struct BlockOffloader {
     /// Counter of prefetches issued since the last strategy `plan()`
     /// call. Threaded through `AccessHints::prefetches_since_last_plan`.
     prefetches_since_plan: u32,
+
+    /// Phase 2 (post-reboot, 2026-05-13): lazy ring-backed allocator for
+    /// the prefetch path's BF16 slot buffers. `None` until the first
+    /// pinned/streaming prefetch needs an alloc, then materialized via
+    /// [`Self::ensure_ring`] with `num_slabs=4` and a slab sized to fit
+    /// the largest seen slot. The ring's bytes are tagged as external in
+    /// the global `cuda_alloc_pool` so the pool's `push_u16` guard
+    /// routes them through `reconstruct_and_forget` instead of caching
+    /// the slice (caching ring bytes would alias on the next forward).
+    /// Compatible with `FLAME_ALLOC_POOL=1` (the default after Phase 2).
+    ring: Option<crate::ring_alloc::RingAllocator>,
 }
 
 // Safety: BlockOffloader is always accessed behind a Mutex (serialized).
@@ -746,6 +757,7 @@ impl BlockOffloader {
             block_size_cache,
             access_history: VecDeque::with_capacity(ACCESS_HISTORY_CAP),
             prefetches_since_plan: 0,
+            ring: None,
         })
     }
 
@@ -911,6 +923,7 @@ impl BlockOffloader {
             block_size_cache,
             access_history: VecDeque::with_capacity(ACCESS_HISTORY_CAP),
             prefetches_since_plan: 0,
+            ring: None,
         })
     }
 
@@ -949,6 +962,74 @@ impl BlockOffloader {
     /// default 2-slot path.
     pub fn clear_strategy(&mut self) {
         self.strategy = None;
+    }
+
+    /// Phase 2 (post-reboot): lazily materialize a 4-slab ring-backed
+    /// allocator sized to fit the largest slot we'll be asked to allocate.
+    /// `max_slot_bytes` is the size of the largest BF16 buffer the
+    /// prefetch path expects to alloc this step; the slab is sized
+    /// `max(256 MiB, 2 * max_slot_bytes)` so multiple tensors from the
+    /// same block can pack into one slab without bumping to the next.
+    ///
+    /// No-op once `self.ring.is_some()`. The first call pays one
+    /// `cudaMalloc` for slab[0]; subsequent slabs materialize lazily on
+    /// ring-wrap.
+    pub fn ensure_ring(&mut self, max_slot_bytes: usize) -> anyhow::Result<()> {
+        if self.ring.is_some() {
+            return Ok(());
+        }
+        let slab_bytes = (256usize * 1024 * 1024).max(2 * max_slot_bytes);
+        let ring = crate::ring_alloc::RingAllocator::new(self.device.clone(), 4, slab_bytes)
+            .map_err(|e| anyhow::anyhow!("BlockOffloader::ensure_ring: {e:?}"))?;
+        self.ring = Some(ring);
+        Ok(())
+    }
+
+    /// Phase 2 (post-reboot): allocate `num_elems` BF16 elements out of
+    /// the ring (forward direction, layer_idx=0 — the offloader doesn't
+    /// distinguish layers at this level), synthesize a `CudaSlice<u16>`
+    /// from the raw device pointer via the cudarc 0.11.x mirror struct,
+    /// and register the pointer as external in the global pool so
+    /// `push_u16` routes it through `reconstruct_and_forget` on return
+    /// instead of caching the slice (which would alias on the next
+    /// ring reset).
+    ///
+    /// Requires [`Self::ensure_ring`] to have been called first.
+    pub fn alloc_bf16_via_ring(&mut self, num_elems: usize) -> anyhow::Result<CudaSlice<u16>> {
+        let ring = self.ring.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("BlockOffloader::alloc_bf16_via_ring: ensure_ring not called")
+        })?;
+        let bytes = num_elems
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| anyhow::anyhow!("alloc_bf16_via_ring: num_elems * 2 overflow"))?;
+        let ptr = {
+            let mut h = ring.forward_handle(0);
+            h.alloc(bytes)
+                .map_err(|e| anyhow::anyhow!("ring alloc_bf16 ({bytes}B): {e:?}"))?
+        };
+        let device = self.device.clone();
+        // SAFETY: `ptr.device_ptr` points into a freshly-allocated ring slab
+        // valid until the next ring `reset()`. The synth slice is registered
+        // as external in the pool below, so when it eventually flows back to
+        // `push_u16` the pool's external guard reconstructs-and-forgets
+        // (never `cudaFree`s, never re-caches the aliasing bytes).
+        // Mirror layout must match cudarc 0.11.x — same trick as
+        // `ring_alloc::pool_adapter::synth_slice`.
+        struct CudaSliceMirror<T> {
+            cu_device_ptr: u64,
+            len: usize,
+            device: Arc<CudaDevice>,
+            host_buf: Option<std::pin::Pin<Vec<T>>>,
+        }
+        let mirror = CudaSliceMirror::<u16> {
+            cu_device_ptr: ptr.device_ptr,
+            len: num_elems,
+            device,
+            host_buf: None,
+        };
+        let slice: CudaSlice<u16> = unsafe { std::mem::transmute(mirror) };
+        crate::cuda_alloc_pool::global_pool().register_external_ptr(ptr.device_ptr);
+        Ok(slice)
     }
 
     /// Currently-attached strategy's name, or `"none"` when no strategy
@@ -1211,52 +1292,117 @@ impl BlockOffloader {
         // Since every allocated byte is immediately overwritten by the memcpy
         // on the same stream as the kernel that will read it, no initial
         // value is ever observed — the unsafe alloc is safe.
-        for (key, pt) in block {
-            match pt.dtype {
-                PinnedDtype::Bf16 => {
-                    let gpu_buf = unsafe { self.device.alloc::<u16>(pt.num_elems) }.map_err(|e| {
+        // Phase 2 (post-reboot): split pinned-path block iteration in two.
+        // Pass 1 captures everything needed (key, src ptr, byte count,
+        // num_elems, shape, dtype kind) from the borrowed `block`. Pass 2
+        // ends the borrow, then calls `&mut self` methods (`ensure_ring`
+        // + `alloc_bf16_via_ring`) and issues the H2D copies. The raw
+        // pointer captured into `src_ptr` stays valid because the pinned
+        // buffer is owned by `self.cpu_blocks` for the offloader's
+        // lifetime.
+        enum PinnedRec {
+            Bf16 {
+                key: String,
+                src_ptr_u: usize,
+                bytes: usize,
+                num_elems: usize,
+                shape: Vec<usize>,
+            },
+            Fp8 {
+                key: String,
+                src_ptr_u: usize,
+                bytes: usize,
+                num_elems: usize,
+                shape: Vec<usize>,
+                scale: f32,
+            },
+        }
+        let (recs, max_bf16_bytes): (Vec<PinnedRec>, usize) = {
+            let mut recs: Vec<PinnedRec> = Vec::with_capacity(block.len());
+            let mut max_bf16: usize = 0;
+            for (key, pt) in block {
+                // Pinned buffer lives as long as `self`; the raw address
+                // stays valid past the borrow of `block`. Stored as
+                // `usize` so the rec is `'static`-friendly (no lifetime
+                // tied to `block`).
+                let src_ptr_u = pt.buffer.as_ptr() as usize;
+                let bytes = pt.buffer.len_bytes();
+                match pt.dtype {
+                    PinnedDtype::Bf16 => {
+                        let nb = pt.num_elems * 2;
+                        if nb > max_bf16 {
+                            max_bf16 = nb;
+                        }
+                        recs.push(PinnedRec::Bf16 {
+                            key: key.clone(),
+                            src_ptr_u,
+                            bytes,
+                            num_elems: pt.num_elems,
+                            shape: pt.shape.clone(),
+                        });
+                    }
+                    PinnedDtype::Fp8 { scale } => {
+                        recs.push(PinnedRec::Fp8 {
+                            key: key.clone(),
+                            src_ptr_u,
+                            bytes,
+                            num_elems: pt.num_elems,
+                            shape: pt.shape.clone(),
+                            scale,
+                        });
+                    }
+                }
+            }
+            (recs, max_bf16)
+        };
+
+        if max_bf16_bytes > 0 {
+            self.ensure_ring(max_bf16_bytes)?;
+        }
+        for rec in recs {
+            match rec {
+                PinnedRec::Bf16 { key, src_ptr_u, bytes, num_elems, shape } => {
+                    let gpu_buf = self.alloc_bf16_via_ring(num_elems).map_err(|e| {
                         let (free, total) =
                             crate::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
                         anyhow::anyhow!(
-                            "GPU alloc for {key} ({} elems, need={} MiB) failed; free={} MiB total={} MiB: {e:?}",
-                            pt.num_elems, (pt.num_elems * 2) / (1024 * 1024),
+                            "GPU alloc (ring) for {key} ({} elems, need={} MiB) failed; free={} MiB total={} MiB: {e:?}",
+                            num_elems, (num_elems * 2) / (1024 * 1024),
                             free / (1024 * 1024), total / (1024 * 1024)
                         )
                     })?;
 
                     let dst = (*gpu_buf.device_ptr() as u64) as *mut c_void;
-                    let src = pt.buffer.as_ptr() as *const c_void;
-                    let bytes = pt.buffer.len_bytes();
+                    let src = src_ptr_u as *const c_void;
                     memcpy_async_host_to_device(dst, src, bytes, stream_ptr)
                         .map_err(|e| anyhow::anyhow!("H2D for {key}: {e}"))?;
 
                     let tensor = Tensor::from_bf16_slice_gpu(
-                        gpu_buf, Shape::from_dims(&pt.shape), self.device.clone(),
+                        gpu_buf, Shape::from_dims(&shape), self.device.clone(),
                     );
-                    tensors.insert(key.clone(), tensor);
+                    tensors.insert(key, tensor);
                 }
-                PinnedDtype::Fp8 { scale } => {
-                    let gpu_buf = unsafe { self.device.alloc::<u8>(pt.num_elems) }.map_err(|e| {
+                PinnedRec::Fp8 { key, src_ptr_u, bytes, num_elems, shape, scale } => {
+                    let gpu_buf = unsafe { self.device.alloc::<u8>(num_elems) }.map_err(|e| {
                         let (free, total) =
                             crate::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
                         anyhow::anyhow!(
                             "GPU alloc (FP8) for {key} ({} elems, need={} MiB) failed; free={} MiB total={} MiB: {e:?}",
-                            pt.num_elems, pt.num_elems / (1024 * 1024),
+                            num_elems, num_elems / (1024 * 1024),
                             free / (1024 * 1024), total / (1024 * 1024)
                         )
                     })?;
 
                     let dst = (*gpu_buf.device_ptr() as u64) as *mut c_void;
-                    let src = pt.buffer.as_ptr() as *const c_void;
-                    let bytes = pt.buffer.len_bytes();
+                    let src = src_ptr_u as *const c_void;
                     memcpy_async_host_to_device(dst, src, bytes, stream_ptr)
                         .map_err(|e| anyhow::anyhow!("H2D (FP8) for {key}: {e}"))?;
 
                     fp8_pending.insert(
-                        key.clone(),
+                        key,
                         Fp8Pending {
                             data: gpu_buf,
-                            shape: pt.shape.clone(),
+                            shape,
                             scale,
                         },
                     );
@@ -1332,12 +1478,24 @@ impl BlockOffloader {
         let stream_ptr = self.transfer_stream.stream as *mut c_void;
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
 
-        // Single mutable borrow scope for streaming state. The staging buffer
-        // is mutated via raw pointer so we can both write CPU bytes into it
-        // (Phase A) and read them out as the H2D source (Phase B) within the
-        // same iteration without violating Rust aliasing — the only outstanding
-        // reference to the staging memory inside this block is the raw
-        // pointer.
+        // Phase 2 (post-reboot): split the per-entry loop in two so the
+        // GPU-alloc + H2D step can run with `self.streaming.as_mut()` no
+        // longer borrowed (we need `&mut self` for `ensure_ring` /
+        // `alloc_bf16_via_ring`). Pass 1 — under the streaming borrow —
+        // does Phase A (CPU memcpy/convert into staging) and collects a
+        // local Vec of staging records. Pass 2 — after the borrow ends —
+        // does Phase B (GPU alloc + async H2D from staging into the
+        // ring-backed slot buffer).
+        struct StagingRec {
+            name: String,
+            shape: Vec<usize>,
+            num_elems: usize,
+            cursor: usize,
+            bf16_bytes: usize,
+        }
+        let staging_ptr: *mut u8;
+        let mut recs: Vec<StagingRec>;
+        let max_bf16_bytes_in_block: usize;
         {
             let stream_state = self
                 .streaming
@@ -1352,7 +1510,7 @@ impl BlockOffloader {
             let staging_capacity_local = *staging_capacity;
             let block_entries = &blocks[block_idx];
             let staging_buf = &mut staging[target];
-            let staging_ptr: *mut u8 = staging_buf.as_mut_ptr();
+            staging_ptr = staging_buf.as_mut_ptr();
             // Mark the staging len so debug prints / future readers see the
             // real fill amount; not load-bearing for correctness because every
             // H2D uses an explicit byte count.
@@ -1360,8 +1518,10 @@ impl BlockOffloader {
                 staging_buf.set_len(staging_capacity_local.min(staging_buf.capacity_bytes()));
             }
 
+            recs = Vec::with_capacity(block_entries.len());
             tensors.reserve(block_entries.len());
             let mut cursor: usize = 0;
+            let mut max_bytes_seen: usize = 0;
             for entry in block_entries {
                 let bf16_bytes = entry.num_elems * 2;
                 if cursor + bf16_bytes > staging_capacity_local {
@@ -1374,6 +1534,9 @@ impl BlockOffloader {
                         bf16_bytes,
                         staging_capacity_local
                     );
+                }
+                if bf16_bytes > max_bytes_seen {
+                    max_bytes_seen = bf16_bytes;
                 }
 
                 // Phase A — CPU memcpy/convert from mmap → staging at offset.
@@ -1418,39 +1581,45 @@ impl BlockOffloader {
                     }
                 }
 
-                // Phase B — alloc GPU and async H2D from staging[target] at
-                // `cursor` into the fresh GPU buffer. Same `unsafe alloc`
-                // rationale as the pinned path: every byte is overwritten by
-                // the immediately-following memcpy_async on the same stream.
-                let gpu_buf = unsafe { device.alloc::<u16>(entry.num_elems) }.map_err(|e| {
-                    let (free, total) =
-                        crate::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
-                    anyhow::anyhow!(
-                        "GPU alloc (streaming) for {} ({} elems, need={} MiB) failed; \
-                         free={} MiB total={} MiB: {e:?}",
-                        entry.name,
-                        entry.num_elems,
-                        bf16_bytes / (1024 * 1024),
-                        free / (1024 * 1024),
-                        total / (1024 * 1024)
-                    )
-                })?;
-                let gpu_dst = (*gpu_buf.device_ptr() as u64) as *mut c_void;
-                let host_src = unsafe { staging_ptr.add(cursor) } as *const c_void;
-                memcpy_async_host_to_device(gpu_dst, host_src, bf16_bytes, stream_ptr)
-                    .map_err(|e| {
-                        anyhow::anyhow!("H2D (streaming) for {}: {e}", entry.name)
-                    })?;
-
-                let tensor = Tensor::from_bf16_slice_gpu(
-                    gpu_buf,
-                    Shape::from_dims(&entry.shape),
-                    device.clone(),
-                );
-                tensors.insert(entry.name.clone(), tensor);
-
+                recs.push(StagingRec {
+                    name: entry.name.clone(),
+                    shape: entry.shape.clone(),
+                    num_elems: entry.num_elems,
+                    cursor,
+                    bf16_bytes,
+                });
                 cursor += bf16_bytes;
             }
+            max_bf16_bytes_in_block = max_bytes_seen;
+        }
+
+        // Pass 2 — `self.streaming` borrow released; safe to call
+        // `&mut self` methods. Ensure ring, then alloc + async H2D for
+        // each staging record.
+        if max_bf16_bytes_in_block > 0 {
+            self.ensure_ring(max_bf16_bytes_in_block)?;
+        }
+        for rec in recs.into_iter() {
+            let gpu_buf = self.alloc_bf16_via_ring(rec.num_elems).map_err(|e| {
+                let (free, total) = crate::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
+                anyhow::anyhow!(
+                    "GPU alloc (streaming, ring) for {} ({} elems, need={} MiB) failed; \
+                     free={} MiB total={} MiB: {e:?}",
+                    rec.name,
+                    rec.num_elems,
+                    rec.bf16_bytes / (1024 * 1024),
+                    free / (1024 * 1024),
+                    total / (1024 * 1024)
+                )
+            })?;
+            let gpu_dst = (*gpu_buf.device_ptr() as u64) as *mut c_void;
+            let host_src = unsafe { staging_ptr.add(rec.cursor) } as *const c_void;
+            memcpy_async_host_to_device(gpu_dst, host_src, rec.bf16_bytes, stream_ptr)
+                .map_err(|e| anyhow::anyhow!("H2D (streaming) for {}: {e}", rec.name))?;
+
+            let tensor =
+                Tensor::from_bf16_slice_gpu(gpu_buf, Shape::from_dims(&rec.shape), device.clone());
+            tensors.insert(rec.name, tensor);
         }
 
         // All H2D copies are on the transfer stream. Record h2d_done so the

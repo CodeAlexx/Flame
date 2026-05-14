@@ -1378,6 +1378,20 @@ transfer stream. Per-slot CUDA events (`h2d_done`, `compute_done`)
 serialize stream-stream waits — no host-side `cudaStreamSynchronize` on
 the hot path (Phase 0 event-safety work).
 
+**Phase 2 post-reboot (2026-05-13): ring-backed slot allocations.**
+Both prefetch paths (pinned at `prefetch_block_inner`, streaming at
+`prefetch_block_streaming_inner`) now route their BF16 slot allocations
+through a lazily-materialized 4-slab `RingAllocator` owned by the
+offloader (`BlockOffloader::ensure_ring` + `alloc_bf16_via_ring`).
+Pointer handed to the new BF16 slot is synthesized via the cudarc
+0.11.x `CudaSlice` mirror layout and tagged as external in the
+global `cuda_alloc_pool` so `push_u16` routes it through
+`reconstruct_and_forget` + `unregister_external_ptr` on return
+(never `cudaFree`, never re-cached). Net effect: trainers can run
+with `FLAME_ALLOC_POOL=1` (the default) under offload without the
+prior corruption mode (cached BF16 slot pointers being re-issued by
+the pool while ring `reset()` had already invalidated them).
+
 **Three load modes:**
 - `BlockOffloader::load(paths, facilitator, device)` — default pinned
   path. Pinned RAM ≈ full block-weight size. Fastest hot path.

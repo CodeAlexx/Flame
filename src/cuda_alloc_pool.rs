@@ -228,20 +228,34 @@ impl CudaAllocPool {
         }
     }
 
-    /// Test if `ptr` is tagged as external (Phase 2a). Internal use.
+    /// Test if `ptr` is tagged as external (Phase 2a). Public so external
+    /// allocators (e.g. `BlockOffloader::alloc_bf16_via_ring`) can verify
+    /// their pointers are tracked.
     #[inline]
-    fn is_external_ptr(&self, ptr: u64) -> bool {
+    pub fn is_external_ptr(&self, ptr: u64) -> bool {
         self.external_ptrs
             .lock()
             .map(|s| s.contains(&ptr))
             .unwrap_or(false)
     }
 
-    /// Register `ptr` as external. Called after a successful
-    /// miss-allocator call returns a slice. Internal use.
-    fn register_external_ptr(&self, ptr: u64) {
+    /// Register `ptr` as external. Public so direct external-allocator
+    /// callers (Phase 2: `BlockOffloader` ring-backed allocs) can mark
+    /// their pointers without going through the `PoolMissAllocator`
+    /// trait.
+    pub fn register_external_ptr(&self, ptr: u64) {
         if let Ok(mut s) = self.external_ptrs.lock() {
             s.insert(ptr);
+        }
+    }
+
+    /// Remove `ptr` from the external set. Called from the `push_*`
+    /// guards when an external entry has been reconstructed-and-forgotten
+    /// (its lifecycle is the external allocator's, not the pool's), so
+    /// the set doesn't grow unbounded across step boundaries.
+    pub fn unregister_external_ptr(&self, ptr: u64) {
+        if let Ok(mut s) = self.external_ptrs.lock() {
+            s.remove(&ptr);
         }
     }
 
@@ -339,6 +353,19 @@ impl CudaAllocPool {
                 }
                 return;
             }
+            // Phase 2 guard: external entries (ring-backed) must NEVER enter the
+            // active free list. The ring slab's bytes will be handed out again
+            // on the next allocation; if a stale entry sat in the free list,
+            // `try_pop` would return a slice aliased to live ring memory and
+            // the caller would silently corrupt training. Reconstruct-and-
+            // forget here (the slab Arc still owns the memory) and untag.
+            if entry.is_external {
+                let ptr = entry.ptr;
+                unsafe { reconstruct_and_forget::<f32>(entry.ptr, entry.len, entry.device) };
+                drop(lists);
+                self.unregister_external_ptr(ptr);
+                return;
+            }
             list.push(entry);
 
             if profiling_enabled() {
@@ -403,6 +430,15 @@ impl CudaAllocPool {
                 } else {
                     unsafe { reconstruct_and_drop::<u16>(entry.ptr, entry.len, entry.device) };
                 }
+                return;
+            }
+            // Phase 2 guard: external (ring-backed) entries must never enter
+            // the active free list. See identical comment in `push_f32`.
+            if entry.is_external {
+                let ptr = entry.ptr;
+                unsafe { reconstruct_and_forget::<u16>(entry.ptr, entry.len, entry.device) };
+                drop(lists);
+                self.unregister_external_ptr(ptr);
                 return;
             }
             list.push(entry);

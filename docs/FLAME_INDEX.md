@@ -855,6 +855,9 @@ Test: `flame-core/tests/ring_pool_adapter_smoke.rs` (3 tests, GPU-real).
 | `install_miss_allocator(allocator)` | `cuda_alloc_pool.rs:671` | Install. Returns previously installed (if any). |
 | `uninstall_miss_allocator()` | `cuda_alloc_pool.rs:692` | Remove. Returns last installed (if any). |
 | `CudaAllocPool::external_miss_count()` | `cuda_alloc_pool.rs:217` | Lock-free count of cache-misses served by external allocator. Diagnostic. |
+| `CudaAllocPool::register_external_ptr(ptr)` | `cuda_alloc_pool.rs:248` | Phase 2: mark a device ptr as ring-/external-owned so `push_*` routes it through `reconstruct_and_forget` instead of caching the slice. |
+| `CudaAllocPool::is_external_ptr(ptr)` | `cuda_alloc_pool.rs:235` | Test if `ptr` is in the external set. |
+| `CudaAllocPool::unregister_external_ptr(ptr)` | `cuda_alloc_pool.rs:259` | Phase 2: remove `ptr` from the external set after `push_*` reconstructs-and-forgets it. Prevents unbounded growth across step boundaries. |
 
 ---
 
@@ -1517,6 +1520,8 @@ for the module overview.
 | ⭐ `BlockOffloader::await_block(&mut self, idx)` | `offload/mod.rs:1227` | Returns `Arc<HashMap<String, Tensor>>`. Legacy API — no scoped handle, so the next slot-reusing `prefetch_block` falls back to host-side `cudaDeviceSynchronize`. Migrate hot paths to `await_block_handle`. |
 | ⭐ `BlockOffloader::await_block_handle(&mut self, idx)` | `offload/mod.rs:1337` | Returns a scoped [`BlockHandle`]. Slot reuse waits on the handle's `compute_done` event via `cudaStreamWaitEvent` instead of host sync. Preferred. |
 | ⭐ `BlockOffloader::ensure_block(&mut self, idx)` | `offload/mod.rs:1357` | Backward-compat: `prefetch_block` + `await_block` in one call. |
+| ⭐ `BlockOffloader::ensure_ring(&mut self, max_slot_bytes)` | `offload/mod.rs` (Phase 2) | Lazy-materialize a 4-slab `RingAllocator` sized `max(256 MiB, 2 × max_slot_bytes)`. No-op if already initialized. Phase 2 post-reboot: ring is the backing store for BF16 slot buffers on the prefetch path, enabling `FLAME_ALLOC_POOL=1` under offload. |
+| ⭐ `BlockOffloader::alloc_bf16_via_ring(&mut self, num_elems)` | `offload/mod.rs` (Phase 2) | Allocate `num_elems` BF16 from the ring's `forward_handle(0)`, synth a `CudaSlice<u16>` via the cudarc 0.11.x mirror, register the pointer as external in the global pool so `push_u16` routes through `reconstruct_and_forget` on return. |
 | `BlockOffloader::evict_block(&mut self)` | `offload/mod.rs:1369` | Drop GPU tensors from both slots. Drains in-flight transfers and does a single host sync before freeing — pre-shutdown / mode-switch path, not hot loop. |
 | `BlockOffloader::block_count(&self)` | `offload/mod.rs:1387` | Accessor. |
 | `BlockOffloader::pinned_bytes(&self)` | `offload/mod.rs:1392` | Total pinned CPU bytes (excludes GPU slots). |
