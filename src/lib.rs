@@ -105,6 +105,7 @@ pub use pinned::{
 pub mod offload;
 pub mod cuda_alloc_pool;
 pub mod external_memory;
+pub mod static_slab_v2;
 #[cfg(feature = "cuda")]
 pub mod ring_alloc;
 pub mod cuda_graph;
