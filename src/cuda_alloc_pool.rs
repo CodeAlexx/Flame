@@ -941,8 +941,16 @@ pub fn pool_alloc_f32(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
     // Set `FLAME_F32_POOL_CACHE=1` to re-enable the (buggy) F32 free-list
     // for experimentation. Default OFF.
     if !f32_pool_cache_enabled() {
-        return unsafe { device.alloc::<f32>(size) }
-            .map_err(|e| crate::Error::CudaDriver(format!("alloc::<f32>({size}): {e:?}")));
+        // Zero-init to match the `pool_disabled` path's behavior. This is
+        // the path that's hit by default once the trainer-side
+        // `FLAME_ALLOC_POOL=0` workaround is removed in Phase 3 — the
+        // visible behavior must match (per Phase 3 safety constraint).
+        // Per the 2026-05-12 audit, no caller observably depends on
+        // zero-init, but the `pool_disabled` path zeros defensively for
+        // "legacy callers expect zero-init"; mirror that here.
+        return device
+            .alloc_zeros::<f32>(size)
+            .map_err(|e| crate::Error::CudaDriver(format!("alloc_zeros::<f32>({size}): {e:?}")));
     }
 
     let pool = global_pool();
