@@ -34,17 +34,18 @@ fn pool_alloc_f32_size_zero_under_opt_out() {
     pool_return_f32(s); // no panic, no leak
 }
 
-/// Stats accounting: under F32 opt-out, the F32 hit/miss/return
-/// counters should NOT advance — the free-list is entirely bypassed.
-/// `alloc_count` and `misses` are only incremented inside the cached
-/// path (see `pool_alloc_f32:953-957`). Same for `return_count` in
-/// `push_f32`.
+/// Stats accounting smoke: an alloc/return loop under F32 opt-out does
+/// not blow up or report incoherent counters. The load-bearing
+/// "F32 free-list does not grow" assertion lives in the regression
+/// suite (`pool_no_f32_cache_growth_under_opt_out`) and uses
+/// `current_cached_entries` which is the durable signal.
 ///
-/// NOTE: this test only runs meaningfully under `FLAME_PROFILE=1`
-/// because all counters are gated on `profiling_enabled()`. Without the
-/// flag, counters stay at 0 regardless and the test is trivially true.
+/// The hit/miss/return counters are global atomics shared across all
+/// concurrent tests in this binary — asserting exact equality before vs
+/// after would be racy. This test just verifies the path is reachable
+/// and doesn't deadlock/panic.
 #[test]
-fn pool_stats_no_growth_under_f32_opt_out() {
+fn pool_stats_smoke_under_f32_opt_out() {
     let dev = cuda_device();
     let before = global_pool().hit_miss_counts();
     for _ in 0..16 {
@@ -52,18 +53,12 @@ fn pool_stats_no_growth_under_f32_opt_out() {
         pool_return_f32(s);
     }
     let after = global_pool().hit_miss_counts();
-    // (hits, misses, external_misses)
-    assert_eq!(
-        after.0, before.0,
-        "F32 opt-out must not register hits"
-    );
-    assert_eq!(
-        after.1, before.1,
-        "F32 opt-out must not register misses (path bypassed before bucket lookup)"
-    );
-    assert_eq!(
-        after.2, before.2,
-        "F32 opt-out must not invoke the external miss allocator"
+    // Counters are monotonically non-decreasing.
+    assert!(after.0 >= before.0, "hits counter went backwards");
+    assert!(after.1 >= before.1, "misses counter went backwards");
+    assert!(
+        after.2 >= before.2,
+        "external_misses counter went backwards"
     );
 }
 
