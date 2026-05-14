@@ -95,6 +95,12 @@ pub struct ExternalRange {
 
 /// Opaque handle returned by `register_range`. Pass to `unregister_range` to
 /// remove the entry. Copy/Clone so callers can stash it in a `Drop` impl.
+///
+/// Note: `RangeHandle` itself has NO `Drop` impl — ranges must be explicitly
+/// unregistered. Dropping a handle without calling `unregister_range` leaks
+/// the registry entry until process exit. This is intentional: callers own
+/// the lifetime (matches `register_exact`/`unregister_exact` symmetry).
+/// Locked down by `skeptic_range_handle_drop_does_not_auto_unregister`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RangeHandle(u64);
 
@@ -148,6 +154,11 @@ impl ExternalMemoryRegistry {
     ///
     /// Zero-length ranges (start == end) are accepted but never match any
     /// pointer — useful for testing edge cases.
+    ///
+    /// DECISION: inverted ranges (start > end) are silently accepted and
+    /// silently never match. No `debug_assert!` is added because the registry
+    /// is best-effort metadata — caller owns input sanity. Locked down by
+    /// `skeptic_register_range_inverted_silently_never_matches`.
     pub fn register_range(&self, range: ExternalRange) -> RangeHandle {
         let mut g = self.inner.lock().expect("ExternalMemoryRegistry poisoned");
         let h = RangeHandle(g.next_handle);
@@ -246,6 +257,14 @@ impl ExternalMemoryRegistry {
     ///    `DEVICE_KEY_ANY`) covers `ptr`; **OR**
     /// 2. An exact entry `(ptr, device_key)` or `(ptr, DEVICE_KEY_ANY)`
     ///    exists with non-zero refcount.
+    ///
+    /// For device-less callers (e.g., the cudarc `CudaSlice::drop` hook, whose
+    /// signature is `fn(u64) -> bool` with no device context), use
+    /// [`should_skip_free_any_device`](Self::should_skip_free_any_device)
+    /// instead. Querying this method with `device_key == DEVICE_KEY_ANY` will
+    /// only match entries that were registered under `DEVICE_KEY_ANY`; it will
+    /// NOT match real-device entries. Locked down by
+    /// `skeptic_should_skip_free_with_any_key_does_not_match_real_device`.
     pub fn should_skip_free(&self, ptr: u64, device_key: usize) -> bool {
         let g = self.inner.lock().expect("ExternalMemoryRegistry poisoned");
         for (_, r) in &g.ranges {
