@@ -3038,7 +3038,12 @@ fn compute_gradients(
             // ── Step 4: Flush allocation pool ──
             // The eager-free above dropped CudaSlices back into flame-core's
             // pool cache. Flush now so subsequent checkpoints can reuse VRAM.
-            crate::cuda_alloc_pool::clear_pool_cache();
+            // 2026-05-15 diagnostic: `FLAME_SKIP_POOL_CLEAR=1` skips the
+            // flush — tests whether the clear is the cuMemcpy2D INVALID_VALUE
+            // trigger (per audit hypothesis H_CLEARCACHE).
+            if std::env::var("FLAME_SKIP_POOL_CLEAR").as_deref() != Ok("1") {
+                crate::cuda_alloc_pool::clear_pool_cache();
+            }
 
             // Profiling
             static CKPT_PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

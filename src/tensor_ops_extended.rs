@@ -489,6 +489,21 @@ impl Tensor {
                                 WidthInBytes: width_bytes,
                                 Height: outer,
                             };
+                            // 2026-05-15 trap: validate src/dst ptrs against
+                            // the BF16 pool's live-ptr tracker. When
+                            // FLAME_POOL_TRAP_BF16=1 and either ptr's last
+                            // recorded state is not Live, panic with
+                            // provenance instead of getting cuMemcpy2D's
+                            // opaque INVALID_VALUE. This is the soul.md-
+                            // pattern trap for the Klein 9B step-13 crash.
+                            crate::cuda_alloc_pool::trap_validate_bf16_ptr(
+                                params.srcDevice as u64,
+                                "Tensor::cat/cuMemcpy2D src",
+                            );
+                            crate::cuda_alloc_pool::trap_validate_bf16_ptr(
+                                params.dstDevice as u64,
+                                "Tensor::cat/cuMemcpy2D dst",
+                            );
                             let rc = unsafe {
                                 cudarc::driver::sys::lib()
                                     .cuMemcpy2DAsync_v2(&params, stream_ptr)

@@ -1388,6 +1388,15 @@ extern "C" __global__ void masked_fill_kernel(
             data.len(),
             numel
         );
+        // 2026-05-15 trap: record the ptr as Live when a caller-provided
+        // slice is wrapped into a Tensor. If the slice's ptr was
+        // previously Freed by clear_pool_cache, the trap history will
+        // show the alternation — that's a use-after-free smoking gun.
+        let trap_ptr = *cudarc::driver::DevicePtr::device_ptr(&data);
+        crate::cuda_alloc_pool::trap_record_external(
+            trap_ptr,
+            "from_bf16_slice_gpu/wrap",
+        );
         Tensor {
             storage: TensorStorage::BF16 {
                 data: wrap_slice(data),

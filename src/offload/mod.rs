@@ -984,6 +984,15 @@ impl BlockOffloader {
     /// `cudaMalloc` for slab[0]; subsequent slabs materialize lazily on
     /// ring-wrap.
     pub fn ensure_ring(&mut self, max_slot_bytes: usize) -> anyhow::Result<()> {
+        // 2026-05-15 regression escape hatch: `FLAME_OFFLOAD_RING_DISABLE=1`
+        // skips ring init. `alloc_bf16_via_ring` then falls through to
+        // `device.alloc::<u16>` (pre-Phase-2-post-reboot behavior). Pre-
+        // conductor Klein 9B baseline (3.4-3.8 s/step at commit 661f9e9)
+        // did not use the ring. Use this to confirm the ring path is the
+        // regression source.
+        if std::env::var("FLAME_OFFLOAD_RING_DISABLE").as_deref() == Ok("1") {
+            return Ok(());
+        }
         if self.ring.is_some() {
             return Ok(());
         }
@@ -1013,6 +1022,15 @@ impl BlockOffloader {
     ///
     /// Requires [`Self::ensure_ring`] to have been called first.
     pub fn alloc_bf16_via_ring(&mut self, num_elems: usize) -> anyhow::Result<CudaSlice<u16>> {
+        // 2026-05-15 regression escape hatch: when FLAME_OFFLOAD_RING_DISABLE=1
+        // is set, ensure_ring is a no-op (self.ring stays None). Fall back to
+        // direct cudart alloc (pre-Phase-2-post-reboot behavior). The
+        // returned slice is NOT registered in external_ptrs — pool_return_u16
+        // will path it through the normal free-list logic on drop.
+        if self.ring.is_none() {
+            return unsafe { self.device.alloc::<u16>(num_elems) }
+                .map_err(|e| anyhow::anyhow!("alloc_bf16 fallback (ring disabled): {e:?}"));
+        }
         let ring = self.ring.as_mut().ok_or_else(|| {
             anyhow::anyhow!("BlockOffloader::alloc_bf16_via_ring: ensure_ring not called")
         })?;
@@ -1046,6 +1064,13 @@ impl BlockOffloader {
         };
         let slice: CudaSlice<u16> = unsafe { std::mem::transmute(mirror) };
         crate::cuda_alloc_pool::global_pool().register_external_ptr(ptr.device_ptr);
+        // 2026-05-15 trap: record ring-allocated ptr as Live. If the trap
+        // history later shows clear_cache/cudaFree on this ptr followed by
+        // alloc_bf16_via_ring/external on the SAME ptr, that's the bug.
+        crate::cuda_alloc_pool::trap_record_external(
+            ptr.device_ptr,
+            "alloc_bf16_via_ring/ring",
+        );
         Ok(slice)
     }
 

@@ -91,11 +91,215 @@ fn f32_zero_init_enabled() -> bool {
 /// 2-13 with `CUDA_ERROR_INVALID_VALUE` (see Skeptic Phase 2c diagnosis).
 /// Disabling the cache routes F32 allocs directly to cudart `device.alloc`
 /// and `cudaFree` on drop, bypassing the free-list entirely. The BF16
-/// path (`pool_alloc_u16`) is unaffected and continues to cache.
+/// path (`pool_alloc_u16`) is gated independently by
+/// [`bf16_pool_cache_enabled`].
 #[inline]
 fn f32_pool_cache_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| std::env::var("FLAME_F32_POOL_CACHE").ok().as_deref() == Some("1"))
+}
+
+/// Cached env check for `FLAME_BF16_POOL_CACHE=1` (opt-in: enable the BF16
+/// free-list caching path in `pool_alloc_u16`).
+///
+/// **Default = OFF.** Phase 2 smoke gate (2026-05-15) showed that the
+/// Klein 9B step-13 `cuMemcpy2DAsync_v2 (cat) failed: CUDA_ERROR_INVALID_VALUE`
+/// crash reproduces with `FLAME_F32_POOL_CACHE=0` (F32 cache OFF), proving
+/// the bug surface is NOT exclusive to F32. The BF16 free-list has the
+/// identical code shape and the same stale-ptr re-use class. Routing BF16
+/// directly to cudart eliminates the crash class entirely.
+///
+/// Cost: BF16 transient allocations (Tensor::cat outputs, intermediate
+/// casts, scratch buffers) lose free-list reuse. cudart's own mempool
+/// still provides allocator-level reuse, so the perf cost is bounded by
+/// the cudart driver's allocation churn — measured in Phase 2 smoke.
+#[inline]
+fn bf16_pool_cache_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("FLAME_BF16_POOL_CACHE").ok().as_deref() == Some("1"))
+}
+
+/// Cached env check for `FLAME_POOL_TRACE_BF16=1` — emits a per-event
+/// trace line to stderr (op kind, ptr, bucket, size) for every BF16
+/// alloc, return, push, and try_pop. Used to forensically reconstruct
+/// the alloc history of a failing pointer.
+#[inline]
+fn pool_trace_bf16_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("FLAME_POOL_TRACE_BF16").ok().as_deref() == Some("1"))
+}
+
+/// Per-event log line: `[BF16-POOL] op=<kind> ptr=0x<hex> bucket=<u> size=<u> ext=<bool> tag=<...>`
+/// Cheap (uses Atomic counters + eprintln). Stripped when env unset.
+#[inline]
+fn trace_bf16(op: &str, ptr: u64, bucket: usize, size: usize, ext: bool, tag: &str) {
+    if pool_trace_bf16_enabled() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[BF16-POOL] seq={} op={} ptr=0x{:x} bucket={} size={} ext={} tag={}",
+            n, op, ptr, bucket, size, ext, tag
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// LIVE-PTR TRAP (2026-05-15)
+//
+// Records every BF16 alloc / return / cache-clear event with a sequence
+// number and last-known state. `trap_validate_bf16_ptr(ptr, site)` queries
+// the trap right before passing a ptr to a CUDA API like cuMemcpy2D —
+// when the trap is on and the ptr is non-Live, panics with provenance
+// instead of getting an opaque `CUDA_ERROR_INVALID_VALUE`. This is the
+// soul.md-pattern trap for the Klein 9B step-13 crash.
+//
+// Activated via `FLAME_POOL_TRAP_BF16=1`. Default OFF (per-op cost is a
+// single OnceLock atomic load).
+// ─────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PtrState {
+    Live,
+    InCache,
+    Freed,
+}
+
+#[derive(Clone, Debug)]
+struct PtrEvent {
+    seq: u64,
+    state: PtrState,
+    op: &'static str,
+    bucket: usize,
+    /// Backtrace of the call site for this event. Captured when
+    /// `FLAME_POOL_TRAP_BACKTRACE=1` and the event op is `pool_return_u16/push`
+    /// — that's the suspect call. Cheap when off (None).
+    bt: Option<std::sync::Arc<String>>,
+}
+
+#[derive(Clone, Debug)]
+struct PtrHistory {
+    state: PtrState,
+    last_seq: u64,
+    last_op: &'static str,
+    bucket: usize,
+    event_count: u32,
+    /// Last N events for forensics (newest at end).
+    events: Vec<PtrEvent>,
+}
+
+const TRAP_HISTORY_LEN: usize = 16;
+
+#[inline]
+fn pool_trap_bf16_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("FLAME_POOL_TRAP_BF16").ok().as_deref() == Some("1"))
+}
+
+/// Backtrace capture is OPT-IN (extra slow) via `FLAME_POOL_TRAP_BACKTRACE=1`.
+#[inline]
+fn pool_trap_backtrace_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("FLAME_POOL_TRAP_BACKTRACE").ok().as_deref() == Some("1"))
+}
+
+fn trap_history() -> &'static Mutex<HashMap<u64, PtrHistory>> {
+    static H: OnceLock<Mutex<HashMap<u64, PtrHistory>>> = OnceLock::new();
+    H.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn trap_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static S: AtomicU64 = AtomicU64::new(0);
+    S.fetch_add(1, Ordering::Relaxed)
+}
+
+#[inline]
+fn trap_record(ptr: u64, state: PtrState, op: &'static str, bucket: usize) {
+    if !pool_trap_bf16_enabled() {
+        return;
+    }
+    // Backtrace only for the suspect ops (push/return) — capture is slow.
+    let bt = if pool_trap_backtrace_enabled() && state == PtrState::InCache {
+        Some(std::sync::Arc::new(
+            std::backtrace::Backtrace::force_capture().to_string(),
+        ))
+    } else {
+        None
+    };
+    if let Ok(mut h) = trap_history().lock() {
+        let seq = trap_seq();
+        let entry = h.entry(ptr).or_insert(PtrHistory {
+            state,
+            last_seq: seq,
+            last_op: op,
+            bucket,
+            event_count: 0,
+            events: Vec::with_capacity(TRAP_HISTORY_LEN),
+        });
+        entry.state = state;
+        entry.last_seq = seq;
+        entry.last_op = op;
+        entry.bucket = bucket;
+        entry.event_count = entry.event_count.saturating_add(1);
+        if entry.events.len() == TRAP_HISTORY_LEN {
+            entry.events.remove(0);
+        }
+        entry.events.push(PtrEvent { seq, state, op, bucket, bt });
+    }
+}
+
+/// Record an externally-sourced BF16 ptr being wrapped into a Tensor
+/// (e.g. via `Tensor::from_bf16_slice_gpu` from a `BlockOffloader`
+/// alloc or ring slice). Sets state to `Live` so subsequent
+/// `pool_return_u16` is the legitimate disposition for THIS Arc — and
+/// the trap can detect if the SAME ptr later gets a SECOND wrap (which
+/// would indicate two independent Arcs for the same memory, the actual
+/// bug pattern).
+pub fn trap_record_external(ptr: u64, call_site: &'static str) {
+    trap_record(ptr, PtrState::Live, call_site, 0);
+}
+
+/// Validate a BF16 ptr right before passing it to a CUDA API. Panics
+/// with provenance when the trap is on AND the ptr's last recorded
+/// state is not `Live`. When the trap is off, no-op. Foreign ptrs
+/// (never seen by the pool) are tolerated silently.
+pub fn trap_validate_bf16_ptr(ptr: u64, call_site: &str) {
+    if !pool_trap_bf16_enabled() {
+        return;
+    }
+    if let Ok(h) = trap_history().lock() {
+        if let Some(hist) = h.get(&ptr) {
+            if hist.state != PtrState::Live {
+                let state = hist.state;
+                let last_seq = hist.last_seq;
+                let last_op = hist.last_op;
+                let bucket = hist.bucket;
+                let event_count = hist.event_count;
+                let events = hist.events.clone();
+                drop(h);
+                eprintln!("[BF16-POOL TRAP] ====== FORENSIC HISTORY (last {} events) ======", events.len());
+                for (i, ev) in events.iter().enumerate() {
+                    eprintln!(
+                        "[BF16-POOL TRAP] [{}] seq={} state={:?} op={} bucket={}",
+                        i, ev.seq, ev.state, ev.op, ev.bucket
+                    );
+                    if let Some(ref bt) = ev.bt {
+                        eprintln!("[BF16-POOL TRAP]      backtrace:");
+                        for line in bt.lines().take(40) {
+                            eprintln!("[BF16-POOL TRAP]        {}", line);
+                        }
+                    }
+                }
+                eprintln!("[BF16-POOL TRAP] ====== END HISTORY ======");
+                panic!(
+                    "[BF16-POOL TRAP] call_site={} ptr=0x{:x} state={:?} \
+                     last_seq={} last_op={} bucket={} event_count={}",
+                    call_site, ptr, state, last_seq, last_op, bucket, event_count
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +707,35 @@ impl CudaAllocPool {
                 self.unregister_external_ptr(ptr);
                 return;
             }
+            // 2026-05-15 DEFENSIVE FIX: if the same ptr is ALREADY in the
+            // free-list (or in ANY bucket's list), this is a duplicate-Arc
+            // bug — two independent `CudaSlice<u16>` objects with the same
+            // underlying ptr. Pushing again would queue a double-cudaFree
+            // for `clear_cache`. Instead, MEM::FORGET this entry (don't
+            // cudaFree, don't push). cudart sees only one allocation at
+            // this ptr; the first cudaFree will free it correctly. This
+            // trades a small leak for crash-class elimination.
+            //
+            // Detection cost: O(N) scan of the matching bucket's list.
+            // Bucket lists are bounded at MAX_FREE_PER_SIZE=32, so per-
+            // call cost is ≤32 ptr comparisons. Worth it.
+            let ptr = entry.ptr;
+            if list.iter().any(|e| e.ptr == ptr) {
+                drop(lists);
+                // Forget the duplicate. The original entry will free it.
+                unsafe { reconstruct_and_forget::<u16>(entry.ptr, entry.len, entry.device) };
+                log::warn!(
+                    "pool: u16 duplicate-return detected ptr=0x{:x} bucket={} — forgetting (defensive fix)",
+                    ptr, size
+                );
+                if pool_trap_bf16_enabled() {
+                    eprintln!(
+                        "[BF16-POOL] DUPLICATE-RETURN DETECTED ptr=0x{:x} bucket={} — forgotten",
+                        ptr, size
+                    );
+                }
+                return;
+            }
             list.push(entry);
 
             if profiling_enabled() {
@@ -604,6 +837,10 @@ impl CudaAllocPool {
             // Default fast path — direct drops, no env check or counters.
             for (key, list) in entries {
                 for entry in list {
+                    let trap_ptr = entry.ptr;
+                    let trap_bucket = key.bucket;
+                    let trap_is_u16 = key.is_u16;
+                    let trap_is_ext = entry.is_external;
                     unsafe {
                         if entry.is_external {
                             if key.is_u16 {
@@ -618,6 +855,14 @@ impl CudaAllocPool {
                                 reconstruct_and_drop::<f32>(entry.ptr, entry.len, entry.device);
                             }
                         }
+                    }
+                    if trap_is_u16 {
+                        let tag = if trap_is_ext {
+                            "clear_cache/external_forget"
+                        } else {
+                            "clear_cache/cudaFree"
+                        };
+                        trap_record(trap_ptr, PtrState::Freed, tag, trap_bucket);
                     }
                 }
             }
@@ -1125,6 +1370,19 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
         };
     }
 
+    // 2026-05-15: BF16 free-list caching is OPT-IN via FLAME_BF16_POOL_CACHE=1.
+    //
+    // Symmetric to the F32 opt-out. Phase 2 smoke proved the crash class
+    // is NOT F32-exclusive — the BF16 free-list has the same stale-ptr
+    // re-use bug. Routes BF16 allocs directly to cudart `device.alloc`
+    // and cudaFree on drop, bypassing the free-list.
+    //
+    // BF16 returns uninitialized (matches the cached path's contract).
+    if !bf16_pool_cache_enabled() {
+        return unsafe { device.alloc::<u16>(size) }
+            .map_err(|e| crate::Error::CudaDriver(format!("alloc::<u16>({size}): {e:?}")));
+    }
+
     let pool = global_pool();
     let bucket = round_elems_up::<u16>(size);
 
@@ -1137,6 +1395,8 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
         if bucket != size {
             pool.bucket_saves.fetch_add(1, Ordering::Relaxed);
         }
+        trace_bf16("alloc_hit", entry.ptr, bucket, size, entry.is_external, "pool_alloc_u16");
+        trap_record(entry.ptr, PtrState::Live, "pool_alloc_u16/hit", bucket);
         // Reconstruct with len = requested size, not bucket (see f32 path).
         let slice = unsafe { reconstruct_slice::<u16>(entry.ptr, size, entry.device) };
         log::trace!(
@@ -1196,25 +1456,37 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
     })?;
 
     if bucket == size {
+        let ptr = *DevicePtr::device_ptr(&allocated);
+        trace_bf16("alloc_miss", ptr, bucket, size, false, "pool_alloc_u16/fresh");
+        trap_record(ptr, PtrState::Live, "pool_alloc_u16/miss", bucket);
         Ok(allocated)
     } else {
         let (ptr, _, dev) = unsafe { decompose_slice(allocated) };
+        trace_bf16("alloc_miss", ptr, bucket, size, false, "pool_alloc_u16/fresh-shrunk");
+        trap_record(ptr, PtrState::Live, "pool_alloc_u16/miss-shrunk", bucket);
         Ok(unsafe { reconstruct_slice::<u16>(ptr, size, dev) })
     }
 }
 
 /// Return a `CudaSlice<u16>` to the caching pool.
 pub fn pool_return_u16(slice: CudaSlice<u16>) {
-    if pool_disabled() {
-        // Defensive: if the pool was disabled mid-run AND the slice came
-        // from an external miss-allocator, do NOT cudaFree it.
+    let trace_ptr = *slice.device_ptr();
+    let trace_len = DeviceSlice::len(&slice);
+    trace_bf16("return_enter", trace_ptr, 0, trace_len, false, "pool_return_u16");
+    // 2026-05-15: symmetric BF16 opt-out — when pool is disabled OR BF16
+    // caching is opt-out (default), drop directly. Mirrors `pool_alloc_u16`
+    // / `pool_return_f32` opt-outs.
+    if pool_disabled() || !bf16_pool_cache_enabled() {
         let ptr = *slice.device_ptr();
         if global_pool().is_external_ptr(ptr) {
             let len = DeviceSlice::len(&slice);
             let (p, _, dev) = unsafe { decompose_slice(slice) };
             unsafe { reconstruct_and_forget::<u16>(p, len, dev) };
+            global_pool().unregister_external_ptr(ptr);
+            trap_record(p, PtrState::Freed, "pool_return_u16/external_forget", 0);
         } else {
             drop(slice);
+            trap_record(ptr, PtrState::Freed, "pool_return_u16/drop", 0);
         }
         return;
     }
@@ -1228,6 +1500,8 @@ pub fn pool_return_u16(slice: CudaSlice<u16>) {
     let (ptr, elem_len, device) = unsafe { decompose_slice(slice) };
     let bucket = round_elems_up::<u16>(elem_len);
     let is_external = global_pool().is_external_ptr(ptr);
+    trace_bf16("return_push", ptr, bucket, elem_len, is_external, "pool_return_u16/push");
+    trap_record(ptr, PtrState::InCache, "pool_return_u16/push", bucket);
 
     global_pool().push_u16(FreeEntry {
         ptr,
