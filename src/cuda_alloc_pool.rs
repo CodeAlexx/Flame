@@ -417,11 +417,15 @@ pub struct CudaAllocPool {
     /// paths in `pool_alloc_u16` / `pool_alloc_f32` route through this
     /// instead of `device.alloc::<T>`. See `PoolMissAllocator` docs.
     miss_alloc: Mutex<Option<Arc<dyn PoolMissAllocator>>>,
-    /// Refcount map of device pointers that originated from an external
-    /// allocator (Phase 2a `PoolMissAllocator` route or Phase 2
-    /// `BlockOffloader::alloc_bf16_via_ring`). Used to tag free-list
-    /// entries via `FreeEntry::is_external` at `push_*` time so subsequent
-    /// `clear_cache` / pool-drop skips `cudaFree` on those entries.
+    /// **R1a:** the underlying refcount storage moved to
+    /// [`crate::external_memory::ExternalMemoryRegistry`]. This crate's
+    /// `register_external_ptr` / `is_external_ptr` / `unregister_external_ptr`
+    /// stay as the public surface (the `BlockOffloader` ring path,
+    /// `pool_return_*` external-guards, and `PoolMissAllocator` callers all
+    /// hit these by name) but route through the unified registry so a
+    /// future range-based slab allocator can protect mid-slab offsets the
+    /// exact-ptr map could never see. See `external_memory.rs` for the
+    /// rationale and `RangeHandle` API.
     ///
     /// **Why a refcount, not a set** (2026-05-14 Phase 2 round 2 fix): the
     /// `RingAllocator` cyclically reuses slab offsets — when the forward
@@ -432,9 +436,10 @@ pub struct CudaAllocPool {
     /// non-external, and then `clear_cache` called `free_async` on a
     /// ring-slab offset → `CUDA_ERROR_INVALID_VALUE` panic. The refcount
     /// keeps the ptr marked external until ALL live tensors sharing it
-    /// have been forgotten. See `tests` in this module and the Klein 9B
-    /// Phase 2 gate (`/tmp/k9_p2r2_*` logs).
-    external_ptrs: Mutex<HashMap<u64, u32>>,
+    /// have been forgotten. The R1a registry preserves that semantics
+    /// exactly. See `tests` in this module and the Klein 9B Phase 2 gate
+    /// (`/tmp/k9_p2r2_*` logs).
+    /// (No local storage — see `external_memory::ExternalMemoryRegistry`.)
     /// Lock-free counter of cache misses that routed through the external
     /// allocator. Useful for verifying the miss-route is firing as
     /// expected from a smoke-test harness.
@@ -455,21 +460,22 @@ impl CudaAllocPool {
             misses: AtomicU64::new(0),
             bucket_saves: AtomicU64::new(0),
             miss_alloc: Mutex::new(None),
-            external_ptrs: Mutex::new(HashMap::new()),
             external_misses: AtomicU64::new(0),
         }
     }
 
     /// Test if `ptr` is tagged as external (Phase 2a). Public so external
     /// allocators (e.g. `BlockOffloader::alloc_bf16_via_ring`) can verify
-    /// their pointers are tracked. Returns true iff the ptr's refcount is
-    /// non-zero (i.e., at least one register without a matching unregister).
+    /// their pointers are tracked.
+    ///
+    /// **R1a:** delegates to
+    /// [`crate::external_memory::ExternalMemoryRegistry::should_skip_free_any_device`].
+    /// Returns true iff any range covers `ptr` OR an exact entry exists
+    /// with non-zero refcount (any device).
     #[inline]
     pub fn is_external_ptr(&self, ptr: u64) -> bool {
-        self.external_ptrs
-            .lock()
-            .map(|m| m.get(&ptr).copied().unwrap_or(0) > 0)
-            .unwrap_or(false)
+        crate::external_memory::ExternalMemoryRegistry::global()
+            .should_skip_free_any_device(ptr)
     }
 
     /// Register `ptr` as external. Public so direct external-allocator
@@ -482,10 +488,19 @@ impl CudaAllocPool {
     /// out the same physical address for multiple concurrent allocations
     /// after the forward cursor wraps, in which case both lifetimes are
     /// tracked here as count=2.
+    ///
+    /// **R1a:** delegates to the unified
+    /// [`crate::external_memory::ExternalMemoryRegistry`] under the
+    /// device-agnostic [`crate::external_memory::DEVICE_KEY_ANY`] key
+    /// (the back-compat API has no device parameter; range entries
+    /// keyed by real devices remain reachable via the
+    /// `should_skip_free_any_device` path).
     pub fn register_external_ptr(&self, ptr: u64) {
-        if let Ok(mut m) = self.external_ptrs.lock() {
-            *m.entry(ptr).or_insert(0) += 1;
-        }
+        crate::external_memory::ExternalMemoryRegistry::global().register_exact(
+            ptr,
+            crate::external_memory::DEVICE_KEY_ANY,
+            crate::external_memory::ExternalOwner::PoolExact,
+        );
     }
 
     /// Decrement `ptr`'s external refcount. Removes the entry when the
@@ -496,33 +511,27 @@ impl CudaAllocPool {
     ///
     /// No-op if `ptr` is not registered. Saturates at 0 (extra unregisters
     /// after the count is already 0 are silently ignored).
+    ///
+    /// **R1a:** delegates to
+    /// [`crate::external_memory::ExternalMemoryRegistry::unregister_exact`].
     pub fn unregister_external_ptr(&self, ptr: u64) {
-        if let Ok(mut m) = self.external_ptrs.lock() {
-            if let Some(c) = m.get_mut(&ptr) {
-                if *c > 1 {
-                    *c -= 1;
-                } else {
-                    m.remove(&ptr);
-                }
-            }
-        }
+        let _ = crate::external_memory::ExternalMemoryRegistry::global()
+            .unregister_exact(ptr);
     }
 
     /// Inspection: total number of external ptr entries currently tracked
     /// (sum across all distinct ptrs, not summed refcounts). Used by tests.
     #[doc(hidden)]
     pub fn external_ptr_count(&self) -> usize {
-        self.external_ptrs.lock().map(|m| m.len()).unwrap_or(0)
+        crate::external_memory::ExternalMemoryRegistry::global().exact_entry_count()
     }
 
     /// Inspection: current refcount for `ptr`. Returns 0 if not tracked.
     /// Used by tests.
     #[doc(hidden)]
     pub fn external_ptr_refcount(&self, ptr: u64) -> u32 {
-        self.external_ptrs
-            .lock()
-            .map(|m| m.get(&ptr).copied().unwrap_or(0))
-            .unwrap_or(0)
+        crate::external_memory::ExternalMemoryRegistry::global()
+            .exact_refcount(ptr, crate::external_memory::DEVICE_KEY_ANY)
     }
 
     /// Lock-free counter of cache misses that were served by an installed
@@ -1095,22 +1104,14 @@ pub fn install_miss_allocator(
     // on ring-backed slices (which can leak out of `pool_alloc_*` through
     // helpers that don't call `pool_return_*`) skip the `cudaFree`. Without
     // this, dropping a slice whose ptr is an offset into a ring slab
-    // panics with `CUDA_ERROR_INVALID_VALUE`. The hook reads the pool's
-    // `external_ptrs` set, which is populated at pool_alloc time.
-    cudarc::driver::install_external_ptr_hook(external_ptr_hook);
+    // panics with `CUDA_ERROR_INVALID_VALUE`.
+    //
+    // **R1a:** the hook closure is owned by
+    // [`crate::external_memory::ExternalMemoryRegistry`] and consults the
+    // unified registry (ranges + exact). Idempotent: first install wins,
+    // subsequent calls are no-ops.
+    crate::external_memory::ExternalMemoryRegistry::ensure_hook_installed();
     prev
-}
-
-/// Hook installed into cudarc's `CudaSlice::drop` when a miss-allocator is
-/// active. Returns true if `ptr` belongs to an external (ring-owned)
-/// allocation and `cudaFree` must be skipped.
-fn external_ptr_hook(ptr: u64) -> bool {
-    // SAFETY against init order: `POOL` is `OnceLock`; if not yet
-    // initialized, no external allocations exist, so return false.
-    match POOL.get() {
-        Some(p) => p.is_external_ptr(ptr),
-        None => false,
-    }
 }
 
 /// Remove the installed miss-allocator (if any). The pool reverts to

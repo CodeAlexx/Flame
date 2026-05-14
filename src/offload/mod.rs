@@ -45,14 +45,12 @@ pub mod transfer_benchmark;
 
 pub use manager::{ForcedStrategy, ManagerConfig, OffloadManager, OffloadPhase};
 
-/// `cudarc-pinctx::install_external_ptr_hook` callback for ring-backed slot
-/// allocations. Returns true when the pool has the pointer tagged as
-/// external — `CudaSlice::drop` then skips `cudaFree`.
-///
-/// Installed lazily by [`BlockOffloader::ensure_ring`]. Idempotent.
-fn ring_external_ptr_hook(ptr: u64) -> bool {
-    crate::cuda_alloc_pool::global_pool().is_external_ptr(ptr)
-}
+// **R1a:** the ring's drop-hook callback now lives in
+// `crate::external_memory::ExternalMemoryRegistry`. `ensure_ring` calls
+// `ExternalMemoryRegistry::ensure_hook_installed()` instead of installing a
+// dedicated `ring_external_ptr_hook` closure. The registry's
+// `should_skip_free_any_device` covers what `is_external_ptr` covered
+// before, plus range-based protection for the upcoming `StaticSlabAllocator`.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -1000,13 +998,12 @@ impl BlockOffloader {
         let ring = crate::ring_alloc::RingAllocator::new(self.device.clone(), 4, slab_bytes)
             .map_err(|e| anyhow::anyhow!("BlockOffloader::ensure_ring: {e:?}"))?;
         // Install the cudarc-pinctx Drop hook so `CudaSlice::drop` consults
-        // the pool's `external_ptrs` set. Without this, slot tensors that
-        // escape into autograd and drop outside `pool_return_u16` would
+        // the unified `ExternalMemoryRegistry`. Without this, slot tensors
+        // that escape into autograd and drop outside `pool_return_u16` would
         // `cudaFree` a ring-slab offset and panic with `CUDA_ERROR_INVALID_VALUE`.
-        // Idempotent: hook is a function pointer atomically swapped, so
-        // multiple calls (across BlockOffloader instances or with
-        // `install_miss_allocator`) are safe.
-        cudarc::driver::install_external_ptr_hook(ring_external_ptr_hook);
+        // R1a: the registry's `ensure_hook_installed` is idempotent across
+        // BlockOffloader, slab, and `install_miss_allocator` first-callers.
+        crate::external_memory::ExternalMemoryRegistry::ensure_hook_installed();
         self.ring = Some(ring);
         Ok(())
     }
