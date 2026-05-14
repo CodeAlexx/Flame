@@ -280,8 +280,12 @@ impl BlockOffloadStrategy {
 /// for the duration of the block's compute.
 pub struct OffloadCoordinator {
     /// Existing weight-block pinned-RAM + double-buffered GPU offloader.
-    /// Owned by the coordinator; trainers don't access directly.
-    blocks: BlockOffloader,
+    /// Owned by the coordinator; trainers don't access directly. `None`
+    /// when the trainer creates its own BlockOffloader and the
+    /// coordinator manages only the activation cache — a temporary state
+    /// during the Phase 6/7 migration. Phase 7b moves block ownership
+    /// into the coordinator across all trainers.
+    blocks: Option<BlockOffloader>,
     /// Existing grow-on-demand activation cache (host pinned slabs +
     /// device-stream HtoD pull). Shared via Arc<Mutex> because the
     /// global `set_grow_activation_cache(arc)` is the install path the
@@ -301,10 +305,6 @@ impl OffloadCoordinator {
     /// offloader and a grow activation cache. The cache is also
     /// installed as the global cache for `checkpoint_offload_boundary`
     /// so model code that calls that API gets the boundary semantics.
-    ///
-    /// Phase 6 will replace this constructor with one that takes raw
-    /// model + dataset config and builds both pools internally. Today's
-    /// shape mirrors how train_klein already constructs them.
     pub fn new(
         device: Arc<CudaDevice>,
         blocks: BlockOffloader,
@@ -313,13 +313,33 @@ impl OffloadCoordinator {
         budget: HostRamBudget,
     ) -> Result<Self> {
         let activations = Arc::new(Mutex::new(activations));
-        // Install as the global cache that `checkpoint_offload_boundary`
-        // reads from. Idempotent — re-installing overrides any previous
-        // cache, which matches how train_klein already calls it directly.
         crate::autograd::set_grow_activation_cache(activations.clone())?;
 
         Ok(Self {
-            blocks,
+            blocks: Some(blocks),
+            activations,
+            strategy,
+            budget,
+            device,
+        })
+    }
+
+    /// Construct with only the activation cache. Used by trainers whose
+    /// model already owns its own `BlockOffloader` (Klein today) — the
+    /// coordinator manages activation offload while the model continues
+    /// to drive its own block streaming. Phase 7b will collapse this
+    /// path into [`Self::new`] once trainers hand block ownership over.
+    pub fn with_activation_cache_only(
+        device: Arc<CudaDevice>,
+        activations: GrowOnDemandActivationCache,
+        strategy: BlockOffloadStrategy,
+        budget: HostRamBudget,
+    ) -> Result<Self> {
+        let activations = Arc::new(Mutex::new(activations));
+        crate::autograd::set_grow_activation_cache(activations.clone())?;
+
+        Ok(Self {
+            blocks: None,
             activations,
             strategy,
             budget,
@@ -352,18 +372,16 @@ impl OffloadCoordinator {
         })
     }
 
-    /// Read-only access to the wrapped block offloader. Trainers that
-    /// still call the offloader directly during the migration window
-    /// (Phase 6) can use this; once migration completes the field stays
-    /// private.
-    pub fn blocks(&self) -> &BlockOffloader {
-        &self.blocks
+    /// Read-only access to the wrapped block offloader, if the
+    /// coordinator owns one. Returns `None` when constructed via
+    /// [`Self::with_activation_cache_only`].
+    pub fn blocks(&self) -> Option<&BlockOffloader> {
+        self.blocks.as_ref()
     }
 
-    /// Mutable access to the wrapped block offloader. Same migration
-    /// caveat as `blocks()`.
-    pub fn blocks_mut(&mut self) -> &mut BlockOffloader {
-        &mut self.blocks
+    /// Mutable access to the wrapped block offloader.
+    pub fn blocks_mut(&mut self) -> Option<&mut BlockOffloader> {
+        self.blocks.as_mut()
     }
 
     /// Arc handle to the activation cache. Cloning the Arc is cheap and
