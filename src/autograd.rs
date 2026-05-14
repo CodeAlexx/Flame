@@ -2018,17 +2018,44 @@ impl AutogradContext {
         // speed — no tape recording, no saved tensor copies. The recompute
         // closure stored below will re-run the forward WITH autograd enabled
         // during backward, which is when we actually need the tape.
-        // Disable autograd + atomic flag so tensor ops skip clone/record entirely
-        {
+        //
+        // 2026-05-14 re-entry fix: save the PRIOR enabled state and restore
+        // it after the forward closure, instead of unconditionally toggling
+        // to true at the end. Critical when this `checkpoint` is called
+        // from inside another `checkpoint`'s recompute closure (which has
+        // already set enabled=false): the unconditional `store(true)` at
+        // function exit clobbered the outer state and let subsequent ops
+        // in the outer closure record into the tape during what was
+        // supposed to be a no_grad scope. RAII via the explicit
+        // save/restore below; the early `?` from `f()?` cannot leak the
+        // wrong state because we use a guard struct that restores on drop.
+        struct EnabledGuard {
+            prior: bool,
+        }
+        impl Drop for EnabledGuard {
+            fn drop(&mut self) {
+                if let Ok(mut ctx) = AUTOGRAD_CONTEXT.lock() {
+                    ctx.enabled = self.prior;
+                }
+                AUTOGRAD_ENABLED.store(self.prior, Ordering::Relaxed);
+            }
+        }
+        let _guard = {
             let mut ctx = AUTOGRAD_CONTEXT.lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+            let prior = ctx.enabled;
             ctx.enabled = false;
-        }
-        AUTOGRAD_ENABLED.store(false, Ordering::Relaxed);
+            AUTOGRAD_ENABLED.store(false, Ordering::Relaxed);
+            EnabledGuard { prior }
+        };
 
         let output = f()?;
 
-        // Re-enable autograd and record a single Checkpoint entry.
+        // Record the Checkpoint tape entry WHILE autograd is still off (we
+        // touch ctx state but do NOT call record_op-on-tensor-ops). Then
+        // the guard drops and restores the prior state at function exit —
+        // re-enabling tape recording for the outer scope only if the
+        // outer scope had it on.
         let input_id = inputs.first()
             .ok_or_else(|| Error::InvalidInput("checkpoint requires at least one input".into()))?
             .id;
@@ -2038,11 +2065,20 @@ impl AutogradContext {
         let mut out_with_grad = output;
         out_with_grad.requires_grad = true;
 
-        {
+        // Only register the tape entry if the OUTER scope wants autograd
+        // (prior == true). When prior == false we're inside a nested
+        // no_grad / inner checkpoint and the outer scope will not run
+        // backward on this Checkpoint entry anyway.
+        //
+        // IMPORTANT: drop the guard FIRST so ctx.enabled is restored to
+        // `prior` BEFORE we call `ctx.record()` — `record()` silently
+        // drops entries when `ctx.enabled == false` (see line ~602).
+        let should_record = _guard.prior;
+        drop(_guard);
+
+        if should_record {
             let mut ctx = AUTOGRAD_CONTEXT.lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
-            ctx.enabled = true;
-            AUTOGRAD_ENABLED.store(true, Ordering::Relaxed);
             ctx.checkpoint_fns.insert(out_with_grad.id, Arc::new(f));
             ctx.record(TapeEntry {
                 output_id: out_with_grad.id,
@@ -2113,13 +2149,27 @@ impl AutogradContext {
         let pulled_ids_slot: Arc<Mutex<Vec<TensorId>>> =
             Arc::new(Mutex::new(Vec::new()));
 
-        // Run forward with autograd DISABLED — same as plain `checkpoint`.
-        {
+        // 2026-05-14 re-entry fix: save prior enabled state and restore it
+        // on scope exit via a guard. Same rationale as in `checkpoint`.
+        struct EnabledGuard {
+            prior: bool,
+        }
+        impl Drop for EnabledGuard {
+            fn drop(&mut self) {
+                if let Ok(mut ctx) = AUTOGRAD_CONTEXT.lock() {
+                    ctx.enabled = self.prior;
+                }
+                AUTOGRAD_ENABLED.store(self.prior, Ordering::Relaxed);
+            }
+        }
+        let _guard = {
             let mut ctx = AUTOGRAD_CONTEXT.lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
+            let prior = ctx.enabled;
             ctx.enabled = false;
-        }
-        AUTOGRAD_ENABLED.store(false, Ordering::Relaxed);
+            AUTOGRAD_ENABLED.store(false, Ordering::Relaxed);
+            EnabledGuard { prior }
+        };
 
         let output = f(inputs)?;
 
@@ -2180,14 +2230,20 @@ impl AutogradContext {
         // Mark the returned output as requiring grad. Store the recompute
         // closure under the output id, then record the new Op variant on
         // the tape with EMPTY saved_tensors (no strong refs to inputs).
+        // Only record if the OUTER scope had autograd enabled.
+        //
+        // IMPORTANT: drop the guard FIRST so ctx.enabled is restored to
+        // `prior` BEFORE `ctx.record()` — record() drops entries when
+        // ctx.enabled == false.
         let mut out_with_grad = output;
         out_with_grad.requires_grad = true;
 
-        {
+        let should_record = _guard.prior;
+        drop(_guard);
+
+        if should_record {
             let mut ctx = AUTOGRAD_CONTEXT.lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
-            ctx.enabled = true;
-            AUTOGRAD_ENABLED.store(true, Ordering::Relaxed);
             ctx.checkpoint_fns
                 .insert(out_with_grad.id, Arc::new(recompute_fn));
             ctx.record(TapeEntry {

@@ -104,6 +104,7 @@ pub use pinned::{
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 pub mod offload;
 pub mod cuda_alloc_pool;
+pub mod static_slab;
 #[cfg(feature = "cuda")]
 pub mod ring_alloc;
 pub mod cuda_graph;
