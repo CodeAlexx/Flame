@@ -803,6 +803,227 @@ fn forward_handle_drop_is_noop_for_cursors() {
     assert_eq!(ring.allocation_end(), post_alloc_end, "alloc persists after handle drop");
 }
 
+// ---------------------------------------------------------------------------
+// Skeptic Phase 1 — additional adversarial coverage tests
+// ---------------------------------------------------------------------------
+//
+// These tests target gaps not covered by Builder + Bug Fixer:
+// - symmetric case of the bug-fix (forward fills first, then backward, then
+//   forward attempts wrap)
+// - OT-parity byte positions for the backward direction (Bug Fixer only
+//   covered forward)
+// - reset() after backward + forward both fired — both cursors reset to ends
+// - reset semantics around wrap-once forward-only case
+// - forward-then-backward, forward attempts wrap with backward in opposite
+//   half — symmetric to Bug Fixer's test that had backward go first
+
+/// Symmetric to `forward_wrap_with_backward_active_does_not_lap_silently`:
+/// forward fires FIRST (filling several slabs), THEN backward fires, THEN
+/// forward attempts to wrap.
+///
+/// Bug Fixer's `forward_wrap_with_backward_active...` test sets up the
+/// scenario backward-first. The same fwd-overlap-with-bwd hazard exists in
+/// the order: forward, backward, forward wrap. The fix `allocation_start <
+/// total_bytes` is order-independent — but let's prove it.
+#[test]
+fn forward_wrap_after_forward_then_backward_also_errors() {
+    let device = cuda_device();
+    let slab_bytes = 1024;
+    let num_slabs = 2;
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes)
+        .expect("new");
+
+    // Forward fills slab 0 partially.
+    {
+        let mut hf = ring.forward_handle(0);
+        let _ = hf.alloc(500).expect("a");
+        let _ = hf.alloc(500).expect("b"); // end = 1012
+        let _ = hf.alloc(500).expect("c"); // jumps to slab 1, end = 1524
+    }
+    assert_eq!(ring.allocation_end(), 1524);
+    assert_eq!(ring.allocation_start(), 2048);
+
+    // Now backward fires — moves allocation_start down.
+    {
+        let mut hb = ring.backward_handle(0);
+        let _ = hb.alloc(100).expect("backward after forward");
+    }
+    let start_before_wrap_attempt = ring.allocation_start();
+    assert!(start_before_wrap_attempt < ring.total_bytes(),
+        "backward must have moved cursor down");
+
+    // Forward attempts a 700-byte alloc that forces wrap.
+    // Per Bug Fixer's invariant, this must error (allocation_start <
+    // total_bytes is the trigger), NOT silently wrap to slab 0.
+    let result = {
+        let mut hf = ring.forward_handle(2);
+        hf.alloc(700)
+    };
+    assert!(
+        result.is_err(),
+        "forward wrap with backward having previously fired must error \
+         regardless of fwd-bwd interleaving order. Got Ok({:?}); \
+         allocation_start={}, allocation_end={}",
+        result.as_ref().map(|p| (p.slab_idx, p.intra_offset, p.len_bytes)).ok(),
+        ring.allocation_start(), ring.allocation_end(),
+    );
+}
+
+/// OT parity (backward): hand-computed byte positions from OT lines 90-109
+/// applied to backward direction. Bug Fixer only covered the forward case.
+///
+/// OT line 91-92: backward index = start/size, intra = start%size.
+/// Line 94-97: if cur_intra < num_bytes, jump prev (idx-1, slab_bytes).
+/// Line 103: new_intra = floor_16(intra_top - num_bytes).
+/// Line 107: new start = idx*size + new_intra.
+///
+/// Trace for slab_bytes=1024, num_slabs=4, sequence [200, 300, 600, 100]:
+/// initial start = 4*1024 = 4096.
+/// 1. start=4096. Special-case: cur=(3, 1024). 1024 >= 200, no jump.
+///    new_intra = floor_16(1024 - 200) = 816. global = 3*1024+816 = 3888.
+/// 2. start=3888: idx=3, intra=816. 816 >= 300, no jump.
+///    new_intra = floor_16(816 - 300) = floor_16(516) = 512. global = 3*1024+512 = 3584.
+/// 3. start=3584: idx=3, intra=512. 512 < 600 → jump (2, 1024).
+///    new_intra = floor_16(1024 - 600) = floor_16(424) = 416. global = 2*1024+416 = 2464.
+/// 4. start=2464: idx=2, intra=416. 416 >= 100, no jump.
+///    new_intra = floor_16(416 - 100) = floor_16(316) = 304. global = 2*1024+304 = 2352.
+#[test]
+fn ot_parity_backward_sequence_byte_positions() {
+    let device = cuda_device();
+    let slab_bytes = 1024;
+    let num_slabs = 4;
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes).expect("new");
+
+    let expected: &[(usize, usize, usize)] = &[
+        // (slab_idx, intra_offset, allocation_start AFTER alloc)
+        (3, 816, 3888),
+        (3, 512, 3584),
+        (2, 416, 2464),  // jumped
+        (2, 304, 2352),
+    ];
+    let sizes = [200, 300, 600, 100];
+
+    let mut h = ring.backward_handle(0);
+    for (i, (&n, &(exp_slab, exp_intra, exp_start))) in
+        sizes.iter().zip(expected.iter()).enumerate()
+    {
+        let p = h.alloc(n).expect("alloc");
+        assert_eq!(
+            (p.slab_idx, p.intra_offset),
+            (exp_slab, exp_intra),
+            "step {i}: backward alloc({n}) slab/intra mismatch — got ({}, {}), expected ({exp_slab}, {exp_intra})",
+            p.slab_idx, p.intra_offset
+        );
+        assert_eq!(
+            h.allocation_start(), exp_start,
+            "step {i}: allocation_start mismatch — got {}, expected {exp_start}",
+            h.allocation_start()
+        );
+    }
+}
+
+/// reset() after both cursors moved — both must return to extremes, and
+/// next allocations behave as a fresh ring.
+///
+/// Test 5 covers reset after fwd-then-bwd but only spot-checks the count.
+/// This test verifies the full post-reset state and that a subsequent
+/// fwd-then-bwd round respects the bug-fix invariant cleanly.
+#[test]
+fn reset_after_both_cursors_moved_restores_invariants() {
+    let device = cuda_device();
+    let slab_bytes = 1024;
+    let num_slabs = 4;
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes).expect("new");
+
+    // Step 1: forward + backward both fire.
+    {
+        let mut hf = ring.forward_handle(0);
+        let _ = hf.alloc(500).expect("fwd");
+    }
+    {
+        let mut hb = ring.backward_handle(0);
+        let _ = hb.alloc(500).expect("bwd");
+    }
+    let mid_end = ring.allocation_end();
+    let mid_start = ring.allocation_start();
+    assert!(mid_end > 0);
+    assert!(mid_start < ring.total_bytes());
+    let slab_count_before_reset = ring.cuda_malloc_count();
+
+    // Reset.
+    ring.reset();
+    assert_eq!(ring.allocation_end(), 0, "reset puts fwd cursor at 0");
+    assert_eq!(ring.allocation_start(), ring.total_bytes(),
+        "reset puts bwd cursor at total_bytes");
+    assert_eq!(ring.cuda_malloc_count(), slab_count_before_reset,
+        "reset does not free or alloc slabs");
+
+    // Step 2: invariants must hold cleanly again.
+    {
+        let mut hf = ring.forward_handle(0);
+        let p = hf.alloc(500).expect("step-2 fwd alloc");
+        assert_aligned_16(&p);
+        // Forward starts fresh at slab 0, intra 0 — confirms reset cleared
+        // mid-state and didn't leave stale wrap-related state behind.
+        assert_eq!((p.slab_idx, p.intra_offset), (0, 0),
+            "step-2 fwd starts at fresh slab 0, intra 0");
+    }
+    {
+        let mut hb = ring.backward_handle(0);
+        let p = hb.alloc(500).expect("step-2 bwd alloc");
+        assert_aligned_16(&p);
+        // Backward starts fresh at top of last slab.
+        assert_eq!(p.slab_idx, num_slabs - 1,
+            "step-2 bwd starts at last slab");
+    }
+
+    // Step-2 cudaMalloc count unchanged (slabs already materialized).
+    assert_eq!(ring.cuda_malloc_count(), slab_count_before_reset,
+        "step-2 reuses existing slabs");
+}
+
+/// The "forward-only wrap silently laps live forward" hazard is documented
+/// (Test 4) but worth pinning EXPLICITLY: with no reset and only-forward
+/// activity, a wrap returns a pointer that aliases an earlier forward
+/// allocation's bytes. This is the structural OT behavior; this test
+/// pins it so any future Phase 2 detection regression is caught.
+///
+/// Tagged with the design-doc-§4 NOTE: forward-only wrap WITHOUT reset
+/// silently aliases. Phase 2 callers MUST reset between steps.
+#[test]
+fn forward_only_wrap_aliases_prior_forward_alloc_without_reset() {
+    let device = cuda_device();
+    let slab_bytes = 1024;
+    let num_slabs = 2;
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes).expect("new");
+
+    // Forward fills both slabs.
+    let p0 = {
+        let mut hf = ring.forward_handle(0);
+        let p0 = hf.alloc(1024).expect("a"); // (0, 0, 1024)
+        let _p1 = hf.alloc(1024).expect("b"); // (1, 0, 1024)
+        p0
+    };
+    assert_eq!((p0.slab_idx, p0.intra_offset), (0, 0));
+
+    // Backward cursor untouched, allocation_start == total_bytes.
+    assert_eq!(ring.allocation_start(), ring.total_bytes());
+
+    // Wrap-around alloc — succeeds because backward is idle.
+    // Returns (slab 0, intra 0): EXACTLY p0's range.
+    let wrap = {
+        let mut hf = ring.forward_handle(2);
+        hf.alloc(512).expect("wrap-around succeeds in forward-only mode")
+    };
+    assert_eq!(wrap.slab_idx, 0,
+        "wrap returns to slab 0 (Phase 1 documented OT-faithful behavior)");
+    assert_eq!(wrap.intra_offset, 0,
+        "wrap returns to intra 0 — silently overwrites p0's range");
+    assert_eq!(wrap.device_ptr, p0.device_ptr,
+        "wrap's device_ptr ALIASES p0's device_ptr — caller-visible \
+         silent alias. Phase 2 must reset between steps to avoid this.");
+}
+
 /// OT parity: the exact byte-position of a sequence of forward allocs
 /// should match what OT's `allocate_like` would produce given the same
 /// num_bytes sequence and the same slab_bytes.
