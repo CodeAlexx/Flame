@@ -1728,6 +1728,12 @@ mod tests {
         // subsequent test. Use poison-tolerant lock acquisition.
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_thread_local_guard_state();
+        // R2a-bf: use EnvGuard so `FLAME_USE_STATIC_SLAB` is restored on
+        // unwind. Previously the test used bare `std::env::set_var` which
+        // leaked `=1` into the process env after `should_panic` caught the
+        // panic — observable in `env_unaffected_by_panicking_test` below.
+        // EnvGuard's Drop fires during unwind (it doesn't panic itself).
+        let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
         // Skip-no-GPU pattern, but we MUST still satisfy `should_panic`
         // on a no-GPU machine. Synthesize a "live" panic on the no-GPU
         // path so the test passes uniformly.
@@ -1738,7 +1744,6 @@ mod tests {
                 panic!("live (synthetic — no GPU available)");
             }
         };
-        std::env::set_var(ENV_USE_STATIC_SLAB, "1");
 
         let guard = StepSlabGuard::enter(device.clone()).expect("enter");
         let s = crate::cuda_alloc_pool::pool_alloc_u16(&device, 64)
@@ -1746,6 +1751,7 @@ mod tests {
         // Leak the slice so live_count stays > 0 when guard drops.
         std::mem::forget(s);
         drop(guard); // expected to panic on "live"
+        // (_env drops here on unwind, restoring prior env.)
     }
 
     /// R2a #5: `finish()` returns Err when live_count > 0; slab NOT reset.
@@ -1958,6 +1964,252 @@ mod tests {
             drop(s);
         }
         std::env::remove_var(ENV_USE_STATIC_SLAB);
+        reset_device_map_for_testing();
+    }
+
+    // -----------------------------------------------------------------
+    // R2a-bf regression tests (Skeptic / Bug Fixer 2026-05-15)
+    // -----------------------------------------------------------------
+
+    /// R2a-bf #1: `guard_drop_with_live_count_panics` (test #4) must not
+    /// leak `FLAME_USE_STATIC_SLAB=1` into subsequent tests via the
+    /// process env. Pre-fix, that test used bare `std::env::set_var` and
+    /// relied on `#[should_panic]` to swallow the panic — but the env
+    /// var was never restored, so any test running AFTER it (in the same
+    /// process / same `cargo test` run) inherited `=1`. The fix is to
+    /// wrap the set in an `EnvGuard` (RAII Drop runs on unwind).
+    ///
+    /// This test verifies the contract: we synthesize the same panic-and-
+    /// recover pattern as test #4 with an EnvGuard, and check that the
+    /// env state matches what was set OUTSIDE the unwinding scope.
+    #[test]
+    fn env_unaffected_by_panicking_test() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        // Establish a known baseline: env unset.
+        std::env::remove_var(ENV_USE_STATIC_SLAB);
+        assert!(
+            std::env::var(ENV_USE_STATIC_SLAB).is_err(),
+            "precondition: env unset"
+        );
+
+        // Run a closure that mirrors test #4: EnvGuard::set → panic on
+        // "live" → catch_unwind. EnvGuard's Drop must restore the env.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
+            assert_eq!(
+                std::env::var(ENV_USE_STATIC_SLAB).unwrap(),
+                "1",
+                "inside scope: env set"
+            );
+            // Simulate the should_panic path.
+            panic!("live (simulated)");
+        }));
+        assert!(r.is_err(), "panic propagated through catch_unwind");
+
+        // After unwind: EnvGuard's Drop must have restored the env.
+        assert!(
+            std::env::var(ENV_USE_STATIC_SLAB).is_err(),
+            "EnvGuard restored env on unwind (no leak)"
+        );
+    }
+
+    /// R2a-bf #2: locks down the silent-overflow-fallback behavior
+    /// (Builder concern #5). When the slab is small enough that an
+    /// allocation overflows mid-step, `pool_alloc_*_via_slab` returns
+    /// `None` and the caller falls through to the legacy pool path.
+    /// The legacy alloc returns memory whose ptr is OUTSIDE the slab
+    /// range, so `slab_v2_return_if_owned` returns false on drop and
+    /// cudaFree fires normally.
+    ///
+    /// This is the DESIGN PIN per the handoff: overflow is a graceful
+    /// fallback, not a hard error. Phase R2c gates will decide whether
+    /// to upgrade to hard-Err; until then this test locks in the
+    /// current contract.
+    #[test]
+    fn slab_overflow_falls_back_to_legacy_pool() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        let Some(device) = skip_if_no_gpu() else { return };
+        reset_device_map_for_testing();
+        let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
+        // Pin the slab capacity tiny (256 bytes) so a single alloc beyond
+        // that overflows. The env is read once on slab materialization in
+        // `slab_for_device`.
+        let _cap = EnvGuard::set(ENV_BF16_SLAB_BYTES, "256");
+
+        let key = Arc::as_ptr(&device) as usize;
+
+        // Enter guard, then alloc something that fits.
+        let _guard = StepSlabGuard::enter(device.clone()).expect("enter");
+        let small = crate::cuda_alloc_pool::pool_alloc_u16(&device, 64)
+            .expect("small alloc fits");
+        let small_ptr = *small.device_ptr();
+
+        // The first alloc should be IN the slab.
+        let slab_mu = {
+            let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+            *g.get(&key).expect("slab registered")
+        };
+        let small_in_slab = {
+            let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+            g.ptr_in_slab(small_ptr)
+        };
+        assert!(small_in_slab, "small alloc landed in slab");
+
+        // Now alloc something that exceeds remaining slab capacity. The
+        // via_slab helper returns None; the caller falls back to legacy.
+        // We expect this to succeed (legacy path always satisfies — barring
+        // OOM) and the ptr to be OUTSIDE the slab range.
+        let big = crate::cuda_alloc_pool::pool_alloc_u16(&device, 1024)
+            .expect("overflow alloc falls back to legacy and succeeds");
+        let big_ptr = *big.device_ptr();
+        let big_in_slab = {
+            let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+            g.ptr_in_slab(big_ptr)
+        };
+        assert!(
+            !big_in_slab,
+            "overflow alloc fell back to legacy (ptr NOT in slab range)"
+        );
+
+        // Slab's live_count is 1 (only the small one).
+        {
+            let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(g.live_count(), 1, "only small alloc counted in slab");
+        }
+
+        // Cleanup: forget the slab-owned slice and decrement; drop big
+        // through the legacy path.
+        unsafe { forget_slice(small) };
+        {
+            let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+            g.live_count.fetch_sub(1, Ordering::AcqRel);
+        }
+        drop(big); // legacy pool path / direct cudaFree.
+
+        // Guard drops cleanly at end of scope.
+        drop(_guard);
+        reset_device_map_for_testing();
+    }
+
+    /// R2a-bf #3: `StepSlabGuard::enter` returning `Err` (nested guards
+    /// forbidden) must NOT corrupt the thread-local. After the failed
+    /// inner enter, the outer guard's `active_device_key()` must still
+    /// match the OUTER guard — not the inner attempt's device.
+    ///
+    /// Builder's `enter()` checks `cell.get().is_some()` BEFORE setting,
+    /// so the inner attempt should leave the cell untouched. Lock that
+    /// down here. (Concern: a future refactor that reorders set vs check
+    /// would silently break this.)
+    #[test]
+    fn enter_err_does_not_corrupt_thread_local() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        let Some(device_a) = skip_if_no_gpu() else { return };
+        reset_device_map_for_testing();
+
+        let key_a = Arc::as_ptr(&device_a) as usize;
+        let outer = StepSlabGuard::enter(device_a.clone()).expect("first enter");
+        assert_eq!(StepSlabGuard::active_device_key(), Some(key_a));
+
+        // Attempt a nested enter with a DIFFERENT Arc (still same physical
+        // device, but distinct Arc → distinct key). The inner attempt must
+        // return Err and leave the thread-local pointing at the OUTER key.
+        // (If `enter` were buggy and set the cell BEFORE the nesting check,
+        // this would silently switch the active key.)
+        let device_b = match CudaDevice::new(0) {
+            Ok(d) => d,
+            Err(_) => {
+                // No second Arc available — bail gracefully, the test
+                // still proved the basic invariant via key_a.
+                drop(outer);
+                reset_device_map_for_testing();
+                return;
+            }
+        };
+        let key_b = Arc::as_ptr(&device_b) as usize;
+        if key_a == key_b {
+            // CUDA runtime returned the same Arc — can't test cross-key
+            // contamination. Bail gracefully.
+            drop(outer);
+            reset_device_map_for_testing();
+            return;
+        }
+
+        let nested = StepSlabGuard::enter(device_b.clone());
+        assert!(nested.is_err(), "nested enter must fail");
+        // CRITICAL: thread-local still points at OUTER (key_a), not at
+        // the inner-attempt's key_b. If this fails, `enter()` is setting
+        // the cell BEFORE checking nesting — a real bug.
+        assert_eq!(
+            StepSlabGuard::active_device_key(),
+            Some(key_a),
+            "failed inner enter must not overwrite the outer thread-local"
+        );
+
+        drop(outer);
+        assert!(!StepSlabGuard::active_on_thread(), "cleared after outer drop");
+        reset_device_map_for_testing();
+    }
+
+    /// R2a-bf #4: with `FLAME_USE_STATIC_SLAB=1` and an active guard,
+    /// the slab dispatch must NEVER route a `pool_alloc_*` whose device
+    /// parameter differs from the guard's device. The current
+    /// implementation reads the device_key from the thread-local (NOT
+    /// the caller's device arg) — so any mismatch silently routes to
+    /// the guard's slab. This test documents that behavior so a future
+    /// refactor that adds a "wrong-device → fall back to legacy" check
+    /// (or a hard-Err) doesn't silently change the contract.
+    ///
+    /// In production the trainer uses ONE Arc<CudaDevice>, so this can't
+    /// fire. The test exists to lock down the contract for future-Skeptic.
+    #[test]
+    fn dispatch_uses_guard_device_not_caller_device() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        let Some(device_a) = skip_if_no_gpu() else { return };
+        // Try to get a distinct Arc for the SAME physical device. If the
+        // runtime shares Arcs, the test is degenerate — bail gracefully.
+        let Ok(device_b) = CudaDevice::new(0) else {
+            return;
+        };
+        if Arc::as_ptr(&device_a) == Arc::as_ptr(&device_b) {
+            eprintln!("[R2a-bf #4] runtime shares Arc — can't exercise cross-Arc routing");
+            return;
+        }
+        reset_device_map_for_testing();
+        let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
+
+        let key_a = Arc::as_ptr(&device_a) as usize;
+        let _guard = StepSlabGuard::enter(device_a.clone()).expect("enter on A");
+
+        // Call pool_alloc with device_B but a guard is active on device_A.
+        // The slab dispatch reads the THREAD-LOCAL key (= A) and routes
+        // to A's slab. The returned slice carries device_A's Arc, NOT
+        // device_B's. This is the contract today.
+        let s = crate::cuda_alloc_pool::pool_alloc_u16(&device_b, 64)
+            .expect("alloc with mismatched device arg routes via guard");
+        let slab_mu = {
+            let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+            *g.get(&key_a).expect("guard's slab registered")
+        };
+        let in_a_slab = {
+            let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+            g.ptr_in_slab(*s.device_ptr())
+        };
+        assert!(
+            in_a_slab,
+            "alloc with device_B arg landed in guard's (device_A) slab"
+        );
+
+        // Cleanup.
+        unsafe { forget_slice(s) };
+        {
+            let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+            g.live_count.fetch_sub(1, Ordering::AcqRel);
+        }
+        drop(_guard);
         reset_device_map_for_testing();
     }
 }
