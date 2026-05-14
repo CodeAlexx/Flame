@@ -571,6 +571,33 @@ Re-exported at `flame_core::PinnedPool`.
 ~16 pub fns. BF16 arena + async copy primitives. Used internally by
 `Tensor` for some hot paths via `bf16_copy_async` and `ArenaLease`.
 
+### `ring_alloc/mod.rs` — bidirectional ring allocator (Gap 1 Phase 1, 2026-05-14)
+
+Faithful Rust port of OneTrainer's `StaticLayerAllocator` +
+`StaticLayerTensorAllocator` (`/home/alex/OneTrainer/modules/util/LayerOffloadConductor.py:37-222`).
+Bidirectional ring over a list of fixed-size GPU slabs. Forward
+allocations advance `allocation_end`; backward allocations retreat
+`allocation_start`. Slabs are `cudaMalloc`-ed lazily on first touch
+(matches OT's `ensure_allocation`). Bytes don't return per-allocation —
+they return at `reset()` between training steps.
+
+The shape is structurally different from `cuda_alloc_pool`'s bucketed
+free list: the two cursors make overlapping forward/backward allocations
+impossible within a step, side-stepping the corruption mode that
+forced `FLAME_ALLOC_POOL=0` on Klein 9B (see
+`HANDOFF_2026-05-14_TRAINER_REGRESSION_FAILURE.md` and
+`docs/OFFLOAD_GAPS_vs_ONETRAINER.md` Gap 1).
+
+Phase 1 (this commit) ships the primitive + 9-test microbench
+(`tests/ring_alloc_microbench.rs`). No consumer wiring; no trainer
+gate. Phase 2 is the Klein migration; design in
+`docs/RING_ALLOC_DESIGN.md`.
+
+Direction is enforced at the type level via `RingForwardHandle` /
+`RingBackwardHandle` (no bool flag). Handles borrow the allocator
+mutably; the type system prevents simultaneous forward + backward
+allocation on the same ring.
+
 ---
 
 ## Autograd — multiple generations, **read carefully**

@@ -792,6 +792,39 @@ convention (`fc_status_t` returns), different file generation:
 ### `cuda_memory_alignment.rs`
 - `alloc_aligned_f32(...)` — aligned F32 alloc (used by tensor.rs)
 
+### `ring_alloc/mod.rs` — bidirectional ring allocator (Gap 1 Phase 1)
+
+Faithful Rust port of OneTrainer's `StaticLayerAllocator` /
+`StaticLayerTensorAllocator` (`/home/alex/OneTrainer/modules/util/LayerOffloadConductor.py:37-222`).
+Direction-typed allocator with two cursors over a slab list — forward
+allocations advance `allocation_end`; backward retreat `allocation_start`.
+Slabs are `cudaMalloc`-ed lazily on first touch. Per-allocation reclaim is
+intentionally absent (matches OT semantics); bytes return at `reset()`.
+
+Phase 1 ships the primitive + microbench only. No consumer wiring; no
+trainer gate. Full design in `docs/RING_ALLOC_DESIGN.md`.
+
+| Symbol | File:line | Notes |
+|---|---|---|
+| `RingAllocator` | `ring_alloc/mod.rs:99` | The allocator. Owns slabs + cursors. Not `Send`/`Sync`. |
+| `RingPtr` | `ring_alloc/mod.rs:65` | Untyped byte range result. Borrowed view; no Drop. Valid until `reset()`. |
+| `RingForwardHandle<'a>` | `ring_alloc/mod.rs:124` | Direction-typed handle for forward allocations. Borrows `&mut RingAllocator`. |
+| `RingBackwardHandle<'a>` | `ring_alloc/mod.rs:131` | Direction-typed handle for backward allocations. |
+| `RingAllocator::new(device, num_slabs, slab_bytes)` | `ring_alloc/mod.rs:143` | Construct. Slabs are NOT allocated upfront. |
+| `RingAllocator::with_slabs(...)` | `ring_alloc/mod.rs:182` | Alias for `new` (convenience for sweeps). |
+| `RingAllocator::num_slabs / slab_bytes / total_bytes` | `ring_alloc/mod.rs:190` | Inspection accessors. |
+| `RingAllocator::allocation_start / allocation_end` | `ring_alloc/mod.rs:207` | Cursor inspection. |
+| `RingAllocator::slabs_allocated / cuda_malloc_count` | `ring_alloc/mod.rs:217` | Lazy-allocation diagnostics. |
+| `RingAllocator::reset()` | `ring_alloc/mod.rs:231` | Cursors back to ends; slabs stay mapped. Call between steps. |
+| `RingAllocator::forward_handle(block_idx)` | `ring_alloc/mod.rs:239` | Begin a forward-pass scope. |
+| `RingAllocator::backward_handle(block_idx)` | `ring_alloc/mod.rs:244` | Begin a backward-pass scope. |
+| `RingForwardHandle::alloc(num_bytes)` | `ring_alloc/mod.rs:412` | Forward alloc. 16-byte pre-aligned. |
+| `RingBackwardHandle::alloc(num_bytes)` | `ring_alloc/mod.rs:430` | Backward alloc. 16-byte pre-aligned. |
+| `RingForwardHandle::allocation_end / allocation_start` | `ring_alloc/mod.rs:418` | Read-through cursor accessors (handle is live, allocator is mutably borrowed). |
+| `RingBackwardHandle::allocation_end / allocation_start` | `ring_alloc/mod.rs:435` | Same. |
+
+Test: `flame-core/tests/ring_alloc_microbench.rs` (9 tests, GPU-real).
+
 ---
 
 ## Activation offload — `activation_offload.rs`

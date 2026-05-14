@@ -1217,6 +1217,33 @@ FlameSwap is deleted. All block offloading uses `BlockOffloader` with
   `compute_done` event and the next prefetch does `cudaStreamWaitEvent`
   instead — GPU-side, no host stall.
 
+### Ring allocator semantics (`flame_core::ring_alloc`, Gap 1 Phase 1, 2026-05-14)
+
+- **`RingPtr` is a borrowed view, not RAII.** Dropping a `RingPtr` does
+  nothing. The underlying bytes are owned by the `RingAllocator` and
+  return to the pool only at `RingAllocator::reset()`. Match the ring's
+  scope to a single training step: forward fills, backward drains,
+  reset between steps. A `RingPtr` held past a reset is a
+  use-after-free.
+- **Slabs allocate lazily, never free.** First touch in a slab triggers
+  `cudaMalloc`; subsequent steps reuse it. `cuda_malloc_count` equals
+  the count of distinct slabs touched, not the count of allocations.
+  Verified by `tests/ring_alloc_microbench.rs`.
+- **Direction is type-level.** `forward_handle(idx)` returns
+  `RingForwardHandle`; `backward_handle(idx)` returns
+  `RingBackwardHandle`. There is no bool flag. The two handle types
+  borrow the allocator mutably, so the compiler enforces that forward
+  and backward allocations don't interleave within the same lexical
+  scope (which would break the cursor invariant).
+- **`alloc(0)` is an error**, as is `alloc(n)` with `n > slab_bytes`
+  (a single allocation cannot span slabs). Forward/backward use
+  `ceil_16` / `floor_16` for alignment.
+- **Per-allocation reclaim is intentionally absent.** OT's
+  `StaticLayerTensorAllocator.deallocate` is a no-op for retiring
+  ranges; mirror that. Reclaiming a sub-range would break the
+  "cursor walks linearly" invariant that makes overlap structurally
+  impossible.
+
 ---
 
 ## Quick "where do I X" reference
