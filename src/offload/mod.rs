@@ -45,6 +45,15 @@ pub mod transfer_benchmark;
 
 pub use manager::{ForcedStrategy, ManagerConfig, OffloadManager, OffloadPhase};
 
+/// `cudarc-pinctx::install_external_ptr_hook` callback for ring-backed slot
+/// allocations. Returns true when the pool has the pointer tagged as
+/// external — `CudaSlice::drop` then skips `cudaFree`.
+///
+/// Installed lazily by [`BlockOffloader::ensure_ring`]. Idempotent.
+fn ring_external_ptr_hook(ptr: u64) -> bool {
+    crate::cuda_alloc_pool::global_pool().is_external_ptr(ptr)
+}
+
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -981,6 +990,14 @@ impl BlockOffloader {
         let slab_bytes = (256usize * 1024 * 1024).max(2 * max_slot_bytes);
         let ring = crate::ring_alloc::RingAllocator::new(self.device.clone(), 4, slab_bytes)
             .map_err(|e| anyhow::anyhow!("BlockOffloader::ensure_ring: {e:?}"))?;
+        // Install the cudarc-pinctx Drop hook so `CudaSlice::drop` consults
+        // the pool's `external_ptrs` set. Without this, slot tensors that
+        // escape into autograd and drop outside `pool_return_u16` would
+        // `cudaFree` a ring-slab offset and panic with `CUDA_ERROR_INVALID_VALUE`.
+        // Idempotent: hook is a function pointer atomically swapped, so
+        // multiple calls (across BlockOffloader instances or with
+        // `install_miss_allocator`) are safe.
+        cudarc::driver::install_external_ptr_hook(ring_external_ptr_hook);
         self.ring = Some(ring);
         Ok(())
     }

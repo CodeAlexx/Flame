@@ -1336,6 +1336,14 @@ out by `BlockOffloader::alloc_bf16_via_ring`). The contract:
   bucket cap is exceeded.** Pre-existing `is_external` branches at
   the top of `push_*` already use `reconstruct_and_forget`; the new
   Phase 2 guard is the *successful* path's variant of the same logic.
+- **`install_external_ptr_hook` is wired by `BlockOffloader::ensure_ring`.**
+  The hook (`ring_external_ptr_hook` in `src/offload/mod.rs`) routes
+  `cudarc::driver::CudaSlice::drop` through `global_pool().is_external_ptr`
+  so ring-slab offsets that escape into autograd and drop outside
+  `pool_return_u16` skip `cudaFree` (which would otherwise panic with
+  `CUDA_ERROR_INVALID_VALUE`). The hook is a function pointer atomically
+  swapped — installing it from multiple `BlockOffloader` instances or in
+  combination with `install_miss_allocator` is idempotent.
 
 ---
 
