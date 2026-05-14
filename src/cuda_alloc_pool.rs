@@ -915,7 +915,12 @@ pub fn pool_alloc_f32(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
             Ok(Some(slice)) => return Ok(slice),
             Ok(None) => { /* fall through */ }
             Err(e) => {
-                log::warn!(
+                // Downgraded to trace: overflow is expected on the
+                // current coarse-scope (one with_region scope per
+                // backward) configuration. The fallback to pool path is
+                // correct + safe; the perf gap will close when per-layer
+                // scope wiring lands (Phase B-5 follow-up).
+                log::trace!(
                     "pool: region-dispatch slab alloc failed ({e:?}) — falling back to pool path"
                 );
             }
