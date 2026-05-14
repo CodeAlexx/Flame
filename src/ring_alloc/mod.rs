@@ -326,7 +326,27 @@ impl RingAllocator {
             };
 
         // OT line 78-82: cyclic wrap if we walked off the end.
-        let (slab_idx, intra) = if cand_slab_idx >= self.slabs.len() {
+        let wrapped = cand_slab_idx >= self.slabs.len();
+        let (slab_idx, intra) = if wrapped {
+            // Refuse the wrap when backward is active — the wrap would
+            // silently lap a live forward allocation and/or collide with
+            // the backward region. Per design doc §4 invariant 2: wrap-
+            // induced violations error rather than silently overlap. Wrap
+            // is permitted only when allocation_start == total_bytes
+            // (i.e., no backward state to conflict with), which is the
+            // documented Phase 1 wrap-when-only-forward-active mode.
+            if self.allocation_start < self.total_bytes {
+                return Err(Error::OutOfMemory(format!(
+                    "RingAllocator exhausted: forward wrap with backward \
+                     active would lap live allocations (allocation_end={}, \
+                     allocation_start={}, total={}, slabs={}). Increase \
+                     ring size or reset between steps.",
+                    self.allocation_end,
+                    self.allocation_start,
+                    self.total_bytes,
+                    self.slabs.len(),
+                )));
+            }
             (0_usize, 0_usize)
         } else {
             (cand_slab_idx, cand_intra)
@@ -400,7 +420,24 @@ impl RingAllocator {
 
         // OT line 98-101: cyclic wrap to the last slab if we walked
         // below slab 0.
-        let (slab_idx, intra_top) = if cand_slab_idx_signed < 0 {
+        let wrapped = cand_slab_idx_signed < 0;
+        let (slab_idx, intra_top) = if wrapped {
+            // Refuse the wrap when forward is active — symmetric to the
+            // forward path above. Backward wrap would silently lap a live
+            // backward allocation in the last slab. Only permitted when
+            // allocation_end == 0 (no forward state present).
+            if self.allocation_end > 0 {
+                return Err(Error::OutOfMemory(format!(
+                    "RingAllocator exhausted: backward wrap with forward \
+                     active would lap live allocations (allocation_start={}, \
+                     allocation_end={}, total={}, slabs={}). Increase \
+                     ring size or reset between steps.",
+                    self.allocation_start,
+                    self.allocation_end,
+                    self.total_bytes,
+                    self.slabs.len(),
+                )));
+            }
             (self.slabs.len() - 1, self.slab_bytes)
         } else {
             (cand_slab_idx_signed as usize, cand_intra_top)

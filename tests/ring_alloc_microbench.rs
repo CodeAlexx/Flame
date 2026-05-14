@@ -521,3 +521,333 @@ fn new_rejects_zero_slab_bytes() {
     let device = cuda_device();
     assert!(RingAllocator::new(device, 2, 0).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Bug Fixer Phase 1 — additional coverage tests
+// ---------------------------------------------------------------------------
+//
+// These tests target gaps and edge cases in the Phase 1 ring allocator.
+// Each test was written against commit 2927038 and either reproduces a
+// genuine bug (failing) or verifies behavior the existing 5 tests do not
+// cover (passing).
+
+/// Bug: forward wrap silently lands BELOW backward and overwrites live
+/// forward allocations when backward has fired but `allocation_start` is
+/// at the top half of the ring.
+///
+/// Setup: 4 slabs × 1024 bytes. backward issues a small alloc (sits high).
+/// Forward fills nearly to slab 3 end, then a final forward alloc that
+/// would jump to slab 4 wraps to slab 0 — overwriting the still-live
+/// forward allocation at slab 0.
+///
+/// The invariant check `new_end > allocation_start` (where new_end is now
+/// small, post-wrap, and allocation_start is in the high half) silently
+/// passes, causing forward to "lap" itself.
+#[test]
+fn forward_wrap_with_backward_active_does_not_lap_silently() {
+    // Construct exact scenario where forward cursor sits in the LAST slab
+    // with some intra offset, and the next alloc forces a slab-jump past
+    // the last slab into a wrap. Meanwhile backward sits in the middle of
+    // the same last slab. After wrap, the new alloc lands at (slab 0,
+    // intra 0) — silently overlapping a live forward alloc from earlier.
+    //
+    // The fwd check `new_end > allocation_start` trivially passes because
+    // new_end is now small (post-wrap, back near 0) and allocation_start
+    // is in the last slab.
+    //
+    // Expected (correct) behavior: the wrap-with-backward-active scenario
+    // must error because forward is about to overwrite its own live
+    // allocations. Per design doc §4 invariant 2:
+    //   "After a wrap, the ring monitors allocation_end <= allocation_start
+    //    (mod total_bytes); violations error rather than silently overlap."
+    //
+    // 2 slabs × 1024 bytes = 2048 total.
+    let device = cuda_device();
+    let slab_bytes = 1024;
+    let num_slabs = 2;
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes)
+        .expect("new");
+
+    // Backward alloc 100 → cur=(_,_), special-case to (1, 1024). 1024 >=
+    // 100 no jump. new_intra = floor_16(1024-100)=912. allocation_start =
+    // 1*1024 + 912 = 1936.
+    {
+        let mut hb = ring.backward_handle(0);
+        let _ = hb.alloc(100).expect("backward initial");
+    }
+    assert_eq!(ring.allocation_start(), 1936);
+
+    // Forward fills slab 0 with two allocations leaving cursor in slab 1
+    // at intra 528 (so next alloc forces a jump):
+    let p0 = {
+        let mut hf = ring.forward_handle(0);
+        // alloc 500 → (0, 0), end=500
+        let p0 = hf.alloc(500).expect("a");
+        assert_eq!((p0.slab_idx, p0.intra_offset), (0, 0));
+        // alloc 500 → cur=(0, ceil_16(500)=512). 512+500=1012<=1024. (0,512). end=1012.
+        let _p1 = hf.alloc(500).expect("b");
+        // alloc 500 → cur=(0, ceil_16(1012)=1024). 1024+500>1024 → jump (1,0).
+        //   1>=2? No. new_end = 1024+0+500=1524. check 1524>1936? No. OK. (1,0).
+        let _p2 = hf.alloc(500).expect("c");
+        p0
+    };
+    assert_eq!(ring.allocation_end(), 1524);
+    // Now allocation_end=1524, allocation_start=1936.
+
+    // The danger alloc: size 700.
+    // cur=(1, ceil_16(500)=512). 512+700=1212>1024 → jump (2,0).
+    // 2>=2 → WRAP → (0,0). new_end = 0+0+700=700.
+    // BUG: check 700 > 1936? NO. Silent pass.
+    // Returned ptr: (slab 0, intra 0). Overlaps p0 ([0, 500)) byte-for-byte!
+    let lapping_result = {
+        let mut hf = ring.forward_handle(1);
+        hf.alloc(700)
+    };
+    assert!(
+        lapping_result.is_err(),
+        "forward wrap-with-backward-active that would silently overlap \
+         a live forward allocation must error. Got Ok({:?}); p0 was at \
+         (slab {}, intra {}, len {}); cursor before was end=1524, start=1936.",
+        lapping_result.as_ref().map(|p| (p.slab_idx, p.intra_offset, p.len_bytes)).ok(),
+        p0.slab_idx, p0.intra_offset, p0.len_bytes,
+    );
+}
+
+/// Bug (mirror): backward wrap silently lands in the LAST slab and
+/// overwrites a live backward allocation made earlier.
+///
+/// Symmetric to `forward_wrap_with_backward_active_does_not_lap_silently`.
+/// Construct a state where backward's cursor sits in slab 0 with some
+/// intra offset and a subsequent backward alloc requires jumping to "slab
+/// -1" → wrap to last slab. The wrap puts backward at the TOP of the
+/// last slab, overwriting an earlier backward alloc there.
+///
+/// The `new_start < allocation_end` check trivially passes because
+/// allocation_end is small (forward only made a tiny alloc) while
+/// new_start is now in the last slab.
+#[test]
+fn backward_wrap_with_forward_active_does_not_lap_silently() {
+    let device = cuda_device();
+    let slab_bytes = 1024;
+    let num_slabs = 2;
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes)
+        .expect("new");
+
+    // Forward alloc 100 → (0, 0), end=100. allocation_end=100.
+    {
+        let mut hf = ring.forward_handle(0);
+        let _ = hf.alloc(100).expect("forward initial");
+    }
+    assert_eq!(ring.allocation_end(), 100);
+
+    // Backward fills last slab + most of slab 0 from the high side:
+    let p_n = {
+        let mut hb = ring.backward_handle(0);
+        // 500: special-case (1, 1024). 1024>=500. new_intra=floor_16(524)=512. global=1*1024+512=1536.
+        let p_n = hb.alloc(500).expect("bwd 1");
+        assert_eq!((p_n.slab_idx, p_n.intra_offset), (1, 512));
+        // 500: cur=(1, 512). 512>=500 no jump. new_intra=floor_16(12)=0. global=1024. ✓ start=1024.
+        let _p1 = hb.alloc(500).expect("bwd 2");
+        // 500: cur=(1, 0). 0<500 → jump (0, 1024). 0 not<0 → no wrap. new_intra=floor_16(524)=512. global=512.
+        // check: 512 < 100? NO → OK. start=512.
+        let _p2 = hb.alloc(500).expect("bwd 3");
+        p_n
+    };
+    assert_eq!(ring.allocation_start(), 512);
+
+    // The danger alloc: size 700. cur=(0, 512). 512<700 → jump prev: (-1, 1024).
+    // -1 < 0 → WRAP: (last slab=1, intra_top=slab_bytes=1024).
+    // new_intra = floor_16(1024-700) = 320. new_global_start = 1*1024+320 = 1344.
+    // BUG: check 1344 < 100? NO → silent pass. But (slab 1, intra 320, len 700)
+    // overlaps pN at (slab 1, intra 512, len 500) — they share [512, 1020).
+    let lapping_result = {
+        let mut hb = ring.backward_handle(1);
+        hb.alloc(700)
+    };
+    assert!(
+        lapping_result.is_err(),
+        "backward wrap-with-forward-active that would silently overlap \
+         a live backward allocation must error. Got Ok({:?}); p_n was at \
+         (slab {}, intra {}, len {}); cursor before was start=512, end=100.",
+        lapping_result.as_ref().map(|p| (p.slab_idx, p.intra_offset, p.len_bytes)).ok(),
+        p_n.slab_idx, p_n.intra_offset, p_n.len_bytes,
+    );
+}
+
+/// Bug: lazy slab allocation from the backward direction.
+///
+/// Forward never touches slab N. Backward wraps into it. The
+/// `ensure_slab(slab_idx)` must materialize that slab on first backward
+/// touch. Verify cuda_malloc_count is incremented from the backward path.
+#[test]
+fn lazy_slab_alloc_from_backward_only() {
+    let device = cuda_device();
+    let slab_bytes = 1024;
+    let num_slabs = 4;
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes)
+        .expect("new");
+
+    // No forward allocations at all.
+    assert_eq!(ring.cuda_malloc_count(), 0);
+    assert_eq!(ring.slabs_allocated(), 0);
+
+    // First backward alloc: starts at allocation_start = total_bytes.
+    // cur_slab_idx = num_slabs (one past), cur_intra = slab_bytes (per
+    // the special case in alloc_backward_impl). Then since cur_intra
+    // (slab_bytes) is NOT < num_bytes (256) → no slab jump. cand_idx =
+    // num_slabs, cand_intra_top = slab_bytes. Then... HOLD ON:
+    // cand_slab_idx_signed = num_slabs as isize, NOT < 0 → no wrap.
+    // slab_idx = num_slabs (out of bounds!). Then
+    // self.ensure_slab(num_slabs) → panics on slabs[num_slabs].
+    //
+    // This is a real bug: the initial-state special case sets
+    // cur_slab_idx = self.slabs.len() - 1 (line 386), which is correct.
+    // Re-reading: yes, line 386 sets it to last. OK, then we land in
+    // last slab, intra = slab_bytes - 256 = 768. Good.
+    let p = {
+        let mut hb = ring.backward_handle(0);
+        hb.alloc(256).expect("backward first alloc")
+    };
+    assert_eq!(p.slab_idx, num_slabs - 1, "first backward lands in last slab");
+    assert_eq!(ring.cuda_malloc_count(), 1, "cudaMalloc fired exactly once");
+    assert_eq!(ring.slabs_allocated(), 1);
+
+    // Continue backward into slab num_slabs-2 — another cudaMalloc.
+    let _ = {
+        let mut hb = ring.backward_handle(0);
+        // Fill rest of last slab to force jump.
+        hb.alloc(slab_bytes - 256).expect("bwd fills rest of last slab")
+    };
+    assert_eq!(ring.cuda_malloc_count(), 1, "still in last slab; no new malloc");
+    let _ = {
+        let mut hb = ring.backward_handle(0);
+        hb.alloc(256).expect("bwd into previous slab")
+    };
+    assert_eq!(
+        ring.cuda_malloc_count(),
+        2,
+        "second cudaMalloc on first touch of slab num_slabs-2"
+    );
+    assert_eq!(ring.slabs_allocated(), 2);
+}
+
+/// Bug: oversized alloc rejection off-by-one.
+/// The existing `alloc_rejects_oversized` uses size = 2*slab_bytes which
+/// is far beyond slab_bytes. Test the exact boundary:
+/// - num_bytes = slab_bytes exactly: must succeed (single slab fits)
+/// - num_bytes = slab_bytes + 1: must error
+#[test]
+fn alloc_size_boundary_at_slab_bytes_exact_and_off_by_one() {
+    let device = cuda_device();
+    let slab_bytes = 1024;
+    let mut ring = RingAllocator::new(device, 4, slab_bytes).expect("new");
+
+    // Exactly slab_bytes — must fit.
+    {
+        let mut h = ring.forward_handle(0);
+        let p = h.alloc(slab_bytes)
+            .expect("alloc of exactly slab_bytes must succeed (fills one slab)");
+        assert_eq!(p.len_bytes, slab_bytes);
+        assert_eq!(p.intra_offset, 0);
+    }
+
+    // slab_bytes + 1 — must error.
+    {
+        let mut h = ring.forward_handle(0);
+        let r = h.alloc(slab_bytes + 1);
+        assert!(
+            r.is_err(),
+            "alloc of slab_bytes+1 must error; got {:?}",
+            r.map(|p| (p.slab_idx, p.intra_offset, p.len_bytes))
+        );
+    }
+}
+
+/// Verify that drop semantics of `RingForwardHandle` are correctly
+/// "no-op" — dropping the handle does not advance/retreat any cursor.
+///
+/// Per design doc §5: "Bytes return to the pool when the matching
+/// RingAllocator::reset() runs. ... Dropping a RingPtr does nothing".
+/// The handle similarly does not change cursor state on Drop.
+#[test]
+fn forward_handle_drop_is_noop_for_cursors() {
+    let device = cuda_device();
+    let mut ring = RingAllocator::new(device, 2, 1024).expect("new");
+
+    let end_before = ring.allocation_end();
+    let start_before = ring.allocation_start();
+
+    // Create a handle but don't alloc.
+    {
+        let _h = ring.forward_handle(0);
+        // Drop here on scope exit.
+    }
+    assert_eq!(ring.allocation_end(), end_before, "drop must not move end");
+    assert_eq!(ring.allocation_start(), start_before, "drop must not move start");
+
+    // Same for backward.
+    {
+        let _h = ring.backward_handle(0);
+    }
+    assert_eq!(ring.allocation_end(), end_before);
+    assert_eq!(ring.allocation_start(), start_before);
+
+    // And: dropping the handle after an alloc should leave cursors at the
+    // post-alloc state (no rollback of the alloc).
+    let post_alloc_end;
+    {
+        let mut h = ring.forward_handle(0);
+        let _p = h.alloc(256).expect("fwd alloc");
+        post_alloc_end = h.allocation_end();
+    }
+    assert_eq!(ring.allocation_end(), post_alloc_end, "alloc persists after handle drop");
+}
+
+/// OT parity: the exact byte-position of a sequence of forward allocs
+/// should match what OT's `allocate_like` would produce given the same
+/// num_bytes sequence and the same slab_bytes.
+///
+/// OT line 71-72: forward index = end/size, intra = ceil_16(end%size).
+/// Line 74-77: if cur_intra + num_bytes > size, jump.
+/// Line 83-88: end = idx*size + intra + num_bytes (after add).
+///
+/// Trace for slab_bytes=1024, sequence [200, 300, 600, 100]:
+/// 1. end=0: idx=0, intra=ceil_16(0)=0. fits (0+200<=1024). end → 200.
+/// 2. end=200: idx=0, intra=ceil_16(200)=208. fits (208+300=508). end → 508.
+/// 3. end=508: idx=0, intra=ceil_16(508)=512. 512+600=1112 > 1024 → jump.
+///    idx=1, intra=0. end → 1*1024 + 0 + 600 = 1624.
+/// 4. end=1624: idx=1, intra=ceil_16(1624%1024)=ceil_16(600)=608. fits.
+///    end → 1*1024 + 608 + 100 = 1732.
+#[test]
+fn ot_parity_forward_sequence_byte_positions() {
+    let device = cuda_device();
+    let slab_bytes = 1024;
+    let mut ring = RingAllocator::new(device, 4, slab_bytes).expect("new");
+
+    let expected: &[(usize, usize, usize)] = &[
+        // (slab_idx, intra_offset, ending_allocation_end)
+        (0, 0, 200),
+        (0, 208, 508),
+        (1, 0, 1624),   // jumped
+        (1, 608, 1732),
+    ];
+    let sizes = [200, 300, 600, 100];
+
+    let mut h = ring.forward_handle(0);
+    for (i, (&n, &(exp_slab, exp_intra, exp_end))) in
+        sizes.iter().zip(expected.iter()).enumerate()
+    {
+        let p = h.alloc(n).expect("alloc");
+        assert_eq!(
+            (p.slab_idx, p.intra_offset),
+            (exp_slab, exp_intra),
+            "step {i}: alloc({n}) slab/intra mismatch — got ({}, {}), expected ({exp_slab}, {exp_intra})",
+            p.slab_idx, p.intra_offset
+        );
+        assert_eq!(
+            h.allocation_end(), exp_end,
+            "step {i}: allocation_end mismatch — got {}, expected {exp_end}",
+            h.allocation_end()
+        );
+    }
+}

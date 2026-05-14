@@ -2099,3 +2099,37 @@ Tolerance `min_cos=0.99 / max_abs_ratio=5e-2` matches the v3 Klein gate;
 the bridge lands at max abs_ratio 0.0093 across the chain (well inside
 the band). Use `flame_core::parity::ParityHarness` for the actual
 compare so the `dx`/`dweight` keys match the fixture naming convention.
+
+## `ring_alloc` — wrap is only legal when the opposite cursor is idle
+
+`flame_core::ring_alloc::RingAllocator` is a bidirectional ring allocator
+(Phase 1 — see `src/ring_alloc/mod.rs` and `docs/RING_ALLOC_DESIGN.md`).
+Forward allocations grow `allocation_end`; backward allocations retreat
+`allocation_start`. When either cursor walks off the end of the slab list,
+the underlying OT algorithm cyclically wraps.
+
+**The convention.** Cyclic wrap is permitted ONLY when the OPPOSITE
+direction has not fired yet:
+
+| Direction | Wrap permitted when |
+|---|---|
+| forward (slab N-1 → slab 0)  | `allocation_start == total_bytes` (no backward state yet) |
+| backward (slab 0 → slab N-1) | `allocation_end == 0` (no forward state yet) |
+
+If the opposite cursor is non-idle, a wrap attempt returns `Error::OutOfMemory`
+with `"RingAllocator exhausted: <fwd|bwd> wrap with <bwd|fwd> active would
+lap live allocations"`. This is stricter than OT (which trusts caller
+sizing and would silently wrap). It catches the failure mode where forward
+wraps post-backward-fire and lands at `(slab 0, intra 0)` — silently
+overlapping a still-live early forward allocation, since the linear-regime
+`new_end > allocation_start` check trivially passes when `new_end` is small.
+
+**Why this matters.** Phase 2 callers (BlockOffloader) treat the ring as a
+per-step working set. A silent wrap-lap corrupts step-N forward results
+mid-backward — exactly the failure mode the ring exists to prevent. The
+strict-wrap discipline makes "too small a ring" loud at the alloc site
+instead of silent at use site. Test coverage:
+- `forward_wrap_with_backward_active_does_not_lap_silently`
+- `backward_wrap_with_forward_active_does_not_lap_silently`
+- the wrap-when-only-forward-active legal path is exercised by
+  `slab_boundary_stress_advances_slab_idx` (existing Test 4).
