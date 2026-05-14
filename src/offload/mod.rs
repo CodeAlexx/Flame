@@ -36,20 +36,13 @@
 //!   profile (and only the profile — strategies are stateless or
 //!   nearly so). Survives process restart.
 
-pub mod coordinator;
 pub mod manager;
 pub mod planner;
-pub mod ring_slab;
 pub mod state;
 pub mod strategy;
 pub mod telemetry;
 pub mod transfer_benchmark;
 
-pub use coordinator::{
-    AutogradDirection, BlockGuard, BlockOffloadStrategy, HostRamBudget, OffloadCoordinator,
-    TransitionCase,
-};
-pub use ring_slab::{DeviceSlab, RingSlabAllocator};
 pub use manager::{ForcedStrategy, ManagerConfig, OffloadManager, OffloadPhase};
 
 use std::collections::{HashMap, VecDeque};

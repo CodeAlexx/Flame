@@ -1,9 +1,27 @@
 # flame-core offload next-gen — design doc
 
-**Date**: 2026-05-13
-**Replaces**: today's `ActivationOffloadPool` (fixed slots, doesn't fit Klein) and `cuda_alloc_pool` (bucketed free-list, corrupts under offload).
-**Borrows from**: `/home/alex/OneTrainer/modules/util/LayerOffloadConductor.py` (the design that works).
-**Goal**: medium models (Klein 9B, Wan 14B+14B-LoRA, similar) that almost fit in 24 GB but don't, on different machines. FlexTensor handles the truly large.
+**Date**: 2026-05-13 (initial), 2026-05-14 (scope reduction)
+**Replaces**: today's `ActivationOffloadPool` (fixed slots, doesn't fit Klein). The `cuda_alloc_pool` corruption under offload is now tracked separately at `HANDOFF_2026-05-14_TRAINER_REGRESSION_FAILURE.md`.
+**Borrows from**: OneTrainer's `docs/RamOffloading.md` + `/home/alex/OneTrainer/modules/util/LayerOffloadConductor.py`.
+**Goal**: medium models (Klein 9B, Wan 14B+14B-LoRA) that almost fit in 24 GB but don't. FlexTensor handles the truly large.
+
+## Status (2026-05-14)
+
+| Phase | Status | Commits |
+|---|---|---|
+| 1: `GrowOnDemandActivationCache` | **DELIVERED** | flame-core@`4f0d026`, fix@`6b5d0a5` |
+| 2a: `checkpoint_offload_boundary` API | **DELIVERED** | flame-core@`c71890c` |
+| 2b: Cache-replay backward correctness | **DELIVERED** | flame-core@`6b5d0a5` |
+| 6 (real): klein.rs → `checkpoint_offload_boundary` | **DELIVERED** | EriDiffusion-v2@`1994cac`, `cff0a60` |
+| 3: `OffloadCoordinator` skeleton | **DELETED 2026-05-14** | was @`e2ec9f1` — no real consumer beyond a one-line wrapper, BlockGuard::Drop was a stub. v2 now installs the cache directly. |
+| 4: `RingSlabAllocator` skeleton | **DELETED 2026-05-14** | was @`98dbebc`, microbench@`31e550b` — off-spec wiring (BlockOffloader weight slots, not the activation path the spec called for), verified ineffective for the Klein step-2 crash. |
+| 5: Fraction knob + 3-case strategy | **DELETED 2026-05-14** | was @`7d3348d`/@`8f13318` — library type with no production consumer. The fraction-cycle pattern from OT is already implemented inside `BlockOffloader`'s existing strategies (TwoSlot/Knapsack/Adaptive). A second strategy surface added complexity without value. |
+| 7+: Other trainer migrations | **DEFERRED** | Per-trainer wiring of `checkpoint_offload_boundary` (the Phase 6 pattern) — Wan22, Chroma, Flux, Ernie, SD35, SDXL — to be done as those trainers are touched. No coordinator wrapping needed; direct cache install via `set_grow_activation_cache`. |
+| 8: HostRamBudget + telemetry | **DEFERRED** | Not blocking any current goal. |
+
+**Live design**: Phase 1 + 2 (the activation-side primitives) shipped and exercised end-to-end in Klein 9B. Layer-side offload remains driven by `BlockOffloader`'s existing strategies, which already match OT's RamOffloading.md fraction-cycle pattern. The Phase 3-5 "coordinator + ring + strategy" axis turned out to be redundant infrastructure when measured against the working trainer code — deleted rather than carried as weight.
+
+The remainder of this doc preserves the original design as historical context for anyone re-evaluating the coordinator pattern (e.g., when adding a model that doesn't fit BlockOffloader's existing surface).
 
 This is a design, not an implementation. Each component below is one PR/session (per SPEED_CONTRACT measurement-first rule).
 
