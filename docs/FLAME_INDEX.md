@@ -855,9 +855,9 @@ Test: `flame-core/tests/ring_pool_adapter_smoke.rs` (3 tests, GPU-real).
 | `install_miss_allocator(allocator)` | `cuda_alloc_pool.rs:671` | Install. Returns previously installed (if any). |
 | `uninstall_miss_allocator()` | `cuda_alloc_pool.rs:692` | Remove. Returns last installed (if any). |
 | `CudaAllocPool::external_miss_count()` | `cuda_alloc_pool.rs:217` | Lock-free count of cache-misses served by external allocator. Diagnostic. |
-| `CudaAllocPool::register_external_ptr(ptr)` | `cuda_alloc_pool.rs:248` | Phase 2: mark a device ptr as ring-/external-owned so `push_*` routes it through `reconstruct_and_forget` instead of caching the slice. |
-| `CudaAllocPool::is_external_ptr(ptr)` | `cuda_alloc_pool.rs:235` | Test if `ptr` is in the external set. |
-| `CudaAllocPool::unregister_external_ptr(ptr)` | `cuda_alloc_pool.rs:259` | Phase 2: remove `ptr` from the external set after `push_*` reconstructs-and-forgets it. Prevents unbounded growth across step boundaries. |
+| `CudaAllocPool::register_external_ptr(ptr)` | `cuda_alloc_pool.rs:266` | Phase 2: mark a device ptr as ring-/external-owned so `push_*` routes it through `reconstruct_and_forget` instead of caching the slice. Increments refcount (round-2 fix 2026-05-14). |
+| `CudaAllocPool::is_external_ptr(ptr)` | `cuda_alloc_pool.rs:249` | Test if `ptr` is in the external refcount map (count > 0). |
+| `CudaAllocPool::unregister_external_ptr(ptr)` | `cuda_alloc_pool.rs:280` | Phase 2: decrement `ptr`'s external refcount after `push_*` reconstructs-and-forgets it; entry is removed only when count reaches 0 (ring-wrap may have count > 1). |
 
 ---
 

@@ -1330,7 +1330,7 @@ out by `BlockOffloader::alloc_bf16_via_ring`). The contract:
   pinned cudarc 0.11.x mirror layout (see `cuda_alloc_pool.rs` top
   comment). Same layout as `ring_alloc/pool_adapter::synth_slice`.
 - **`unregister_external_ptr` MUST follow every `is_external`
-  reconstruct.** Otherwise the `external_ptrs` `HashSet` grows
+  reconstruct.** Otherwise the `external_ptrs` refcount map grows
   unbounded across steps and tagged-pointer lookups slow down.
 - **The bypass path also fires when the pool is inactive or the
   bucket cap is exceeded.** Pre-existing `is_external` branches at
@@ -1344,6 +1344,23 @@ out by `BlockOffloader::alloc_bf16_via_ring`). The contract:
   `CUDA_ERROR_INVALID_VALUE`). The hook is a function pointer atomically
   swapped — installing it from multiple `BlockOffloader` instances or in
   combination with `install_miss_allocator` is idempotent.
+- **`external_ptrs` is a `HashMap<u64, u32>` refcount, not a `HashSet`**
+  (2026-05-14 Phase 2 round-2 fix). The `RingAllocator` cyclically
+  reuses slab offsets — when the forward cursor wraps, the same
+  `device_ptr` may be handed out for a new allocation while a prior
+  tensor with the same ptr is still alive. A `HashSet` made
+  registration idempotent: the first drop unregistered the ptr and the
+  second drop saw `is_external_ptr=false`, tagged its `FreeEntry`
+  non-external, and `clear_cache` later called `free_async` on a
+  ring-slab offset → `CUDA_ERROR_INVALID_VALUE` panic at step 0 of
+  Klein 9B `--offload`. The refcount keeps the ptr marked external
+  until ALL live tensors sharing it have been forgotten. Regression
+  test: `cuda_alloc_pool::tests::test_external_ptr_refcount_under_ring_wrap`.
+- **`FLAME_POOL_CLEAR_DEBUG=1`** routes `clear_cache` through a
+  per-entry `eprintln!` + `catch_unwind` slow path that logs every
+  drop's `(ptr,bucket,is_u16,tagged_ext,hook_ext)` and survives a
+  panic in any single drop. Used to localize the round-2 ring-wrap
+  bug. Leave off for production runs.
 
 ---
 

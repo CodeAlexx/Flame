@@ -9,7 +9,7 @@
 //! returns slices via [`pool_return_f32`].
 
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, DeviceSlice};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -198,11 +198,24 @@ pub struct CudaAllocPool {
     /// paths in `pool_alloc_u16` / `pool_alloc_f32` route through this
     /// instead of `device.alloc::<T>`. See `PoolMissAllocator` docs.
     miss_alloc: Mutex<Option<Arc<dyn PoolMissAllocator>>>,
-    /// Set of device pointers that originated from the external miss
-    /// allocator (Phase 2a). Used to tag free-list entries via
-    /// `FreeEntry::is_external` at `push_*` time so subsequent
+    /// Refcount map of device pointers that originated from an external
+    /// allocator (Phase 2a `PoolMissAllocator` route or Phase 2
+    /// `BlockOffloader::alloc_bf16_via_ring`). Used to tag free-list
+    /// entries via `FreeEntry::is_external` at `push_*` time so subsequent
     /// `clear_cache` / pool-drop skips `cudaFree` on those entries.
-    external_ptrs: Mutex<HashSet<u64>>,
+    ///
+    /// **Why a refcount, not a set** (2026-05-14 Phase 2 round 2 fix): the
+    /// `RingAllocator` cyclically reuses slab offsets — when the forward
+    /// cursor wraps, the SAME `device_ptr` is handed out for a fresh
+    /// allocation while a prior tensor with the same ptr may still be
+    /// alive. With a `HashSet`, the first drop unregistered the ptr and
+    /// the second drop saw `is_external_ptr=false`, tagged its FreeEntry
+    /// non-external, and then `clear_cache` called `free_async` on a
+    /// ring-slab offset → `CUDA_ERROR_INVALID_VALUE` panic. The refcount
+    /// keeps the ptr marked external until ALL live tensors sharing it
+    /// have been forgotten. See `tests` in this module and the Klein 9B
+    /// Phase 2 gate (`/tmp/k9_p2r2_*` logs).
+    external_ptrs: Mutex<HashMap<u64, u32>>,
     /// Lock-free counter of cache misses that routed through the external
     /// allocator. Useful for verifying the miss-route is firing as
     /// expected from a smoke-test harness.
@@ -223,19 +236,20 @@ impl CudaAllocPool {
             misses: AtomicU64::new(0),
             bucket_saves: AtomicU64::new(0),
             miss_alloc: Mutex::new(None),
-            external_ptrs: Mutex::new(HashSet::new()),
+            external_ptrs: Mutex::new(HashMap::new()),
             external_misses: AtomicU64::new(0),
         }
     }
 
     /// Test if `ptr` is tagged as external (Phase 2a). Public so external
     /// allocators (e.g. `BlockOffloader::alloc_bf16_via_ring`) can verify
-    /// their pointers are tracked.
+    /// their pointers are tracked. Returns true iff the ptr's refcount is
+    /// non-zero (i.e., at least one register without a matching unregister).
     #[inline]
     pub fn is_external_ptr(&self, ptr: u64) -> bool {
         self.external_ptrs
             .lock()
-            .map(|s| s.contains(&ptr))
+            .map(|m| m.get(&ptr).copied().unwrap_or(0) > 0)
             .unwrap_or(false)
     }
 
@@ -243,20 +257,53 @@ impl CudaAllocPool {
     /// callers (Phase 2: `BlockOffloader` ring-backed allocs) can mark
     /// their pointers without going through the `PoolMissAllocator`
     /// trait.
+    ///
+    /// Each call increments the ptr's refcount by 1. Must be balanced by
+    /// a matching `unregister_external_ptr`. The ring allocator may hand
+    /// out the same physical address for multiple concurrent allocations
+    /// after the forward cursor wraps, in which case both lifetimes are
+    /// tracked here as count=2.
     pub fn register_external_ptr(&self, ptr: u64) {
-        if let Ok(mut s) = self.external_ptrs.lock() {
-            s.insert(ptr);
+        if let Ok(mut m) = self.external_ptrs.lock() {
+            *m.entry(ptr).or_insert(0) += 1;
         }
     }
 
-    /// Remove `ptr` from the external set. Called from the `push_*`
-    /// guards when an external entry has been reconstructed-and-forgotten
-    /// (its lifecycle is the external allocator's, not the pool's), so
-    /// the set doesn't grow unbounded across step boundaries.
+    /// Decrement `ptr`'s external refcount. Removes the entry when the
+    /// count reaches zero. Called from the `push_*` guards when an
+    /// external entry has been reconstructed-and-forgotten (its
+    /// lifecycle is the external allocator's, not the pool's), so the
+    /// map doesn't grow unbounded across step boundaries.
+    ///
+    /// No-op if `ptr` is not registered. Saturates at 0 (extra unregisters
+    /// after the count is already 0 are silently ignored).
     pub fn unregister_external_ptr(&self, ptr: u64) {
-        if let Ok(mut s) = self.external_ptrs.lock() {
-            s.remove(&ptr);
+        if let Ok(mut m) = self.external_ptrs.lock() {
+            if let Some(c) = m.get_mut(&ptr) {
+                if *c > 1 {
+                    *c -= 1;
+                } else {
+                    m.remove(&ptr);
+                }
+            }
         }
+    }
+
+    /// Inspection: total number of external ptr entries currently tracked
+    /// (sum across all distinct ptrs, not summed refcounts). Used by tests.
+    #[doc(hidden)]
+    pub fn external_ptr_count(&self) -> usize {
+        self.external_ptrs.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Inspection: current refcount for `ptr`. Returns 0 if not tracked.
+    /// Used by tests.
+    #[doc(hidden)]
+    pub fn external_ptr_refcount(&self, ptr: u64) -> u32 {
+        self.external_ptrs
+            .lock()
+            .map(|m| m.get(&ptr).copied().unwrap_or(0))
+            .unwrap_or(0)
     }
 
     /// Lock-free counter of cache misses that were served by an installed
@@ -517,6 +564,16 @@ impl CudaAllocPool {
     /// backing memory came from an installed `PoolMissAllocator`) is dropped
     /// via `reconstruct_and_forget` so that the external allocator's slab
     /// retains ownership. Non-external entries `cudaFree` as before.
+    ///
+    /// **Diagnostic mode**: set `FLAME_POOL_CLEAR_DEBUG=1` to enable
+    /// per-entry `eprintln!` before each drop, plus `catch_unwind`
+    /// around each drop so a panic in one entry is logged with its
+    /// `(ptr,bucket,is_u16,tagged_ext,hook_ext)` provenance instead of
+    /// unwinding the whole process. Used to pinpoint exact failing
+    /// entries when Phase 2 ring + pool integration trips
+    /// `CUDA_ERROR_INVALID_VALUE`. The diagnostic was the tool that
+    /// localized the ring-wrap double-free fixed in 2026-05-14 (see
+    /// `external_ptrs` doc and `test_external_ptr_refcount_under_ring_wrap`).
     pub fn clear_cache(&self) {
         let entries: Vec<(CacheKey, Vec<FreeEntry>)> = {
             let mut lists = match self.free_lists.lock() {
@@ -525,21 +582,26 @@ impl CudaAllocPool {
             };
             lists.drain().collect()
         };
-        // Now free everything outside the lock.
-        for (key, list) in entries {
-            for entry in list {
-                unsafe {
-                    if entry.is_external {
-                        if key.is_u16 {
-                            reconstruct_and_forget::<u16>(entry.ptr, entry.len, entry.device);
+        let debug = std::env::var("FLAME_POOL_CLEAR_DEBUG").ok().as_deref() == Some("1");
+        if debug {
+            self.clear_cache_debug(entries);
+        } else {
+            // Default fast path — direct drops, no env check or counters.
+            for (key, list) in entries {
+                for entry in list {
+                    unsafe {
+                        if entry.is_external {
+                            if key.is_u16 {
+                                reconstruct_and_forget::<u16>(entry.ptr, entry.len, entry.device);
+                            } else {
+                                reconstruct_and_forget::<f32>(entry.ptr, entry.len, entry.device);
+                            }
                         } else {
-                            reconstruct_and_forget::<f32>(entry.ptr, entry.len, entry.device);
-                        }
-                    } else {
-                        if key.is_u16 {
-                            reconstruct_and_drop::<u16>(entry.ptr, entry.len, entry.device);
-                        } else {
-                            reconstruct_and_drop::<f32>(entry.ptr, entry.len, entry.device);
+                            if key.is_u16 {
+                                reconstruct_and_drop::<u16>(entry.ptr, entry.len, entry.device);
+                            } else {
+                                reconstruct_and_drop::<f32>(entry.ptr, entry.len, entry.device);
+                            }
                         }
                     }
                 }
@@ -557,9 +619,61 @@ impl CudaAllocPool {
         //
         // External entries removed FROM the free list above have already
         // been `reconstruct_and_forget`-ed and will never drop again, so
-        // their ptr need never appear in the set again — but the set is
-        // a HashSet keyed by u64, so leaving stale entries is harmless
-        // (the matching slab is also gone, so no live tensor can collide).
+        // their ptr need never appear in the map again — but the map is
+        // a HashMap<u64, u32> refcount, so leaving stale entries is
+        // harmless (the matching slab is also gone, so no live tensor
+        // can collide).
+    }
+
+    /// `FLAME_POOL_CLEAR_DEBUG=1` slow path: per-entry log + `catch_unwind`
+    /// so a panic in one drop is captured with provenance rather than
+    /// terminating the process. Used to localize ring/pool integration
+    /// bugs (e.g., the 2026-05-14 round-2 ring-wrap double-free).
+    #[cold]
+    fn clear_cache_debug(&self, entries: Vec<(CacheKey, Vec<FreeEntry>)>) {
+        let mut total_entries = 0usize;
+        let mut total_fail = 0usize;
+        for (key, list) in entries {
+            for entry in list {
+                total_entries += 1;
+                let ptr = entry.ptr;
+                let len = entry.len;
+                let tagged_external = entry.is_external;
+                let hook_says_external = self.is_external_ptr(ptr);
+                eprintln!(
+                    "[pool.clear_cache] #{total_entries} ptr=0x{ptr:x} bucket={} u16={} tagged_ext={} hook_ext={}",
+                    len, key.is_u16, tagged_external, hook_says_external,
+                );
+                let do_drop = move || {
+                    unsafe {
+                        if tagged_external {
+                            if key.is_u16 {
+                                reconstruct_and_forget::<u16>(ptr, len, entry.device);
+                            } else {
+                                reconstruct_and_forget::<f32>(ptr, len, entry.device);
+                            }
+                        } else {
+                            if key.is_u16 {
+                                reconstruct_and_drop::<u16>(ptr, len, entry.device);
+                            } else {
+                                reconstruct_and_drop::<f32>(ptr, len, entry.device);
+                            }
+                        }
+                    }
+                };
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(do_drop));
+                if r.is_err() {
+                    total_fail += 1;
+                    eprintln!(
+                        "[pool.clear_cache] PANIC at #{total_entries} ptr=0x{ptr:x} bucket={} u16={} tagged_ext={} hook_ext={}",
+                        len, key.is_u16, tagged_external, hook_says_external,
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "[pool.clear_cache] done: entries={total_entries} failed={total_fail}",
+        );
     }
 }
 
@@ -1237,5 +1351,59 @@ mod tests {
         pool_return_f32(slice_b);
         global_pool().clear_cache();
         Ok(())
+    }
+
+    /// Regression test for the Phase 2 round-2 ring-wrap double-free.
+    ///
+    /// Pre-fix (`HashSet<u64>`): registering the same ptr twice was a
+    /// no-op; the first `unregister_external_ptr` cleared the entry,
+    /// so the second `is_external_ptr(ptr)` returned `false`. Under
+    /// `BlockOffloader` + ring wrap, the second return path tagged
+    /// the FreeEntry non-external and `clear_cache` later called
+    /// `free_async` on a ring-slab offset → CUDA_ERROR_INVALID_VALUE.
+    ///
+    /// Post-fix (`HashMap<u64, u32>` refcount): two registrations
+    /// produce count=2; the first unregister leaves count=1 (ptr
+    /// stays external); the second unregister removes the entry.
+    /// `is_external_ptr` correctly returns true for the duration of
+    /// either tensor's lifetime.
+    #[test]
+    fn test_external_ptr_refcount_under_ring_wrap() {
+        let pool = global_pool();
+        let fake_ptr: u64 = 0xdeadbeef_cafef00d;
+
+        // Clean any prior state from other tests / threads.
+        while pool.external_ptr_refcount(fake_ptr) > 0 {
+            pool.unregister_external_ptr(fake_ptr);
+        }
+        assert_eq!(pool.external_ptr_refcount(fake_ptr), 0);
+        assert!(!pool.is_external_ptr(fake_ptr));
+
+        // Simulate ring wrap: alloc_bf16_via_ring is called twice with
+        // the same physical address before either tensor is dropped.
+        pool.register_external_ptr(fake_ptr);
+        pool.register_external_ptr(fake_ptr);
+        assert_eq!(pool.external_ptr_refcount(fake_ptr), 2);
+        assert!(pool.is_external_ptr(fake_ptr));
+
+        // First tensor drops → push_u16 external-guard unregisters.
+        pool.unregister_external_ptr(fake_ptr);
+        // Critical: ptr MUST still be tagged external for the second
+        // tensor. This is the regression — pre-fix, this was false.
+        assert!(
+            pool.is_external_ptr(fake_ptr),
+            "ptr must stay tagged external while a second live tensor \
+             still holds it (ring-wrap double-allocation case)"
+        );
+        assert_eq!(pool.external_ptr_refcount(fake_ptr), 1);
+
+        // Second tensor drops → final unregister.
+        pool.unregister_external_ptr(fake_ptr);
+        assert!(!pool.is_external_ptr(fake_ptr));
+        assert_eq!(pool.external_ptr_refcount(fake_ptr), 0);
+
+        // Extra unregister after count=0 must be a no-op (saturate).
+        pool.unregister_external_ptr(fake_ptr);
+        assert_eq!(pool.external_ptr_refcount(fake_ptr), 0);
     }
 }
