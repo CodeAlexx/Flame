@@ -9,7 +9,7 @@
 //! returns slices via [`pool_return_f32`].
 
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, DeviceSlice};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -38,6 +38,13 @@ struct FreeEntry {
     ptr: u64,
     len: usize, // element count (f32 elements, not bytes)
     device: Arc<CudaDevice>,
+    /// True if this entry's backing memory is owned by an external allocator
+    /// (e.g. `ring_alloc::RingAllocator`) installed via
+    /// [`install_miss_allocator`]. External entries skip `cudaFree` on
+    /// `clear_cache` / pool drop; their lifecycle is the external allocator's
+    /// responsibility. See "Ring allocator as pool backend" in
+    /// `docs/FLAME_CONVENTIONS.md` for the lifecycle contract.
+    is_external: bool,
 }
 
 /// Cached env check for FLAME_PROFILE=1.
@@ -187,6 +194,19 @@ pub struct CudaAllocPool {
     hits: AtomicU64,
     misses: AtomicU64,
     bucket_saves: AtomicU64,
+    /// External cache-miss allocator (Phase 2a). When `Some`, cache-MISS
+    /// paths in `pool_alloc_u16` / `pool_alloc_f32` route through this
+    /// instead of `device.alloc::<T>`. See `PoolMissAllocator` docs.
+    miss_alloc: Mutex<Option<Arc<dyn PoolMissAllocator>>>,
+    /// Set of device pointers that originated from the external miss
+    /// allocator (Phase 2a). Used to tag free-list entries via
+    /// `FreeEntry::is_external` at `push_*` time so subsequent
+    /// `clear_cache` / pool-drop skips `cudaFree` on those entries.
+    external_ptrs: Mutex<HashSet<u64>>,
+    /// Lock-free counter of cache misses that routed through the external
+    /// allocator. Useful for verifying the miss-route is firing as
+    /// expected from a smoke-test harness.
+    external_misses: AtomicU64,
 }
 
 impl CudaAllocPool {
@@ -202,7 +222,35 @@ impl CudaAllocPool {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             bucket_saves: AtomicU64::new(0),
+            miss_alloc: Mutex::new(None),
+            external_ptrs: Mutex::new(HashSet::new()),
+            external_misses: AtomicU64::new(0),
         }
+    }
+
+    /// Test if `ptr` is tagged as external (Phase 2a). Internal use.
+    #[inline]
+    fn is_external_ptr(&self, ptr: u64) -> bool {
+        self.external_ptrs
+            .lock()
+            .map(|s| s.contains(&ptr))
+            .unwrap_or(false)
+    }
+
+    /// Register `ptr` as external. Called after a successful
+    /// miss-allocator call returns a slice. Internal use.
+    fn register_external_ptr(&self, ptr: u64) {
+        if let Ok(mut s) = self.external_ptrs.lock() {
+            s.insert(ptr);
+        }
+    }
+
+    /// Lock-free counter of cache misses that were served by an installed
+    /// `PoolMissAllocator` (Phase 2a diagnostic). Returns 0 when no
+    /// external allocator is installed.
+    #[inline]
+    pub fn external_miss_count(&self) -> u64 {
+        self.external_misses.load(Ordering::Relaxed)
     }
 
     /// Snapshot of hit/miss/bucket-save counters. `bucket_saves` is incremented
@@ -251,7 +299,13 @@ impl CudaAllocPool {
     /// `(device, bucket-rounded element count)`.
     fn push_f32(&self, entry: FreeEntry) {
         if !self.active.load(Ordering::Relaxed) {
-            unsafe { reconstruct_and_drop::<f32>(entry.ptr, entry.len, entry.device) };
+            // Skip cudaFree if the backing memory is owned by the
+            // external miss-allocator (Phase 2a) — the slab Arc owns it.
+            if entry.is_external {
+                unsafe { reconstruct_and_forget::<f32>(entry.ptr, entry.len, entry.device) };
+            } else {
+                unsafe { reconstruct_and_drop::<f32>(entry.ptr, entry.len, entry.device) };
+            }
             return;
         }
 
@@ -260,7 +314,11 @@ impl CudaAllocPool {
 
         // Don't cache huge allocations (>2 GiB).
         if bytes > MAX_POOL_BYTES {
-            unsafe { reconstruct_and_drop::<f32>(entry.ptr, entry.len, entry.device) };
+            if entry.is_external {
+                unsafe { reconstruct_and_forget::<f32>(entry.ptr, entry.len, entry.device) };
+            } else {
+                unsafe { reconstruct_and_drop::<f32>(entry.ptr, entry.len, entry.device) };
+            }
             return;
         }
 
@@ -274,7 +332,11 @@ impl CudaAllocPool {
             let list = lists.entry(key).or_insert_with(Vec::new);
             if list.len() >= MAX_FREE_PER_SIZE {
                 drop(lists);
-                unsafe { reconstruct_and_drop::<f32>(entry.ptr, entry.len, entry.device) };
+                if entry.is_external {
+                    unsafe { reconstruct_and_forget::<f32>(entry.ptr, entry.len, entry.device) };
+                } else {
+                    unsafe { reconstruct_and_drop::<f32>(entry.ptr, entry.len, entry.device) };
+                }
                 return;
             }
             list.push(entry);
@@ -296,21 +358,33 @@ impl CudaAllocPool {
                 }
             }
         } else {
-            unsafe { reconstruct_and_drop::<f32>(entry.ptr, entry.len, entry.device) };
+            if entry.is_external {
+                unsafe { reconstruct_and_forget::<f32>(entry.ptr, entry.len, entry.device) };
+            } else {
+                unsafe { reconstruct_and_drop::<f32>(entry.ptr, entry.len, entry.device) };
+            }
         }
     }
 
     /// Push a u16 (BF16) allocation back into the pool.
     fn push_u16(&self, entry: FreeEntry) {
         if !self.active.load(Ordering::Relaxed) {
-            unsafe { reconstruct_and_drop::<u16>(entry.ptr, entry.len, entry.device) };
+            if entry.is_external {
+                unsafe { reconstruct_and_forget::<u16>(entry.ptr, entry.len, entry.device) };
+            } else {
+                unsafe { reconstruct_and_drop::<u16>(entry.ptr, entry.len, entry.device) };
+            }
             return;
         }
 
         let size = entry.len; // already bucket-sized
         let bytes = size * std::mem::size_of::<u16>();
         if bytes > MAX_POOL_BYTES {
-            unsafe { reconstruct_and_drop::<u16>(entry.ptr, entry.len, entry.device) };
+            if entry.is_external {
+                unsafe { reconstruct_and_forget::<u16>(entry.ptr, entry.len, entry.device) };
+            } else {
+                unsafe { reconstruct_and_drop::<u16>(entry.ptr, entry.len, entry.device) };
+            }
             return;
         }
 
@@ -324,7 +398,11 @@ impl CudaAllocPool {
             let list = lists.entry(key).or_insert_with(Vec::new);
             if list.len() >= MAX_FREE_PER_SIZE {
                 drop(lists);
-                unsafe { reconstruct_and_drop::<u16>(entry.ptr, entry.len, entry.device) };
+                if entry.is_external {
+                    unsafe { reconstruct_and_forget::<u16>(entry.ptr, entry.len, entry.device) };
+                } else {
+                    unsafe { reconstruct_and_drop::<u16>(entry.ptr, entry.len, entry.device) };
+                }
                 return;
             }
             list.push(entry);
@@ -346,7 +424,11 @@ impl CudaAllocPool {
                 }
             }
         } else {
-            unsafe { reconstruct_and_drop::<u16>(entry.ptr, entry.len, entry.device) };
+            if entry.is_external {
+                unsafe { reconstruct_and_forget::<u16>(entry.ptr, entry.len, entry.device) };
+            } else {
+                unsafe { reconstruct_and_drop::<u16>(entry.ptr, entry.len, entry.device) };
+            }
         }
     }
 
@@ -394,6 +476,11 @@ impl CudaAllocPool {
     }
 
     /// Free all cached memory. Call between training steps or on OOM retry.
+    ///
+    /// **Phase 2a — external entries**: any entry tagged `is_external` (its
+    /// backing memory came from an installed `PoolMissAllocator`) is dropped
+    /// via `reconstruct_and_forget` so that the external allocator's slab
+    /// retains ownership. Non-external entries `cudaFree` as before.
     pub fn clear_cache(&self) {
         let entries: Vec<(CacheKey, Vec<FreeEntry>)> = {
             let mut lists = match self.free_lists.lock() {
@@ -406,15 +493,37 @@ impl CudaAllocPool {
         for (key, list) in entries {
             for entry in list {
                 unsafe {
-                    if key.is_u16 {
-                        reconstruct_and_drop::<u16>(entry.ptr, entry.len, entry.device);
+                    if entry.is_external {
+                        if key.is_u16 {
+                            reconstruct_and_forget::<u16>(entry.ptr, entry.len, entry.device);
+                        } else {
+                            reconstruct_and_forget::<f32>(entry.ptr, entry.len, entry.device);
+                        }
                     } else {
-                        reconstruct_and_drop::<f32>(entry.ptr, entry.len, entry.device);
+                        if key.is_u16 {
+                            reconstruct_and_drop::<u16>(entry.ptr, entry.len, entry.device);
+                        } else {
+                            reconstruct_and_drop::<f32>(entry.ptr, entry.len, entry.device);
+                        }
                     }
                 }
             }
         }
         self.current_bytes.store(0, Ordering::Relaxed);
+        // NOTE: do NOT clear `external_ptrs` here. Live tensors (whose
+        // storage holds CudaSlice<T> values not yet returned to the pool)
+        // still carry external pointers. When those tensors later drop, the
+        // cudarc-pinctx Drop hook MUST see their ptr in `external_ptrs` to
+        // skip `cudaFree` on the ring slab. Clearing the set on
+        // `clear_cache` orphans every in-flight external tensor and causes
+        // `CUDA_ERROR_INVALID_VALUE` panics inside `CudaSlice::drop` (see
+        // Phase 2a 5-step smoke crash at backward-graph teardown).
+        //
+        // External entries removed FROM the free list above have already
+        // been `reconstruct_and_forget`-ed and will never drop again, so
+        // their ptr need never appear in the set again — but the set is
+        // a HashSet keyed by u64, so leaving stale entries is harmless
+        // (the matching slab is also gone, so no live tensor can collide).
     }
 }
 
@@ -443,6 +552,32 @@ unsafe fn reconstruct_and_drop<T>(ptr: u64, len: usize, device: Arc<CudaDevice>)
     };
     let slice: CudaSlice<T> = std::mem::transmute(mirror);
     drop(slice); // runs cudaFree
+}
+
+/// Reconstruct a `CudaSlice<T>` mirror from raw parts and immediately
+/// `mem::forget` it — does NOT run `cudaFree`. Used for Phase 2a external
+/// allocations whose backing memory is owned by a `PoolMissAllocator`
+/// (e.g., a `ring_alloc::RingAllocator` slab).
+///
+/// The `device: Arc<CudaDevice>` clone increments the Arc refcount when
+/// the mirror is built; `mem::forget` then leaks that one ref. The
+/// caller path always passes an Arc obtained from a fresh `clone()` /
+/// move on the input entry, so the leak is bounded to the lifecycle of
+/// the in-flight pool return.
+///
+/// # Safety
+/// `ptr` MUST point into memory owned by the installed
+/// `PoolMissAllocator` (i.e., the slab Arc keeps it alive). Calling this
+/// on a `device.alloc`-sourced pointer leaks GPU memory.
+unsafe fn reconstruct_and_forget<T>(ptr: u64, len: usize, device: Arc<CudaDevice>) {
+    let mirror = CudaSliceMirror::<T> {
+        cu_device_ptr: ptr,
+        len,
+        device,
+        host_buf: None,
+    };
+    let slice: CudaSlice<T> = std::mem::transmute(mirror);
+    std::mem::forget(slice);
 }
 
 /// Reconstruct a `CudaSlice<T>` from raw parts WITHOUT dropping.
@@ -474,6 +609,111 @@ unsafe fn decompose_slice<T>(slice: CudaSlice<T>) -> (u64, usize, Arc<CudaDevice
     // (CudaSliceMirror has no Drop, but Arc<CudaDevice> clone keeps it alive.)
     std::mem::forget(mirror);
     (ptr, len, device)
+}
+
+// ---------------------------------------------------------------------------
+// Miss-allocator plugin (Phase 2a — ring-alloc backend opt-in)
+//
+// When installed, ALL cache-MISS allocations of `pool_alloc_u16` /
+// `pool_alloc_f32` route through the installed allocator instead of
+// calling `device.alloc::<T>(bucket)`. The returned `CudaSlice<T>` is
+// expected to be a transmuted "borrowed view" onto memory the external
+// allocator owns; the pool tags free-list entries from this path with
+// `is_external: true` so that subsequent `clear_cache` / `pool.drop`
+// skips `cudaFree` on those entries.
+//
+// Failure mode: if the external allocator returns `Err`, the cache miss
+// falls back to `device.alloc::<T>` (identical to the no-allocator path).
+//
+// Design rationale: this exists to test the hypothesis (per
+// `OFFLOAD_GAPS_vs_ONETRAINER.md` Gap 1) that routing cache-miss
+// allocations through a `ring_alloc::RingAllocator` reduces the count of
+// `cudaMallocAsync` / driver-mempool interactions across step boundaries
+// and resolves the Klein 9B + `--offload` step-2 `CUDA_ERROR_INVALID_VALUE`
+// crash without the `FLAME_ALLOC_POOL=0` workaround. See
+// `OFFLOAD_NEXT_GEN_DESIGN.md` Phase 4-restart Phase 2 status.
+// ---------------------------------------------------------------------------
+
+/// External allocator that the pool can route cache misses through.
+///
+/// Implementors must return memory that is **NOT** owned by the returned
+/// `CudaSlice` (i.e., dropping the slice MUST NOT call `cudaFree`). The
+/// pool tags free-list entries from this path so that on `clear_cache` /
+/// pool drop it skips the `cudaFree` step.
+///
+/// The element-count argument is the bucket-rounded size (already > 0).
+/// Return `Err` to fall back to the default `device.alloc::<T>` path.
+pub trait PoolMissAllocator: Send + Sync {
+    /// Allocate `bucket_elems` u16 elements. Returned slice's `len()` MUST
+    /// be `bucket_elems`. Underlying memory MUST NOT be freed when the
+    /// slice is dropped.
+    fn alloc_u16(
+        &self,
+        device: &Arc<CudaDevice>,
+        bucket_elems: usize,
+    ) -> crate::Result<CudaSlice<u16>>;
+
+    /// Allocate `bucket_elems` f32 elements. Same contract as `alloc_u16`.
+    fn alloc_f32(
+        &self,
+        device: &Arc<CudaDevice>,
+        bucket_elems: usize,
+    ) -> crate::Result<CudaSlice<f32>>;
+}
+
+/// Install a miss-allocator. All subsequent `pool_alloc_*` cache MISSES
+/// route through this allocator instead of calling `device.alloc::<T>`.
+///
+/// Replaces any previously installed allocator. The previous allocator
+/// (if any) is returned so the caller can restore it.
+///
+/// **Lifecycle contract** — the caller is responsible for:
+/// 1. Calling [`clear_pool_cache`] BEFORE invalidating the backing
+///    memory of any slice this allocator handed out. The pool's free
+///    list may still hold ring-sourced entries; clearing the cache
+///    drops the (no-op-cudaFree) mirror handles.
+/// 2. Calling [`uninstall_miss_allocator`] when done; otherwise the
+///    pool keeps trying to allocate through an allocator whose
+///    backing storage may already be reset.
+pub fn install_miss_allocator(
+    allocator: Arc<dyn PoolMissAllocator>,
+) -> Option<Arc<dyn PoolMissAllocator>> {
+    let mut guard = global_pool().miss_alloc.lock().unwrap();
+    let prev = guard.take();
+    *guard = Some(allocator);
+    // Install the cudarc-pinctx Drop hook so direct `CudaSlice::drop` calls
+    // on ring-backed slices (which can leak out of `pool_alloc_*` through
+    // helpers that don't call `pool_return_*`) skip the `cudaFree`. Without
+    // this, dropping a slice whose ptr is an offset into a ring slab
+    // panics with `CUDA_ERROR_INVALID_VALUE`. The hook reads the pool's
+    // `external_ptrs` set, which is populated at pool_alloc time.
+    cudarc::driver::install_external_ptr_hook(external_ptr_hook);
+    prev
+}
+
+/// Hook installed into cudarc's `CudaSlice::drop` when a miss-allocator is
+/// active. Returns true if `ptr` belongs to an external (ring-owned)
+/// allocation and `cudaFree` must be skipped.
+fn external_ptr_hook(ptr: u64) -> bool {
+    // SAFETY against init order: `POOL` is `OnceLock`; if not yet
+    // initialized, no external allocations exist, so return false.
+    match POOL.get() {
+        Some(p) => p.is_external_ptr(ptr),
+        None => false,
+    }
+}
+
+/// Remove the installed miss-allocator (if any). The pool reverts to
+/// calling `device.alloc::<T>` on cache miss. Returns the previously
+/// installed allocator (if any) so the caller can decide whether to
+/// drop it.
+///
+/// You should normally call [`clear_pool_cache`] immediately before this
+/// to drain any free-list entries that point into the external
+/// allocator's memory.
+pub fn uninstall_miss_allocator() -> Option<Arc<dyn PoolMissAllocator>> {
+    let mut guard = global_pool().miss_alloc.lock().unwrap();
+    guard.take()
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +796,30 @@ pub fn pool_alloc_f32(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
         pool.misses.load(Ordering::Relaxed),
     );
 
+    // Phase 2a: if a miss-allocator is installed, route through it.
+    // Returns a slice whose backing memory is owned by the external
+    // allocator (e.g., a `ring_alloc::RingAllocator` slab). Drop on that
+    // slice MUST NOT call cudaFree — see `reconstruct_and_forget`.
+    if let Some(ext) = pool.miss_alloc.lock().ok().and_then(|g| g.as_ref().cloned()) {
+        match ext.alloc_f32(device, bucket) {
+            Ok(slice) => {
+                pool.external_misses.fetch_add(1, Ordering::Relaxed);
+                let (ptr, _, dev) = unsafe { decompose_slice(slice) };
+                // Register the pointer as external so the eventual pool_return
+                // tags its FreeEntry correctly.
+                pool.register_external_ptr(ptr);
+                // Hand back a slice with len = original request.
+                return Ok(unsafe { reconstruct_slice::<f32>(ptr, size, dev) });
+            }
+            Err(e) => {
+                log::warn!(
+                    "pool: external miss-allocator alloc_f32({bucket}) failed: {e:?} — falling back to device.alloc"
+                );
+                // Fall through to legacy path.
+            }
+        }
+    }
+
     let zero_init = f32_zero_init_enabled();
 
     let alloc_once = |dev: &Arc<CudaDevice>, n: usize| -> crate::Result<CudaSlice<f32>> {
@@ -606,7 +870,18 @@ pub fn pool_alloc_f32(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
 /// caller must not use it.
 pub fn pool_return_f32(slice: CudaSlice<f32>) {
     if pool_disabled() {
-        drop(slice); // normal cudaFree
+        // If the slice's pointer is external (slab-owned), do NOT cudaFree
+        // it. The slab Arc keeps it alive. This is the rare case where
+        // `pool_disabled()` flipped between alloc and return — under
+        // normal flow pool_disabled is constant for a run. Be defensive.
+        let ptr = *slice.device_ptr();
+        if global_pool().is_external_ptr(ptr) {
+            let len = DeviceSlice::len(&slice);
+            let (p, _, dev) = unsafe { decompose_slice(slice) };
+            unsafe { reconstruct_and_forget::<f32>(p, len, dev) };
+        } else {
+            drop(slice); // normal cudaFree
+        }
         return;
     }
 
@@ -621,11 +896,13 @@ pub fn pool_return_f32(slice: CudaSlice<f32>) {
     // the same input always yields the same bucket, so alloc and free see
     // matching keys.
     let bucket = round_elems_up::<f32>(elem_len);
+    let is_external = global_pool().is_external_ptr(ptr);
 
     global_pool().push_f32(FreeEntry {
         ptr,
         len: bucket,
         device,
+        is_external,
     });
 }
 
@@ -684,6 +961,24 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
         pool.misses.load(Ordering::Relaxed),
     );
 
+    // Phase 2a: if a miss-allocator is installed, route through it.
+    if let Some(ext) = pool.miss_alloc.lock().ok().and_then(|g| g.as_ref().cloned()) {
+        match ext.alloc_u16(device, bucket) {
+            Ok(slice) => {
+                pool.external_misses.fetch_add(1, Ordering::Relaxed);
+                let (ptr, _, dev) = unsafe { decompose_slice(slice) };
+                pool.register_external_ptr(ptr);
+                return Ok(unsafe { reconstruct_slice::<u16>(ptr, size, dev) });
+            }
+            Err(e) => {
+                log::warn!(
+                    "pool: external miss-allocator alloc_u16({bucket}) failed: {e:?} — falling back to device.alloc"
+                );
+                // Fall through.
+            }
+        }
+    }
+
     // Fresh allocation at the bucket size (uninitialized).
     let result = unsafe {
         device
@@ -713,7 +1008,16 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
 /// Return a `CudaSlice<u16>` to the caching pool.
 pub fn pool_return_u16(slice: CudaSlice<u16>) {
     if pool_disabled() {
-        drop(slice);
+        // Defensive: if the pool was disabled mid-run AND the slice came
+        // from an external miss-allocator, do NOT cudaFree it.
+        let ptr = *slice.device_ptr();
+        if global_pool().is_external_ptr(ptr) {
+            let len = DeviceSlice::len(&slice);
+            let (p, _, dev) = unsafe { decompose_slice(slice) };
+            unsafe { reconstruct_and_forget::<u16>(p, len, dev) };
+        } else {
+            drop(slice);
+        }
         return;
     }
 
@@ -725,11 +1029,13 @@ pub fn pool_return_u16(slice: CudaSlice<u16>) {
 
     let (ptr, elem_len, device) = unsafe { decompose_slice(slice) };
     let bucket = round_elems_up::<u16>(elem_len);
+    let is_external = global_pool().is_external_ptr(ptr);
 
     global_pool().push_u16(FreeEntry {
         ptr,
         len: bucket,
         device,
+        is_external,
     });
 }
 

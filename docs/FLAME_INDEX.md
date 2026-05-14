@@ -822,8 +822,39 @@ trainer gate. Full design in `docs/RING_ALLOC_DESIGN.md`.
 | `RingBackwardHandle::alloc(num_bytes)` | `ring_alloc/mod.rs:430` | Backward alloc. 16-byte pre-aligned. |
 | `RingForwardHandle::allocation_end / allocation_start` | `ring_alloc/mod.rs:418` | Read-through cursor accessors (handle is live, allocator is mutably borrowed). |
 | `RingBackwardHandle::allocation_end / allocation_start` | `ring_alloc/mod.rs:435` | Same. |
+| `RingAllocator::device()` | `ring_alloc/mod.rs:246` | Backing `Arc<CudaDevice>`. Phase 2a adapter helper. |
+| `RingAllocator::alloc_forward(num_bytes)` | `ring_alloc/mod.rs:252` | Handle-free forward alloc. Phase 2a adapter helper. |
+| `RingAllocator::alloc_backward(num_bytes)` | `ring_alloc/mod.rs:258` | Handle-free backward alloc. Phase 2a adapter helper. |
 
-Test: `flame-core/tests/ring_alloc_microbench.rs` (9 tests, GPU-real).
+Test: `flame-core/tests/ring_alloc_microbench.rs` (19 tests, GPU-real).
+
+### `ring_alloc/pool_adapter.rs` — pool miss-route backend (Gap 1 Phase 2a)
+
+Adapter exposing a `RingAllocator` through `cuda_alloc_pool::PoolMissAllocator`.
+Wraps the ring in a `Mutex` for `Sync`; routes cache-miss allocations from
+`pool_alloc_u16` / `pool_alloc_f32` into the ring's forward direction.
+Returned slices are transmuted views into ring slabs; the pool tags
+free-list entries as `is_external: true` so neither `clear_cache` nor
+`pool_return_*` calls `cudaFree` on them.
+
+| Symbol | File:line | Notes |
+|---|---|---|
+| `RingPoolAdapter` | `ring_alloc/pool_adapter.rs:99` | The adapter type. `Send + Sync`. |
+| `RingPoolAdapter::new(ring)` | `ring_alloc/pool_adapter.rs:108` | Wrap a `RingAllocator`. |
+| `RingPoolAdapter::reset()` | `ring_alloc/pool_adapter.rs:125` | Reset wrapped ring cursors. Call AFTER `clear_pool_cache`. |
+| `RingPoolAdapter::slabs_allocated() / cuda_malloc_count() / num_slabs() / slab_bytes()` | `ring_alloc/pool_adapter.rs:133` | Inspection accessors. |
+| `impl PoolMissAllocator for RingPoolAdapter` | `ring_alloc/pool_adapter.rs:151` | `alloc_u16` / `alloc_f32` route through ring forward direction. |
+
+Test: `flame-core/tests/ring_pool_adapter_smoke.rs` (3 tests, GPU-real).
+
+### `cuda_alloc_pool` — Phase 2a additions
+
+| Symbol | File:line | Notes |
+|---|---|---|
+| `PoolMissAllocator` (trait) | `cuda_alloc_pool.rs:639` | Pluggable cache-miss backend trait. `alloc_u16` / `alloc_f32`. |
+| `install_miss_allocator(allocator)` | `cuda_alloc_pool.rs:671` | Install. Returns previously installed (if any). |
+| `uninstall_miss_allocator()` | `cuda_alloc_pool.rs:692` | Remove. Returns last installed (if any). |
+| `CudaAllocPool::external_miss_count()` | `cuda_alloc_pool.rs:217` | Lock-free count of cache-misses served by external allocator. Diagnostic. |
 
 ---
 

@@ -588,15 +588,37 @@ forced `FLAME_ALLOC_POOL=0` on Klein 9B (see
 `HANDOFF_2026-05-14_TRAINER_REGRESSION_FAILURE.md` and
 `docs/OFFLOAD_GAPS_vs_ONETRAINER.md` Gap 1).
 
-Phase 1 (this commit) ships the primitive + 9-test microbench
+Phase 1 (2026-05-14) ships the primitive + 19-test microbench
 (`tests/ring_alloc_microbench.rs`). No consumer wiring; no trainer
-gate. Phase 2 is the Klein migration; design in
+gate. Phase 2a (2026-05-14) ships `pool_adapter.rs` — opt-in
+`PoolMissAllocator` trait + `RingPoolAdapter` — which routes
+`cuda_alloc_pool` cache-miss allocations through a shared ring. Klein
+trainer-side opt-in (env `KLEIN_POOL_RING=1`) tests the hypothesis that
+ring-backed misses fix the Klein 9B step-2 `INVALID_VALUE` crash
+without the `FLAME_ALLOC_POOL=0` workaround. Design and lifecycle in
 `docs/RING_ALLOC_DESIGN.md`.
 
 Direction is enforced at the type level via `RingForwardHandle` /
 `RingBackwardHandle` (no bool flag). Handles borrow the allocator
 mutably; the type system prevents simultaneous forward + backward
 allocation on the same ring.
+
+### `ring_alloc/pool_adapter.rs` — pool miss-route backend (Gap 1 Phase 2a)
+
+`RingPoolAdapter` wraps a `RingAllocator` in a `Mutex` (`Send + Sync`)
+and implements `cuda_alloc_pool::PoolMissAllocator`. When installed via
+`cuda_alloc_pool::install_miss_allocator`, all cache-MISS allocations
+of `pool_alloc_u16` / `pool_alloc_f32` flow through the ring's forward
+direction; cache HITS still serve from the bucket free lists. The
+adapter synthesizes a `CudaSlice<T>` view onto a ring slab via the
+`CudaSliceMirror` transmute pattern; the pool tags free-list entries
+as `is_external: true` so `clear_cache` / pool drop skip `cudaFree`
+on those entries.
+
+Lifecycle: every training step boundary should call
+`cuda_alloc_pool::clear_pool_cache()` then `adapter.reset()` — in that
+order — to drain bucket entries pointing into ring slabs before
+cursors return to extremes.
 
 ---
 

@@ -1244,6 +1244,51 @@ FlameSwap is deleted. All block offloading uses `BlockOffloader` with
   "cursor walks linearly" invariant that makes overlap structurally
   impossible.
 
+### Ring allocator as pool backend (`flame_core::ring_alloc::pool_adapter`, Gap 1 Phase 2a, 2026-05-14)
+
+Opt-in routing of `cuda_alloc_pool` cache-MISSES through a
+`RingAllocator` via the `PoolMissAllocator` trait. Conventions when
+using this surface:
+
+- **Install once at trainer init, BEFORE the first `pool_alloc_*` call.**
+  Construct `RingAllocator::new(device, num_slabs, slab_bytes)`, wrap in
+  `Arc::new(RingPoolAdapter::new(ring))`, then call
+  `cuda_alloc_pool::install_miss_allocator(adapter.clone())`. Hold a
+  long-lived `Arc<RingPoolAdapter>` for per-step `reset()` calls.
+- **Per-step lifecycle is `clear_pool_cache()` THEN `adapter.reset()`,
+  in that order.** Place the pair immediately after
+  `AutogradContext::clear()` at the step boundary.
+  - `clear_pool_cache` drains every bucket free-list entry. Entries
+    pointing into ring slabs (`is_external: true`) are reconstructed-
+    and-`mem::forget`-ed (no `cudaFree`); the slab `Arc` keeps memory
+    alive across the reset.
+  - `adapter.reset()` then snaps the ring cursors back to extremes.
+  - Reversing the order is undefined: `reset()`-before-clear leaves
+    bucket entries pointing at bytes the next forward allocation will
+    re-issue.
+- **Cross-step tensors MUST NOT pass through `pool_alloc_*` while a ring
+  is installed.** Parameters, optimizer state, EMA weights live across
+  steps; if they were ring-backed, `reset()` would re-issue their
+  bytes. The pool's hot-path callers all allocate transient step-scope
+  tensors — verify by grepping for `pool_alloc_*` in the trainer init
+  path and ensuring it doesn't fire there.
+- **The opt-in is process-global.** `install_miss_allocator` returns
+  any previously installed allocator. Production usage = one allocator
+  per trainer process. Multi-trainer tests must install/uninstall
+  around test boundaries.
+- **Failure mode is self-documenting.** If the ring exhausts mid-step
+  (working set > `num_slabs * slab_bytes`), the allocator returns
+  `Error::OutOfMemory("RingAllocator exhausted...")` which propagates
+  out of `pool_alloc_*`. Bump ring size by env or commit constant.
+- **Cache-HIT path is unchanged.** Only cache-MISS routes through the
+  ring. Steady-state allocations are mostly hits; the ring sees
+  per-step new-shape allocations and once they're returned to the
+  pool the bucket free list serves the next request.
+- **No autograd-direction propagation in 2a.** All ring routes go
+  `alloc_forward`. The bidirectional invariant from Phase 1 is unused
+  here. Phase 2b can wire `AutogradContext::is_backward()` into the
+  adapter for direction-typed allocs.
+
 ---
 
 ## Quick "where do I X" reference

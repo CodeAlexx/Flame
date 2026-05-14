@@ -40,11 +40,17 @@ Plus three control knobs:
 
 ## Gap-by-gap (ranked by value for "medium models that almost fit")
 
-### Gap 1 — **No ring buffer allocator** (HIGH)
+### Gap 1 — **No ring buffer allocator** (Phase 1 + 2a SHIPPED 2026-05-14, full closure pending 5-step smoke + 30-step gate)
+
+**Phase 1 SHIPPED 2026-05-14**: `flame_core::ring_alloc` — bidirectional ring allocator with direction-typed handles. 19 tests pass. No consumer wiring.
+
+**Phase 2a SHIPPED 2026-05-14**: `flame_core::ring_alloc::pool_adapter` + `cuda_alloc_pool::PoolMissAllocator` trait. Opt-in routing of `cuda_alloc_pool` cache-MISS allocations through a shared ring (`KLEIN_POOL_RING=1` on the Klein trainer). 3 GPU smoke tests. Klein 5-step trainer smoke gate pending.
+
+**Phase 2b pending**: Klein 9B 30-step run, removal of `FLAME_ALLOC_POOL=0` auto-disable, loss-curve and steady-state s/step gate.
 
 **OT mechanism**: `StaticLayerAllocator` pre-allocates `num_cache_tensors` slab tensors of `cache_tensor_size` each (heuristic: `max(target/N, max_tensor_bytes×2, ≥10% headroom)`, capped at 10 slabs). Each layer requests a sub-allocation via `StaticLayerTensorAllocator`. Allocations move `allocation_end` forward (forward pass) or `allocation_start` backward (backward pass). When the cursor crosses a slab boundary, jumps to the next slab; wraps cyclically. Bidirectional → forward and backward never fragment.
 
-**flame-core today**: `cuda_alloc_pool.rs` is a power-of-2 bucketed free list (PyTorch CUDACachingAllocator clone). It corrupts under BlockOffloader+checkpoint replay on Klein 9B — had to disable with `FLAME_ALLOC_POOL=0` this session (`EDv2@4511140`). Adopting a ring-buffer-on-slabs shape would (a) fix the corruption root-cause and (b) match OT's bidirectional access pattern.
+**flame-core today**: `cuda_alloc_pool.rs` is a power-of-2 bucketed free list (PyTorch CUDACachingAllocator clone). It corrupts under BlockOffloader+checkpoint replay on Klein 9B — had to disable with `FLAME_ALLOC_POOL=0` this session (`EDv2@4511140`). Phase 2a routes cache MISSES through `flame_core::ring_alloc::RingAllocator` via the `PoolMissAllocator` trait while preserving the pool's bucket-cache hit path. Bidirectional invariant currently unused (all routes are forward-only); Phase 2b polish wires autograd direction.
 
 **Where the fix lives**: `flame_core::cuda_alloc_pool` (replace) or new `flame_core::ring_alloc` (parallel). API surface unchanged: `pool_alloc_f32` / `pool_return_f32` callers don't move. Internals: slab-list with `allocation_start` / `allocation_end` cursors, bidirectional advance.
 

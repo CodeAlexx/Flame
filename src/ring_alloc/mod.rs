@@ -32,6 +32,9 @@
 //! Phase 1 ships the primitive + a microbench. Phase 2 wires Klein and
 //! drops the `FLAME_ALLOC_POOL=0` workaround.
 
+pub mod pool_adapter;
+pub use pool_adapter::RingPoolAdapter;
+
 use std::sync::Arc;
 
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
@@ -244,6 +247,28 @@ impl RingAllocator {
     #[inline]
     pub fn cuda_malloc_count(&self) -> u64 {
         self.cuda_malloc_count
+    }
+
+    /// Backing `CudaDevice`. Useful for wrapping a `RingAllocator` in a
+    /// `PoolMissAllocator` adapter where the alloc surfaces need the
+    /// device handle anyway.
+    #[inline]
+    pub fn device(&self) -> &Arc<cudarc::driver::CudaDevice> {
+        &self.device
+    }
+
+    /// Allocate `num_bytes` bytes forward without a handle. Convenience
+    /// for adapters (e.g. `PoolMissAllocator`) that don't carry a
+    /// `RingForwardHandle`. Semantics identical to
+    /// `forward_handle(0).alloc(num_bytes)`.
+    pub fn alloc_forward(&mut self, num_bytes: usize) -> Result<RingPtr> {
+        self.alloc_forward_impl(num_bytes)
+    }
+
+    /// Allocate `num_bytes` bytes backward without a handle. Convenience
+    /// for adapters; see `alloc_forward`.
+    pub fn alloc_backward(&mut self, num_bytes: usize) -> Result<RingPtr> {
+        self.alloc_backward_impl(num_bytes)
     }
 
     /// Reset cursors. Forward starts at byte 0, backward at `total_bytes`.
