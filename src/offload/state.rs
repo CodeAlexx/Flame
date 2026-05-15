@@ -36,9 +36,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::transfer_benchmark::{
-    TransferBandwidthProfile, TransferDirection, TransferMeasurement,
-};
+use super::transfer_benchmark::{TransferBandwidthProfile, TransferDirection, TransferMeasurement};
 
 /// Filename the manager writes the profile cache under by default.
 pub const DEFAULT_PROFILE_FILENAME: &str = "offload_profile.json";
@@ -282,8 +280,13 @@ mod tests {
         // Predictions across a sweep must match within 1% (we measure
         // them through the same log-log interpolator, so they should be
         // bit-identical, modulo float round-trip).
-        for &bytes in &[1024usize, 64 * 1024, 1 << 20, 4 * 1024 * 1024, 16 * 1024 * 1024]
-        {
+        for &bytes in &[
+            1024usize,
+            64 * 1024,
+            1 << 20,
+            4 * 1024 * 1024,
+            16 * 1024 * 1024,
+        ] {
             let a = profile.predict_h2d(bytes);
             let b = loaded.predict_h2d(bytes);
             let rel = relative_error(a, b);

@@ -209,10 +209,7 @@ pub struct Telemetry {
 
 impl Telemetry {
     fn new() -> Self {
-        let initial = match std::env::var("FLAME_OFFLOAD_TELEMETRY")
-            .ok()
-            .as_deref()
-        {
+        let initial = match std::env::var("FLAME_OFFLOAD_TELEMETRY").ok().as_deref() {
             Some("off") | Some("0") | None => 0usize,
             Some("trace") => 2usize,
             // Any other non-empty value enables counters but not trace.
@@ -345,13 +342,9 @@ impl Telemetry {
             await_hits: self.await_hits.load(Ordering::Acquire),
             await_misses: self.await_misses.load(Ordering::Acquire),
             prefetch_issued: self.prefetch_issued.load(Ordering::Acquire),
-            prefetch_already_resident: self
-                .prefetch_already_resident
-                .load(Ordering::Acquire),
+            prefetch_already_resident: self.prefetch_already_resident.load(Ordering::Acquire),
             strategy_plans: self.strategy_plans.load(Ordering::Acquire),
-            strategy_eviction_decisions: self
-                .strategy_eviction_decisions
-                .load(Ordering::Acquire),
+            strategy_eviction_decisions: self.strategy_eviction_decisions.load(Ordering::Acquire),
             strategy_keep_total: self.strategy_keep_total.load(Ordering::Acquire),
             strategy_last_target_resident_bytes: self
                 .strategy_last_target_resident_bytes
@@ -632,9 +625,8 @@ fn write_json_atomic<P: AsRef<Path>, T: Serialize>(path: P, value: &T) -> std::i
     let tmp = path.with_extension("tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;
-        let json = serde_json::to_vec_pretty(value).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("serde: {e}"))
-        })?;
+        let json = serde_json::to_vec_pretty(value)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("serde: {e}")))?;
         f.write_all(&json)?;
         f.sync_all()?;
     }

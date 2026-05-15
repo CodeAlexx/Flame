@@ -256,7 +256,13 @@ fn trap_record(ptr: u64, state: PtrState, op: &'static str, bucket: usize) {
         if entry.events.len() == TRAP_HISTORY_LEN {
             entry.events.remove(0);
         }
-        entry.events.push(PtrEvent { seq, state, op, bucket, bt });
+        entry.events.push(PtrEvent {
+            seq,
+            state,
+            op,
+            bucket,
+            bt,
+        });
     }
 }
 
@@ -313,7 +319,12 @@ pub fn trap_record_external_range(ptr: u64, elems: usize, call_site: &'static st
 /// Record a BF16 allocation as live. Used by allocator paths that do not pass
 /// through the BF16 free-list checkout path (direct cudart alloc, external miss
 /// allocators, and the static slab).
-pub(crate) fn trap_record_bf16_live(ptr: u64, elems: usize, call_site: &'static str, bucket: usize) {
+pub(crate) fn trap_record_bf16_live(
+    ptr: u64,
+    elems: usize,
+    call_site: &'static str,
+    bucket: usize,
+) {
     trap_record_range(ptr, PtrState::Live, call_site, bucket, elems);
 }
 
@@ -350,7 +361,10 @@ pub fn trap_validate_bf16_ptr(ptr: u64, call_site: &str) {
                 let event_count = hist.event_count;
                 let events = hist.events.clone();
                 drop(h);
-                eprintln!("[BF16-POOL TRAP] ====== FORENSIC HISTORY (last {} events) ======", events.len());
+                eprintln!(
+                    "[BF16-POOL TRAP] ====== FORENSIC HISTORY (last {} events) ======",
+                    events.len()
+                );
                 for (i, ev) in events.iter().enumerate() {
                     eprintln!(
                         "[BF16-POOL TRAP] [{}] seq={} state={:?} op={} bucket={}",
@@ -546,8 +560,7 @@ impl CudaAllocPool {
     /// with non-zero refcount (any device).
     #[inline]
     pub fn is_external_ptr(&self, ptr: u64) -> bool {
-        crate::external_memory::ExternalMemoryRegistry::global()
-            .should_skip_free_any_device(ptr)
+        crate::external_memory::ExternalMemoryRegistry::global().should_skip_free_any_device(ptr)
     }
 
     /// Register `ptr` as external. Public so direct external-allocator
@@ -587,8 +600,7 @@ impl CudaAllocPool {
     /// **R1a:** delegates to
     /// [`crate::external_memory::ExternalMemoryRegistry::unregister_exact`].
     pub fn unregister_external_ptr(&self, ptr: u64) {
-        let _ = crate::external_memory::ExternalMemoryRegistry::global()
-            .unregister_exact(ptr);
+        let _ = crate::external_memory::ExternalMemoryRegistry::global().unregister_exact(ptr);
     }
 
     /// Inspection: total number of external ptr entries currently tracked
@@ -985,20 +997,18 @@ impl CudaAllocPool {
                     "[pool.clear_cache] #{total_entries} ptr=0x{ptr:x} bucket={} u16={} tagged_ext={} hook_ext={}",
                     len, key.is_u16, tagged_external, hook_says_external,
                 );
-                let do_drop = move || {
-                    unsafe {
-                        if tagged_external {
-                            if key.is_u16 {
-                                reconstruct_and_forget::<u16>(ptr, len, entry.device);
-                            } else {
-                                reconstruct_and_forget::<f32>(ptr, len, entry.device);
-                            }
+                let do_drop = move || unsafe {
+                    if tagged_external {
+                        if key.is_u16 {
+                            reconstruct_and_forget::<u16>(ptr, len, entry.device);
                         } else {
-                            if key.is_u16 {
-                                reconstruct_and_drop::<u16>(ptr, len, entry.device);
-                            } else {
-                                reconstruct_and_drop::<f32>(ptr, len, entry.device);
-                            }
+                            reconstruct_and_forget::<f32>(ptr, len, entry.device);
+                        }
+                    } else {
+                        if key.is_u16 {
+                            reconstruct_and_drop::<u16>(ptr, len, entry.device);
+                        } else {
+                            reconstruct_and_drop::<f32>(ptr, len, entry.device);
                         }
                     }
                 };
@@ -1012,9 +1022,7 @@ impl CudaAllocPool {
                 }
             }
         }
-        eprintln!(
-            "[pool.clear_cache] done: entries={total_entries} failed={total_fail}",
-        );
+        eprintln!("[pool.clear_cache] done: entries={total_entries} failed={total_fail}",);
     }
 }
 
@@ -1325,7 +1333,12 @@ pub fn pool_alloc_f32(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
     // Returns a slice whose backing memory is owned by the external
     // allocator (e.g., a `ring_alloc::RingAllocator` slab). Drop on that
     // slice MUST NOT call cudaFree — see `reconstruct_and_forget`.
-    if let Some(ext) = pool.miss_alloc.lock().ok().and_then(|g| g.as_ref().cloned()) {
+    if let Some(ext) = pool
+        .miss_alloc
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().cloned())
+    {
         match ext.alloc_f32(device, bucket) {
             Ok(slice) => {
                 pool.external_misses.fetch_add(1, Ordering::Relaxed);
@@ -1478,7 +1491,14 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
         let slice = unsafe { device.alloc::<u16>(size) }
             .map_err(|e| crate::Error::CudaDriver(format!("alloc::<u16>({size}): {e:?}")))?;
         let ptr = *DevicePtr::device_ptr(&slice);
-        trace_bf16("alloc_direct", ptr, size, size, false, "pool_alloc_u16/direct");
+        trace_bf16(
+            "alloc_direct",
+            ptr,
+            size,
+            size,
+            false,
+            "pool_alloc_u16/direct",
+        );
         trap_record_bf16_live(ptr, size, "pool_alloc_u16/direct", size);
         return Ok(slice);
     }
@@ -1495,7 +1515,14 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
         if bucket != size {
             pool.bucket_saves.fetch_add(1, Ordering::Relaxed);
         }
-        trace_bf16("alloc_hit", entry.ptr, bucket, size, entry.is_external, "pool_alloc_u16");
+        trace_bf16(
+            "alloc_hit",
+            entry.ptr,
+            bucket,
+            size,
+            entry.is_external,
+            "pool_alloc_u16",
+        );
         trap_record_bf16_live(entry.ptr, size, "pool_alloc_u16/hit", bucket);
         // Reconstruct with len = requested size, not bucket (see f32 path).
         let slice = unsafe { reconstruct_slice::<u16>(entry.ptr, size, entry.device) };
@@ -1520,7 +1547,12 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
     );
 
     // Phase 2a: if a miss-allocator is installed, route through it.
-    if let Some(ext) = pool.miss_alloc.lock().ok().and_then(|g| g.as_ref().cloned()) {
+    if let Some(ext) = pool
+        .miss_alloc
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().cloned())
+    {
         match ext.alloc_u16(device, bucket) {
             Ok(slice) => {
                 pool.external_misses.fetch_add(1, Ordering::Relaxed);
@@ -1556,22 +1588,36 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
     let allocated = result.or_else(|_| {
         pool.clear_cache();
         unsafe {
-            device
-                .alloc::<u16>(bucket)
-                .map_err(|e| crate::Error::CudaDriver(format!(
+            device.alloc::<u16>(bucket).map_err(|e| {
+                crate::Error::CudaDriver(format!(
                     "alloc::<u16>({bucket}) after pool.clear_cache: {e:?}"
-                )))
+                ))
+            })
         }
     })?;
 
     if bucket == size {
         let ptr = *DevicePtr::device_ptr(&allocated);
-        trace_bf16("alloc_miss", ptr, bucket, size, false, "pool_alloc_u16/fresh");
+        trace_bf16(
+            "alloc_miss",
+            ptr,
+            bucket,
+            size,
+            false,
+            "pool_alloc_u16/fresh",
+        );
         trap_record_bf16_live(ptr, size, "pool_alloc_u16/miss", bucket);
         Ok(allocated)
     } else {
         let (ptr, _, dev) = unsafe { decompose_slice(allocated) };
-        trace_bf16("alloc_miss", ptr, bucket, size, false, "pool_alloc_u16/fresh-shrunk");
+        trace_bf16(
+            "alloc_miss",
+            ptr,
+            bucket,
+            size,
+            false,
+            "pool_alloc_u16/fresh-shrunk",
+        );
         trap_record_bf16_live(ptr, size, "pool_alloc_u16/miss-shrunk", bucket);
         Ok(unsafe { reconstruct_slice::<u16>(ptr, size, dev) })
     }
@@ -1581,7 +1627,14 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
 pub fn pool_return_u16(slice: CudaSlice<u16>) {
     let trace_ptr = *slice.device_ptr();
     let trace_len = DeviceSlice::len(&slice);
-    trace_bf16("return_enter", trace_ptr, 0, trace_len, false, "pool_return_u16");
+    trace_bf16(
+        "return_enter",
+        trace_ptr,
+        0,
+        trace_len,
+        false,
+        "pool_return_u16",
+    );
     // 2026-05-15: symmetric BF16 opt-out — when pool is disabled OR BF16
     // caching is opt-out (default), drop directly. Mirrors `pool_alloc_u16`
     // / `pool_return_f32` opt-outs.
@@ -1609,8 +1662,21 @@ pub fn pool_return_u16(slice: CudaSlice<u16>) {
     let (ptr, elem_len, device) = unsafe { decompose_slice(slice) };
     let bucket = round_elems_up::<u16>(elem_len);
     let is_external = global_pool().is_external_ptr(ptr);
-    trace_bf16("return_push", ptr, bucket, elem_len, is_external, "pool_return_u16/push");
-    trap_record_range(ptr, PtrState::InCache, "pool_return_u16/push", bucket, elem_len);
+    trace_bf16(
+        "return_push",
+        ptr,
+        bucket,
+        elem_len,
+        is_external,
+        "pool_return_u16/push",
+    );
+    trap_record_range(
+        ptr,
+        PtrState::InCache,
+        "pool_return_u16/push",
+        bucket,
+        elem_len,
+    );
 
     global_pool().push_u16(FreeEntry {
         ptr,
@@ -1731,8 +1797,14 @@ mod tests {
         assert_eq!(round_bytes_up(9 * 1024 * 1024), 10 * 1024 * 1024);
 
         // Large: >= 10 MiB rounds to 2 MiB.
-        assert_eq!(round_bytes_up(K_MIN_LARGE_ALLOC_BYTES), K_MIN_LARGE_ALLOC_BYTES);
-        assert_eq!(round_bytes_up(K_MIN_LARGE_ALLOC_BYTES + 1), K_MIN_LARGE_ALLOC_BYTES + K_ROUND_LARGE_BYTES);
+        assert_eq!(
+            round_bytes_up(K_MIN_LARGE_ALLOC_BYTES),
+            K_MIN_LARGE_ALLOC_BYTES
+        );
+        assert_eq!(
+            round_bytes_up(K_MIN_LARGE_ALLOC_BYTES + 1),
+            K_MIN_LARGE_ALLOC_BYTES + K_ROUND_LARGE_BYTES
+        );
     }
 
     #[test]

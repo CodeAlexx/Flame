@@ -63,9 +63,7 @@ use cudarc::driver::CudaDevice;
 
 use super::strategy::{Adaptive, Strategy, TwoSlot};
 use super::telemetry;
-use super::transfer_benchmark::{
-    self, BenchmarkConfig, TransferBandwidthProfile,
-};
+use super::transfer_benchmark::{self, BenchmarkConfig, TransferBandwidthProfile};
 use super::{state, BlockFacilitator, BlockOffloader};
 
 // ───────────────────────────────────────────────────────────────────────
@@ -431,12 +429,7 @@ impl OffloadManager {
     /// non-CUDA build, driver error) — preserves pre-Phase-3 behavior
     /// for callers in degraded environments.
     fn auto_select_strategy(&self) -> ForcedStrategy {
-        let max_block_bytes = self
-            .block_sizes
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0) as u64;
+        let max_block_bytes = self.block_sizes.iter().copied().max().unwrap_or(0) as u64;
 
         // No blocks (e.g. an empty model) → strategy is moot, default
         // to TwoSlot (cheapest). Bit-identical to no strategy.
@@ -444,16 +437,13 @@ impl OffloadManager {
             return ForcedStrategy::TwoSlot;
         }
 
-        let (free_bytes, _total_bytes) =
-            match crate::cuda::utils::cuda_mem_get_info() {
-                Ok(t) => (t.0 as u64, t.1 as u64),
-                Err(_e) => {
-                    log::warn!(
-                        "[offload-manager] cuda_mem_get_info failed — defaulting to TwoSlot"
-                    );
-                    return ForcedStrategy::TwoSlot;
-                }
-            };
+        let (free_bytes, _total_bytes) = match crate::cuda::utils::cuda_mem_get_info() {
+            Ok(t) => (t.0 as u64, t.1 as u64),
+            Err(_e) => {
+                log::warn!("[offload-manager] cuda_mem_get_info failed — defaulting to TwoSlot");
+                return ForcedStrategy::TwoSlot;
+            }
+        };
         let effective_free = free_bytes.saturating_sub(self.config.vram_headroom_bytes);
 
         // Decision: if the two largest slots' static footprint fits

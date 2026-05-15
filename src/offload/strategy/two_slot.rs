@@ -50,10 +50,7 @@ impl Strategy for TwoSlot {
         // the 2-slot offloader this is the unique resident block that
         // is *not* the most recently accessed one. We fall back to
         // "the first resident" when history is empty.
-        let last_accessed = state
-            .access_history
-            .front()
-            .map(|&b| b as usize);
+        let last_accessed = state.access_history.front().map(|&b| b as usize);
         let mut evict: Vec<usize> = Vec::new();
         for &b in resident {
             if Some(b) != last_accessed {

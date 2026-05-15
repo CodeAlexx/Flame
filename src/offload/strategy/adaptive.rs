@@ -113,17 +113,11 @@ impl Default for Adaptive {
 
 impl Strategy for Adaptive {
     fn plan(&mut self, state: &OffloaderState) -> ResidentPlan {
-        let total_block_bytes: u64 = state
-            .block_sizes
-            .iter()
-            .map(|&s| s as u64)
-            .sum::<u64>();
+        let total_block_bytes: u64 = state.block_sizes.iter().map(|&s| s as u64).sum::<u64>();
 
         // Decide a target budget.
         let target = if state.hints.vram_authoritative && state.total_vram_bytes > 0 {
-            let used = state
-                .total_vram_bytes
-                .saturating_sub(state.free_vram_bytes);
+            let used = state.total_vram_bytes.saturating_sub(state.free_vram_bytes);
             let pressure = used as f64 / state.total_vram_bytes as f64;
             self.last_pressure = pressure;
 

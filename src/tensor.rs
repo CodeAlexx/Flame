@@ -431,7 +431,6 @@ extern "C" __global__ void masked_fill_kernel(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         })
     }
 
@@ -477,7 +476,6 @@ extern "C" __global__ void masked_fill_kernel(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         })
     }
 
@@ -509,7 +507,6 @@ extern "C" __global__ void masked_fill_kernel(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         })
     }
 
@@ -609,10 +606,7 @@ extern "C" __global__ void masked_fill_kernel(
                         lhs: self.id,
                         rhs: other.id,
                     },
-                    vec![
-                        (self.id, self.clone()),
-                        (other.id, other.clone()),
-                    ],
+                    vec![(self.id, self.clone()), (other.id, other.clone())],
                 );
             }
         }
@@ -632,10 +626,7 @@ extern "C" __global__ void masked_fill_kernel(
                         lhs: self.id,
                         rhs: other.id,
                     },
-                    vec![
-                        (self.id, self.clone()),
-                        (other.id, other.clone()),
-                    ],
+                    vec![(self.id, self.clone()), (other.id, other.clone())],
                 );
             }
         }
@@ -1101,7 +1092,6 @@ extern "C" __global__ void masked_fill_kernel(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
         if self.requires_grad && AutogradContext::is_recording() {
             // Record autograd Cast op so gradients flow across dtype boundaries
@@ -1142,10 +1132,7 @@ extern "C" __global__ void masked_fill_kernel(
                     indices: ids.id,
                     dim: 0,
                 },
-                vec![
-                    (self.id, self.clone()),
-                    (ids.id, ids.clone()),
-                ],
+                vec![(self.id, self.clone()), (ids.id, ids.clone())],
             );
             Ok(tracked)
         } else {
@@ -1213,7 +1200,6 @@ extern "C" __global__ void masked_fill_kernel(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         })
     }
 
@@ -1303,7 +1289,6 @@ extern "C" __global__ void masked_fill_kernel(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         })
     }
 
@@ -1333,7 +1318,6 @@ extern "C" __global__ void masked_fill_kernel(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         })
     }
 
@@ -1365,7 +1349,6 @@ extern "C" __global__ void masked_fill_kernel(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         })
     }
 
@@ -1411,7 +1394,6 @@ extern "C" __global__ void masked_fill_kernel(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         }
     }
 
@@ -1428,11 +1410,7 @@ extern "C" __global__ void masked_fill_kernel(
     /// - `ptr` must be a valid device pointer to `numel` BF16 elements.
     /// - The backing buffer must outlive this tensor.
     #[cfg(feature = "bf16_u16")]
-    pub unsafe fn view_from_buffer(
-        ptr: *mut u16,
-        shape: Shape,
-        device: Arc<CudaDevice>,
-    ) -> Self {
+    pub unsafe fn view_from_buffer(ptr: *mut u16, shape: Shape, device: Arc<CudaDevice>) -> Self {
         let numel = shape.elem_count();
         Tensor {
             storage: TensorStorage::BF16View {
@@ -1447,7 +1425,6 @@ extern "C" __global__ void masked_fill_kernel(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         }
     }
 
@@ -1535,7 +1512,6 @@ extern "C" __global__ void masked_fill_kernel(
                 view_offset: 0,
                 #[cfg(feature = "autograd_v2")]
                 autograd_meta: None,
-
             })
         }
         #[cfg(feature = "bf16_u16")]
@@ -1557,7 +1533,6 @@ extern "C" __global__ void masked_fill_kernel(
                 view_offset: 0,
                 #[cfg(feature = "autograd_v2")]
                 autograd_meta: None,
-
             })
         }
     }
@@ -1744,7 +1719,10 @@ extern "C" __global__ void masked_fill_kernel(
                         lhs: lhs_for_grad.id,
                         rhs: rhs_for_grad.id,
                     },
-                    vec![(lhs_for_grad.id, lhs_for_grad), (rhs_for_grad.id, rhs_for_grad)],
+                    vec![
+                        (lhs_for_grad.id, lhs_for_grad),
+                        (rhs_for_grad.id, rhs_for_grad),
+                    ],
                 );
             }
         }
@@ -1852,10 +1830,7 @@ extern "C" __global__ void masked_fill_kernel(
                         lhs: self.id,
                         rhs: other.id,
                     },
-                    vec![
-                        (self.id, self.clone()),
-                        (other.id, other.clone()),
-                    ],
+                    vec![(self.id, self.clone()), (other.id, other.clone())],
                 );
             }
         }
@@ -1913,10 +1888,7 @@ extern "C" __global__ void masked_fill_kernel(
                         lhs: self.id,
                         rhs: other.id,
                     },
-                    vec![
-                        (self.id, self.clone()),
-                        (other.id, other.clone()),
-                    ],
+                    vec![(self.id, self.clone()), (other.id, other.clone())],
                 );
             }
         }
@@ -2094,7 +2066,6 @@ extern "C" __global__ void slice_kernel(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         })
     }
 
@@ -2644,9 +2615,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         // against `self`, so gradient flow is unchanged.
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
         {
-            if matches!(self.dtype(), DType::BF16)
-                && !crate::env_flags::bf16_reduce_legacy()
-            {
+            if matches!(self.dtype(), DType::BF16) && !crate::env_flags::bf16_reduce_legacy() {
                 let mut out = crate::bf16_reduce::mean_bf16(self)?;
                 if self.requires_grad {
                     out.requires_grad = true;
@@ -2888,7 +2857,6 @@ extern "C" __global__ void f32_to_bool_kernel(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
         // Record autograd op so gradients flow through reshape
         if self.requires_grad && AutogradContext::is_recording() {
@@ -3235,11 +3203,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         }
         // Sort axes by descending stride: that recovers the original axis order.
         // (Row-major strides are strictly decreasing in original order.)
-        let mut by_stride: Vec<(usize, usize)> = view_strides
-            .iter()
-            .copied()
-            .enumerate()
-            .collect(); // (view_axis, stride)
+        let mut by_stride: Vec<(usize, usize)> = view_strides.iter().copied().enumerate().collect(); // (view_axis, stride)
         by_stride.sort_by(|a, b| b.1.cmp(&a.1));
         // `dims[i] = orig_axis at view_axis i`.
         // After sorting by stride desc, by_stride[j].0 is the view-axis whose
@@ -3450,8 +3414,8 @@ extern "C" __global__ void f32_to_bool_kernel(
             #[cfg(feature = "bf16_u16")]
             TensorStorage::BF16Arena { ptr, numel, .. } => {
                 use cudarc::driver::DevicePtrMut;
-                let mut new_data =
-                    unsafe { self.device.alloc::<u16>(*numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
+                let mut new_data = unsafe { self.device.alloc::<u16>(*numel) }
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 let stream = CudaStream::from_raw(self.device.cuda_stream_raw_ptr());
                 bf16_copy_async(
                     (*new_data.device_ptr_mut()) as *mut std::ffi::c_void,
@@ -3467,8 +3431,8 @@ extern "C" __global__ void f32_to_bool_kernel(
             #[cfg(feature = "bf16_u16")]
             TensorStorage::BF16View { ptr, numel } => {
                 use cudarc::driver::DevicePtrMut;
-                let mut new_data =
-                    unsafe { self.device.alloc::<u16>(*numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
+                let mut new_data = unsafe { self.device.alloc::<u16>(*numel) }
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 let stream = CudaStream::from_raw(self.device.cuda_stream_raw_ptr());
                 bf16_copy_async(
                     (*new_data.device_ptr_mut()) as *mut std::ffi::c_void,
@@ -3482,8 +3446,8 @@ extern "C" __global__ void f32_to_bool_kernel(
                 }
             }
             TensorStorage::I8 { data, numel } => {
-                let mut new_data =
-                    unsafe { self.device.alloc::<i8>(*numel) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
+                let mut new_data = unsafe { self.device.alloc::<i8>(*numel) }
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
                 self.device
                     .dtod_copy(slice_ref(data), &mut new_data)
                     .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
@@ -3524,7 +3488,6 @@ extern "C" __global__ void f32_to_bool_kernel(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         })
     }
 
@@ -3549,8 +3512,8 @@ extern "C" __global__ void f32_to_bool_kernel(
     /// so backward() stops here and accumulates `.grad`.
     pub fn detach_leaf(&self) -> Tensor {
         let mut t = self.clone(); // Arc bump, same storage, same shape
-        t.id = TensorId::new();   // Fresh ID — not in any tape
-        t.requires_grad = true;   // Track in the new local graph
+        t.id = TensorId::new(); // Fresh ID — not in any tape
+        t.requires_grad = true; // Track in the new local graph
         t
     }
 
@@ -3622,12 +3585,7 @@ extern "C" __global__ void f32_to_bool_kernel(
     /// inside the underlying storage; a debug-only bounds check is performed.
     /// No autograd op is recorded here — the higher-level op (narrow, chunk,
     /// etc.) is responsible for recording the appropriate backward op.
-    pub fn as_strided(
-        &self,
-        shape: &[usize],
-        strides: &[usize],
-        offset: usize,
-    ) -> Result<Tensor> {
+    pub fn as_strided(&self, shape: &[usize], strides: &[usize], offset: usize) -> Result<Tensor> {
         if shape.len() != strides.len() {
             return Err(Error::InvalidOperation(format!(
                 "as_strided: shape rank {} != strides rank {}",
@@ -3700,8 +3658,7 @@ extern "C" __global__ void f32_to_bool_kernel(
 
         let self_strides = self.strides();
         let new_shape: Vec<usize> = dims.iter().map(|&d| shape[d]).collect();
-        let new_strides: crate::shape::Strides =
-            dims.iter().map(|&d| self_strides[d]).collect();
+        let new_strides: crate::shape::Strides = dims.iter().map(|&d| self_strides[d]).collect();
 
         let mut output = if is_identity {
             self.clone()
@@ -3758,10 +3715,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         // catastrophically slow (175× PyTorch) and allocated 5× tensor memory.
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
         {
-            if !self.requires_grad
-                && self.dtype() == DType::BF16
-                && dim == shape.len() - 1
-            {
+            if !self.requires_grad && self.dtype() == DType::BF16 && dim == shape.len() - 1 {
                 let mut output = crate::bf16_elementwise::softmax_lastdim_bf16(self)?;
                 if output.dtype() != crate::config::default_dtype() {
                     output = output.to_dtype(crate::config::default_dtype())?;
@@ -4107,8 +4061,7 @@ extern "C" __global__ void f32_to_bool_kernel(
             if self.requires_grad {
                 out.requires_grad = true;
                 if AutogradContext::is_recording() {
-                    let mut ranges: Vec<(usize, usize)> =
-                        dims.iter().map(|&d| (0, d)).collect();
+                    let mut ranges: Vec<(usize, usize)> = dims.iter().map(|&d| (0, d)).collect();
                     ranges[dim] = (start, start + length);
                     AutogradContext::record_op(
                         out.id,
@@ -4212,8 +4165,7 @@ extern "C" __global__ void f32_to_bool_kernel(
         if self.requires_grad {
             out.requires_grad = true;
             if AutogradContext::is_recording() {
-                let mut ranges: Vec<(usize, usize)> =
-                    dims.iter().map(|&d| (0, d)).collect();
+                let mut ranges: Vec<(usize, usize)> = dims.iter().map(|&d| (0, d)).collect();
                 ranges[dim] = (start, start + length);
                 AutogradContext::record_op(
                     out.id,

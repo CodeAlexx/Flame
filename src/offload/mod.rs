@@ -59,10 +59,10 @@ use std::sync::Arc;
 
 use crate::offload::strategy::{AccessHints, OffloaderState, Strategy, ACCESS_HISTORY_CAP};
 
-use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, DevicePtr};
 use crate::{
     memcpy_async_host_to_device, DType, PinnedAllocFlags, PinnedHostBuffer, Shape, Tensor,
 };
+use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, DevicePtr};
 
 // ---------------------------------------------------------------------------
 // Phase 0 (block-offloader event safety): CUDA event helpers
@@ -97,6 +97,30 @@ extern "C" {
 /// `cudaEventCreateWithFlags(cudaEventDisableTiming)` — events used purely
 /// for ordering, not measurement, are cheaper without the timing buffer.
 const CUDA_EVENT_DISABLE_TIMING: u32 = 0x02;
+
+#[inline]
+fn align_16(n: usize) -> usize {
+    n + (16 - (n % 16)) % 16
+}
+
+// Mirror layout for cudarc 0.11.x `CudaSlice<T>`.
+// Must remain Rust-layout, not repr(C), to match cudarc's private type.
+struct CudaSliceMirror<T> {
+    cu_device_ptr: u64,
+    len: usize,
+    device: Arc<CudaDevice>,
+    host_buf: Option<std::pin::Pin<Vec<T>>>,
+}
+
+unsafe fn synth_cuda_slice<T>(ptr: u64, len: usize, device: Arc<CudaDevice>) -> CudaSlice<T> {
+    let mirror = CudaSliceMirror::<T> {
+        cu_device_ptr: ptr,
+        len,
+        device,
+        host_buf: None,
+    };
+    std::mem::transmute(mirror)
+}
 
 struct CudaEvent {
     raw: *mut c_void,
@@ -318,6 +342,84 @@ struct Fp8Pending {
     scale: f32,
 }
 
+/// Reusable device slab owned by one offload slot.
+///
+/// The widened OneTrainer-style resident set can reload hundreds of BF16
+/// tensors per step. Routing those through raw cudarc allocation paid a large
+/// host allocator tax. This slab keeps a slot's backing allocation mapped and
+/// hands out synthetic `CudaSlice<u16>` views for each tensor. The external
+/// range registry prevents those synthetic views from calling `cudaFree` when
+/// their `TensorStorage` drops; the slot reuses the bytes only after its CUDA
+/// compute/H2D events prove the previous tenant is finished.
+struct SlotBuffer {
+    data: CudaSlice<u8>,
+    capacity_bytes: usize,
+    offset_bytes: usize,
+    range_handle: crate::external_memory::RangeHandle,
+    device: Arc<CudaDevice>,
+}
+
+impl SlotBuffer {
+    fn new(device: Arc<CudaDevice>, capacity_bytes: usize) -> anyhow::Result<Self> {
+        let capacity_bytes = align_16(capacity_bytes.max(16));
+        crate::external_memory::ExternalMemoryRegistry::ensure_hook_installed();
+        let data = unsafe { device.alloc::<u8>(capacity_bytes) }
+            .map_err(|e| anyhow::anyhow!("SlotBuffer cuda alloc {capacity_bytes}B: {e:?}"))?;
+        let start = *data.device_ptr();
+        let range_handle = crate::external_memory::ExternalMemoryRegistry::global().register_range(
+            crate::external_memory::ExternalRange {
+                start,
+                end: start.saturating_add(capacity_bytes as u64),
+                device_key: Arc::as_ptr(&device) as usize,
+                owner: crate::external_memory::ExternalOwner::BlockOffloader,
+            },
+        );
+        Ok(Self {
+            data,
+            capacity_bytes,
+            offset_bytes: 0,
+            range_handle,
+            device,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.offset_bytes = 0;
+    }
+
+    fn alloc_u16(&mut self, num_elems: usize) -> anyhow::Result<CudaSlice<u16>> {
+        let bytes = num_elems
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| anyhow::anyhow!("SlotBuffer alloc_u16 size overflow"))?;
+        let start = align_16(self.offset_bytes);
+        let end = start
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!("SlotBuffer alloc_u16 offset overflow"))?;
+        if end > self.capacity_bytes {
+            anyhow::bail!(
+                "SlotBuffer exhausted: need end={}B capacity={}B request={} elems",
+                end,
+                self.capacity_bytes,
+                num_elems
+            );
+        }
+        self.offset_bytes = end;
+        let ptr = (*self.data.device_ptr()).saturating_add(start as u64);
+        // SAFETY: `ptr` points into `self.data`, which outlives every tensor
+        // handed out from this slot until slot reuse. The registered external
+        // range makes TensorStorage/drop forget these synthetic slices instead
+        // of freeing the slot-owned allocation.
+        Ok(unsafe { synth_cuda_slice::<u16>(ptr, num_elems, self.device.clone()) })
+    }
+}
+
+impl Drop for SlotBuffer {
+    fn drop(&mut self) {
+        crate::external_memory::ExternalMemoryRegistry::global()
+            .unregister_range(self.range_handle);
+    }
+}
+
 enum SlotState {
     Empty,
     /// Raw GPU tensors — H2D done but prepare_weights not yet applied.
@@ -365,8 +467,8 @@ impl SlotState {
 // BlockOffloader
 // ---------------------------------------------------------------------------
 
-/// Double-buffered block offloader. Holds all block weights in pinned CPU
-/// memory. Two GPU slots for prefetch/compute overlap.
+/// Block offloader. Holds all block weights in pinned CPU memory and keeps a
+/// configurable GPU-resident slot window for prefetch/compute overlap.
 pub struct BlockOffloader {
     /// Per-block weights in pinned CPU memory. Index = block_idx.
     /// Empty `Vec` when `streaming` is `Some` — the streaming path stores
@@ -383,10 +485,17 @@ pub struct BlockOffloader {
     /// Dedicated CUDA stream for async H2D transfers.
     transfer_stream: CudaStream,
 
-    /// Two GPU-side buffer slots for ping-pong.
-    slots: [SlotState; 2],
+    /// GPU-side buffer slots. Default is two-slot ping-pong; pinned-RAM mode
+    /// can widen this via `FLAME_BLOCK_OFFLOAD_SLOTS` to retain a larger
+    /// forward/backward window on GPU.
+    slots: Vec<SlotState>,
 
-    /// Which slot index (0 or 1) holds the current compute block.
+    /// Reusable BF16 backing slabs paired with `slots`. Only used by the
+    /// widened OneTrainer-style resident-set path; the legacy two-slot path
+    /// keeps using the existing ring/direct fallback.
+    slot_buffers: Vec<Option<SlotBuffer>>,
+
+    /// Which slot index holds the current compute block.
     active: usize,
 
     /// Block index currently being prefetched (None = idle).
@@ -434,6 +543,12 @@ pub struct BlockOffloader {
     /// call. Threaded through `AccessHints::prefetches_since_last_plan`.
     prefetches_since_plan: u32,
 
+    /// OneTrainer-style resident-set policy. `fraction` means the fraction
+    /// of total block weights that should live in pinned host RAM only; the
+    /// remaining byte budget is kept GPU-resident around the current
+    /// forward/backward layer position.
+    layer_offload_fraction: Option<f32>,
+
     /// Phase 2 (post-reboot, 2026-05-13): lazy ring-backed allocator for
     /// the prefetch path's BF16 slot buffers. `None` until the first
     /// pinned/streaming prefetch needs an alloc, then materialized via
@@ -453,6 +568,294 @@ unsafe impl Send for BlockOffloader {}
 unsafe impl Sync for BlockOffloader {}
 
 impl BlockOffloader {
+    fn configured_layer_offload_fraction(streaming: bool) -> Option<f32> {
+        if streaming {
+            return None;
+        }
+        let raw = std::env::var("FLAME_LAYER_OFFLOAD_FRACTION").ok()?;
+        let fraction = raw.parse::<f32>().ok()?;
+        if !(0.0..=1.0).contains(&fraction) {
+            log::warn!(
+                "BlockOffloader: ignoring FLAME_LAYER_OFFLOAD_FRACTION={raw:?}; expected 0.0..=1.0"
+            );
+            return None;
+        }
+        Some(fraction)
+    }
+
+    fn configured_slot_count(
+        block_count: usize,
+        streaming: bool,
+        block_sizes: &[usize],
+        layer_offload_fraction: Option<f32>,
+    ) -> usize {
+        if streaming {
+            return 2;
+        }
+        std::env::var("FLAME_BLOCK_OFFLOAD_SLOTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|count| count.max(2).min(block_count.max(2)))
+            .unwrap_or_else(|| {
+                layer_offload_fraction
+                    .map(|fraction| Self::max_ot_plan_len(block_sizes, fraction).max(2))
+                    .unwrap_or(2)
+            })
+    }
+
+    fn empty_slots(count: usize) -> Vec<SlotState> {
+        std::iter::repeat_with(|| SlotState::Empty)
+            .take(count)
+            .collect()
+    }
+
+    fn empty_slot_buffers(count: usize) -> Vec<Option<SlotBuffer>> {
+        std::iter::repeat_with(|| None).take(count).collect()
+    }
+
+    fn resident_contains(&self, block_idx: usize) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| slot.block_idx() == Some(block_idx))
+    }
+
+    fn target_loaded_bytes(block_sizes: &[usize], fraction: f32) -> usize {
+        let total: usize = block_sizes.iter().sum();
+        ((total as f64) * (1.0 - fraction as f64)).round().max(0.0) as usize
+    }
+
+    fn ot_layers_below(
+        block_sizes: &[usize],
+        start_layer: usize,
+        max_bytes: usize,
+        is_forward: bool,
+        is_cyclic: bool,
+    ) -> Vec<usize> {
+        let mut accumulator = 0usize;
+        let mut layers = Vec::new();
+        let mut consider = |i: usize, layers: &mut Vec<usize>, accumulator: &mut usize| -> bool {
+            *accumulator = accumulator.saturating_add(block_sizes.get(i).copied().unwrap_or(0));
+            if *accumulator > max_bytes && layers.len() >= 2 {
+                return false;
+            }
+            layers.push(i);
+            true
+        };
+
+        if is_forward && is_cyclic {
+            for i in start_layer..block_sizes.len() {
+                if !consider(i, &mut layers, &mut accumulator) {
+                    break;
+                }
+            }
+            for i in 0..start_layer {
+                if !consider(i, &mut layers, &mut accumulator) {
+                    break;
+                }
+            }
+        } else if is_forward {
+            for i in start_layer..block_sizes.len() {
+                if !consider(i, &mut layers, &mut accumulator) {
+                    break;
+                }
+            }
+            for i in (0..start_layer).rev() {
+                if !consider(i, &mut layers, &mut accumulator) {
+                    break;
+                }
+            }
+        } else {
+            for i in (0..=start_layer).rev() {
+                if !consider(i, &mut layers, &mut accumulator) {
+                    break;
+                }
+            }
+            for i in start_layer + 1..block_sizes.len() {
+                if !consider(i, &mut layers, &mut accumulator) {
+                    break;
+                }
+            }
+        }
+
+        layers.sort_unstable();
+        layers
+    }
+
+    fn ot_plan_for(
+        &self,
+        layer_index: usize,
+        is_forward: bool,
+        is_next_forward: bool,
+    ) -> Option<Vec<usize>> {
+        let fraction = self.layer_offload_fraction?;
+        if layer_index >= self.block_size_cache.len() {
+            return None;
+        }
+        let target = Self::target_loaded_bytes(&self.block_size_cache, fraction);
+        Some(Self::ot_layers_below(
+            &self.block_size_cache,
+            layer_index,
+            target,
+            is_forward,
+            is_forward && is_next_forward,
+        ))
+    }
+
+    fn max_ot_plan_len(block_sizes: &[usize], fraction: f32) -> usize {
+        if block_sizes.is_empty() {
+            return 2;
+        }
+        let target = Self::target_loaded_bytes(block_sizes, fraction);
+        let mut max_len = 2usize;
+        for i in 0..block_sizes.len() {
+            max_len = max_len.max(Self::ot_layers_below(block_sizes, i, target, true, false).len());
+            max_len = max_len.max(Self::ot_layers_below(block_sizes, i, target, true, true).len());
+            max_len =
+                max_len.max(Self::ot_layers_below(block_sizes, i, target, false, false).len());
+        }
+        max_len.min(block_sizes.len().max(2))
+    }
+
+    fn ordered_missing_layers(
+        desired: &[usize],
+        loaded: &[usize],
+        layer_index: usize,
+        is_forward: bool,
+    ) -> Vec<usize> {
+        let mut missing: Vec<usize> = desired
+            .iter()
+            .copied()
+            .filter(|idx| !loaded.contains(idx))
+            .collect();
+        missing.sort_unstable();
+        if is_forward {
+            let mut hi: Vec<usize> = missing
+                .iter()
+                .copied()
+                .filter(|idx| *idx >= layer_index)
+                .collect();
+            let lo: Vec<usize> = missing
+                .iter()
+                .copied()
+                .filter(|idx| *idx < layer_index)
+                .collect();
+            hi.extend(lo);
+            hi
+        } else {
+            missing.sort_unstable_by(|a, b| b.cmp(a));
+            let mut lo: Vec<usize> = missing
+                .iter()
+                .copied()
+                .filter(|idx| *idx < layer_index)
+                .collect();
+            let hi: Vec<usize> = missing
+                .iter()
+                .copied()
+                .filter(|idx| *idx >= layer_index)
+                .collect();
+            lo.extend(hi);
+            lo
+        }
+    }
+
+    fn protected_contains(protected: Option<&[usize]>, block_idx: Option<usize>) -> bool {
+        match (protected, block_idx) {
+            (Some(protected), Some(block_idx)) => protected.contains(&block_idx),
+            _ => false,
+        }
+    }
+
+    fn select_prefetch_target(&self, protected: Option<&[usize]>) -> usize {
+        if let Some(idx) = self
+            .slots
+            .iter()
+            .position(|slot| matches!(slot, SlotState::Empty))
+        {
+            return idx;
+        }
+
+        if self.slots.len() <= 2 {
+            return (self.active + 1) % self.slots.len();
+        }
+
+        for offset in 1..=self.slots.len() {
+            let idx = (self.active + offset) % self.slots.len();
+            if idx == self.active {
+                continue;
+            }
+            if Self::protected_contains(protected, self.slots[idx].block_idx()) {
+                continue;
+            }
+            match &self.slots[idx] {
+                SlotState::Prepared { events, .. }
+                    if !events.compute_recorded.load(Ordering::Acquire) =>
+                {
+                    continue;
+                }
+                _ => return idx,
+            }
+        }
+
+        (self.active + 1) % self.slots.len()
+    }
+
+    fn wait_slot_reusable(&self, slot_idx: usize) -> anyhow::Result<()> {
+        match &self.slots[slot_idx] {
+            SlotState::Empty => Ok(()),
+            SlotState::Prepared { events, .. } => {
+                if events.compute_recorded.load(Ordering::Acquire) {
+                    events.compute_done.synchronize()?;
+                    Ok(())
+                } else {
+                    let s = unsafe { cudaDeviceSynchronize() };
+                    if s != 0 {
+                        anyhow::bail!("cudaDeviceSynchronize before slot reuse: {s}");
+                    }
+                    Ok(())
+                }
+            }
+            SlotState::Raw { events, .. } => {
+                if events.h2d_recorded.load(Ordering::Acquire) {
+                    events.h2d_done.synchronize()?;
+                } else {
+                    self.sync_transfer_stream()?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn use_slot_buffer_allocator(&self) -> bool {
+        self.streaming.is_none()
+            && self.slots.len() != 2
+            && std::env::var("FLAME_OFFLOAD_SLOT_SLAB_DISABLE").as_deref() != Ok("1")
+    }
+
+    fn ensure_slot_buffer_capacity(
+        &mut self,
+        slot_idx: usize,
+        required_bytes: usize,
+    ) -> anyhow::Result<()> {
+        if required_bytes == 0 {
+            return Ok(());
+        }
+        let required_bytes = align_16(required_bytes.saturating_add(4096));
+        let needs_alloc = self
+            .slot_buffers
+            .get(slot_idx)
+            .and_then(|buf| buf.as_ref())
+            .map(|buf| buf.capacity_bytes < required_bytes)
+            .unwrap_or(true);
+        if needs_alloc {
+            let buffer = SlotBuffer::new(self.device.clone(), required_bytes)?;
+            self.slot_buffers[slot_idx] = Some(buffer);
+        }
+        if let Some(buffer) = self.slot_buffers[slot_idx].as_mut() {
+            buffer.reset();
+        }
+        Ok(())
+    }
+
     /// Load all block weights from safetensors file(s) into pinned CPU memory.
     ///
     /// Opens each file, reads block tensors into `cudaMallocHost` pinned buffers
@@ -495,8 +898,7 @@ impl BlockOffloader {
         let mut cpu_blocks: Vec<HashMap<String, PinnedTensor>> =
             (0..block_count).map(|_| HashMap::new()).collect();
         let mut total_pinned_bytes: usize = 0;
-        let fp8_pinned_mode =
-            force_fp8_pinned || std::env::var("BLOCKOFF_FP8_PINNED").is_ok();
+        let fp8_pinned_mode = force_fp8_pinned || std::env::var("BLOCKOFF_FP8_PINNED").is_ok();
 
         // Pre-flight visibility: pinned-RAM allocation is a long synchronous
         // operation (~60-90s for klein 9B's 16.6 GB on PCIe Gen4). If the
@@ -563,11 +965,17 @@ impl BlockOffloader {
                     .as_array()
                     .ok_or_else(|| anyhow::anyhow!("missing data_offsets for {name}"))?;
                 let start = data_start
-                    + offsets.first().and_then(|v| v.as_u64())
-                        .ok_or_else(|| anyhow::anyhow!("bad start offset for {name}"))? as usize;
+                    + offsets
+                        .first()
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| anyhow::anyhow!("bad start offset for {name}"))?
+                        as usize;
                 let end = data_start
-                    + offsets.get(1).and_then(|v| v.as_u64())
-                        .ok_or_else(|| anyhow::anyhow!("bad end offset for {name}"))? as usize;
+                    + offsets
+                        .get(1)
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| anyhow::anyhow!("bad end offset for {name}"))?
+                        as usize;
 
                 let dtype_str = info["dtype"].as_str().unwrap_or("F32");
                 if !matches!(dtype_str, "F32" | "BF16" | "F16" | "F8_E4M3") {
@@ -606,7 +1014,10 @@ impl BlockOffloader {
                             let so = si["data_offsets"].as_array()?;
                             let ss = data_start + so[0].as_u64()? as usize;
                             Some(f32::from_le_bytes([
-                                mmap[ss], mmap[ss + 1], mmap[ss + 2], mmap[ss + 3],
+                                mmap[ss],
+                                mmap[ss + 1],
+                                mmap[ss + 2],
+                                mmap[ss + 3],
                             ]))
                         })
                     };
@@ -617,13 +1028,16 @@ impl BlockOffloader {
                         })
                         .unwrap_or(1.0);
 
-
                     let byte_len = raw.len(); // == num_elems for FP8
                     let mut pinned = PinnedHostBuffer::<u8>::with_capacity_elems(
-                        byte_len, PinnedAllocFlags::DEFAULT,
-                    ).map_err(|e| anyhow::anyhow!("pinned alloc for {name}: {e}"))?;
+                        byte_len,
+                        PinnedAllocFlags::DEFAULT,
+                    )
+                    .map_err(|e| anyhow::anyhow!("pinned alloc for {name}: {e}"))?;
                     pinned.as_mut_bytes()[..byte_len].copy_from_slice(raw);
-                    unsafe { pinned.set_len(byte_len); }
+                    unsafe {
+                        pinned.set_len(byte_len);
+                    }
 
                     total_pinned_bytes += byte_len;
                     cpu_blocks[block_idx].insert(
@@ -692,7 +1106,12 @@ impl BlockOffloader {
                             metadata_obj.get(key).and_then(|si| {
                                 let so = si["data_offsets"].as_array()?;
                                 let ss = data_start + so[0].as_u64()? as usize;
-                                Some(f32::from_le_bytes([mmap[ss], mmap[ss+1], mmap[ss+2], mmap[ss+3]]))
+                                Some(f32::from_le_bytes([
+                                    mmap[ss],
+                                    mmap[ss + 1],
+                                    mmap[ss + 2],
+                                    mmap[ss + 3],
+                                ]))
                             })
                         };
                         let scale = lookup(&format!("{name}_scale"))
@@ -711,15 +1130,18 @@ impl BlockOffloader {
                 };
 
                 let byte_len = bf16_u16.len() * 2;
-                let mut pinned =
-                    PinnedHostBuffer::<u8>::with_capacity_elems(byte_len, PinnedAllocFlags::DEFAULT)
-                        .map_err(|e| anyhow::anyhow!("pinned alloc for {name}: {e}"))?;
+                let mut pinned = PinnedHostBuffer::<u8>::with_capacity_elems(
+                    byte_len,
+                    PinnedAllocFlags::DEFAULT,
+                )
+                .map_err(|e| anyhow::anyhow!("pinned alloc for {name}: {e}"))?;
 
-                let src_bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(bf16_u16.as_ptr() as *const u8, byte_len)
-                };
+                let src_bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(bf16_u16.as_ptr() as *const u8, byte_len) };
                 pinned.as_mut_bytes()[..byte_len].copy_from_slice(src_bytes);
-                unsafe { pinned.set_len(byte_len); }
+                unsafe {
+                    pinned.set_len(byte_len);
+                }
 
                 total_pinned_bytes += byte_len;
 
@@ -749,13 +1171,35 @@ impl BlockOffloader {
             .iter()
             .map(|m| m.values().map(|pt| pt.buffer.len_bytes()).sum())
             .collect();
+        let layer_offload_fraction = Self::configured_layer_offload_fraction(false);
+        let slot_count = Self::configured_slot_count(
+            block_count,
+            false,
+            &block_size_cache,
+            layer_offload_fraction,
+        );
+        if slot_count != 2 {
+            log::info!(
+                "BlockOffloader: resident GPU slot window={} (FLAME_BLOCK_OFFLOAD_SLOTS)",
+                slot_count
+            );
+        }
+        if let Some(fraction) = layer_offload_fraction {
+            let target = Self::target_loaded_bytes(&block_size_cache, fraction);
+            log::info!(
+                "BlockOffloader: OT-style layer offload fraction={:.2}, target resident {:.1} MB",
+                fraction,
+                target as f64 / (1024.0 * 1024.0),
+            );
+        }
 
         Ok(Self {
             cpu_blocks,
             streaming: None,
             device,
             transfer_stream,
-            slots: [SlotState::Empty, SlotState::Empty],
+            slots: Self::empty_slots(slot_count),
+            slot_buffers: Self::empty_slot_buffers(slot_count),
             active: 0,
             prefetch_in_flight: None,
             total_pinned_bytes,
@@ -764,6 +1208,7 @@ impl BlockOffloader {
             block_size_cache,
             access_history: VecDeque::with_capacity(ACCESS_HISTORY_CAP),
             prefetches_since_plan: 0,
+            layer_offload_fraction,
             ring: None,
         })
     }
@@ -839,11 +1284,17 @@ impl BlockOffloader {
                     .as_array()
                     .ok_or_else(|| anyhow::anyhow!("missing data_offsets for {name}"))?;
                 let start = data_start
-                    + offsets.first().and_then(|v| v.as_u64())
-                        .ok_or_else(|| anyhow::anyhow!("bad start offset for {name}"))? as usize;
+                    + offsets
+                        .first()
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| anyhow::anyhow!("bad start offset for {name}"))?
+                        as usize;
                 let end = data_start
-                    + offsets.get(1).and_then(|v| v.as_u64())
-                        .ok_or_else(|| anyhow::anyhow!("bad end offset for {name}"))? as usize;
+                    + offsets
+                        .get(1)
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| anyhow::anyhow!("bad end offset for {name}"))?
+                        as usize;
                 let src_byte_len = end.saturating_sub(start);
 
                 let dtype_str = info["dtype"].as_str().unwrap_or("F32");
@@ -886,12 +1337,22 @@ impl BlockOffloader {
             max_block_bf16_bytes,
             PinnedAllocFlags::DEFAULT,
         )
-        .map_err(|e| anyhow::anyhow!("staging buffer 0 alloc ({} bytes): {e}", max_block_bf16_bytes))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "staging buffer 0 alloc ({} bytes): {e}",
+                max_block_bf16_bytes
+            )
+        })?;
         let staging1 = PinnedHostBuffer::<u8>::with_capacity_elems(
             max_block_bf16_bytes,
             PinnedAllocFlags::DEFAULT,
         )
-        .map_err(|e| anyhow::anyhow!("staging buffer 1 alloc ({} bytes): {e}", max_block_bf16_bytes))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "staging buffer 1 alloc ({} bytes): {e}",
+                max_block_bf16_bytes
+            )
+        })?;
 
         let total_pinned_bytes = max_block_bf16_bytes * 2;
 
@@ -908,6 +1369,7 @@ impl BlockOffloader {
         );
 
         let block_size_cache: Vec<usize> = streaming_blocks_byte_sizes(&blocks);
+        let layer_offload_fraction = Self::configured_layer_offload_fraction(true);
 
         let streaming = StreamingState {
             files,
@@ -921,7 +1383,18 @@ impl BlockOffloader {
             streaming: Some(streaming),
             device,
             transfer_stream,
-            slots: [SlotState::Empty, SlotState::Empty],
+            slots: Self::empty_slots(Self::configured_slot_count(
+                block_count,
+                true,
+                &block_size_cache,
+                layer_offload_fraction,
+            )),
+            slot_buffers: Self::empty_slot_buffers(Self::configured_slot_count(
+                block_count,
+                true,
+                &block_size_cache,
+                layer_offload_fraction,
+            )),
             active: 0,
             prefetch_in_flight: None,
             total_pinned_bytes,
@@ -930,6 +1403,7 @@ impl BlockOffloader {
             block_size_cache,
             access_history: VecDeque::with_capacity(ACCESS_HISTORY_CAP),
             prefetches_since_plan: 0,
+            layer_offload_fraction,
             ring: None,
         })
     }
@@ -982,6 +1456,12 @@ impl BlockOffloader {
     /// `cudaMalloc` for slab[0]; subsequent slabs materialize lazily on
     /// ring-wrap.
     pub fn ensure_ring(&mut self, max_slot_bytes: usize) -> anyhow::Result<()> {
+        // The current BF16 offload ring is sized around the original two-slot
+        // invariant. Widened resident windows keep more slots alive at once, so
+        // use direct CUDA allocations until the ring is resized for that shape.
+        if self.slots.len() != 2 {
+            return Ok(());
+        }
         // 2026-05-15 regression escape hatch: `FLAME_OFFLOAD_RING_DISABLE=1`
         // skips ring init. `alloc_bf16_via_ring` then falls through to
         // `device.alloc::<u16>` (pre-Phase-2-post-reboot behavior). Pre-
@@ -1089,16 +1569,73 @@ impl BlockOffloader {
         &self.block_size_cache
     }
 
+    pub fn has_layer_offload_policy(&self) -> bool {
+        self.layer_offload_fraction.is_some()
+    }
+
     /// Currently-resident block IDs across both slots. May be empty
-    /// (cold start), 1 element (only one slot used), or 2 elements.
+    /// (cold start) or up to the configured slot-window size.
     pub fn resident_blocks(&self) -> Vec<usize> {
-        let mut out = Vec::with_capacity(2);
+        let mut out = Vec::with_capacity(self.slots.len());
         for slot in &self.slots {
             if let Some(b) = slot.block_idx() {
                 out.push(b);
             }
         }
         out
+    }
+
+    /// Apply the OneTrainer-style resident-set policy for the current layer.
+    ///
+    /// When `FLAME_LAYER_OFFLOAD_FRACTION` is unset this degrades to a normal
+    /// single-block prefetch of `layer_index`. When set, it computes the
+    /// desired GPU-resident block set for the current traversal direction and
+    /// queues async H2D for any missing blocks without forcing host syncs
+    /// between different blocks.
+    pub fn plan_layer_access(
+        &mut self,
+        layer_index: usize,
+        is_forward: bool,
+        is_next_forward: bool,
+    ) -> anyhow::Result<()> {
+        let Some(desired) = self.ot_plan_for(layer_index, is_forward, is_next_forward) else {
+            return self.prefetch_block(layer_index);
+        };
+
+        if desired.is_empty() {
+            return self.prefetch_block(layer_index);
+        }
+
+        // Do not eagerly evict stale residents here. The prefetch path can
+        // reuse an unprotected Prepared slot by placing a GPU-side wait on
+        // `compute_done`; eager eviction used `cudaEventSynchronize` on the
+        // host for every stale slot and showed up as ~2s/step of API stall in
+        // Klein 9B. Keep a legacy escape hatch for bisecting.
+        if std::env::var("FLAME_OT_EAGER_EVICT").as_deref() == Ok("1") {
+            for slot_idx in 0..self.slots.len() {
+                let Some(block_idx) = self.slots[slot_idx].block_idx() else {
+                    continue;
+                };
+                if block_idx == layer_index || desired.contains(&block_idx) {
+                    continue;
+                }
+                self.wait_slot_reusable(slot_idx)?;
+                self.slots[slot_idx] = SlotState::Empty;
+            }
+        }
+
+        let loaded = self.resident_blocks();
+        let missing = Self::ordered_missing_layers(&desired, &loaded, layer_index, is_forward);
+        for block_idx in missing {
+            if block_idx >= self.block_size_cache.len() {
+                continue;
+            }
+            if self.resident_contains(block_idx) {
+                continue;
+            }
+            self.prefetch_block_inner_with_protected(block_idx, Some(&desired))?;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1115,8 +1652,7 @@ impl BlockOffloader {
         // at <5 ns under perf, safe on the hot path.
         let tele = telemetry::global();
         let timer = tele.record_prefetch_begin();
-        let already_resident = self.slots[0].block_idx() == Some(block_idx)
-            || self.slots[1].block_idx() == Some(block_idx);
+        let already_resident = self.resident_contains(block_idx);
 
         // Already on a slot?
         if already_resident {
@@ -1185,7 +1721,11 @@ impl BlockOffloader {
 
         // Build the state snapshot. Cheap — borrows into existing
         // fields, no allocations.
-        let resident = self.slots.iter().filter_map(|s| s.block_idx()).collect::<Vec<_>>();
+        let resident = self
+            .slots
+            .iter()
+            .filter_map(|s| s.block_idx())
+            .collect::<Vec<_>>();
         let hints = AccessHints {
             vram_authoritative: false,
             prefetches_since_last_plan: self.prefetches_since_plan,
@@ -1215,18 +1755,15 @@ impl BlockOffloader {
     }
 
     fn prefetch_block_inner(&mut self, block_idx: usize) -> anyhow::Result<()> {
+        self.prefetch_block_inner_with_protected(block_idx, None)
+    }
 
-        // Different prefetch in flight? Sync it first (wasteful but safe).
-        if let Some(inflight) = self.prefetch_in_flight {
-            if inflight != block_idx {
-                self.sync_transfer_stream()?;
-                // Promote the raw slot to... just leave it as Raw, await will handle it.
-                self.prefetch_in_flight = None;
-            }
-        }
-
-        // Pick the non-active slot.
-        let target = 1 - self.active;
+    fn prefetch_block_inner_with_protected(
+        &mut self,
+        block_idx: usize,
+        protected: Option<&[usize]>,
+    ) -> anyhow::Result<()> {
+        let target = self.select_prefetch_target(protected);
 
         // Phase 0 safety: before reusing a slot, ensure any default-stream
         // compute that may still be reading the slot's storage has finished.
@@ -1260,6 +1797,8 @@ impl BlockOffloader {
                     }
                 }
             }
+        } else if matches!(self.slots[target], SlotState::Raw { .. }) {
+            self.wait_slot_reusable(target)?;
         }
 
         // Streaming-mode extra: the per-slot pinned staging buffer is the H2D
@@ -1319,7 +1858,9 @@ impl BlockOffloader {
             let (free, total) = crate::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
             eprintln!(
                 "[blockoff] prefetch block {} starting: GPU free={} MiB / total={} MiB",
-                block_idx, free / (1024 * 1024), total / (1024 * 1024)
+                block_idx,
+                free / (1024 * 1024),
+                total / (1024 * 1024)
             );
         }
         // Allocate GPU buffers with `unsafe alloc` (no zero-fill). A prior
@@ -1357,9 +1898,10 @@ impl BlockOffloader {
                 scale: f32,
             },
         }
-        let (recs, max_bf16_bytes): (Vec<PinnedRec>, usize) = {
+        let (recs, max_bf16_bytes, total_bf16_bytes): (Vec<PinnedRec>, usize, usize) = {
             let mut recs: Vec<PinnedRec> = Vec::with_capacity(block.len());
             let mut max_bf16: usize = 0;
+            let mut total_bf16: usize = 0;
             for (key, pt) in block {
                 // Pinned buffer lives as long as `self`; the raw address
                 // stays valid past the borrow of `block`. Stored as
@@ -1370,6 +1912,7 @@ impl BlockOffloader {
                 match pt.dtype {
                     PinnedDtype::Bf16 => {
                         let nb = pt.num_elems * 2;
+                        total_bf16 = total_bf16.saturating_add(nb);
                         if nb > max_bf16 {
                             max_bf16 = nb;
                         }
@@ -1393,24 +1936,52 @@ impl BlockOffloader {
                     }
                 }
             }
-            (recs, max_bf16)
+            (recs, max_bf16, total_bf16)
         };
 
-        if max_bf16_bytes > 0 {
+        let use_slot_buffer_allocator = self.use_slot_buffer_allocator();
+        if use_slot_buffer_allocator {
+            self.ensure_slot_buffer_capacity(target, total_bf16_bytes)?;
+        } else if max_bf16_bytes > 0 {
             self.ensure_ring(max_bf16_bytes)?;
         }
+        let device_for_fp8 = self.device.clone();
         for rec in recs {
             match rec {
-                PinnedRec::Bf16 { key, src_ptr_u, bytes, num_elems, shape } => {
-                    let gpu_buf = self.alloc_bf16_via_ring(num_elems).map_err(|e| {
-                        let (free, total) =
-                            crate::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
-                        anyhow::anyhow!(
-                            "GPU alloc (ring) for {key} ({} elems, need={} MiB) failed; free={} MiB total={} MiB: {e:?}",
-                            num_elems, (num_elems * 2) / (1024 * 1024),
-                            free / (1024 * 1024), total / (1024 * 1024)
-                        )
-                    })?;
+                PinnedRec::Bf16 {
+                    key,
+                    src_ptr_u,
+                    bytes,
+                    num_elems,
+                    shape,
+                } => {
+                    let gpu_buf = if use_slot_buffer_allocator {
+                        self.slot_buffers[target]
+                            .as_mut()
+                            .ok_or_else(|| anyhow::anyhow!("slot buffer missing for slot {target}"))?
+                            .alloc_u16(num_elems)
+                            .map_err(|e| {
+                                let (free, total) =
+                                    crate::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
+                                anyhow::anyhow!(
+                                    "GPU alloc (slot slab) for {key} ({} elems, need={} MiB) failed; free={} MiB total={} MiB: {e:?}",
+                                    num_elems,
+                                    (num_elems * 2) / (1024 * 1024),
+                                    free / (1024 * 1024),
+                                    total / (1024 * 1024)
+                                )
+                            })?
+                    } else {
+                        self.alloc_bf16_via_ring(num_elems).map_err(|e| {
+                            let (free, total) =
+                                crate::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
+                            anyhow::anyhow!(
+                                "GPU alloc (ring) for {key} ({} elems, need={} MiB) failed; free={} MiB total={} MiB: {e:?}",
+                                num_elems, (num_elems * 2) / (1024 * 1024),
+                                free / (1024 * 1024), total / (1024 * 1024)
+                            )
+                        })?
+                    };
 
                     let dst = (*gpu_buf.device_ptr() as u64) as *mut c_void;
                     let src = src_ptr_u as *const c_void;
@@ -1418,12 +1989,21 @@ impl BlockOffloader {
                         .map_err(|e| anyhow::anyhow!("H2D for {key}: {e}"))?;
 
                     let tensor = Tensor::from_bf16_slice_gpu(
-                        gpu_buf, Shape::from_dims(&shape), self.device.clone(),
+                        gpu_buf,
+                        Shape::from_dims(&shape),
+                        self.device.clone(),
                     );
                     tensors.insert(key, tensor);
                 }
-                PinnedRec::Fp8 { key, src_ptr_u, bytes, num_elems, shape, scale } => {
-                    let gpu_buf = unsafe { self.device.alloc::<u8>(num_elems) }.map_err(|e| {
+                PinnedRec::Fp8 {
+                    key,
+                    src_ptr_u,
+                    bytes,
+                    num_elems,
+                    shape,
+                    scale,
+                } => {
+                    let gpu_buf = unsafe { device_for_fp8.alloc::<u8>(num_elems) }.map_err(|e| {
                         let (free, total) =
                             crate::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
                         anyhow::anyhow!(
@@ -1601,8 +2181,7 @@ impl BlockOffloader {
                         StreamSrcDtype::F16 => {
                             let dst_u16 = dst as *mut u16;
                             for i in 0..entry.num_elems {
-                                let bits =
-                                    u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
+                                let bits = u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
                                 *dst_u16.add(i) = f32_to_bf16(f16_to_f32(bits));
                             }
                         }
@@ -1697,8 +2276,7 @@ impl BlockOffloader {
         // "Miss" = await had to fall back to issuing its own H2D.
         let tele = telemetry::global();
         let timer = tele.record_await_begin();
-        let is_hit = self.slots[0].block_idx() == Some(block_idx)
-            || self.slots[1].block_idx() == Some(block_idx);
+        let is_hit = self.resident_contains(block_idx);
 
         let result = self.await_block_inner(block_idx);
         if result.is_ok() {
@@ -1716,14 +2294,19 @@ impl BlockOffloader {
         block_idx: usize,
     ) -> anyhow::Result<Arc<HashMap<String, Tensor>>> {
         // Check active slot — already prepared?
-        if let SlotState::Prepared { block_idx: idx, ref tensors, .. } = self.slots[self.active] {
+        if let SlotState::Prepared {
+            block_idx: idx,
+            ref tensors,
+            ..
+        } = self.slots[self.active]
+        {
             if idx == block_idx {
                 return Ok(tensors.clone());
             }
         }
 
-        // Check both slots for a Raw or Prepared match
-        for slot_idx in 0..2 {
+        // Check every slot for a Raw or Prepared match.
+        for slot_idx in 0..self.slots.len() {
             let matches = self.slots[slot_idx].block_idx() == Some(block_idx);
             if !matches {
                 continue;
@@ -1750,7 +2333,13 @@ impl BlockOffloader {
             self.prefetch_in_flight = None;
 
             let raw = self.slots[slot_idx].take();
-            if let SlotState::Raw { block_idx: idx, mut tensors, fp8_pending, events } = raw {
+            if let SlotState::Raw {
+                block_idx: idx,
+                mut tensors,
+                fp8_pending,
+                events,
+            } = raw
+            {
                 Self::prepare_weights(&mut tensors, fp8_pending, self.native_layout)?;
                 let arc = Arc::new(tensors);
                 // Reset the per-handle compute_recorded flag — a new tenant
@@ -1779,7 +2368,11 @@ impl BlockOffloader {
         // than double counting both sides.
         self.prefetch_block_inner(block_idx)?;
 
-        let target = 1 - self.active;
+        let target = self
+            .slots
+            .iter()
+            .position(|slot| slot.block_idx() == Some(block_idx))
+            .unwrap_or(self.active);
         // Gate default stream on the just-issued H2D via the slot's event,
         // not a host-side cudaStreamSynchronize.
         if let Some(events) = self.slots[target].events() {
@@ -1794,7 +2387,13 @@ impl BlockOffloader {
         self.prefetch_in_flight = None;
 
         let raw = self.slots[target].take();
-        if let SlotState::Raw { block_idx: idx, mut tensors, fp8_pending, events } = raw {
+        if let SlotState::Raw {
+            block_idx: idx,
+            mut tensors,
+            fp8_pending,
+            events,
+        } = raw
+        {
             Self::prepare_weights(&mut tensors, fp8_pending, self.native_layout)?;
             let arc = Arc::new(tensors);
             events.compute_recorded.store(false, Ordering::Release);
@@ -1826,10 +2425,7 @@ impl BlockOffloader {
     /// Hold the handle for the entire duration of the block's compute (i.e.
     /// past every kernel launch that reads the block's weights), then drop
     /// it. Drop is the signal that compute on this block is complete.
-    pub fn await_block_handle(
-        &mut self,
-        block_idx: usize,
-    ) -> anyhow::Result<BlockHandle> {
+    pub fn await_block_handle(&mut self, block_idx: usize) -> anyhow::Result<BlockHandle> {
         // Reuse await_block to get the prepared Arc; then attach the slot's
         // event tracker into a fresh handle.
         let tensors = self.await_block(block_idx)?;
@@ -1871,8 +2467,9 @@ impl BlockOffloader {
         if s != 0 {
             log::warn!("evict_block: cudaDeviceSynchronize returned {s}");
         }
-        self.slots[0] = SlotState::Empty;
-        self.slots[1] = SlotState::Empty;
+        for slot in &mut self.slots {
+            *slot = SlotState::Empty;
+        }
     }
 
     /// How many blocks are loaded.
@@ -1920,7 +2517,11 @@ impl BlockOffloader {
         let keys: Vec<String> = bw.keys().cloned().collect();
         for key in keys {
             let t = bw.remove(&key).unwrap();
-            let t = if t.dtype() != DType::BF16 { t.to_dtype(DType::BF16)? } else { t };
+            let t = if t.dtype() != DType::BF16 {
+                t.to_dtype(DType::BF16)?
+            } else {
+                t
+            };
             let t = t.requires_grad_(false);
             // Default (legacy) layout: pre-transpose every 2D `.weight` to
             // `[Cin, Cout]` for callers using `Tensor::matmul`. When
@@ -1942,8 +2543,8 @@ impl BlockOffloader {
     }
 
     fn mmap_safetensors(path: &str) -> anyhow::Result<(String, usize, memmap2::Mmap)> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| anyhow::anyhow!("failed to open {path}: {e}"))?;
+        let file =
+            std::fs::File::open(path).map_err(|e| anyhow::anyhow!("failed to open {path}: {e}"))?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| anyhow::anyhow!("failed to mmap {path}: {e}"))?;
         if mmap.len() < 8 {
@@ -2032,13 +2633,19 @@ fn fp8_e4m3_to_f32(bits: u8) -> f32 {
     let sign = (bits >> 7) & 1;
     let exp = (bits >> 3) & 0xF;
     let mantissa = bits & 0x7;
-    if exp == 0xF && mantissa == 0x7 { return f32::NAN; }
+    if exp == 0xF && mantissa == 0x7 {
+        return f32::NAN;
+    }
     let f = if exp == 0 {
         (mantissa as f32) / 8.0 * (2.0f32).powi(-6)
     } else {
         (1.0 + mantissa as f32 / 8.0) * (2.0f32).powi(exp as i32 - 7)
     };
-    if sign == 1 { -f } else { f }
+    if sign == 1 {
+        -f
+    } else {
+        f
+    }
 }
 
 #[inline]
@@ -2047,16 +2654,23 @@ fn f16_to_f32(bits: u16) -> f32 {
     let exp = ((bits >> 10) & 0x1F) as u32;
     let frac = (bits & 0x3FF) as u32;
     if exp == 0 {
-        if frac == 0 { return f32::from_bits(sign << 31); }
+        if frac == 0 {
+            return f32::from_bits(sign << 31);
+        }
         let mut e = 0i32;
         let mut f = frac;
-        while f & 0x400 == 0 { f <<= 1; e -= 1; }
+        while f & 0x400 == 0 {
+            f <<= 1;
+            e -= 1;
+        }
         f &= 0x3FF;
         let f32_exp = (127 - 15 + 1 + e) as u32;
         return f32::from_bits((sign << 31) | (f32_exp << 23) | (f << 13));
     }
     if exp == 0x1F {
-        if frac == 0 { return f32::from_bits((sign << 31) | (0xFF << 23)); }
+        if frac == 0 {
+            return f32::from_bits((sign << 31) | (0xFF << 23));
+        }
         return f32::from_bits((sign << 31) | (0xFF << 23) | (frac << 13));
     }
     let f32_exp = exp + (127 - 15);

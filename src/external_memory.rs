@@ -51,8 +51,8 @@
 //! ptr alive?") when adding logging. Values: `Slab`, `Ring`, `PoolExact`,
 //! `BlockOffloader`.
 
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Sentinel device-key used by the back-compat shim in `cuda_alloc_pool`
 /// when the caller did not supply a device.
@@ -209,11 +209,7 @@ impl ExternalMemoryRegistry {
         // shape; the dedicated device-key API is `unregister_exact_keyed`.
         let mut g = self.inner.lock().expect("ExternalMemoryRegistry poisoned");
         // Find any entry whose key.0 == ptr.
-        let key_to_touch = g
-            .exact
-            .keys()
-            .find(|(p, _)| *p == ptr)
-            .copied();
+        let key_to_touch = g.exact.keys().find(|(p, _)| *p == ptr).copied();
         match key_to_touch {
             Some(k) => {
                 if let Some(c) = g.exact.get_mut(&k) {
@@ -334,10 +330,7 @@ impl ExternalMemoryRegistry {
     /// tracked in the exact-pointer map.
     #[doc(hidden)]
     pub fn exact_entry_count(&self) -> usize {
-        self.inner
-            .lock()
-            .map(|g| g.exact.len())
-            .unwrap_or(0)
+        self.inner.lock().map(|g| g.exact.len()).unwrap_or(0)
     }
 
     /// Returns the current refcount for exact-pointer `(ptr, device_key)`.
@@ -1021,7 +1014,10 @@ mod tests {
             device_key: dev,
             owner: ExternalOwner::Slab,
         });
-        assert!(reg.should_skip_free(0, dev), "address 0 is inside [0, 0x1000)");
+        assert!(
+            reg.should_skip_free(0, dev),
+            "address 0 is inside [0, 0x1000)"
+        );
         assert!(reg.should_skip_free(0xFFF, dev));
         assert!(!reg.should_skip_free(0x1000, dev));
         reg.unregister_range(h);
@@ -1070,7 +1066,7 @@ mod tests {
             });
             assert_eq!(reg.range_count(), 1);
         } // _h dropped here.
-        // Range is STILL present — no auto-Drop logic.
+          // Range is STILL present — no auto-Drop logic.
         assert_eq!(
             reg.range_count(),
             1,

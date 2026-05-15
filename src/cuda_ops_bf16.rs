@@ -18,14 +18,12 @@ use crate::perf_telemetry;
 use crate::strict::{self, GuardMode};
 use crate::{
     cuda_ops_ffi::{
-        fc_bf16_broadcast, fc_bf16_index_select, fc_bf16_repeat_axis,
-        fc_bf16_repeat_nd, fc_bf16_slice, fc_gelu_bf16, fc_gemm_bf16, fc_group_norm_backward_bf16,
-        fc_group_norm_bf16, fc_layer_norm_backward_bf16, fc_layer_norm_bf16,
-        fc_rms_norm_bf16, fc_rms_norm_bf16_to_f32, fc_silu_bf16, flame_conv2d_nhwc_bf16,
-        flame_sdpa_chunked_bf16,
-        flame_status_to_result, sdpa_stream_bf16_launch, tensor_as_view_bf16,
-        tensor_as_view_bf16_mut, tensor_as_view_f32_mut, CudaStream,
-        FLAME_CUDA_ERR_UNSUPPORTED, FLAME_CUDA_OK,
+        fc_bf16_broadcast, fc_bf16_index_select, fc_bf16_repeat_axis, fc_bf16_repeat_nd,
+        fc_bf16_slice, fc_gelu_bf16, fc_gemm_bf16, fc_group_norm_backward_bf16, fc_group_norm_bf16,
+        fc_layer_norm_backward_bf16, fc_layer_norm_bf16, fc_rms_norm_bf16, fc_rms_norm_bf16_to_f32,
+        fc_silu_bf16, flame_conv2d_nhwc_bf16, flame_sdpa_chunked_bf16, flame_status_to_result,
+        sdpa_stream_bf16_launch, tensor_as_view_bf16, tensor_as_view_bf16_mut,
+        tensor_as_view_f32_mut, CudaStream, FLAME_CUDA_ERR_UNSUPPORTED, FLAME_CUDA_OK,
     },
     staging::{
         arena_alloc, arena_record_and_release, conv2d_autotune_stats as staging_conv2d_stats,
@@ -253,11 +251,10 @@ pub fn rms_norm_bf16(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> Result<Te
     // autograd recording (caller's `x` doesn't require grad in inference).
     // The normalized_shape arg is the trailing dim (RMSNorm always
     // normalizes along the last dim in flame's contract).
-    let last_dim = *x
-        .shape()
-        .dims()
-        .last()
-        .ok_or_else(|| Error::InvalidInput("rms_norm_bf16: input must have rank >= 1".into()))?;
+    let last_dim =
+        *x.shape().dims().last().ok_or_else(|| {
+            Error::InvalidInput("rms_norm_bf16: input must have rank >= 1".into())
+        })?;
     crate::norm::rms_norm(x, &[last_dim], weight, eps)
 }
 
@@ -272,14 +269,7 @@ pub fn rms_norm_bf16_to_f32(x: &Tensor, eps: f32) -> Result<Tensor> {
     let vx = tensor_as_view_bf16(x, "rms_norm_bf16_to_f32:x")?;
     let mut vy = tensor_as_view_f32_mut(&mut out, "rms_norm_bf16_to_f32:out")?;
 
-    let status = unsafe {
-        fc_rms_norm_bf16_to_f32(
-            &vx,
-            eps,
-            &mut vy,
-            stream.as_raw(),
-        )
-    };
+    let status = unsafe { fc_rms_norm_bf16_to_f32(&vx, eps, &mut vy, stream.as_raw()) };
     status_to_result(status, "fc_rms_norm_bf16_to_f32")?;
     Ok(out)
 }
@@ -1082,9 +1072,8 @@ pub fn gemm_bf16(x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> Result<Tensor
                         autograd_meta: None,
                     };
                     let x_3d = x.reshape(&[1, m, k])?;
-                    let out_3d = crate::ops::fused_inference::fused_linear3d_native(
-                        &x_3d, &w_native, None,
-                    )?;
+                    let out_3d =
+                        crate::ops::fused_inference::fused_linear3d_native(&x_3d, &w_native, None)?;
                     return out_3d.reshape(&[m, n]);
                 }
             }

@@ -137,9 +137,7 @@ pub fn fused_gated_scatter_add_bf16(
 
     let status = unsafe {
         crate::cuda::ffi::flame_fused_gated_scatter_add_bf16(
-            eo_ptr, g_ptr, i_ptr, acc_ptr,
-            t as i32, d as i32, n as i32,
-            stream,
+            eo_ptr, g_ptr, i_ptr, acc_ptr, t as i32, d as i32, n as i32, stream,
         )
     };
     if status != 0 {
@@ -196,7 +194,9 @@ mod tests {
         gating: &[f32],     // T
         indices: &[i32],    // T
         accum: &mut [f32],  // N*D
-        t: usize, d: usize, n: usize,
+        t: usize,
+        d: usize,
+        n: usize,
     ) {
         for ti in 0..t {
             let idx = indices[ti];
@@ -233,9 +233,8 @@ mod tests {
             .collect();
         // indices: each token routes to a specific row; some collide so we
         // exercise the atomicAdd path.
-        let idx_i32: Vec<i32> =
-            (0..t).map(|i| ((i * 3) % (n + 2)) as i32 - 1).collect(); // some -1's get skipped
-        // accum: start non-zero so we verify it's add, not overwrite
+        let idx_i32: Vec<i32> = (0..t).map(|i| ((i * 3) % (n + 2)) as i32 - 1).collect(); // some -1's get skipped
+                                                                                          // accum: start non-zero so we verify it's add, not overwrite
         let acc_init: Vec<f32> = (0..n * d).map(|i| (i as f32) * 0.001).collect();
 
         let expert_out = Tensor::from_vec_dtype(

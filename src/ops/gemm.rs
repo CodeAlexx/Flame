@@ -84,8 +84,16 @@ pub(crate) fn launch_gemm(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, Error> {
         } else {
             lhs.dtype()
         };
-        let lhs_cast = if lhs.dtype() != target { lhs.to_dtype_no_grad(target)? } else { lhs.clone() };
-        let rhs_cast = if rhs.dtype() != target { rhs.to_dtype_no_grad(target)? } else { rhs.clone() };
+        let lhs_cast = if lhs.dtype() != target {
+            lhs.to_dtype_no_grad(target)?
+        } else {
+            lhs.clone()
+        };
+        let rhs_cast = if rhs.dtype() != target {
+            rhs.to_dtype_no_grad(target)?
+        } else {
+            rhs.clone()
+        };
         return launch_gemm(&lhs_cast, &rhs_cast);
     }
 
@@ -199,7 +207,6 @@ fn gemm_f32(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, Error> {
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     })
 }
 
@@ -276,7 +283,11 @@ fn bmm_bf16_acc_f32(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, Error> {
         )));
     }
     if m == 0 || n == 0 {
-        return Tensor::zeros_dtype(Shape::from_dims(&[batch, m, n]), DType::BF16, lhs.device.clone());
+        return Tensor::zeros_dtype(
+            Shape::from_dims(&[batch, m, n]),
+            DType::BF16,
+            lhs.device.clone(),
+        );
     }
 
     // cuBLASLt bmm_bf16_fp32acc_out below uses beta=0 → output fully

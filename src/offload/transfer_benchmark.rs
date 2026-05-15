@@ -46,8 +46,7 @@ use std::time::Duration;
 use cudarc::driver::{CudaDevice, CudaStream, DevicePtr};
 
 use crate::{
-    memcpy_async_device_to_host, memcpy_async_host_to_device, PinnedAllocFlags,
-    PinnedHostBuffer,
+    memcpy_async_device_to_host, memcpy_async_host_to_device, PinnedAllocFlags, PinnedHostBuffer,
 };
 
 // --- CUDA event FFI -------------------------------------------------------
@@ -169,9 +168,9 @@ pub struct BenchmarkConfig {
 impl Default for BenchmarkConfig {
     fn default() -> Self {
         Self {
-            min_bytes: 1024,                  // 1 KiB
-            max_bytes: 256 * 1024 * 1024,     // 256 MiB
-            samples: 9,                       // 1K, 4K, 16K, 64K, 256K, 1M, 4M, 16M, 64M (approx)
+            min_bytes: 1024,              // 1 KiB
+            max_bytes: 256 * 1024 * 1024, // 256 MiB
+            samples: 9,                   // 1K, 4K, 16K, 64K, 256K, 1M, 4M, 16M, 64M (approx)
             trials: 5,
             warmup_trials: 1,
             measure_d2h: true,
@@ -360,13 +359,14 @@ pub fn run_benchmark(
     // every (size, direction, trial). Allocating once and slicing keeps
     // measurements free of allocator/free cost.
     let mut pinned: PinnedHostBuffer<u8> =
-        PinnedHostBuffer::with_capacity_elems(cfg.max_bytes, PinnedAllocFlags::DEFAULT)
-            .map_err(|e| {
+        PinnedHostBuffer::with_capacity_elems(cfg.max_bytes, PinnedAllocFlags::DEFAULT).map_err(
+            |e| {
                 anyhow::anyhow!(
                     "transfer_benchmark: pinned alloc of {} bytes failed: {e}",
                     cfg.max_bytes
                 )
-            })?;
+            },
+        )?;
     // Touch each page so the OS materializes them and we don't time
     // first-touch faults inside the measured window. Pinned host pages
     // from `cudaHostAlloc` are technically already locked but writing
@@ -405,26 +405,16 @@ pub fn run_benchmark(
 
         // ----- H2D -----
         for _ in 0..cfg.warmup_trials {
-            memcpy_async_host_to_device(
-                gpu_ptr,
-                pinned_ptr as *const c_void,
-                size,
-                stream_ptr,
-            )
-            .map_err(|e| anyhow::anyhow!("transfer_benchmark: H2D warmup: {e}"))?;
+            memcpy_async_host_to_device(gpu_ptr, pinned_ptr as *const c_void, size, stream_ptr)
+                .map_err(|e| anyhow::anyhow!("transfer_benchmark: H2D warmup: {e}"))?;
         }
         let mut samples_ns: Vec<u64> = Vec::with_capacity(cfg.trials);
         for _ in 0..cfg.trials {
             let start = BenchEvent::new()?;
             let end = BenchEvent::new()?;
             start.record(stream_ptr)?;
-            memcpy_async_host_to_device(
-                gpu_ptr,
-                pinned_ptr as *const c_void,
-                size,
-                stream_ptr,
-            )
-            .map_err(|e| anyhow::anyhow!("transfer_benchmark: H2D: {e}"))?;
+            memcpy_async_host_to_device(gpu_ptr, pinned_ptr as *const c_void, size, stream_ptr)
+                .map_err(|e| anyhow::anyhow!("transfer_benchmark: H2D: {e}"))?;
             end.record(stream_ptr)?;
             end.synchronize()?;
             let ms = elapsed_ms(&start, &end)?;
@@ -446,26 +436,16 @@ pub fn run_benchmark(
         // ----- D2H -----
         if cfg.measure_d2h {
             for _ in 0..cfg.warmup_trials {
-                memcpy_async_device_to_host(
-                    pinned_ptr as *mut c_void,
-                    gpu_ptr,
-                    size,
-                    stream_ptr,
-                )
-                .map_err(|e| anyhow::anyhow!("transfer_benchmark: D2H warmup: {e}"))?;
+                memcpy_async_device_to_host(pinned_ptr as *mut c_void, gpu_ptr, size, stream_ptr)
+                    .map_err(|e| anyhow::anyhow!("transfer_benchmark: D2H warmup: {e}"))?;
             }
             let mut samples_ns: Vec<u64> = Vec::with_capacity(cfg.trials);
             for _ in 0..cfg.trials {
                 let start = BenchEvent::new()?;
                 let end = BenchEvent::new()?;
                 start.record(stream_ptr)?;
-                memcpy_async_device_to_host(
-                    pinned_ptr as *mut c_void,
-                    gpu_ptr,
-                    size,
-                    stream_ptr,
-                )
-                .map_err(|e| anyhow::anyhow!("transfer_benchmark: D2H: {e}"))?;
+                memcpy_async_device_to_host(pinned_ptr as *mut c_void, gpu_ptr, size, stream_ptr)
+                    .map_err(|e| anyhow::anyhow!("transfer_benchmark: D2H: {e}"))?;
                 end.record(stream_ptr)?;
                 end.synchronize()?;
                 let ms = elapsed_ms(&start, &end)?;
@@ -636,9 +616,8 @@ mod tests {
 
         // Above-range prediction must be ≥ measured at max_bytes — log-log
         // extrapolation with positive slope (which PCIe is) cannot drop.
-        let measured_at_max = Duration::from_nanos(
-            profile.h2d().last().expect("h2d empty").duration_ns,
-        );
+        let measured_at_max =
+            Duration::from_nanos(profile.h2d().last().expect("h2d empty").duration_ns);
         assert!(
             above >= measured_at_max,
             "extrapolation above max_bytes ({:?}) must be >= measured at max_bytes ({:?})",

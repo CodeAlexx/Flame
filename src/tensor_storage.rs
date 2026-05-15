@@ -203,10 +203,7 @@ pub enum TensorStorage {
     /// Non-owning view into a shared GPU buffer. Does NOT free on drop.
     /// The caller must guarantee the backing buffer outlives all views.
     #[cfg(feature = "bf16_u16")]
-    BF16View {
-        ptr: NonNull<u16>,
-        numel: usize,
-    },
+    BF16View { ptr: NonNull<u16>, numel: usize },
     I8 {
         data: StorageSlice<i8>,
         numel: usize,
@@ -283,7 +280,9 @@ impl TensorStorage {
         match self {
             TensorStorage::F32 { .. } => DType::F32,
             TensorStorage::F16 { .. } => DType::F16,
-            TensorStorage::BF16 { .. } | TensorStorage::BF16Arena { .. } | TensorStorage::BF16View { .. } => DType::BF16,
+            TensorStorage::BF16 { .. }
+            | TensorStorage::BF16Arena { .. }
+            | TensorStorage::BF16View { .. } => DType::BF16,
             TensorStorage::I8 { .. } => DType::I8,
             TensorStorage::I32 { .. } => DType::I32,
             TensorStorage::Bool { .. } => DType::Bool,
@@ -295,7 +294,9 @@ impl TensorStorage {
         match self {
             TensorStorage::F32 { numel, .. } => *numel,
             TensorStorage::F16 { numel, .. } => *numel,
-            TensorStorage::BF16 { numel, .. } | TensorStorage::BF16Arena { numel, .. } | TensorStorage::BF16View { numel, .. } => *numel,
+            TensorStorage::BF16 { numel, .. }
+            | TensorStorage::BF16Arena { numel, .. }
+            | TensorStorage::BF16View { numel, .. } => *numel,
             TensorStorage::I8 { numel, .. } => *numel,
             TensorStorage::I32 { numel, .. } => *numel,
             TensorStorage::Bool { numel, .. } => *numel,
@@ -325,28 +326,44 @@ impl TensorStorage {
         match dtype {
             DType::F32 => {
                 let data = alloc_aligned_f32(device, numel)?;
-                Ok(TensorStorage::F32 { data: wrap_slice(data), numel })
+                Ok(TensorStorage::F32 {
+                    data: wrap_slice(data),
+                    numel,
+                })
             }
             DType::F16 => {
                 let data = alloc_aligned_f32(device, numel)?;
-                Ok(TensorStorage::F16 { data: wrap_slice(data), numel, scale: 1.0 })
+                Ok(TensorStorage::F16 {
+                    data: wrap_slice(data),
+                    numel,
+                    scale: 1.0,
+                })
             }
             DType::BF16 => {
                 #[cfg(not(feature = "bf16_u16"))]
                 {
                     let data = alloc_aligned_f32(device, numel)?;
-                    Ok(TensorStorage::BF16 { data: wrap_slice(data), numel })
+                    Ok(TensorStorage::BF16 {
+                        data: wrap_slice(data),
+                        numel,
+                    })
                 }
                 #[cfg(feature = "bf16_u16")]
                 {
                     // Raw alloc via caching pool, no memset — kernel must fully write.
                     let data = crate::cuda_alloc_pool::pool_alloc_u16(device, numel)?;
-                    Ok(TensorStorage::BF16 { data: wrap_slice(data), numel })
+                    Ok(TensorStorage::BF16 {
+                        data: wrap_slice(data),
+                        numel,
+                    })
                 }
             }
             DType::I32 => {
                 let data = alloc_aligned_f32(device, numel)?;
-                Ok(TensorStorage::I32 { data: wrap_slice(data), numel })
+                Ok(TensorStorage::I32 {
+                    data: wrap_slice(data),
+                    numel,
+                })
             }
             // Rare dtypes: fall through to zeros semantics.
             DType::I8 | DType::Bool | DType::F64 | DType::U8 | DType::U32 | DType::I64 => {
@@ -574,7 +591,11 @@ impl TensorStorage {
             )),
             #[cfg(feature = "bf16_u16")]
             TensorStorage::BF16View { numel, .. } => Err(Error::InvalidInput(
-                format!("expected F32 slice, got view-backed BF16(u16) (len={})", numel).into(),
+                format!(
+                    "expected F32 slice, got view-backed BF16(u16) (len={})",
+                    numel
+                )
+                .into(),
             )),
             TensorStorage::I8 { .. } => {
                 Err(Error::InvalidInput("expected F32 slice, got I8".into()))
@@ -875,7 +896,7 @@ impl Drop for TensorStorage {
                             } else {
                                 crate::cuda_alloc_pool::pool_return_f32(slice);
                             }
-                        },
+                        }
                         Err(arc) => drop(arc),
                     }
                     unsafe { std::ptr::write(data, Arc::new(make_dummy_slice::<f32>(dev))) };
@@ -896,7 +917,9 @@ impl Drop for TensorStorage {
             }
             TensorStorage::F16 { data, .. } => {
                 // F16 has no slab path — preserve legacy pool_off short-circuit.
-                if pool_off { return; }
+                if pool_off {
+                    return;
+                }
                 #[cfg(feature = "shared_storage")]
                 {
                     let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };
@@ -918,7 +941,9 @@ impl Drop for TensorStorage {
             #[cfg(not(feature = "bf16_u16"))]
             TensorStorage::BF16 { data, .. } => {
                 // Legacy F32-backed BF16: no slab path (slab is bf16_u16-only).
-                if pool_off { return; }
+                if pool_off {
+                    return;
+                }
                 #[cfg(feature = "shared_storage")]
                 {
                     let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };
@@ -973,7 +998,9 @@ impl Drop for TensorStorage {
                 }
             }
             TensorStorage::I32 { data, .. } => {
-                if pool_off { return; }
+                if pool_off {
+                    return;
+                }
                 #[cfg(feature = "shared_storage")]
                 {
                     let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };
@@ -993,7 +1020,9 @@ impl Drop for TensorStorage {
                 }
             }
             TensorStorage::Bool { data, .. } => {
-                if pool_off { return; }
+                if pool_off {
+                    return;
+                }
                 #[cfg(feature = "shared_storage")]
                 {
                     let arc: Arc<CudaSlice<f32>> = unsafe { std::ptr::read(data) };

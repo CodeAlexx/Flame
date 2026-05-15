@@ -12,13 +12,13 @@
 //! seamlessly with the Tensor API.
 pub mod policy;
 
+use crate::activation_offload::{ActivationOffloadPool, OffloadHandle};
 use crate::autograd::policy::GradStorePolicy;
 use crate::cuda::ffi;
 use crate::cuda_kernels_gpu::CudaKernels;
 use crate::cuda_ops::GpuOps;
 use crate::device::CudaStreamRawPtrExt;
 use crate::gradient::GradientMap;
-use crate::activation_offload::{ActivationOffloadPool, OffloadHandle};
 use crate::gradient_checkpointing::{CHECKPOINT_HAS_ENTRIES, CHECKPOINT_MANAGER};
 use crate::tensor::contracts::assert_nhwc_bf16_public;
 use crate::tensor::TensorId;
@@ -457,6 +457,19 @@ pub enum Op {
         gate: TensorId,
         up: TensorId,
     },
+    /// Packed SwiGLU over a tensor whose last dim is [gate | up].
+    /// Backward returns one packed gradient and avoids dual narrow scatters.
+    FusedSwiGLUSplit {
+        input: TensorId,
+    },
+    /// Fused QKV split+permute output. Each recorded output contributes its
+    /// Q, K, or V slice back into one full QKV gradient tensor.
+    QkvSplitPermute {
+        input: TensorId,
+        part: u8,
+        heads: usize,
+        head_dim: usize,
+    },
     /// Fused RoPE with precomputed cos/sin.
     /// Backward: apply_rope(grad, cos, -sin) via same fused kernel.
     RoPePrecomputed {
@@ -666,7 +679,9 @@ fn tensor_raw_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
         #[cfg(feature = "bf16_u16")]
         TensorStorage::BF16View { ptr, .. } => Ok(ptr.as_ptr() as *const core::ffi::c_void),
         TensorStorage::I32 { data, .. } => Ok(*data.device_ptr() as *const core::ffi::c_void),
-        _ => Err(Error::InvalidOperation("unsupported dtype for raw ptr".into())),
+        _ => Err(Error::InvalidOperation(
+            "unsupported dtype for raw ptr".into(),
+        )),
     }
 }
 
@@ -682,7 +697,9 @@ fn tensor_raw_ptr_mut(t: &mut Tensor) -> Result<*mut core::ffi::c_void> {
             let slice = crate::tensor_storage::ensure_unique_slice(data)?;
             Ok(*slice.device_ptr_mut() as *mut core::ffi::c_void)
         }
-        _ => Err(Error::InvalidOperation("unsupported dtype for raw ptr mut".into())),
+        _ => Err(Error::InvalidOperation(
+            "unsupported dtype for raw ptr mut".into(),
+        )),
     }
 }
 
@@ -772,7 +789,9 @@ fn fused_unary_backward(
         )
     };
     if status != 0 {
-        return Err(Error::Cuda(format!("{op_name} f32 kernel failed (mixed dtype)")));
+        return Err(Error::Cuda(format!(
+            "{op_name} f32 kernel failed (mixed dtype)"
+        )));
     }
     Ok(out)
 }
@@ -869,9 +888,7 @@ pub fn backward(loss: &Tensor, _retain_graph: bool) -> Result<crate::GradientMap
 #[inline]
 fn sdpa_bwd_log(msg: &str) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| {
-        std::env::var("FLAME_LOG_SDPA_BWD").ok().as_deref() == Some("1")
-    }) {
+    if !*ENABLED.get_or_init(|| std::env::var("FLAME_LOG_SDPA_BWD").ok().as_deref() == Some("1")) {
         return;
     }
     eprintln!("[sdpa-bwd] {msg}");
@@ -901,7 +918,10 @@ fn try_cudnn_sdpa_backward(
         return Ok(None);
     }
     // All the reasons to bail out.
-    if mask.is_some() { sdpa_bwd_log("bail:mask-present"); return Ok(None); }
+    if mask.is_some() {
+        sdpa_bwd_log("bail:mask-present");
+        return Ok(None);
+    }
     let (Some(o), Some(stats)) = (o, stats) else {
         sdpa_bwd_log("bail:missing-o-or-stats");
         return Ok(None);
@@ -930,11 +950,17 @@ fn try_cudnn_sdpa_backward(
     }
     // Q/K/V/O must be BF16 (saved from the BF16 forward). If they aren't,
     // we're in a non-flash codepath and must bail to the decomposed fallback.
-    if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16
-        || o.dtype() != DType::BF16 {
+    if q.dtype() != DType::BF16
+        || k.dtype() != DType::BF16
+        || v.dtype() != DType::BF16
+        || o.dtype() != DType::BF16
+    {
         sdpa_bwd_log(&format!(
             "bail:dtype q={:?} k={:?} v={:?} o={:?}",
-            q.dtype(), k.dtype(), v.dtype(), o.dtype()
+            q.dtype(),
+            k.dtype(),
+            v.dtype(),
+            o.dtype()
         ));
         return Ok(None);
     }
@@ -958,17 +984,20 @@ fn try_cudnn_sdpa_backward(
     if stats.shape().dims() != [b * h, n_q] {
         sdpa_bwd_log(&format!(
             "bail:stats-shape got={:?} want=[{},{n_q}]",
-            stats.shape().dims(), b * h
+            stats.shape().dims(),
+            b * h
         ));
         return Ok(None);
     }
-    sdpa_bwd_log(&format!("fired cuDNN bf16 [B={b},H={h},Nq={n_q},Nkv={n_kv},d={d}]"));
+    sdpa_bwd_log(&format!(
+        "fired cuDNN bf16 [B={b},H={h},Nq={n_q},Nkv={n_kv},d={d}]"
+    ));
 
     // Read each tensor's native 4D strides.
-    let q_strides  = strides_4d(q)?;
-    let k_strides  = strides_4d(k)?;
-    let v_strides  = strides_4d(v)?;
-    let o_strides  = strides_4d(o)?;
+    let q_strides = strides_4d(q)?;
+    let k_strides = strides_4d(k)?;
+    let v_strides = strides_4d(v)?;
+    let o_strides = strides_4d(o)?;
     let do_strides = strides_4d(d_o)?;
 
     // Allocate contiguous dQ/dK/dV. Strides computed from shape
@@ -983,44 +1012,66 @@ fn try_cudnn_sdpa_backward(
     use cudarc::driver::DevicePtr;
     let stream = crate::cuda::device_lt::stream_ptr(device)?;
 
-    let q_ptr  = q.as_device_ptr_bf16("cudnn_sdpa_bwd:q")?  as *const core::ffi::c_void;
-    let k_ptr  = k.as_device_ptr_bf16("cudnn_sdpa_bwd:k")?  as *const core::ffi::c_void;
-    let v_ptr  = v.as_device_ptr_bf16("cudnn_sdpa_bwd:v")?  as *const core::ffi::c_void;
-    let o_ptr  = o.as_device_ptr_bf16("cudnn_sdpa_bwd:o")?  as *const core::ffi::c_void;
+    let q_ptr = q.as_device_ptr_bf16("cudnn_sdpa_bwd:q")? as *const core::ffi::c_void;
+    let k_ptr = k.as_device_ptr_bf16("cudnn_sdpa_bwd:k")? as *const core::ffi::c_void;
+    let v_ptr = v.as_device_ptr_bf16("cudnn_sdpa_bwd:v")? as *const core::ffi::c_void;
+    let o_ptr = o.as_device_ptr_bf16("cudnn_sdpa_bwd:o")? as *const core::ffi::c_void;
     let do_ptr = d_o.as_device_ptr_bf16("cudnn_sdpa_bwd:do")? as *const core::ffi::c_void;
     let dq_ptr = dq.as_device_ptr_bf16("cudnn_sdpa_bwd:dq")? as *mut core::ffi::c_void;
     let dk_ptr = dk.as_device_ptr_bf16("cudnn_sdpa_bwd:dk")? as *mut core::ffi::c_void;
     let dv_ptr = dv.as_device_ptr_bf16("cudnn_sdpa_bwd:dv")? as *mut core::ffi::c_void;
 
     let stats_ptr = match &stats.storage {
-        crate::tensor_storage::TensorStorage::F32 { data, .. } =>
-            *crate::tensor_storage::slice_ref(data).device_ptr() as *const core::ffi::c_void,
+        crate::tensor_storage::TensorStorage::F32 { data, .. } => {
+            *crate::tensor_storage::slice_ref(data).device_ptr() as *const core::ffi::c_void
+        }
         _ => return Ok(None),
     };
 
-    let q_off  = q.offset()   as i64;
-    let k_off  = k.offset()   as i64;
-    let v_off  = v.offset()   as i64;
-    let o_off  = o.offset()   as i64;
+    let q_off = q.offset() as i64;
+    let k_off = k.offset() as i64;
+    let v_off = v.offset() as i64;
+    let o_off = o.offset() as i64;
     let do_off = d_o.offset() as i64;
-    let dq_off = dq.offset()  as i64;
-    let dk_off = dk.offset()  as i64;
-    let dv_off = dv.offset()  as i64;
+    let dq_off = dq.offset() as i64;
+    let dk_off = dk.offset() as i64;
+    let dv_off = dv.offset() as i64;
     let stats_off = stats.offset() as i64;
 
     let ret = unsafe {
         crate::cuda::ffi::flame_cudnn_sdpa_bwd_bf16(
-            q_ptr, k_ptr, v_ptr, o_ptr, do_ptr, stats_ptr,
-            dq_ptr, dk_ptr, dv_ptr,
-            b as i32, h as i32, n_q as i32, n_kv as i32, d as i32,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            o_ptr,
+            do_ptr,
+            stats_ptr,
+            dq_ptr,
+            dk_ptr,
+            dv_ptr,
+            b as i32,
+            h as i32,
+            n_q as i32,
+            n_kv as i32,
+            d as i32,
             scale,
-            q_strides.as_ptr(), k_strides.as_ptr(),
-            v_strides.as_ptr(), o_strides.as_ptr(),
+            q_strides.as_ptr(),
+            k_strides.as_ptr(),
+            v_strides.as_ptr(),
+            o_strides.as_ptr(),
             do_strides.as_ptr(),
-            dq_strides.as_ptr(), dk_strides.as_ptr(),
+            dq_strides.as_ptr(),
+            dk_strides.as_ptr(),
             dv_strides.as_ptr(),
-            q_off, k_off, v_off, o_off, do_off, stats_off,
-            dq_off, dk_off, dv_off,
+            q_off,
+            k_off,
+            v_off,
+            o_off,
+            do_off,
+            stats_off,
+            dq_off,
+            dk_off,
+            dv_off,
             stream,
         )
     };
@@ -1032,10 +1083,15 @@ fn try_cudnn_sdpa_backward(
 
 #[cfg(not(all(feature = "cuda", feature = "bf16_u16")))]
 fn try_cudnn_sdpa_backward(
-    _q: &Tensor, _k: &Tensor, _v: &Tensor,
-    _o: Option<&Tensor>, _d_o: &Tensor,
-    _stats: Option<&Tensor>, _mask: Option<&Tensor>,
-    _scale: f32, _device: &Arc<cudarc::driver::CudaDevice>,
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _o: Option<&Tensor>,
+    _d_o: &Tensor,
+    _stats: Option<&Tensor>,
+    _mask: Option<&Tensor>,
+    _scale: f32,
+    _device: &Arc<cudarc::driver::CudaDevice>,
 ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
     Ok(None)
 }
@@ -1067,10 +1123,26 @@ fn attention_backward_recompute(
     cached_attn: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     // All ops in BF16 (bmm requires matching dtypes)
-    let q = if q.dtype() != DType::BF16 { &q.to_dtype_no_grad(DType::BF16)? } else { q };
-    let k = if k.dtype() != DType::BF16 { &k.to_dtype_no_grad(DType::BF16)? } else { k };
-    let v = if v.dtype() != DType::BF16 { &v.to_dtype_no_grad(DType::BF16)? } else { v };
-    let dout = if dout.dtype() != DType::BF16 { &dout.to_dtype_no_grad(DType::BF16)? } else { dout };
+    let q = if q.dtype() != DType::BF16 {
+        &q.to_dtype_no_grad(DType::BF16)?
+    } else {
+        q
+    };
+    let k = if k.dtype() != DType::BF16 {
+        &k.to_dtype_no_grad(DType::BF16)?
+    } else {
+        k
+    };
+    let v = if v.dtype() != DType::BF16 {
+        &v.to_dtype_no_grad(DType::BF16)?
+    } else {
+        v
+    };
+    let dout = if dout.dtype() != DType::BF16 {
+        &dout.to_dtype_no_grad(DType::BF16)?
+    } else {
+        dout
+    };
 
     let attn_owned;
     let attn: &Tensor = if let Some(cached) = cached_attn {
@@ -1136,11 +1208,7 @@ impl AutogradContext {
     /// (the inline-sized `SmallVec<[(TensorId, Tensor); 3]>`). This keeps
     /// the existing `vec![...]` call sites compiling unchanged while
     /// avoiding a heap allocation for the common 0-3 tensor case.
-    pub fn record_op(
-        output_id: TensorId,
-        op: Op,
-        saved_tensors: impl Into<SavedTensors>,
-    ) {
+    pub fn record_op(output_id: TensorId, op: Op, saved_tensors: impl Into<SavedTensors>) {
         // Fast path: skip lock entirely when autograd is disabled (e.g., during backward).
         // This prevents deadlock when backward ops call high-level Tensor methods
         // that would otherwise try to re-acquire the already-held context lock.
@@ -1247,7 +1315,10 @@ impl AutogradContext {
 
     /// Number of entries currently on the autograd tape.
     pub fn tape_len() -> usize {
-        AUTOGRAD_CONTEXT.lock().map(|ctx| ctx.tape.len()).unwrap_or(0)
+        AUTOGRAD_CONTEXT
+            .lock()
+            .map(|ctx| ctx.tape.len())
+            .unwrap_or(0)
     }
 
     /// Reset the entire autograd context (for testing)
@@ -1346,7 +1417,7 @@ impl AutogradContext {
                         Err(e) => {
                             println!("  ERROR computing gradients: {:?}", e);
                             ctx.enabled = prev_enabled;
-                    AUTOGRAD_ENABLED.store(prev_enabled, Ordering::Relaxed);
+                            AUTOGRAD_ENABLED.store(prev_enabled, Ordering::Relaxed);
                             return Err(e);
                         }
                     }
@@ -1371,7 +1442,7 @@ impl AutogradContext {
             // Clear tape and restore state
             ctx.tape.clear();
             ctx.enabled = prev_enabled;
-                    AUTOGRAD_ENABLED.store(prev_enabled, Ordering::Relaxed);
+            AUTOGRAD_ENABLED.store(prev_enabled, Ordering::Relaxed);
         }
 
         println!("\n=== AUTOGRAD DEBUG COMPLETE ===");
@@ -1442,7 +1513,10 @@ impl AutogradContext {
         // Cache profiling flag once (avoid syscall per-op)
         static PROFILE_CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let profile = *PROFILE_CACHED.get_or_init(|| {
-            std::env::var("FLAME_PROFILE").ok().map(|v| v == "1").unwrap_or(false)
+            std::env::var("FLAME_PROFILE")
+                .ok()
+                .map(|v| v == "1")
+                .unwrap_or(false)
         });
         if !loss.requires_grad {
             return Err(Error::InvalidOperation(
@@ -1467,7 +1541,15 @@ impl AutogradContext {
         // backward re-acquires the lock to re-enable autograd and record
         // recomputed ops. Holding the lock across the whole loop deadlocks.
         let gradients = {
-            let (tape_entries, prev_enabled, compact_index, needed_grad_ids, use_cuda_graph, tape_len, graph_phase) = {
+            let (
+                tape_entries,
+                prev_enabled,
+                compact_index,
+                needed_grad_ids,
+                use_cuda_graph,
+                tape_len,
+                graph_phase,
+            ) = {
                 let mut ctx = AUTOGRAD_CONTEXT
                     .lock()
                     .map_err(|_| Error::Training("autograd context mutex poisoned".into()))?;
@@ -1480,98 +1562,216 @@ impl AutogradContext {
                 // Build compact index from the tape for Vec-based gradient storage.
                 let compact_index = {
                     use crate::gradient::CompactIndex;
-                    let id_iter = std::iter::once(loss.id).chain(
-                        ctx.tape.iter().flat_map(|e| {
-                            let mut ids = vec![e.output_id];
-                            for (tid, _) in &e.saved_tensors {
-                                ids.push(*tid);
+                    let id_iter = std::iter::once(loss.id).chain(ctx.tape.iter().flat_map(|e| {
+                        let mut ids = vec![e.output_id];
+                        for (tid, _) in &e.saved_tensors {
+                            ids.push(*tid);
+                        }
+                        for r in &e.saved_refs {
+                            ids.push(r.id);
+                        }
+                        match &e.op {
+                            Op::Add { lhs, rhs, .. }
+                            | Op::Sub { lhs, rhs }
+                            | Op::Mul { lhs, rhs }
+                            | Op::Div { lhs, rhs, .. }
+                            | Op::MatMul { lhs, rhs }
+                            | Op::BatchMatMul { lhs, rhs }
+                            | Op::Maximum { a: lhs, b: rhs }
+                            | Op::Minimum { a: lhs, b: rhs } => {
+                                ids.push(*lhs);
+                                ids.push(*rhs);
                             }
-                            for r in &e.saved_refs {
-                                ids.push(r.id);
+                            Op::MulScalar { input, .. }
+                            | Op::AddScalar { input, .. }
+                            | Op::ReLU { input }
+                            | Op::GELU { input }
+                            | Op::SiLU { input }
+                            | Op::Tanh { input }
+                            | Op::Sigmoid { input }
+                            | Op::Square { input }
+                            | Op::Sqrt { input }
+                            | Op::Sum { input, .. }
+                            | Op::Mean { input, .. }
+                            | Op::Transpose { input }
+                            | Op::Reshape { input, .. }
+                            | Op::Permute { input, .. }
+                            | Op::UpsampleNearest2D { input, .. }
+                            | Op::SumDim { input, .. }
+                            | Op::SumDimKeepdim { input, .. }
+                            | Op::SumDims { input, .. }
+                            | Op::Repeat { input, .. }
+                            | Op::MaxDim { input, .. }
+                            | Op::Clamp { input, .. }
+                            | Op::Abs { input }
+                            | Op::Log { input }
+                            | Op::Softmax { input, .. }
+                            | Op::LogSoftmax { input, .. }
+                            | Op::Checkpoint { input, .. }
+                            | Op::CheckpointOffload { input, .. }
+                            | Op::Cast { input, .. } => {
+                                ids.push(*input);
                             }
-                            match &e.op {
-                                Op::Add { lhs, rhs, .. } | Op::Sub { lhs, rhs }
-                                | Op::Mul { lhs, rhs } | Op::Div { lhs, rhs, .. }
-                                | Op::MatMul { lhs, rhs } | Op::BatchMatMul { lhs, rhs }
-                                | Op::Maximum { a: lhs, b: rhs } | Op::Minimum { a: lhs, b: rhs } => {
-                                    ids.push(*lhs); ids.push(*rhs);
-                                }
-                                Op::MulScalar { input, .. } | Op::AddScalar { input, .. }
-                                | Op::ReLU { input } | Op::GELU { input } | Op::SiLU { input }
-                                | Op::Tanh { input } | Op::Sigmoid { input } | Op::Square { input }
-                                | Op::Sqrt { input }
-                                | Op::Sum { input, .. } | Op::Mean { input, .. }
-                                | Op::Transpose { input } | Op::Reshape { input, .. }
-                                | Op::Permute { input, .. } | Op::UpsampleNearest2D { input, .. }
-                                | Op::SumDim { input, .. }
-                                | Op::SumDimKeepdim { input, .. } | Op::SumDims { input, .. }
-                                | Op::Repeat { input, .. } | Op::MaxDim { input, .. }
-                                | Op::Clamp { input, .. } | Op::Abs { input }
-                                | Op::Log { input } | Op::Softmax { input, .. }
-                                | Op::LogSoftmax { input, .. } | Op::Checkpoint { input, .. }
-                                | Op::CheckpointOffload { input, .. }
-                                | Op::Cast { input, .. } => {
-                                    ids.push(*input);
-                                }
-                                Op::CheckpointOffloadBoundary { input_ids, .. } => {
-                                    for tid in input_ids { ids.push(*tid); }
-                                }
-                                Op::Conv2d { input, weight, .. } | Op::Conv2dNHWC { input, weight, .. }
-                                | Op::AddBias { input, bias: weight } => {
-                                    ids.push(*input); ids.push(*weight);
-                                }
-                                Op::Linear { input, weight, bias } => {
-                                    ids.push(*input); ids.push(*weight);
-                                    if let Some(b) = bias { ids.push(*b); }
-                                }
-                                Op::LayerNorm { input, .. } => { ids.push(*input); }
-                                Op::RMSNorm { input, weight, inv_rms, .. } => {
-                                    ids.push(*input); ids.push(*inv_rms);
-                                    if let Some(w) = weight { ids.push(*w); }
-                                }
-                                Op::GroupNorm { input, weight, bias, .. } => {
-                                    ids.push(*input);
-                                    if let Some(w) = weight { ids.push(*w); }
-                                    if let Some(b) = bias { ids.push(*b); }
-                                }
-                                Op::Embedding { weight, indices } | Op::IndexSelect { input: weight, indices, .. } => {
-                                    ids.push(*weight); ids.push(*indices);
-                                }
-                                Op::IndexAssign { input, indices, values, .. } => {
-                                    ids.push(*input); ids.push(*indices); ids.push(*values);
-                                }
-                                Op::Cat { inputs, .. } => { ids.extend(inputs.iter()); }
-                                Op::Split { input, .. } | Op::Slice { input, .. } => { ids.push(*input); }
-                                Op::Where { cond, t, f } => { ids.push(*cond); ids.push(*t); ids.push(*f); }
-                                Op::MSELoss { predictions, targets, .. }
-                                | Op::L1Loss { predictions, targets, .. }
-                                | Op::HuberLoss { predictions, targets, .. }
-                                | Op::BCELoss { predictions, targets, .. } => {
-                                    ids.push(*predictions); ids.push(*targets);
-                                }
-                                Op::NLLLoss { log_probs, targets, .. } => {
-                                    ids.push(*log_probs); ids.push(*targets);
-                                }
-                                Op::FlashAttention { query, key, value, mask, .. } => {
-                                    ids.push(*query); ids.push(*key); ids.push(*value);
-                                    if let Some(m) = mask { ids.push(*m); }
-                                }
-                                Op::SageAttention { query_id, key_id, value_id, .. } => {
-                                    ids.push(*query_id); ids.push(*key_id); ids.push(*value_id);
-                                }
-                                Op::FusedSwiGLU { gate, up } => {
-                                    ids.push(*gate); ids.push(*up);
-                                }
-                                Op::RoPePrecomputed { input, cos, sin } => {
-                                    ids.push(*input); ids.push(*cos); ids.push(*sin);
-                                }
-                                Op::GateResidual { residual, gate, x } => {
-                                    ids.push(*residual); ids.push(*gate); ids.push(*x);
+                            Op::CheckpointOffloadBoundary { input_ids, .. } => {
+                                for tid in input_ids {
+                                    ids.push(*tid);
                                 }
                             }
-                            ids
-                        })
-                    );
+                            Op::Conv2d { input, weight, .. }
+                            | Op::Conv2dNHWC { input, weight, .. }
+                            | Op::AddBias {
+                                input,
+                                bias: weight,
+                            } => {
+                                ids.push(*input);
+                                ids.push(*weight);
+                            }
+                            Op::Linear {
+                                input,
+                                weight,
+                                bias,
+                            } => {
+                                ids.push(*input);
+                                ids.push(*weight);
+                                if let Some(b) = bias {
+                                    ids.push(*b);
+                                }
+                            }
+                            Op::LayerNorm { input, .. } => {
+                                ids.push(*input);
+                            }
+                            Op::RMSNorm {
+                                input,
+                                weight,
+                                inv_rms,
+                                ..
+                            } => {
+                                ids.push(*input);
+                                ids.push(*inv_rms);
+                                if let Some(w) = weight {
+                                    ids.push(*w);
+                                }
+                            }
+                            Op::GroupNorm {
+                                input,
+                                weight,
+                                bias,
+                                ..
+                            } => {
+                                ids.push(*input);
+                                if let Some(w) = weight {
+                                    ids.push(*w);
+                                }
+                                if let Some(b) = bias {
+                                    ids.push(*b);
+                                }
+                            }
+                            Op::Embedding { weight, indices }
+                            | Op::IndexSelect {
+                                input: weight,
+                                indices,
+                                ..
+                            } => {
+                                ids.push(*weight);
+                                ids.push(*indices);
+                            }
+                            Op::IndexAssign {
+                                input,
+                                indices,
+                                values,
+                                ..
+                            } => {
+                                ids.push(*input);
+                                ids.push(*indices);
+                                ids.push(*values);
+                            }
+                            Op::Cat { inputs, .. } => {
+                                ids.extend(inputs.iter());
+                            }
+                            Op::Split { input, .. } | Op::Slice { input, .. } => {
+                                ids.push(*input);
+                            }
+                            Op::Where { cond, t, f } => {
+                                ids.push(*cond);
+                                ids.push(*t);
+                                ids.push(*f);
+                            }
+                            Op::MSELoss {
+                                predictions,
+                                targets,
+                                ..
+                            }
+                            | Op::L1Loss {
+                                predictions,
+                                targets,
+                                ..
+                            }
+                            | Op::HuberLoss {
+                                predictions,
+                                targets,
+                                ..
+                            }
+                            | Op::BCELoss {
+                                predictions,
+                                targets,
+                                ..
+                            } => {
+                                ids.push(*predictions);
+                                ids.push(*targets);
+                            }
+                            Op::NLLLoss {
+                                log_probs, targets, ..
+                            } => {
+                                ids.push(*log_probs);
+                                ids.push(*targets);
+                            }
+                            Op::FlashAttention {
+                                query,
+                                key,
+                                value,
+                                mask,
+                                ..
+                            } => {
+                                ids.push(*query);
+                                ids.push(*key);
+                                ids.push(*value);
+                                if let Some(m) = mask {
+                                    ids.push(*m);
+                                }
+                            }
+                            Op::SageAttention {
+                                query_id,
+                                key_id,
+                                value_id,
+                                ..
+                            } => {
+                                ids.push(*query_id);
+                                ids.push(*key_id);
+                                ids.push(*value_id);
+                            }
+                            Op::FusedSwiGLU { gate, up } => {
+                                ids.push(*gate);
+                                ids.push(*up);
+                            }
+                            Op::FusedSwiGLUSplit { input } => {
+                                ids.push(*input);
+                            }
+                            Op::QkvSplitPermute { input, .. } => {
+                                ids.push(*input);
+                            }
+                            Op::RoPePrecomputed { input, cos, sin } => {
+                                ids.push(*input);
+                                ids.push(*cos);
+                                ids.push(*sin);
+                            }
+                            Op::GateResidual { residual, gate, x } => {
+                                ids.push(*residual);
+                                ids.push(*gate);
+                                ids.push(*x);
+                            }
+                        }
+                        ids
+                    }));
                     CompactIndex::from_tensor_ids(id_iter)
                 };
 
@@ -1601,7 +1801,9 @@ impl AutogradContext {
                 let graph_phase = if use_cuda_graph {
                     let cache = crate::cuda_graph::BACKWARD_GRAPH_CACHE
                         .lock()
-                        .map_err(|_| Error::Training("backward graph cache mutex poisoned".into()))?;
+                        .map_err(|_| {
+                            Error::Training("backward graph cache mutex poisoned".into())
+                        })?;
                     cache.phase(tape_len)
                 } else {
                     crate::cuda_graph::BackwardPhase::Warmup
@@ -1610,7 +1812,15 @@ impl AutogradContext {
                 // Drain the tape — we now own all entries, lock can be released.
                 let tape_entries: Vec<TapeEntry> = ctx.tape.drain(..).collect();
 
-                (tape_entries, prev_enabled, compact_index, needed_grad_ids, use_cuda_graph, tape_len, graph_phase)
+                (
+                    tape_entries,
+                    prev_enabled,
+                    compact_index,
+                    needed_grad_ids,
+                    use_cuda_graph,
+                    tape_len,
+                    graph_phase,
+                )
             }; // ← lock released here
 
             // Initialize gradient storage with compact index for O(1) Vec-based access.
@@ -1653,13 +1863,12 @@ impl AutogradContext {
                 {
                     let cache = crate::cuda_graph::BACKWARD_GRAPH_CACHE
                         .lock()
-                        .map_err(|_| Error::Training("backward graph cache mutex poisoned".into()))?;
+                        .map_err(|_| {
+                            Error::Training("backward graph cache mutex poisoned".into())
+                        })?;
                     for entry in cache.grad_recipe() {
-                        let grad = Tensor::zeros_dtype(
-                            entry.shape.clone(),
-                            entry.dtype,
-                            device.clone(),
-                        )?;
+                        let grad =
+                            Tensor::zeros_dtype(entry.shape.clone(), entry.dtype, device.clone())?;
                         gradients.set(entry.tensor_id, grad);
                     }
 
@@ -1670,9 +1879,12 @@ impl AutogradContext {
                 }
 
                 {
-                    let mut cache = crate::cuda_graph::BACKWARD_GRAPH_CACHE
-                        .lock()
-                        .map_err(|_| Error::Training("backward graph cache mutex poisoned".into()))?;
+                    let mut cache =
+                        crate::cuda_graph::BACKWARD_GRAPH_CACHE
+                            .lock()
+                            .map_err(|_| {
+                                Error::Training("backward graph cache mutex poisoned".into())
+                            })?;
                     cache.advance();
                 }
 
@@ -1699,17 +1911,17 @@ impl AutogradContext {
             }
 
             // ── Capture or warmup path ──────────────────────────────
-            let capturing = use_cuda_graph
-                && graph_phase == crate::cuda_graph::BackwardPhase::Capture;
+            let capturing =
+                use_cuda_graph && graph_phase == crate::cuda_graph::BackwardPhase::Capture;
             let stream: *mut core::ffi::c_void = core::ptr::null_mut();
 
             if capturing {
-                crate::cuda_graph::begin_capture(
-                    stream,
-                    crate::cuda_graph::CAPTURE_MODE_GLOBAL,
-                )?;
+                crate::cuda_graph::begin_capture(stream, crate::cuda_graph::CAPTURE_MODE_GLOBAL)?;
                 if profile {
-                    eprintln!("[cuda_graph] began capture on default stream (tape_len={})", tape_len);
+                    eprintln!(
+                        "[cuda_graph] began capture on default stream (tape_len={})",
+                        tape_len
+                    );
                 }
             }
 
@@ -1730,7 +1942,10 @@ impl AutogradContext {
                 // Snapshot the test-only retain set once (cheap clone of a
                 // small HashSet, only Some during diagnostic runs).
                 let retain_ids: Option<std::collections::HashSet<TensorId>> =
-                    RETAINED_INTERMEDIATE_GRAD_IDS.lock().ok().and_then(|s| s.clone());
+                    RETAINED_INTERMEDIATE_GRAD_IDS
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.clone());
                 for entry in tape_entries.iter().rev() {
                     if let Some(output_grad) = gradients.take(entry.output_id) {
                         if let Some(ref ids) = retain_ids {
@@ -1758,18 +1973,24 @@ impl AutogradContext {
                         let input_grads = match compute_gradients(entry, &output_grad, &device) {
                             Ok(g) => g,
                             Err(e) => {
-                                eprintln!("[bwd:ERROR] #{} {:?} shape={:?}: {e:?}",
-                                    nodes_executed, std::mem::discriminant(&entry.op),
-                                    output_grad.shape().dims());
+                                eprintln!(
+                                    "[bwd:ERROR] #{} {:?} shape={:?}: {e:?}",
+                                    nodes_executed,
+                                    std::mem::discriminant(&entry.op),
+                                    output_grad.shape().dims()
+                                );
                                 return Err(e);
                             }
                         };
                         let kernel_dt = t_node.elapsed();
                         total_kernel_time += kernel_dt;
                         // Aggregate by op kind.
-                        let disc_u64: u64 =
-                            unsafe { std::mem::transmute::<_, u64>(std::mem::discriminant(&entry.op)) };
-                        let e = per_op_time.entry(disc_u64).or_insert((std::time::Duration::ZERO, 0));
+                        let disc_u64: u64 = unsafe {
+                            std::mem::transmute::<_, u64>(std::mem::discriminant(&entry.op))
+                        };
+                        let e = per_op_time
+                            .entry(disc_u64)
+                            .or_insert((std::time::Duration::ZERO, 0));
                         e.0 += kernel_dt;
                         e.1 += 1;
 
@@ -1830,7 +2051,12 @@ impl AutogradContext {
                         }
                     }
                 }
-                log::debug!("[backward] processed {} of {} entries, gradients.len()={}", nodes_executed, tape_entries.len(), gradients.len());
+                log::debug!(
+                    "[backward] processed {} of {} entries, gradients.len()={}",
+                    nodes_executed,
+                    tape_entries.len(),
+                    gradients.len()
+                );
                 Ok(())
             })();
 
@@ -1860,9 +2086,12 @@ impl AutogradContext {
                         };
 
                         // Store in cache
-                        let mut cache = crate::cuda_graph::BACKWARD_GRAPH_CACHE
-                            .lock()
-                            .map_err(|_| Error::Training("backward graph cache mutex poisoned".into()))?;
+                        let mut cache =
+                            crate::cuda_graph::BACKWARD_GRAPH_CACHE
+                                .lock()
+                                .map_err(|_| {
+                                    Error::Training("backward graph cache mutex poisoned".into())
+                                })?;
                         cache.store(exec, tape_len, grad_recipe);
                         cache.advance();
 
@@ -1883,18 +2112,24 @@ impl AutogradContext {
                         // Capture failed — cancel by ending capture (graph will be empty/null)
                         // and fall back to non-graph mode on next step.
                         let _ = crate::cuda_graph::end_capture(stream);
-                        let mut cache = crate::cuda_graph::BACKWARD_GRAPH_CACHE
-                            .lock()
-                            .map_err(|_| Error::Training("backward graph cache mutex poisoned".into()))?;
+                        let mut cache =
+                            crate::cuda_graph::BACKWARD_GRAPH_CACHE
+                                .lock()
+                                .map_err(|_| {
+                                    Error::Training("backward graph cache mutex poisoned".into())
+                                })?;
                         cache.invalidate();
 
-                        eprintln!("[cuda_graph] capture failed, falling back to normal backward: {:?}", e);
+                        eprintln!(
+                            "[cuda_graph] capture failed, falling back to normal backward: {:?}",
+                            e
+                        );
 
                         // Re-enable autograd
                         {
-                            let mut ctx = AUTOGRAD_CONTEXT
-                                .lock()
-                                .map_err(|_| Error::Training("autograd context mutex poisoned".into()))?;
+                            let mut ctx = AUTOGRAD_CONTEXT.lock().map_err(|_| {
+                                Error::Training("autograd context mutex poisoned".into())
+                            })?;
                             ctx.enabled = prev_enabled;
                             AUTOGRAD_ENABLED.store(prev_enabled, Ordering::Relaxed);
                         }
@@ -1907,17 +2142,24 @@ impl AutogradContext {
 
                 // Advance the graph cache step counter (warmup → capture next time)
                 if use_cuda_graph {
-                    let mut cache = crate::cuda_graph::BACKWARD_GRAPH_CACHE
-                        .lock()
-                        .map_err(|_| Error::Training("backward graph cache mutex poisoned".into()))?;
+                    let mut cache =
+                        crate::cuda_graph::BACKWARD_GRAPH_CACHE
+                            .lock()
+                            .map_err(|_| {
+                                Error::Training("backward graph cache mutex poisoned".into())
+                            })?;
                     cache.advance();
                     if profile {
-                        let phase_name = if graph_phase == crate::cuda_graph::BackwardPhase::Warmup {
+                        let phase_name = if graph_phase == crate::cuda_graph::BackwardPhase::Warmup
+                        {
                             "warmup"
                         } else {
                             "normal"
                         };
-                        eprintln!("[cuda_graph] {} step complete, next step will capture", phase_name);
+                        eprintln!(
+                            "[cuda_graph] {} step complete, next step will capture",
+                            phase_name
+                        );
                     }
                 }
             }
@@ -1926,7 +2168,10 @@ impl AutogradContext {
             if profile && !capturing && !per_op_time.is_empty() {
                 let mut sorted: Vec<_> = per_op_time.iter().collect();
                 sorted.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
-                eprintln!("[bwd:per-op] top 8 by total time across {} nodes:", nodes_executed);
+                eprintln!(
+                    "[bwd:per-op] top 8 by total time across {} nodes:",
+                    nodes_executed
+                );
                 for (disc, (dt, n)) in sorted.iter().take(8) {
                     eprintln!(
                         "  disc={:<4} total={:6.1}ms  count={:4}  avg={:5.2}ms",
@@ -1952,21 +2197,34 @@ impl AutogradContext {
                 eprintln!("║ Tape entries:     {}", tape_len);
                 eprintln!("║ Nodes executed:   {}", nodes_executed);
                 eprintln!("║ Total backward:   {:.3}s", total_dt.as_secs_f64());
-                eprintln!("║ Kernel time:      {:.3}s ({:.1}%)",
+                eprintln!(
+                    "║ Kernel time:      {:.3}s ({:.1}%)",
                     total_kernel_time.as_secs_f64(),
-                    100.0 * total_kernel_time.as_secs_f64() / total_dt.as_secs_f64().max(1e-9));
-                eprintln!("║ Accum time:       {:.3}s ({:.1}%)",
+                    100.0 * total_kernel_time.as_secs_f64() / total_dt.as_secs_f64().max(1e-9)
+                );
+                eprintln!(
+                    "║ Accum time:       {:.3}s ({:.1}%)",
                     total_accum_time.as_secs_f64(),
-                    100.0 * total_accum_time.as_secs_f64() / total_dt.as_secs_f64().max(1e-9));
-                eprintln!("║ Overhead:         {:.3}s ({:.1}%)",
+                    100.0 * total_accum_time.as_secs_f64() / total_dt.as_secs_f64().max(1e-9)
+                );
+                eprintln!(
+                    "║ Overhead:         {:.3}s ({:.1}%)",
                     overhead.as_secs_f64(),
-                    100.0 * overhead.as_secs_f64() / total_dt.as_secs_f64().max(1e-9));
-                eprintln!("║ Per-node avg:     {:.3}ms",
-                    total_dt.as_secs_f64() * 1000.0 / nodes_executed.max(1) as f64);
+                    100.0 * overhead.as_secs_f64() / total_dt.as_secs_f64().max(1e-9)
+                );
+                eprintln!(
+                    "║ Per-node avg:     {:.3}ms",
+                    total_dt.as_secs_f64() * 1000.0 / nodes_executed.max(1) as f64
+                );
                 eprintln!("╠══════════════════════════════════════════════════════════");
                 eprintln!("║ Top 10 slowest ops:");
                 for (i, (dt, op)) in slowest_nodes.iter().take(10).enumerate() {
-                    eprintln!("║  {:2}. {:8.3}ms  {}", i + 1, dt.as_secs_f64() * 1000.0, op);
+                    eprintln!(
+                        "║  {:2}. {:8.3}ms  {}",
+                        i + 1,
+                        dt.as_secs_f64() * 1000.0,
+                        op
+                    );
                 }
                 eprintln!("╚══════════════════════════════════════════════════════════\n");
             }
@@ -2036,7 +2294,8 @@ impl AutogradContext {
     {
         // Check if autograd is even enabled — if not, just run the closure directly.
         let was_enabled = {
-            let ctx = AUTOGRAD_CONTEXT.lock()
+            let ctx = AUTOGRAD_CONTEXT
+                .lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
             ctx.enabled
         };
@@ -2079,7 +2338,8 @@ impl AutogradContext {
             }
         }
         let _guard = {
-            let mut ctx = AUTOGRAD_CONTEXT.lock()
+            let mut ctx = AUTOGRAD_CONTEXT
+                .lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
             let prior = ctx.enabled;
             ctx.enabled = false;
@@ -2094,7 +2354,8 @@ impl AutogradContext {
         // the guard drops and restores the prior state at function exit —
         // re-enabling tape recording for the outer scope only if the
         // outer scope had it on.
-        let input_id = inputs.first()
+        let input_id = inputs
+            .first()
             .ok_or_else(|| Error::InvalidInput("checkpoint requires at least one input".into()))?
             .id;
 
@@ -2115,7 +2376,8 @@ impl AutogradContext {
         drop(_guard);
 
         if should_record {
-            let mut ctx = AUTOGRAD_CONTEXT.lock()
+            let mut ctx = AUTOGRAD_CONTEXT
+                .lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
             ctx.checkpoint_fns.insert(out_with_grad.id, Arc::new(f));
             ctx.record(TapeEntry {
@@ -2158,7 +2420,8 @@ impl AutogradContext {
     {
         // Fast path: autograd off → just run f and return.
         let was_enabled = {
-            let ctx = AUTOGRAD_CONTEXT.lock()
+            let ctx = AUTOGRAD_CONTEXT
+                .lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
             ctx.enabled
         };
@@ -2184,8 +2447,7 @@ impl AutogradContext {
 
         let cache = cache_opt.unwrap();
         let input_ids: Vec<TensorId> = inputs.iter().map(|t| t.id).collect();
-        let pulled_ids_slot: Arc<Mutex<Vec<TensorId>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let pulled_ids_slot: Arc<Mutex<Vec<TensorId>>> = Arc::new(Mutex::new(Vec::new()));
 
         // 2026-05-14 re-entry fix: save prior enabled state and restore it
         // on scope exit via a guard. Same rationale as in `checkpoint`.
@@ -2201,7 +2463,8 @@ impl AutogradContext {
             }
         }
         let _guard = {
-            let mut ctx = AUTOGRAD_CONTEXT.lock()
+            let mut ctx = AUTOGRAD_CONTEXT
+                .lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
             let prior = ctx.enabled;
             ctx.enabled = false;
@@ -2280,7 +2543,8 @@ impl AutogradContext {
         drop(_guard);
 
         if should_record {
-            let mut ctx = AUTOGRAD_CONTEXT.lock()
+            let mut ctx = AUTOGRAD_CONTEXT
+                .lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
             ctx.checkpoint_fns
                 .insert(out_with_grad.id, Arc::new(recompute_fn));
@@ -2313,14 +2577,19 @@ impl AutogradContext {
         F: Fn() -> Result<Tensor> + Send + Sync + 'static,
     {
         // No pool installed (or torn down) → fall back to standard checkpoint.
-        let pool_arc = match ACTIVATION_POOL.read().ok().and_then(|g| g.as_ref().cloned()) {
+        let pool_arc = match ACTIVATION_POOL
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+        {
             Some(p) => p,
             None => return Self::checkpoint(inputs, f),
         };
 
         // No autograd → just run closure (sampling path).
         let was_enabled = {
-            let ctx = AUTOGRAD_CONTEXT.lock()
+            let ctx = AUTOGRAD_CONTEXT
+                .lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
             ctx.enabled
         };
@@ -2330,7 +2599,8 @@ impl AutogradContext {
 
         // Record tape position before the forward pass.
         let tape_start = {
-            let ctx = AUTOGRAD_CONTEXT.lock()
+            let ctx = AUTOGRAD_CONTEXT
+                .lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
             ctx.tape.len()
         };
@@ -2340,13 +2610,17 @@ impl AutogradContext {
         // instead of discarding it and storing a recompute closure.
         let output = f()?;
 
-        let input_id = inputs.first()
-            .ok_or_else(|| Error::InvalidInput("checkpoint_offload requires at least one input".into()))?
+        let input_id = inputs
+            .first()
+            .ok_or_else(|| {
+                Error::InvalidInput("checkpoint_offload requires at least one input".into())
+            })?
             .id;
 
         // Extract the sub-tape entries produced by the forward pass.
         let sub_tape: Vec<TapeEntry> = {
-            let mut ctx = AUTOGRAD_CONTEXT.lock()
+            let mut ctx = AUTOGRAD_CONTEXT
+                .lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
             if ctx.tape.len() > tape_start {
                 ctx.tape.drain(tape_start..).collect()
@@ -2360,7 +2634,8 @@ impl AutogradContext {
         let mut offloaded_entries: Vec<OffloadedTapeEntry> = Vec::with_capacity(sub_tape.len());
         let mut offload_failed = false;
         {
-            let mut pool = pool_arc.lock()
+            let mut pool = pool_arc
+                .lock()
                 .map_err(|_| Error::Training("offload pool mutex poisoned".into()))?;
 
             for entry in &sub_tape {
@@ -2436,14 +2711,18 @@ impl AutogradContext {
             return Self::checkpoint(inputs, f);
         }
 
-        log::debug!("checkpoint_offload: offloaded {} sub-tape entries successfully", offloaded_entries.len());
+        log::debug!(
+            "checkpoint_offload: offloaded {} sub-tape entries successfully",
+            offloaded_entries.len()
+        );
         // Success: record a single CheckpointOffload op on the outer tape
         // with the offloaded sub-tape. No recompute closure stored.
         let mut out_with_grad = output;
         out_with_grad.requires_grad = true;
 
         {
-            let mut ctx = AUTOGRAD_CONTEXT.lock()
+            let mut ctx = AUTOGRAD_CONTEXT
+                .lock()
                 .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
             ctx.record(TapeEntry {
                 output_id: out_with_grad.id,
@@ -2502,7 +2781,10 @@ fn compute_gradients(
     // Cached to avoid syscall per-op (was ~0.5ms × 800 ops = 400ms overhead)
     static TRACE_CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let trace = *TRACE_CACHED.get_or_init(|| {
-        std::env::var("FLAME_BACKWARD_TRACE").ok().map(|v| v == "1").unwrap_or(false)
+        std::env::var("FLAME_BACKWARD_TRACE")
+            .ok()
+            .map(|v| v == "1")
+            .unwrap_or(false)
     });
     if trace {
         let og = output_grad.shape().dims().to_vec();
@@ -2510,7 +2792,12 @@ fn compute_gradients(
             .saved_tensors
             .iter()
             .map(|(_, t)| t.shape().dims().to_vec())
-            .chain(entry.saved_refs.iter().map(|r| r.tensor.shape().dims().to_vec()))
+            .chain(
+                entry
+                    .saved_refs
+                    .iter()
+                    .map(|r| r.tensor.shape().dims().to_vec()),
+            )
             .collect();
         println!("[backtrace] op={:?}", entry.op);
         println!("[backtrace] out_grad={:?} saved={:?}", og, saved);
@@ -2555,7 +2842,12 @@ fn compute_gradients(
     };
 
     let grads = match &entry.op {
-        Op::Add { lhs, rhs, lhs_shape, rhs_shape } => {
+        Op::Add {
+            lhs,
+            rhs,
+            lhs_shape,
+            rhs_shape,
+        } => {
             // Gradient flows unchanged to both inputs, but handle broadcasting.
             let grad_lhs = if lhs_shape != output_grad.shape() {
                 reduce_grad_for_broadcast(output_grad, lhs_shape)?
@@ -2581,9 +2873,8 @@ fn compute_gradients(
         Op::Mul { lhs, rhs } => {
             // d/dx(x*y) = y, d/dy(x*y) = x
             static DEBUG_CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let _verbose = *DEBUG_CACHED.get_or_init(|| {
-                std::env::var("DEBUG_AUTOGRAD").ok().as_deref() == Some("1")
-            });
+            let _verbose = *DEBUG_CACHED
+                .get_or_init(|| std::env::var("DEBUG_AUTOGRAD").ok().as_deref() == Some("1"));
             if _verbose {
                 println!("  Computing Mul gradients...");
             }
@@ -2659,19 +2950,11 @@ fn compute_gradients(
                     &grad_bf16_owned
                 };
                 // grad_lhs = output_grad @ rhs^T
-                let grad_lhs = crate::ops::gemm_bf16::matmul_bf16_trans(
-                    grad_bf16,
-                    rhs_tensor,
-                    false,
-                    true,
-                )?;
+                let grad_lhs =
+                    crate::ops::gemm_bf16::matmul_bf16_trans(grad_bf16, rhs_tensor, false, true)?;
                 // grad_rhs = lhs^T @ output_grad
-                let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
-                    lhs_tensor,
-                    grad_bf16,
-                    true,
-                    false,
-                )?;
+                let grad_rhs =
+                    crate::ops::gemm_bf16::matmul_bf16_trans(lhs_tensor, grad_bf16, true, false)?;
                 return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
             }
 
@@ -2699,19 +2982,22 @@ fn compute_gradients(
                     )?;
                     let grad_lhs = grad_lhs_2d.reshape(&[batch, m, k])?;
                     // grad_rhs = lhs^T @ og
-                    let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
-                        &lhs_2d, &og_bf16, true, false,
-                    )?;
+                    let grad_rhs =
+                        crate::ops::gemm_bf16::matmul_bf16_trans(&lhs_2d, &og_bf16, true, false)?;
                     return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
                 }
 
                 // Fallback for non-BF16
                 let og_cast = if og_2d.dtype() != rhs_tensor.dtype() {
                     og_2d.to_dtype_no_grad(rhs_tensor.dtype())?
-                } else { og_2d.clone() };
+                } else {
+                    og_2d.clone()
+                };
                 let lhs_cast = if lhs_2d.dtype() != og_cast.dtype() {
                     lhs_2d.to_dtype_no_grad(og_cast.dtype())?
-                } else { lhs_2d };
+                } else {
+                    lhs_2d
+                };
 
                 let rhs_t = GpuOps::transpose(rhs_tensor)?;
                 let grad_lhs_2d = GpuOps::matmul(&og_cast, &rhs_t)?;
@@ -2728,7 +3014,8 @@ fn compute_gradients(
             // grad_lhs = output_grad @ rhs^T   (trans_b=true)
             // grad_rhs = lhs^T @ output_grad   (trans_a=true)
             #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-            if lhs_tensor.rank() == 3 && rhs_tensor.rank() == 3
+            if lhs_tensor.rank() == 3
+                && rhs_tensor.rank() == 3
                 && lhs_tensor.dtype() == DType::BF16
                 && rhs_tensor.dtype() == DType::BF16
             {
@@ -2739,12 +3026,10 @@ fn compute_gradients(
                     grad_bf16_owned = output_grad.to_dtype_no_grad(DType::BF16)?;
                     &grad_bf16_owned
                 };
-                let grad_lhs = crate::ops::gemm_bf16::matmul_bf16_trans(
-                    grad_bf16, rhs_tensor, false, true,
-                )?;
-                let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
-                    lhs_tensor, grad_bf16, true, false,
-                )?;
+                let grad_lhs =
+                    crate::ops::gemm_bf16::matmul_bf16_trans(grad_bf16, rhs_tensor, false, true)?;
+                let grad_rhs =
+                    crate::ops::gemm_bf16::matmul_bf16_trans(lhs_tensor, grad_bf16, true, false)?;
                 return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
             }
 
@@ -2816,7 +3101,8 @@ fn compute_gradients(
                         tensor_raw_ptr(output_grad)?,
                         tensor_raw_ptr(&x)?,
                         tensor_raw_ptr_mut(&mut out)?,
-                        n, stream,
+                        n,
+                        stream,
                     )
                 };
                 if status != 0 {
@@ -2830,7 +3116,8 @@ fn compute_gradients(
                         tensor_raw_ptr(output_grad)?,
                         tensor_raw_ptr(&x)?,
                         tensor_raw_ptr_mut(&mut out)?,
-                        n, stream,
+                        n,
+                        stream,
                     )
                 };
                 if status != 0 {
@@ -2839,15 +3126,25 @@ fn compute_gradients(
                 out
             } else {
                 // Fallback: mixed dtypes — cast and use f32 kernel
-                let og_f32 = if output_grad.dtype() != DType::F32 { output_grad.to_dtype_no_grad(DType::F32)? } else { output_grad.clone() };
-                let x_f32 = if x.dtype() != DType::F32 { x.to_dtype_no_grad(DType::F32)? } else { x };
-                let mut out = Tensor::empty_dtype(x_f32.shape().clone(), DType::F32, device.clone())?;
+                let og_f32 = if output_grad.dtype() != DType::F32 {
+                    output_grad.to_dtype_no_grad(DType::F32)?
+                } else {
+                    output_grad.clone()
+                };
+                let x_f32 = if x.dtype() != DType::F32 {
+                    x.to_dtype_no_grad(DType::F32)?
+                } else {
+                    x
+                };
+                let mut out =
+                    Tensor::empty_dtype(x_f32.shape().clone(), DType::F32, device.clone())?;
                 let status = unsafe {
                     crate::cuda::ffi::flame_silu_backward_f32(
                         tensor_raw_ptr(&og_f32)?,
                         tensor_raw_ptr(&x_f32)?,
                         tensor_raw_ptr_mut(&mut out)?,
-                        n, stream,
+                        n,
+                        stream,
                     )
                 };
                 if status != 0 {
@@ -2899,10 +3196,7 @@ fn compute_gradients(
             // Use the output (sqrt(x)) from saved tensor to compute: grad * 0.5 / sqrt(x)
             let input_tensor = fetch_saved(input)?;
             let sqrt_x = GpuOps::sqrt(&input_tensor)?;
-            let half_inv_sqrt = GpuOps::div(
-                &GpuOps::mul_scalar(output_grad, 0.5)?,
-                &sqrt_x,
-            )?;
+            let half_inv_sqrt = GpuOps::div(&GpuOps::mul_scalar(output_grad, 0.5)?, &sqrt_x)?;
             Ok(smallvec![(*input, half_inv_sqrt)])
         }
 
@@ -2931,7 +3225,10 @@ fn compute_gradients(
             Ok(smallvec![(*input, g)])
         }
 
-        Op::Checkpoint { input, original_tape_len: _ } => {
+        Op::Checkpoint {
+            input,
+            original_tape_len: _,
+        } => {
             // ────────────────────────────────────────────────────────────────
             // PyTorch-style checkpoint backward (detach-recompute pattern)
             //
@@ -2950,19 +3247,23 @@ fn compute_gradients(
             let _ckpt_t0 = std::time::Instant::now();
 
             let recompute_fn = {
-                let ctx = AUTOGRAD_CONTEXT.lock()
+                let ctx = AUTOGRAD_CONTEXT
+                    .lock()
                     .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
-                ctx.checkpoint_fns.get(&entry.output_id).cloned()
-                    .ok_or_else(|| Error::Training(
-                        "Checkpoint backward: no recompute closure found".into()
-                    ))?
+                ctx.checkpoint_fns
+                    .get(&entry.output_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Training("Checkpoint backward: no recompute closure found".into())
+                    })?
             };
 
             // ── Step 1: Detach inputs ──
             // Create leaf tensors with fresh IDs. The closure will operate on
             // the SAME GPU data (Arc bump, zero copy) but the new IDs are not
             // connected to any tape entry in the outer graph.
-            let original_input_ids: Vec<TensorId> = entry.saved_tensors
+            let original_input_ids: Vec<TensorId> = entry
+                .saved_tensors
                 .iter()
                 .map(|(tid, _)| *tid)
                 .chain(entry.saved_refs.iter().map(|r| r.id))
@@ -2974,13 +3275,15 @@ fn compute_gradients(
 
             // ── Step 2: Recompute with autograd → local sub-tape ──
             let tape_start = {
-                let ctx = AUTOGRAD_CONTEXT.lock()
+                let ctx = AUTOGRAD_CONTEXT
+                    .lock()
                     .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
                 ctx.tape.len()
             };
 
             {
-                let mut ctx = AUTOGRAD_CONTEXT.lock()
+                let mut ctx = AUTOGRAD_CONTEXT
+                    .lock()
                     .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
                 ctx.enabled = true;
                 AUTOGRAD_ENABLED.store(true, Ordering::Relaxed);
@@ -2995,7 +3298,8 @@ fn compute_gradients(
 
             // Drain the local sub-tape from the global tape
             let mut sub_tape: Vec<TapeEntry> = {
-                let mut ctx = AUTOGRAD_CONTEXT.lock()
+                let mut ctx = AUTOGRAD_CONTEXT
+                    .lock()
                     .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
                 ctx.enabled = false;
                 AUTOGRAD_ENABLED.store(false, Ordering::Relaxed);
@@ -3038,16 +3342,23 @@ fn compute_gradients(
             // Build compact gradient map for the sub-backward
             let sub_compact = {
                 use crate::gradient::CompactIndex;
-                let ids = sub_tape.iter().flat_map(|e| {
-                    let mut ids = vec![e.output_id];
-                    for (sid, _) in &e.saved_tensors { ids.push(*sid); }
-                    for r in &e.saved_refs { ids.push(r.id); }
-                    ids
-                }).chain(std::iter::once(*input));
+                let ids = sub_tape
+                    .iter()
+                    .flat_map(|e| {
+                        let mut ids = vec![e.output_id];
+                        for (sid, _) in &e.saved_tensors {
+                            ids.push(*sid);
+                        }
+                        for r in &e.saved_refs {
+                            ids.push(r.id);
+                        }
+                        ids
+                    })
+                    .chain(std::iter::once(*input));
                 CompactIndex::from_tensor_ids(ids)
             };
-            let mut sub_grads = crate::gradient::GradientMap::with_index(
-                device.clone(), sub_compact);
+            let mut sub_grads =
+                crate::gradient::GradientMap::with_index(device.clone(), sub_compact);
 
             // Seed with upstream gradient at the recomputed output
             if let Some(last_entry) = sub_tape.last() {
@@ -3065,7 +3376,9 @@ fn compute_gradients(
                     let input_grads = compute_gradients(&sub_entry, &sg, device)?;
                     for (tid, g) in input_grads {
                         if all_needed.contains(&tid) {
-                            if g.dtype() != DType::F32 { n_bf16_casts += 1; }
+                            if g.dtype() != DType::F32 {
+                                n_bf16_casts += 1;
+                            }
                             sub_grads.accumulate(tid, g)?;
                         }
                     }
@@ -3089,16 +3402,21 @@ fn compute_gradients(
             // Profiling
             static CKPT_PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let ckpt_profile = *CKPT_PROFILE.get_or_init(|| {
-                std::env::var("FLAME_PROFILE").ok().map(|v| v == "1").unwrap_or(false)
+                std::env::var("FLAME_PROFILE")
+                    .ok()
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
             });
             if ckpt_profile {
                 let total_dt = _ckpt_t0.elapsed();
-                eprintln!("[checkpoint:{}] recomp={:.1}ms total={:.1}ms ({} entries, {} bf16_casts)",
+                eprintln!(
+                    "[checkpoint:{}] recomp={:.1}ms total={:.1}ms ({} entries, {} bf16_casts)",
                     entry.output_id.0,
                     _recomp_dt.as_secs_f64() * 1000.0,
                     total_dt.as_secs_f64() * 1000.0,
                     n_sub_entries,
-                    n_bf16_casts);
+                    n_bf16_casts
+                );
             }
 
             // ── Step 5: Return only chain + trainable gradients ──
@@ -3113,7 +3431,10 @@ fn compute_gradients(
             Ok(result)
         }
 
-        Op::CheckpointOffloadBoundary { input_ids, pulled_ids_slot } => {
+        Op::CheckpointOffloadBoundary {
+            input_ids,
+            pulled_ids_slot,
+        } => {
             // Same detach-recompute pattern as Op::Checkpoint above, but:
             //   - No strong tensor refs in saved_tensors (entry.saved_tensors
             //     is empty by construction).
@@ -3122,22 +3443,29 @@ fn compute_gradients(
             //     inputs from the GrowOnDemandActivationCache internally
             //     before calling the user closure.
             let recompute_fn = {
-                let ctx = AUTOGRAD_CONTEXT.lock()
+                let ctx = AUTOGRAD_CONTEXT
+                    .lock()
                     .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
-                ctx.checkpoint_fns.get(&entry.output_id).cloned()
-                    .ok_or_else(|| Error::Training(
-                        "CheckpointOffloadBoundary backward: no recompute closure".into()
-                    ))?
+                ctx.checkpoint_fns
+                    .get(&entry.output_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Training(
+                            "CheckpointOffloadBoundary backward: no recompute closure".into(),
+                        )
+                    })?
             };
 
             // Recompute with autograd → local sub-tape.
             let tape_start = {
-                let ctx = AUTOGRAD_CONTEXT.lock()
+                let ctx = AUTOGRAD_CONTEXT
+                    .lock()
                     .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
                 ctx.tape.len()
             };
             {
-                let mut ctx = AUTOGRAD_CONTEXT.lock()
+                let mut ctx = AUTOGRAD_CONTEXT
+                    .lock()
                     .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
                 ctx.enabled = true;
                 AUTOGRAD_ENABLED.store(true, Ordering::Relaxed);
@@ -3147,7 +3475,8 @@ fn compute_gradients(
                 (recompute_fn)()?
             };
             let mut sub_tape: Vec<TapeEntry> = {
-                let mut ctx = AUTOGRAD_CONTEXT.lock()
+                let mut ctx = AUTOGRAD_CONTEXT
+                    .lock()
                     .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
                 ctx.enabled = false;
                 AUTOGRAD_ENABLED.store(false, Ordering::Relaxed);
@@ -3211,16 +3540,24 @@ fn compute_gradients(
 
             let sub_compact = {
                 use crate::gradient::CompactIndex;
-                let ids = sub_tape.iter().flat_map(|e| {
-                    let mut ids = vec![e.output_id];
-                    for (sid, _) in &e.saved_tensors { ids.push(*sid); }
-                    for r in &e.saved_refs { ids.push(r.id); }
-                    ids
-                }).chain(input_ids.iter().copied()).chain(pulled_ids.iter().copied());
+                let ids = sub_tape
+                    .iter()
+                    .flat_map(|e| {
+                        let mut ids = vec![e.output_id];
+                        for (sid, _) in &e.saved_tensors {
+                            ids.push(*sid);
+                        }
+                        for r in &e.saved_refs {
+                            ids.push(r.id);
+                        }
+                        ids
+                    })
+                    .chain(input_ids.iter().copied())
+                    .chain(pulled_ids.iter().copied());
                 CompactIndex::from_tensor_ids(ids)
             };
-            let mut sub_grads = crate::gradient::GradientMap::with_index(
-                device.clone(), sub_compact);
+            let mut sub_grads =
+                crate::gradient::GradientMap::with_index(device.clone(), sub_compact);
 
             if let Some(last_entry) = sub_tape.last() {
                 sub_grads.set(last_entry.output_id, output_grad.clone());
@@ -3256,10 +3593,13 @@ fn compute_gradients(
         Op::CheckpointOffload { input, sub_tape } => {
             // Level 2: NO recompute. Walk the stored sub-tape, pulling
             // offloaded saved tensors from CPU as needed.
-            let pool_arc = ACTIVATION_POOL.read().ok().and_then(|g| g.as_ref().cloned())
-                .ok_or_else(|| Error::Training(
-                    "CheckpointOffload backward: no offload pool set".into()
-                ))?;
+            let pool_arc = ACTIVATION_POOL
+                .read()
+                .ok()
+                .and_then(|g| g.as_ref().cloned())
+                .ok_or_else(|| {
+                    Error::Training("CheckpointOffload backward: no offload pool set".into())
+                })?;
 
             // Build the set of tensor IDs we need gradients for.
             let sub_needed: std::collections::HashSet<TensorId> = {
@@ -3283,7 +3623,8 @@ fn compute_gradients(
             // Walk the sub-tape in reverse (backward order). For each entry,
             // pull offloaded saved tensors from CPU, rebuild a TapeEntry,
             // and call compute_gradients.
-            let mut pool = pool_arc.lock()
+            let mut pool = pool_arc
+                .lock()
                 .map_err(|_| Error::Training("offload pool mutex poisoned".into()))?;
 
             for oe in sub_tape.iter().rev() {
@@ -3298,7 +3639,9 @@ fn compute_gradients(
                             saved.push((*sid, pulled));
                         } else {
                             // Resident fallback (non-BF16 tensor).
-                            if let Some((_, t)) = oe.resident_fallback.iter().find(|(id, _)| id == sid) {
+                            if let Some((_, t)) =
+                                oe.resident_fallback.iter().find(|(id, _)| id == sid)
+                            {
                                 saved.push((*sid, t.clone()));
                             }
                         }
@@ -3341,12 +3684,10 @@ fn compute_gradients(
                 && gate_tensor.dtype() == DType::BF16
                 && up_tensor.dtype() == DType::BF16
             {
-                let mut d_gate_t = Tensor::empty_dtype(
-                    gate_tensor.shape().clone(), DType::BF16, device.clone(),
-                )?;
-                let mut d_up_t = Tensor::empty_dtype(
-                    up_tensor.shape().clone(), DType::BF16, device.clone(),
-                )?;
+                let mut d_gate_t =
+                    Tensor::empty_dtype(gate_tensor.shape().clone(), DType::BF16, device.clone())?;
+                let mut d_up_t =
+                    Tensor::empty_dtype(up_tensor.shape().clone(), DType::BF16, device.clone())?;
                 let status = unsafe {
                     crate::cuda::ffi::flame_swiglu_backward_bf16(
                         tensor_raw_ptr(output_grad)?,
@@ -3354,7 +3695,8 @@ fn compute_gradients(
                         tensor_raw_ptr(&up_tensor)?,
                         tensor_raw_ptr_mut(&mut d_gate_t)?,
                         tensor_raw_ptr_mut(&mut d_up_t)?,
-                        n, stream,
+                        n,
+                        stream,
                     )
                 };
                 if status != 0 {
@@ -3378,12 +3720,10 @@ fn compute_gradients(
                 } else {
                     up_tensor
                 };
-                let mut d_gate_t = Tensor::empty_dtype(
-                    gt.shape().clone(), DType::BF16, device.clone(),
-                )?;
-                let mut d_up_t = Tensor::empty_dtype(
-                    ut.shape().clone(), DType::BF16, device.clone(),
-                )?;
+                let mut d_gate_t =
+                    Tensor::empty_dtype(gt.shape().clone(), DType::BF16, device.clone())?;
+                let mut d_up_t =
+                    Tensor::empty_dtype(ut.shape().clone(), DType::BF16, device.clone())?;
                 let status = unsafe {
                     crate::cuda::ffi::flame_swiglu_backward_bf16(
                         tensor_raw_ptr(&og)?,
@@ -3391,14 +3731,190 @@ fn compute_gradients(
                         tensor_raw_ptr(&ut)?,
                         tensor_raw_ptr_mut(&mut d_gate_t)?,
                         tensor_raw_ptr_mut(&mut d_up_t)?,
-                        gt.shape().elem_count() as i64, stream,
+                        gt.shape().elem_count() as i64,
+                        stream,
                     )
                 };
                 if status != 0 {
-                    return Err(Error::Cuda("flame_swiglu_backward_bf16 (fallback) failed".into()));
+                    return Err(Error::Cuda(
+                        "flame_swiglu_backward_bf16 (fallback) failed".into(),
+                    ));
                 }
                 Ok(smallvec![(*gate, d_gate_t), (*up, d_up_t)])
             }
+        }
+
+        Op::FusedSwiGLUSplit { input } => {
+            let input_tensor = fetch_saved(input)?;
+            if input_tensor.dtype() != DType::BF16 {
+                return Err(Error::InvalidOperation(
+                    "FusedSwiGLUSplit backward expects BF16 input".into(),
+                ));
+            }
+
+            let dims = input_tensor.shape().dims();
+            let ndim = dims.len();
+            if ndim == 0 {
+                return Err(Error::InvalidOperation(
+                    "FusedSwiGLUSplit backward expects rank >= 1".into(),
+                ));
+            }
+            let last = dims[ndim - 1];
+            if last % 2 != 0 {
+                return Err(Error::InvalidOperation(format!(
+                    "FusedSwiGLUSplit backward last dim {last} is not even"
+                )));
+            }
+            let half = last / 2;
+            let out_n = output_grad.shape().elem_count();
+            if out_n * 2 != input_tensor.shape().elem_count() {
+                return Err(Error::ShapeMismatch {
+                    expected: Shape::from_dims(&{
+                        let mut out_dims = dims.to_vec();
+                        out_dims[ndim - 1] = half;
+                        out_dims
+                    }),
+                    got: output_grad.shape().clone(),
+                });
+            }
+
+            let output_grad_bf16;
+            let grad_src = if output_grad.dtype() == DType::BF16 {
+                output_grad
+            } else {
+                output_grad_bf16 = output_grad.to_dtype_no_grad(DType::BF16)?;
+                &output_grad_bf16
+            };
+
+            let mut meta: Vec<i64> = input_tensor.strides().iter().map(|&s| s as i64).collect();
+            meta.extend(dims.iter().map(|&d| d as i64));
+            let mut d_meta: cudarc::driver::CudaSlice<i64> = unsafe { device.alloc(meta.len()) }
+                .map_err(|e| Error::Cuda(format!("alloc swiglu split meta: {:?}", e)))?;
+            device
+                .htod_copy_into(meta, &mut d_meta)
+                .map_err(|e| Error::Cuda(format!("htod swiglu split meta: {:?}", e)))?;
+            use cudarc::driver::DevicePtr;
+
+            let mut grad_input =
+                Tensor::empty_dtype(input_tensor.shape().clone(), DType::BF16, device.clone())?;
+            let status = unsafe {
+                crate::cuda::ffi::flame_swiglu_split_backward_bf16(
+                    tensor_raw_ptr(grad_src)?,
+                    tensor_raw_ptr(&input_tensor)?,
+                    tensor_raw_ptr_mut(&mut grad_input)?,
+                    *d_meta.device_ptr() as *const i64,
+                    input_tensor.offset() as i64,
+                    ndim as i32,
+                    out_n as i64,
+                    half as i64,
+                    device.cuda_stream_raw_ptr(),
+                )
+            };
+            if status != 0 {
+                return Err(Error::Cuda(
+                    "flame_swiglu_split_backward_bf16 failed".into(),
+                ));
+            }
+            Ok(smallvec![(*input, grad_input)])
+        }
+
+        Op::QkvSplitPermute {
+            input,
+            part,
+            heads,
+            head_dim,
+        } => {
+            let input_tensor = fetch_saved(input)?;
+            let dims = input_tensor.shape().dims();
+            if dims.len() != 3 {
+                return Err(Error::InvalidOperation(format!(
+                    "QkvSplitPermute backward expects input [B,N,3*H*D], got {:?}",
+                    dims
+                )));
+            }
+            let (b, n, c) = (dims[0], dims[1], dims[2]);
+            let hd = *heads * *head_dim;
+            if c != 3 * hd {
+                return Err(Error::InvalidOperation(format!(
+                    "QkvSplitPermute backward input last dim {c} != 3*{heads}*{head_dim}"
+                )));
+            }
+            if *part > 2 {
+                return Err(Error::InvalidOperation(format!(
+                    "QkvSplitPermute backward invalid part {part}"
+                )));
+            }
+            let og_dims = output_grad.shape().dims();
+            if og_dims != &[b, *heads, n, *head_dim] {
+                return Err(Error::ShapeMismatch {
+                    expected: Shape::from_dims(&[b, *heads, n, *head_dim]),
+                    got: output_grad.shape().clone(),
+                });
+            }
+
+            let output_grad_f32;
+            let (grad_src, grad_dtype) = match output_grad.dtype() {
+                DType::F32 => (output_grad, DType::F32),
+                DType::BF16 => (output_grad, DType::BF16),
+                _ => {
+                    output_grad_f32 = output_grad.to_dtype_no_grad(DType::F32)?;
+                    (&output_grad_f32, DType::F32)
+                }
+            };
+
+            let mut grad_strides: Vec<i64> =
+                grad_src.strides().iter().map(|&s| s as i64).collect();
+            if grad_strides.len() != 4 {
+                return Err(Error::InvalidOperation(format!(
+                    "QkvSplitPermute backward expected rank-4 grad strides, got {:?}",
+                    grad_strides
+                )));
+            }
+            let mut d_strides: cudarc::driver::CudaSlice<i64> =
+                unsafe { device.alloc(grad_strides.len()) }
+                    .map_err(|e| Error::Cuda(format!("alloc qkv split grad strides: {:?}", e)))?;
+            device
+                .htod_copy_into(std::mem::take(&mut grad_strides), &mut d_strides)
+                .map_err(|e| Error::Cuda(format!("htod qkv split grad strides: {:?}", e)))?;
+            use cudarc::driver::DevicePtr;
+
+            let mut grad_input =
+                Tensor::empty_dtype(input_tensor.shape().clone(), grad_dtype, device.clone())?;
+            let status = unsafe {
+                match grad_dtype {
+                    DType::BF16 => crate::cuda::ffi::flame_qkv_split_permute_backward_bf16(
+                        tensor_raw_ptr(grad_src)?,
+                        tensor_raw_ptr_mut(&mut grad_input)?,
+                        *d_strides.device_ptr() as *const i64,
+                        grad_src.offset() as i64,
+                        *part as i32,
+                        b as i64,
+                        *heads as i64,
+                        n as i64,
+                        *head_dim as i64,
+                        device.cuda_stream_raw_ptr(),
+                    ),
+                    DType::F32 => crate::cuda::ffi::flame_qkv_split_permute_backward_f32(
+                        tensor_raw_ptr(grad_src)?,
+                        tensor_raw_ptr_mut(&mut grad_input)?,
+                        *d_strides.device_ptr() as *const i64,
+                        grad_src.offset() as i64,
+                        *part as i32,
+                        b as i64,
+                        *heads as i64,
+                        n as i64,
+                        *head_dim as i64,
+                        device.cuda_stream_raw_ptr(),
+                    ),
+                    _ => unreachable!(),
+                }
+            };
+            if status != 0 {
+                return Err(Error::Cuda(
+                    "flame_qkv_split_permute_backward failed".into(),
+                ));
+            }
+            Ok(smallvec![(*input, grad_input)])
         }
 
         Op::GateResidual { residual, gate, x } => {
@@ -3434,7 +3950,7 @@ fn compute_gradients(
             // ([B,N,dim] → [B,dim] needs sum on axis 1, not axis 0); do it
             // explicitly by sum_dim_keepdim then reshape.
             let grad_gate_full = GpuOps::mul(output_grad, &x_tensor)?;
-            let grad_gate_3d = grad_gate_full.sum_dim_keepdim(1)?;  // [B, 1, dim]
+            let grad_gate_3d = grad_gate_full.sum_dim_keepdim(1)?; // [B, 1, dim]
             let grad_gate = grad_gate_3d.reshape(&[b, dim])?;
 
             Ok(smallvec![
@@ -3473,10 +3989,7 @@ fn compute_gradients(
             let sin_tensor = fetch_saved(sin)?;
             let neg_sin = GpuOps::mul_scalar(&sin_tensor, -1.0)?;
             let cos_dims = cos_tensor.shape().dims();
-            let is_broadcast_cos = matches!(
-                cos_dims,
-                [1, _, _, _] | [1, 1, _, _] | [1, _, _]
-            );
+            let is_broadcast_cos = matches!(cos_dims, [1, _, _, _] | [1, 1, _, _] | [1, _, _]);
             let grad_input = if is_broadcast_cos {
                 crate::bf16_ops::rope_fused_bf16(&grad_bf16, &cos_tensor, &neg_sin)?
             } else {
@@ -3684,13 +4197,19 @@ fn compute_gradients(
             let w_bf16_owned;
             let w_bf16: Option<&Tensor> = match weight_tensor {
                 Some(w) if w.dtype() == DType::BF16 => Some(w),
-                Some(w) => { w_bf16_owned = w.to_dtype_no_grad(DType::BF16)?; Some(&w_bf16_owned) }
+                Some(w) => {
+                    w_bf16_owned = w.to_dtype_no_grad(DType::BF16)?;
+                    Some(&w_bf16_owned)
+                }
                 None => None,
             };
             let b_bf16_owned;
             let b_bf16: Option<&Tensor> = match bias_tensor {
                 Some(b) if b.dtype() == DType::BF16 => Some(b),
-                Some(b) => { b_bf16_owned = b.to_dtype_no_grad(DType::BF16)?; Some(&b_bf16_owned) }
+                Some(b) => {
+                    b_bf16_owned = b.to_dtype_no_grad(DType::BF16)?;
+                    Some(&b_bf16_owned)
+                }
                 None => None,
             };
 
@@ -3897,12 +4416,10 @@ fn compute_gradients(
                     grad_bf16_owned = output_grad.to_dtype_no_grad(DType::BF16)?;
                     &grad_bf16_owned
                 };
-                let grad_lhs = crate::ops::gemm_bf16::matmul_bf16_trans(
-                    grad_bf16, rhs_tensor, false, true,
-                )?;
-                let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
-                    lhs_tensor, grad_bf16, true, false,
-                )?;
+                let grad_lhs =
+                    crate::ops::gemm_bf16::matmul_bf16_trans(grad_bf16, rhs_tensor, false, true)?;
+                let grad_rhs =
+                    crate::ops::gemm_bf16::matmul_bf16_trans(lhs_tensor, grad_bf16, true, false)?;
                 return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
             }
 
@@ -3911,12 +4428,10 @@ fn compute_gradients(
             let lhs_bf16 = lhs_tensor.to_dtype_no_grad(DType::BF16)?;
             let rhs_bf16 = rhs_tensor.to_dtype_no_grad(DType::BF16)?;
             let grad_bf16 = output_grad.to_dtype_no_grad(DType::BF16)?;
-            let grad_lhs = crate::ops::gemm_bf16::matmul_bf16_trans(
-                &grad_bf16, &rhs_bf16, false, true,
-            )?;
-            let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
-                &lhs_bf16, &grad_bf16, true, false,
-            )?;
+            let grad_lhs =
+                crate::ops::gemm_bf16::matmul_bf16_trans(&grad_bf16, &rhs_bf16, false, true)?;
+            let grad_rhs =
+                crate::ops::gemm_bf16::matmul_bf16_trans(&lhs_bf16, &grad_bf16, true, false)?;
             Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
         }
 
@@ -3967,7 +4482,10 @@ fn compute_gradients(
             }
             let grad_bias = ensure_bf16(output_grad.sum_dims(&sum_dims)?)?;
 
-            Ok(smallvec![(*input, ensure_bf16(grad_input)?), (*bias, grad_bias)])
+            Ok(smallvec![
+                (*input, ensure_bf16(grad_input)?),
+                (*bias, grad_bias)
+            ])
         }
 
         Op::SumDim { input, dim } => {
@@ -3991,16 +4509,17 @@ fn compute_gradients(
             } else {
                 output_grad
             };
-            let grad = crate::autograd_ops_complete::clamp_backward(
-                grad_bf16,
-                input_tensor,
-                *min,
-                *max,
-            )?;
+            let grad =
+                crate::autograd_ops_complete::clamp_backward(grad_bf16, input_tensor, *min, *max)?;
             Ok(smallvec![(*input, ensure_bf16(grad)?)])
         }
 
-        Op::Div { lhs, rhs, lhs_shape, rhs_shape } => {
+        Op::Div {
+            lhs,
+            rhs,
+            lhs_shape,
+            rhs_shape,
+        } => {
             // d/dx (x/y) = 1/y
             // d/dy (x/y) = -x/y^2
             let lhs_tensor = fetch_saved(lhs)?;
@@ -4292,11 +4811,8 @@ fn compute_gradients(
                 output_grad.dtype(),
                 output_grad.device().clone(),
             )?;
-            let grad_input_full = output_grad.index_assign_no_grad(
-                *dim,
-                indices_tensor,
-                &zeros_for_assign,
-            )?;
+            let grad_input_full =
+                output_grad.index_assign_no_grad(*dim, indices_tensor, &zeros_for_assign)?;
             let grad_input = if input_tensor.dtype() == grad_input_full.dtype() {
                 grad_input_full
             } else {
@@ -4373,7 +4889,8 @@ fn compute_gradients(
                     let mut expanded_dims = tmp.shape().dims().to_vec();
                     expanded_dims[axis] = in_dims[axis];
                     let expanded_shape = crate::Shape::from_dims(&expanded_dims);
-                    let mut expanded = Tensor::zeros_dtype(expanded_shape, grad_dtype, device.clone())?;
+                    let mut expanded =
+                        Tensor::zeros_dtype(expanded_shape, grad_dtype, device.clone())?;
                     gpu_scatter_add_narrow(&tmp, &mut expanded, axis, s)?;
                     tmp = expanded;
                 }
@@ -4391,7 +4908,8 @@ fn compute_gradients(
                     let mut expanded_dims = tmp.shape().dims().to_vec();
                     expanded_dims[axis] = in_dims[axis];
                     let expanded_shape = crate::Shape::from_dims(&expanded_dims);
-                    let mut expanded = Tensor::zeros_dtype(expanded_shape, grad_dtype, device.clone())?;
+                    let mut expanded =
+                        Tensor::zeros_dtype(expanded_shape, grad_dtype, device.clone())?;
                     gpu_scatter_add_narrow(&tmp, &mut expanded, axis, s)?;
                     tmp = expanded;
                 }
@@ -4838,9 +5356,15 @@ fn compute_gradients(
 
             // Try cuDNN backward for supported shapes.
             let cudnn_result = try_cudnn_sdpa_backward(
-                query_tensor, key_tensor, value_tensor,
-                output_tensor, output_grad, stats_tensor, mask_tensor,
-                *scale, device,
+                query_tensor,
+                key_tensor,
+                value_tensor,
+                output_tensor,
+                output_grad,
+                stats_tensor,
+                mask_tensor,
+                *scale,
+                device,
             )?;
 
             let (grad_q, grad_k, grad_v) = if let Some(triple) = cudnn_result {
@@ -4860,11 +5384,20 @@ fn compute_gradients(
                         .find(|t| t.shape().dims() == s)
                 });
                 attention_backward_recompute(
-                    query_tensor, key_tensor, value_tensor,
-                    output_grad, mask_tensor, *scale, cached_attn,
+                    query_tensor,
+                    key_tensor,
+                    value_tensor,
+                    output_grad,
+                    mask_tensor,
+                    *scale,
+                    cached_attn,
                 )?
             };
-            Ok(smallvec![(*query, grad_q), (*key, grad_k), (*value, grad_v)])
+            Ok(smallvec![
+                (*query, grad_q),
+                (*key, grad_k),
+                (*value, grad_v)
+            ])
         }
 
         Op::SageAttention {
@@ -5100,6 +5633,8 @@ fn op_tag(op: &Op) -> &'static str {
         Op::FlashAttention { .. } => "FlashAttention",
         Op::SageAttention { .. } => "SageAttention",
         Op::FusedSwiGLU { .. } => "FusedSwiGLU",
+        Op::FusedSwiGLUSplit { .. } => "FusedSwiGLUSplit",
+        Op::QkvSplitPermute { .. } => "QkvSplitPermute",
         Op::RoPePrecomputed { .. } => "RoPePrecomputed",
         Op::GateResidual { .. } => "GateResidual",
         Op::Checkpoint { .. } => "Checkpoint",

@@ -212,7 +212,11 @@ fn score_block(block_id: usize, state: &OffloaderState, w: &ValueWeights) -> f64
         }
     }
     let frequency_score = freq_count / history_len as f64;
-    let requested_bonus = if block_id == state.requested { 0.5 } else { 0.0 };
+    let requested_bonus = if block_id == state.requested {
+        0.5
+    } else {
+        0.0
+    };
     w.recency_weight * recency_score + w.frequency_weight * frequency_score + requested_bonus
 }
 

@@ -26,9 +26,19 @@ pub fn bmm_bf16_fp32acc_out(
     // memory. Phase 2b will teach trans_a/trans_b to absorb per-input
     // transposes directly so callers can pass permute-views.
     let a_owned;
-    let a = if a.is_contiguous() { a } else { a_owned = a.contiguous()?; &a_owned };
+    let a = if a.is_contiguous() {
+        a
+    } else {
+        a_owned = a.contiguous()?;
+        &a_owned
+    };
     let b_owned;
-    let b = if b.is_contiguous() { b } else { b_owned = b.contiguous()?; &b_owned };
+    let b = if b.is_contiguous() {
+        b
+    } else {
+        b_owned = b.contiguous()?;
+        &b_owned
+    };
 
     let ashp = a.shape().dims();
     let bshp = b.shape().dims();
@@ -130,12 +140,7 @@ pub fn bmm_bf16_fp32acc_out(
 /// `transpose2d_bf16` (full BF16 memcpy per call). Fused path is 2-3×
 /// faster on Klein 9B backward MatMul.
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-pub fn matmul_bf16_trans(
-    a: &Tensor,
-    b: &Tensor,
-    trans_a: bool,
-    trans_b: bool,
-) -> Result<Tensor> {
+pub fn matmul_bf16_trans(a: &Tensor, b: &Tensor, trans_a: bool, trans_b: bool) -> Result<Tensor> {
     use crate::Shape;
 
     if a.dtype() != DType::BF16 || b.dtype() != DType::BF16 {
@@ -148,9 +153,19 @@ pub fn matmul_bf16_trans(
     // from contiguous shape; trans_a / trans_b only flip cuBLAS's logical
     // interpretation, they don't accept arbitrary strided views yet.
     let a_owned;
-    let a = if a.is_contiguous() { a } else { a_owned = a.contiguous()?; &a_owned };
+    let a = if a.is_contiguous() {
+        a
+    } else {
+        a_owned = a.contiguous()?;
+        &a_owned
+    };
     let b_owned;
-    let b = if b.is_contiguous() { b } else { b_owned = b.contiguous()?; &b_owned };
+    let b = if b.is_contiguous() {
+        b
+    } else {
+        b_owned = b.contiguous()?;
+        &b_owned
+    };
 
     let a_dims = a.shape().dims();
     let b_dims = b.shape().dims();

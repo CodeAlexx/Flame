@@ -758,10 +758,20 @@ fn rms_norm_forward_bf16(
     // benchmarking; keep this gate until the vec path has been validated in
     // training, then drop the gate.
     let use_vec = norm_size % 4 == 0
-        && std::env::var("FLAME_RMS_NORM_LEGACY").map(|v| v == "0").unwrap_or(true);
+        && std::env::var("FLAME_RMS_NORM_LEGACY")
+            .map(|v| v == "0")
+            .unwrap_or(true);
 
-    let kernel_src = if use_vec { RMS_NORM_FWD_KERNEL_BF16_VEC } else { RMS_NORM_FWD_KERNEL_BF16 };
-    let kernel_name = if use_vec { "rms_norm_forward_bf16_vec" } else { "rms_norm_forward_bf16" };
+    let kernel_src = if use_vec {
+        RMS_NORM_FWD_KERNEL_BF16_VEC
+    } else {
+        RMS_NORM_FWD_KERNEL_BF16
+    };
+    let kernel_name = if use_vec {
+        "rms_norm_forward_bf16_vec"
+    } else {
+        "rms_norm_forward_bf16"
+    };
     CudaKernels::ensure_kernel(device, kernel_name, kernel_src)?;
     let f = device
         .get_func(kernel_name, kernel_name)
@@ -846,7 +856,6 @@ fn rms_norm_forward_bf16(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
     Ok(RmsNormForwardArtifacts {
@@ -878,14 +887,13 @@ pub(crate) fn rms_norm_backward(
     normalized_shape: &[usize],
 ) -> Result<(Tensor, Option<Tensor>)> {
     let grad_out_bf16_owned;
-    let grad_out_bf16: &Tensor = if grad_out.dtype() == DType::BF16
-        && grad_out.storage.dtype() == DType::BF16
-    {
-        grad_out
-    } else {
-        grad_out_bf16_owned = grad_out.to_dtype(DType::BF16)?;
-        &grad_out_bf16_owned
-    };
+    let grad_out_bf16: &Tensor =
+        if grad_out.dtype() == DType::BF16 && grad_out.storage.dtype() == DType::BF16 {
+            grad_out
+        } else {
+            grad_out_bf16_owned = grad_out.to_dtype(DType::BF16)?;
+            &grad_out_bf16_owned
+        };
     if input.dtype() != DType::BF16 || input.storage.dtype() != DType::BF16 {
         return Err(Error::InvalidInput(
             "RMSNorm backward expects BF16 input storage".into(),
@@ -952,7 +960,6 @@ pub(crate) fn rms_norm_backward(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
         Some(grad_weight_f32_tensor.to_dtype(DType::BF16)?)
     } else {
@@ -979,17 +986,28 @@ fn rms_norm_backward_bf16(
     // divisible by 4 (all production shapes qualify). Env override
     // `FLAME_RMS_NORM_LEGACY=1` forces the scalar path (mirrors forward dispatch).
     let use_vec = norm_size % 4 == 0
-        && std::env::var("FLAME_RMS_NORM_LEGACY").map(|v| v == "0").unwrap_or(true);
+        && std::env::var("FLAME_RMS_NORM_LEGACY")
+            .map(|v| v == "0")
+            .unwrap_or(true);
 
-    let kernel_src = if use_vec { RMS_NORM_BWD_KERNEL_BF16_VEC } else { RMS_NORM_BWD_KERNEL_BF16 };
-    let kernel_name = if use_vec { "rms_norm_backward_bf16_vec" } else { "rms_norm_backward_bf16" };
+    let kernel_src = if use_vec {
+        RMS_NORM_BWD_KERNEL_BF16_VEC
+    } else {
+        RMS_NORM_BWD_KERNEL_BF16
+    };
+    let kernel_name = if use_vec {
+        "rms_norm_backward_bf16_vec"
+    } else {
+        "rms_norm_backward_bf16"
+    };
     CudaKernels::ensure_kernel(device, kernel_name, kernel_src)?;
     let f = device
         .get_func(kernel_name, kernel_name)
         .ok_or_else(|| Error::Cuda(format!("Failed to get {kernel_name} kernel")))?;
 
-    let grad_input_data = crate::cuda_alloc_pool::pool_alloc_u16(device, input.shape().elem_count())
-        .map_err(|e| Error::Cuda(format!("rms_norm backward alloc failed: {e:?}")))?;
+    let grad_input_data =
+        crate::cuda_alloc_pool::pool_alloc_u16(device, input.shape().elem_count())
+            .map_err(|e| Error::Cuda(format!("rms_norm backward alloc failed: {e:?}")))?;
     let mut grad_weight_data = if weight.is_some() {
         Some(crate::tensor::alloc_zeros_from_pool(device, norm_size)?)
     } else {
@@ -1054,9 +1072,13 @@ fn rms_norm_backward_bf16(
                     RMS_NORM_GRAD_WEIGHT_KERNEL_BF16,
                 )?;
                 let gw_func = device
-                    .get_func("rms_norm_grad_weight_bf16_vec", "rms_norm_grad_weight_bf16_vec")
-                    .ok_or_else(|| Error::Cuda(
-                        "Failed to get rms_norm_grad_weight_bf16_vec kernel".into()))?;
+                    .get_func(
+                        "rms_norm_grad_weight_bf16_vec",
+                        "rms_norm_grad_weight_bf16_vec",
+                    )
+                    .ok_or_else(|| {
+                        Error::Cuda("Failed to get rms_norm_grad_weight_bf16_vec kernel".into())
+                    })?;
 
                 const COLS_PER_BLOCK: u32 = 64;
                 const ROWS_PER_BLOCK: u32 = 512;
@@ -1111,7 +1133,6 @@ fn rms_norm_backward_bf16(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
     Ok((grad_input, grad_weight_data))
@@ -1197,7 +1218,12 @@ impl RMSNorm {
     /// Forward pass for RMSNorm
     /// RMSNorm(x) = x * weight / sqrt(mean(x^2) + eps)
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        rms_norm(input, &self.normalized_shape, self.weight.as_ref(), self.eps)
+        rms_norm(
+            input,
+            &self.normalized_shape,
+            self.weight.as_ref(),
+            self.eps,
+        )
     }
 }
 
@@ -1286,7 +1312,6 @@ pub fn rms_norm(
                 view_offset: 0,
                 #[cfg(feature = "autograd_v2")]
                 autograd_meta: None,
-
             };
             let inv_rms_id = inv_rms_tensor.id;
             saved_tensors.push((inv_rms_id, inv_rms_tensor));
