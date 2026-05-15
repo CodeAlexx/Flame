@@ -2251,3 +2251,95 @@ instead of silent at use site. Test coverage:
 - `backward_wrap_with_forward_active_does_not_lap_silently`
 - the wrap-when-only-forward-active legal path is exercised by
   `slab_boundary_stress_advances_slab_idx` (existing Test 4).
+
+## `static_slab_v2` — every BF16 alloc must go through `pool_alloc_u16`
+
+R1a–R2c shipped a transient-scope slab allocator
+(`src/static_slab_v2.rs`) that dispatches under
+`FLAME_USE_STATIC_SLAB=1` + active `StepSlabGuard`. The slab eliminates
+the BF16 use-after-free bug class structurally: one `cudaMalloc` per
+device lifetime, bump-cursor per-step, strict-reset at guard drop,
+never `cudaFree` during training.
+
+For this to be correct, **every BF16 allocation that produces a
+training-step tensor must enter through `pool_alloc_u16`** — not
+through raw `device.alloc::<u16>` / `device.alloc_zeros::<u16>`.
+Raw cudart allocs bypass the slab dispatch AND the trap range table,
+so any view-pointer validation against them sees a stale exact-pointer
+`Freed` event from a prior lifetime and the trap fires false-positive
+on `Tensor::cat`. This was the actual root cause of the first R2c
+Klein 9B failure (RMSNorm bypass at `norm.rs::rms_norm_forward_bf16`).
+
+| ✅ Correct | ❌ Wrong |
+|---|---|
+| `pool_alloc_u16(device, n)` | `unsafe { device.alloc::<u16>(n) }` |
+| `Tensor::zeros_dtype(_, DType::BF16, _)` | `device.alloc_zeros::<u16>(n)` |
+
+Exceptions: pre-step staging buffers (allocate, write, drop within one
+op, never escape into autograd) and the slab's own zero-size short-
+circuit (`alloc_u16(0)`).
+
+**Sweep before merging a new BF16 kernel.** Grep
+`device\.alloc::<u16>|device\.alloc_zeros::<u16>` in the file you
+touched. If the alloc produces a tensor that flows into autograd, you
+must route through the pool.
+
+## `StepSlabGuard` — placement and lifetime
+
+When wiring a trainer to the slab path, the guard MUST be the FIRST
+allocation-creating local in the per-step body. Rust's reverse drop
+order means the guard drops LAST, after step-local tensors. Drop-
+order accidents = `live_count != 0` at guard drop = strict-reset
+panic.
+
+```rust
+for step in start_step..args.steps {
+    let _slab_step = StepSlabGuard::enter(device.clone())?;
+    // batch load, forward, loss, backward, optimizer step,
+    // AutogradContext::clear() — ALL transient allocations here.
+}
+// validation / sampling lives OUTSIDE the guard scope.
+```
+
+Two `r2b_wiring_lint` tests in `train_klein.rs` enforce the pattern
+at build time. The same shape applies to any future trainer.
+
+### Persistent state must pre-warm BEFORE the slab env-flag activates
+
+Optimizer state (Adam `m`/`v`, custom optimizers' state HashMaps) is
+allocated lazily on first `opt.step` call. If that allocation happens
+INSIDE the slab guard scope, the persistent state survives the step
+boundary in the slab's range → `live_count` permanently leaked → all
+subsequent `reset()`s error.
+
+Fix: pre-warm before activating the slab. Trainer-side:
+```rust
+// (a) Build params + load checkpoint state
+opt.ensure_state_initialized(&params)?;
+// (b) NOW activate slab dispatch
+std::env::set_var("FLAME_USE_STATIC_SLAB", "1");
+// (c) Run the step loop
+```
+
+Locked down by `r2b_bf1_persistent_state_in_guard_scope_panics`
+(`#[should_panic]`) + `r2b_bf3_adam_prewarm_allows_step_inside_guard`
+in `flame-core/tests/r2a_adversarial.rs`.
+
+### Don't `Send` the guard across threads
+
+`StepSlabGuard` has no `!Send` marker today (a follow-up). The thread-
+local active flag is per-thread by construction. Moving the guard via
+`thread::spawn(move || drop(guard))` strands the source thread's
+active flag at `Some(..)` — every subsequent `enter()` on that thread
+returns `Err("nested guards forbidden")`. Locked down by
+`sk_send_across_threads_corrupts_enter_thread_local`.
+
+### Drop-during-unwind is panic-suppressed
+
+`StepSlabGuard::drop` calls `slab.reset()`. If `live_count != 0`, the
+strict reset returns `Err` and the guard normally panics with the
+count. BUT — if the thread is already unwinding (`thread::panicking()
+== true`), the panic is suppressed and logged instead. This avoids
+the double-panic-during-unwind abort that would mask the original
+panic. So a panic mid-step propagates cleanly; the slab leaks are
+the secondary signal.

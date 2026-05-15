@@ -551,6 +551,143 @@ scripts currently use `0`).
 dispatch_overhead bench pool=ON delta: zimage block -24%, small -45%,
 tiny -48%. zimage 12-step pool=ON: 1.9 → 1.8 s/step.
 
+**Updated 2026-05-15 (R2c — range-aware BF16 trap):** the `PtrHistory`
+trap that was exact-pointer-only got a parallel live-range table.
+`trap_record_bf16_live(ptr, call_site, bucket)` records a live range
+`[ptr, ptr + len*2)`; `trap_record_bf16_released` clears it. Used by
+`pool_alloc_u16` (direct + external-miss paths), `static_slab_v2`,
+and `TensorStorage::Drop`. Resolves false-positives where `Tensor::cat`
+validated a view-pointer inside a live BF16 allocation but the exact-
+pointer history showed only a stale `Freed` event from a prior
+lifetime. The live-range table coexists with the exact-pointer
+forensic history; range hit on lookup wins over a `Freed` exact-match.
+
+### ⭐ `external_memory.rs` — unified registry for ranges + exact pointers (R1a, 2026-05-15)
+
+Process-wide singleton (`OnceLock<ExternalMemoryRegistry>`) that
+tracks GPU memory NOT owned by `cuda_alloc_pool`'s bucket free lists:
+
+- **Ranges** (`Vec<(RangeHandle, ExternalRange)>`): half-open
+  `[start, end)` keyed by `device_key = Arc::as_ptr(&device) as usize`.
+  Used by `static_slab_v2` to register the whole slab once at
+  materialization. Linear scan on lookup — the expected steady-state
+  count is small (slab + ring + per-block-offloader).
+- **Exact pointers** (`HashMap<(ptr, device_key), u32>`): refcounted.
+  Used by the ring allocator and `BlockOffloader` external-ptr
+  bookkeeping. Preserves the pre-R1a `register_external_ptr` /
+  `unregister_external_ptr` / `is_external_ptr` semantics — the old
+  public API in `cuda_alloc_pool` is now a back-compat shim that
+  delegates to this registry under `DEVICE_KEY_ANY` (= 0 sentinel).
+- **Hook installation**: `ensure_hook_installed()` calls
+  `cudarc::driver::install_external_ptr_hook` exactly once via a
+  `compare_exchange(false→true)` race. The closure consults
+  `should_skip_free_any_device(ptr)` — cudarc's `CudaSlice::drop`
+  signature is `fn(u64) -> bool` with no device parameter, so the
+  hook-side query has to be device-less.
+
+Updated 2026-05-15 (R2c): the hook closure now ALSO calls
+`static_slab_v2::slab_v2_return_if_owned(ptr, device_key)` when the
+ptr lands in a slab range. This catches raw `CudaSlice` scratch drops
+(not wrapped in `TensorStorage`) so `live_count` decrements uniformly
+across both code paths.
+
+Public surface: `ExternalMemoryRegistry::global()`, `register_range` /
+`unregister_range` returning `RangeHandle`, `register_exact` /
+`unregister_exact` / `unregister_exact_keyed`, `should_skip_free` /
+`should_skip_free_any_device`, `ensure_hook_installed`. 16 R1a-Skeptic
+adversarial tests in `src/external_memory.rs::tests` lock down boundary
+math, device isolation, exact-vs-range composition, and double-install
+idempotency.
+
+### ⭐ `static_slab_v2.rs` — bump-allocator slab for transient training scope (R1b–R2a, 2026-05-15)
+
+Direct Rust port of OneTrainer's static-slab pattern
+(`LayerOffloadConductor.py:122-321`). Replaces the "many small
+`cuMemAllocAsync` + `cuMemFreeAsync` per step → cudart VA reuse →
+use-after-free" failure mode that the original `cuda_alloc_pool`
+bucket allocator hit on Klein 9B (`HANDOFF_2026-05-15_OT_STATIC_SLAB_REDESIGN.md`).
+
+**Core type — `StaticSlabAllocator`** (R1b, commit `416be6d`):
+- One backing `CudaSlice<u8>` per device, sized by
+  `FLAME_STATIC_SLAB_BYTES_BF16` (default 4 GiB) and
+  `FLAME_STATIC_SLAB_BYTES_F32` (default 4 GiB).
+- **Lazy materialization** — `cudaMalloc` does not fire until the
+  first `alloc_*` call. `release()` drops the backing slab; subsequent
+  `alloc_*` re-materializes.
+- **Bump-cursor allocation** with 16-byte alignment. `alloc_u16(n)`,
+  `alloc_f32_zeroed(n)` (memsets via cudarc), and
+  `alloc_f32_uninit(n)` (no zero-init, document as such). Returns
+  synthesized `CudaSlice<T>` via the existing cudarc layout-mirror
+  pattern — the same trick `offload::alloc_bf16_via_ring` uses.
+- **`AtomicUsize` live_count** — incremented at every `alloc_*`,
+  decremented at slice drop via either `TensorStorage::Drop`'s
+  `slab_v2_try_claim` OR the external-memory drop hook (R2c, see
+  `external_memory.rs`). `reset()` is **strict**: returns `Err`
+  with the current count if `live_count != 0`.
+- **Per-step exhaustion short-circuit** (R2c-perf, commit `8b494f9`):
+  once an `alloc_*` overflows the slab capacity within a guarded
+  step, a thread-local "slab exhausted" flag is set, and remaining
+  `pool_alloc_*` calls in the same step skip the slab lookup
+  entirely and go straight to legacy. Resets at guard enter / drop.
+  Eliminates the ~9k warning-format-and-log per step that capped
+  perf at 4.3 s/step pre-fix.
+- **Per-device global accessor**: `slab_for_device(&Arc<CudaDevice>)`
+  returns `&'static Mutex<StaticSlabAllocator>` from a leaked
+  `OnceLock<Mutex<HashMap>>`. Two threads racing on `enter` for the
+  same device key get the same `Mutex` (loser's `Box::leak` wastes
+  a small amount of memory; cold path).
+
+**Guard type — `StepSlabGuard`** (R2a, commit `79289d4`):
+- RAII guard that turns ON slab dispatch for the current thread.
+  `enter(device) -> Result<Self>`; rejects nested guards with `Err`.
+  `finish() -> Result<()>` for graceful close; `Drop` for scope-end.
+- Sets a thread-local `Cell<Option<usize>>` to the device key at
+  enter; clears at drop/finish. `pool_alloc_u16` / `pool_alloc_f32`
+  in `cuda_alloc_pool` check `StepSlabGuard::active_on_thread()` AND
+  `FLAME_USE_STATIC_SLAB=1` at the very top of the function before
+  any bucket lookup; if both are true, dispatch to
+  `pool_alloc_*_via_slab(n)`. Misses fall through to legacy.
+- **Strict reset on Drop**: if `live_count != 0`, panics with the
+  count and cursor. The panic is suppressed if the thread is already
+  unwinding (`std::thread::panicking()`) to avoid the double-panic-
+  during-unwind abort.
+- **Footgun**: do NOT `mem::forget`/`mem::transmute`/`Send` the
+  guard across threads. The thread-local is per-thread; moving the
+  guard strands the source thread's active flag. Locked down by
+  `r2a_skeptic::sk_send_across_threads_corrupts_enter_thread_local`.
+
+**TensorStorage::Drop integration** (R1b, commit `afb066e`; R1b-bf
+`0d046e3`; R2c hook expansion `8e6cc7b`):
+- F32 + BF16(u16) Drop arms call `slab_v2_try_claim(&slice, _)`
+  BEFORE the legacy `pool_return_*` path. On success: `mem::forget`
+  the slice (cudarc Drop hook intercepts cudaFree because the slab
+  range is registered) and decrement `live_count`. On miss: fall
+  through to `pool_return_*` for legacy pool ownership.
+- The pool_disabled short-circuit was moved INSIDE each arm AFTER
+  the slab check so `FLAME_ALLOC_POOL=0 + FLAME_USE_STATIC_SLAB=1`
+  (R3-target config) works without the live_count leak (R1b-bf).
+
+**Trainer wiring** — `EriDiffusion-v2/crates/eridiffusion-cli/src/bin/train_klein.rs`:
+- The guard MUST be the first allocation-creating local in the step
+  body. Subsequent step-local tensors drop before the guard via
+  Rust's reverse drop order. Validation/sample lives OUTSIDE the
+  guard scope (they have lifetime patterns that don't fit per-step
+  reset). Two `r2b_wiring_lint` tests in `train_klein.rs` enforce
+  the pattern at build time.
+- The optimizer's persistent state (Adam m/v) MUST be pre-warmed
+  BEFORE the slab env-flag activates. The trainer calls
+  `Optimizer::ensure_state_initialized(&params)` post-resume and
+  pre-step-loop. Without prewarm, m/v allocate lazily on step 0
+  inside the guard scope → live_count violation at step-end drop.
+  See `Adam::ensure_state_initialized` / `AdamW::ensure_state_initialized`.
+
+**Test coverage**: 14 R1b lib unit tests (`slab_*`), 23 R1b-Skeptic
+adversarial integration tests, 11 R2a-Skeptic adversarial tests,
+8 R2b tests (3 bf + 5 sk for the prewarm hook contract), 1 microbench,
+1 drop-wiring regression. All tests serialize on a `TEST_LOCK` because
+the per-device slab map is process-global; parallel test execution
+without the lock cascades into futex deadlocks.
+
 ### `memory_pool.rs`
 F32 device memory pool. ~15 pub fns. Mostly training, but the pool is also
 used by some BF16 fast-path arena code.
@@ -1391,6 +1528,38 @@ global `cuda_alloc_pool` so `push_u16` routes it through
 with `FLAME_ALLOC_POOL=1` (the default) under offload without the
 prior corruption mode (cached BF16 slot pointers being re-issued by
 the pool while ring `reset()` had already invalidated them).
+
+**R2c-perf (2026-05-15, commit `be67185`): OT-style resident-set conductor.**
+The hard-coded two-slot ping-pong + one-block-prefetch policy is replaced
+with a conductor modelled on OneTrainer's `LayerOffloadConductor`:
+
+- `plan_layer_access` knows the forward AND backward traversal order
+  and maintains the desired resident set under a fraction-of-VRAM byte
+  budget. Slot count is no longer fixed; the policy admits as many
+  blocks as the budget allows. `FLAME_BLOCK_OFFLOAD_SLOTS` (default 2)
+  controls the slot ceiling for the pinned-RAM mode pre-conductor
+  fallback.
+- **Multiple async prefetches in flight**, queued by per-slot CUDA
+  events instead of the prior one-block global in-flight gate.
+- **Direction-aware**: separate forward-visit and backward-visit
+  lists. During backward replay the conductor pre-stages block N-1
+  while the trainer's checkpoint closure recomputes block N. Hooks
+  on `AutogradContext::is_checkpoint_recompute()` (flame-core
+  thread-local) so forward passes don't trigger spurious backward-
+  direction prefetches.
+- **Lazy eviction**: stale resident slots stay until a missing desired
+  block needs that slot. Eviction is then GPU-side via
+  `cudaStreamWaitEvent` on the previous `compute_done` — no host-side
+  `cudaEventSynchronize` on the hot path. Pre-fix the eager evictor
+  was at 51.0s / 1275 calls (~2.04 s/step) in nsys; lazy-evict
+  eliminates it.
+
+Telemetry: `258 AwaitHit / 0 AwaitMiss` on a 6-step Klein 9B run
+confirms the bucket prefetch is landing. Combined with the
+R2c-perf `static_slab_v2` + QKV/SwiGLU backward fixes, Klein 9B +
+`--offload` ran at **2.8 s/step** on a 25-step gate (vs 4.6 s/step
+`FLAME_ALLOC_POOL=0` workaround baseline; vs OneTrainer's 2.07 s/step
+reference).
 
 **Three load modes:**
 - `BlockOffloader::load(paths, facilitator, device)` — default pinned

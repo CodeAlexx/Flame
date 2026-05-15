@@ -855,9 +855,78 @@ Test: `flame-core/tests/ring_pool_adapter_smoke.rs` (3 tests, GPU-real).
 | `install_miss_allocator(allocator)` | `cuda_alloc_pool.rs:671` | Install. Returns previously installed (if any). |
 | `uninstall_miss_allocator()` | `cuda_alloc_pool.rs:692` | Remove. Returns last installed (if any). |
 | `CudaAllocPool::external_miss_count()` | `cuda_alloc_pool.rs:217` | Lock-free count of cache-misses served by external allocator. Diagnostic. |
-| `CudaAllocPool::register_external_ptr(ptr)` | `cuda_alloc_pool.rs:266` | Phase 2: mark a device ptr as ring-/external-owned so `push_*` routes it through `reconstruct_and_forget` instead of caching the slice. Increments refcount (round-2 fix 2026-05-14). |
-| `CudaAllocPool::is_external_ptr(ptr)` | `cuda_alloc_pool.rs:249` | Test if `ptr` is in the external refcount map (count > 0). |
-| `CudaAllocPool::unregister_external_ptr(ptr)` | `cuda_alloc_pool.rs:280` | Phase 2: decrement `ptr`'s external refcount after `push_*` reconstructs-and-forgets it; entry is removed only when count reaches 0 (ring-wrap may have count > 1). |
+| `CudaAllocPool::register_external_ptr(ptr)` | `cuda_alloc_pool.rs:266` | Phase 2: mark a device ptr as ring-/external-owned so `push_*` routes it through `reconstruct_and_forget` instead of caching the slice. Increments refcount (round-2 fix 2026-05-14). Now a back-compat shim that delegates to `external_memory::ExternalMemoryRegistry::register_exact` under `DEVICE_KEY_ANY`. |
+| `CudaAllocPool::is_external_ptr(ptr)` | `cuda_alloc_pool.rs:249` | Test if `ptr` is in the external refcount map (count > 0). Delegates to registry. |
+| `CudaAllocPool::unregister_external_ptr(ptr)` | `cuda_alloc_pool.rs:280` | Decrement refcount. Delegates to `ExternalMemoryRegistry::unregister_exact`. |
+| `trap_record_bf16_live(ptr, call_site, bucket)` | `cuda_alloc_pool.rs` | R2c. Records a live BF16 range `[ptr, ptr + bucket*2)` in the trap's range table. Called from `pool_alloc_u16` direct + external-miss paths, `static_slab_v2::alloc_u16`, and `Tensor::from_bf16_slice_gpu`. `pub(crate)`. |
+| `trap_record_bf16_released(ptr, call_site, bucket)` | `cuda_alloc_pool.rs` | R2c. Clears the live range. Called from `pool_return_u16` and `TensorStorage::Drop` (slab path). `pub(crate)`. |
+| `PtrState::Live` (enum variant) | `cuda_alloc_pool.rs` | R2c. New state for range-aware trap. The trap fires only on `Freed` when no live range covers the ptr. |
+
+---
+
+## R1a — `external_memory.rs` (unified registry, 2026-05-15)
+
+⭐ Process-wide `OnceLock` registry tracking GPU memory NOT owned by `cuda_alloc_pool` bucket free lists. Supports both half-open `[start, end)` ranges (slab) and exact-pointer refcounts (ring + back-compat). Single shared cudarc `install_external_ptr_hook` installation.
+
+| Symbol | File:line | Notes |
+|---|---|---|
+| `ExternalMemoryRegistry::global()` | `external_memory.rs` | Singleton accessor. Returns `&'static ExternalMemoryRegistry`. |
+| `ExternalRange { start, end, device_key, owner }` | `external_memory.rs` | Half-open range entry. `end` exclusive. |
+| `ExternalOwner { Slab, Ring, PoolExact, BlockOffloader }` | `external_memory.rs` | Origin tag (metadata). |
+| `RangeHandle(u64)` | `external_memory.rs` | Opaque `Copy` handle for `unregister_range`. NO `Drop` — explicit unregister required. |
+| `DEVICE_KEY_ANY = 0` | `external_memory.rs` | Sentinel for the device-less back-compat shim path. Real `Arc::as_ptr` values are non-zero. |
+| `register_range(range) -> RangeHandle` | `external_memory.rs` | Add a range entry. Inverted ranges (`start > end`) silently accepted and never match — by design, caller owns sanity. |
+| `unregister_range(handle)` | `external_memory.rs` | Remove. Double-unregister is a silent no-op. |
+| `register_exact(ptr, device_key, owner)` | `external_memory.rs` | Add or increment refcount on an exact ptr. |
+| `unregister_exact(ptr) -> usize` | `external_memory.rs` | Decrement refcount; returns new value. Removes entry at 0. Device-agnostic — matches any registered device for that ptr. |
+| `unregister_exact_keyed(ptr, device_key) -> usize` | `external_memory.rs` | Strict variant — only matches the specified device. |
+| `should_skip_free(ptr, device_key) -> bool` | `external_memory.rs` | True if a registered range covers `ptr` for `device_key` (or `DEVICE_KEY_ANY`), OR an exact entry has refcount > 0. Used by the cudarc Drop hook. |
+| `should_skip_free_any_device(ptr) -> bool` | `external_memory.rs` | Device-less query — for the cudarc `CudaSlice::drop` hook signature `fn(u64) -> bool`. |
+| `ensure_hook_installed()` | `external_memory.rs` | Idempotent cudarc hook install via `compare_exchange(false→true)`. First caller wins. |
+
+---
+
+## R1b–R2a — `static_slab_v2.rs` (bump-allocator + RAII guard, 2026-05-15)
+
+⭐ OneTrainer-style static-slab allocator that backs transient training step allocations. Resolves the BF16 use-after-free bug class structurally: one `cudaMalloc` per device lifetime, bump-cursor allocation, cursor reset at guard drop, never `cudaFree` during training.
+
+| Symbol | File:line | Notes |
+|---|---|---|
+| `StaticSlabAllocator` | `static_slab_v2.rs` | Per-device bump allocator. Lazy materialization (no `cudaMalloc` until first `alloc_*`). |
+| `StaticSlabAllocator::new(device, capacity_bytes)` | `static_slab_v2.rs` | Construct (no alloc fires). |
+| `StaticSlabAllocator::alloc_u16(n) -> Result<CudaSlice<u16>>` | `static_slab_v2.rs` | Bump-allocate BF16 elements. `n == 0` is a no-op (no cursor bump, no `live_count` inc). Increments live_count on success. |
+| `StaticSlabAllocator::alloc_f32_zeroed(n) -> Result<CudaSlice<f32>>` | `static_slab_v2.rs` | Bump-allocate F32, zero-init via `cudaMemsetAsync`. Preserves the F32-opt-out zero contract. |
+| `StaticSlabAllocator::alloc_f32_uninit(n) -> Result<CudaSlice<f32>>` | `static_slab_v2.rs` | Bump-allocate F32, no init. Data is undefined. |
+| `StaticSlabAllocator::reset() -> Result<()>` | `static_slab_v2.rs` | Strict — returns `Err` if `live_count != 0`. Zeros the cursor; does NOT drop the slab. |
+| `StaticSlabAllocator::release() -> Result<()>` | `static_slab_v2.rs` | Strict-check + unregister range + drop slab `CudaSlice<u8>` (so `cudaFree` actually fires). Next `alloc_*` lazily re-materializes. |
+| `StaticSlabAllocator::live_count() -> usize` | `static_slab_v2.rs` | Atomic load. Diagnostic. |
+| `StaticSlabAllocator::used_bytes()` / `capacity_bytes()` | `static_slab_v2.rs` | Cursor / capacity introspection. |
+| `slab_for_device(device) -> &'static Mutex<StaticSlabAllocator>` | `static_slab_v2.rs` | Per-device leaked-`'static` accessor. Keyed by `Arc::as_ptr(device) as usize`. |
+| `slab_v2_return_if_owned(ptr, device_key) -> bool` | `static_slab_v2.rs` | Drop-path helper. If `ptr` is in a registered slab range, decrement live_count and return true. Called from `TensorStorage::Drop` AND from the `external_memory` cudarc hook. |
+| `pool_alloc_u16_via_slab(n) -> Option<CudaSlice<u16>>` | `static_slab_v2.rs` | Dispatch helper — called from `cuda_alloc_pool::pool_alloc_u16` when env=1 + guard active. None on overflow, slab missing, or env disabled — caller falls back to legacy. |
+| `pool_alloc_f32_via_slab(n) -> Option<CudaSlice<f32>>` | `static_slab_v2.rs` | F32 mirror. Calls `alloc_f32_zeroed` to preserve zero contract. |
+| `StepSlabGuard` | `static_slab_v2.rs` | RAII guard activating slab dispatch for the current thread. |
+| `StepSlabGuard::enter(device) -> Result<Self>` | `static_slab_v2.rs` | Enter scope. Nested-guard rejected with Err. Eagerly registers slab in `device_map`. |
+| `StepSlabGuard::enter_default() -> Result<Self>` | `static_slab_v2.rs` | Convenience: uses `CudaDevice::new(0)`. **Footgun**: if the trainer holds a different `Arc<CudaDevice>`, dispatch routes through this one. Prefer explicit `enter(device.clone())`. |
+| `StepSlabGuard::finish(self) -> Result<()>` | `static_slab_v2.rs` | Graceful close. Err on `live_count != 0`. Drop becomes no-op. |
+| `StepSlabGuard::active_on_thread() -> bool` | `static_slab_v2.rs` | Cheap thread-local query. |
+| `Drop for StepSlabGuard` | `static_slab_v2.rs` | Strict reset. Panics on `live_count != 0` UNLESS `thread::panicking()` is already true (avoids double-panic-during-unwind abort). **Footgun**: never `Send`/`mem::transmute` the guard across threads — the thread-local is per-thread; moving the guard strands the source thread's flag. |
+| `FLAME_USE_STATIC_SLAB=1` (env) | `static_slab_v2.rs` | Per-call env check. Gate for `pool_alloc_*` slab dispatch. |
+| `FLAME_STATIC_SLAB_BYTES_BF16` (env) | `static_slab_v2.rs` | Default 4 GiB. Klein 9B overflows at this size; raise or accept legacy-fallback. |
+| `FLAME_STATIC_SLAB_BYTES_F32` (env) | `static_slab_v2.rs` | Default 4 GiB. |
+
+### `AutogradContext` — checkpoint recompute hook (R2c-perf)
+
+| Symbol | File:line | Notes |
+|---|---|---|
+| `AutogradContext::is_checkpoint_recompute() -> bool` | `autograd.rs` | True iff the current thread is inside a checkpoint closure's backward replay. Used by `BlockOffloader` (and consumers like Klein's per-block closure) to trigger direction-aware async prefetch only during backward. Thread-local depth counter. |
+
+### `Optimizer` — state prewarm (R2b)
+
+| Symbol | File:line | Notes |
+|---|---|---|
+| `Adam::ensure_state_initialized(&[Parameter]) -> Result<()>` | `adam.rs` | Pre-materialize F32 `m` / `v` slots for every parameter without advancing `t` or touching values. Must be called BEFORE `FLAME_USE_STATIC_SLAB=1` is set on a trainer using the slab. Idempotent. Empty list ok. |
+| `AdamW::ensure_state_initialized(&[Parameter]) -> Result<()>` | `adam.rs` | AdamW variant. Same contract. |
 
 ---
 
