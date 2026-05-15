@@ -2924,6 +2924,11 @@ fn compute_gradients(
             let lhs_tensor = &fetch_saved(lhs)?;
             let rhs_tensor = &fetch_saved(rhs)?;
             let og_dtype = output_grad.dtype();
+            let need_lhs_grad = lhs_tensor.requires_grad();
+            let need_rhs_grad = rhs_tensor.requires_grad();
+            if !need_lhs_grad && !need_rhs_grad {
+                return Ok(SmallVec::new());
+            }
 
             // Fast path: BF16 2D. Use cuBLASLt with trans flags so neither
             // operand materializes a transpose. This is the dominant backward
@@ -2949,13 +2954,22 @@ fn compute_gradients(
                     grad_bf16_owned = output_grad.to_dtype_no_grad(DType::BF16)?;
                     &grad_bf16_owned
                 };
-                // grad_lhs = output_grad @ rhs^T
-                let grad_lhs =
-                    crate::ops::gemm_bf16::matmul_bf16_trans(grad_bf16, rhs_tensor, false, true)?;
-                // grad_rhs = lhs^T @ output_grad
-                let grad_rhs =
-                    crate::ops::gemm_bf16::matmul_bf16_trans(lhs_tensor, grad_bf16, true, false)?;
-                return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+                let mut grads: GradVec = SmallVec::new();
+                if need_lhs_grad {
+                    // grad_lhs = output_grad @ rhs^T
+                    let grad_lhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                        grad_bf16, rhs_tensor, false, true,
+                    )?;
+                    grads.push((*lhs, grad_lhs));
+                }
+                if need_rhs_grad {
+                    // grad_rhs = lhs^T @ output_grad
+                    let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                        lhs_tensor, grad_bf16, true, false,
+                    )?;
+                    grads.push((*rhs, grad_rhs));
+                }
+                return Ok(grads);
             }
 
             // 3D×2D path: lhs=[B,M,K], rhs=[K,N], out=[B,M,N]
@@ -2976,15 +2990,23 @@ fn compute_gradients(
                     } else {
                         og_2d.to_dtype_no_grad(DType::BF16)?
                     };
-                    // grad_lhs = og @ rhs^T
-                    let grad_lhs_2d = crate::ops::gemm_bf16::matmul_bf16_trans(
-                        &og_bf16, rhs_tensor, false, true,
-                    )?;
-                    let grad_lhs = grad_lhs_2d.reshape(&[batch, m, k])?;
-                    // grad_rhs = lhs^T @ og
-                    let grad_rhs =
-                        crate::ops::gemm_bf16::matmul_bf16_trans(&lhs_2d, &og_bf16, true, false)?;
-                    return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+                    let mut grads: GradVec = SmallVec::new();
+                    if need_lhs_grad {
+                        // grad_lhs = og @ rhs^T
+                        let grad_lhs_2d = crate::ops::gemm_bf16::matmul_bf16_trans(
+                            &og_bf16, rhs_tensor, false, true,
+                        )?;
+                        let grad_lhs = grad_lhs_2d.reshape(&[batch, m, k])?;
+                        grads.push((*lhs, grad_lhs));
+                    }
+                    if need_rhs_grad {
+                        // grad_rhs = lhs^T @ og
+                        let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                            &lhs_2d, &og_bf16, true, false,
+                        )?;
+                        grads.push((*rhs, grad_rhs));
+                    }
+                    return Ok(grads);
                 }
 
                 // Fallback for non-BF16
@@ -2999,14 +3021,20 @@ fn compute_gradients(
                     lhs_2d
                 };
 
-                let rhs_t = GpuOps::transpose(rhs_tensor)?;
-                let grad_lhs_2d = GpuOps::matmul(&og_cast, &rhs_t)?;
-                let grad_lhs = grad_lhs_2d.reshape(&[batch, m, k])?;
+                let mut grads: GradVec = SmallVec::new();
+                if need_lhs_grad {
+                    let rhs_t = GpuOps::transpose(rhs_tensor)?;
+                    let grad_lhs_2d = GpuOps::matmul(&og_cast, &rhs_t)?;
+                    let grad_lhs = grad_lhs_2d.reshape(&[batch, m, k])?;
+                    grads.push((*lhs, grad_lhs));
+                }
+                if need_rhs_grad {
+                    let lhs_t = GpuOps::transpose(&lhs_cast)?;
+                    let grad_rhs = GpuOps::matmul(&lhs_t, &og_cast)?;
+                    grads.push((*rhs, grad_rhs));
+                }
 
-                let lhs_t = GpuOps::transpose(&lhs_cast)?;
-                let grad_rhs = GpuOps::matmul(&lhs_t, &og_cast)?;
-
-                return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+                return Ok(grads);
             }
 
             // 3D×3D path: lhs=[B,M,K], rhs=[B,K,N], out=[B,M,N]
@@ -3026,36 +3054,52 @@ fn compute_gradients(
                     grad_bf16_owned = output_grad.to_dtype_no_grad(DType::BF16)?;
                     &grad_bf16_owned
                 };
-                let grad_lhs =
-                    crate::ops::gemm_bf16::matmul_bf16_trans(grad_bf16, rhs_tensor, false, true)?;
-                let grad_rhs =
-                    crate::ops::gemm_bf16::matmul_bf16_trans(lhs_tensor, grad_bf16, true, false)?;
-                return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+                let mut grads: GradVec = SmallVec::new();
+                if need_lhs_grad {
+                    let grad_lhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                        grad_bf16, rhs_tensor, false, true,
+                    )?;
+                    grads.push((*lhs, grad_lhs));
+                }
+                if need_rhs_grad {
+                    let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                        lhs_tensor, grad_bf16, true, false,
+                    )?;
+                    grads.push((*rhs, grad_rhs));
+                }
+                return Ok(grads);
             }
 
             // Slow / fallback path (non-BF16, non-2D, mixed dtype): materialize
             // transposes and call GpuOps::matmul as before.
-            let rhs_for_grad = if rhs_tensor.dtype() != og_dtype {
-                let cast = rhs_tensor.to_dtype_no_grad(og_dtype)?;
-                GpuOps::transpose(&cast)?
-            } else if og_dtype == DType::BF16 && rhs_tensor.rank() == 2 {
-                crate::bf16_elementwise::transpose2d_bf16(rhs_tensor)?
-            } else {
-                GpuOps::transpose(rhs_tensor)?
-            };
-            let grad_lhs = GpuOps::matmul(output_grad, &rhs_for_grad)?;
+            let mut grads: GradVec = SmallVec::new();
+            if need_lhs_grad {
+                let rhs_for_grad = if rhs_tensor.dtype() != og_dtype {
+                    let cast = rhs_tensor.to_dtype_no_grad(og_dtype)?;
+                    GpuOps::transpose(&cast)?
+                } else if og_dtype == DType::BF16 && rhs_tensor.rank() == 2 {
+                    crate::bf16_elementwise::transpose2d_bf16(rhs_tensor)?
+                } else {
+                    GpuOps::transpose(rhs_tensor)?
+                };
+                let grad_lhs = GpuOps::matmul(output_grad, &rhs_for_grad)?;
+                grads.push((*lhs, grad_lhs));
+            }
 
-            let lhs_for_grad = if lhs_tensor.dtype() != og_dtype {
-                let cast = lhs_tensor.to_dtype_no_grad(og_dtype)?;
-                GpuOps::transpose(&cast)?
-            } else if og_dtype == DType::BF16 && lhs_tensor.rank() == 2 {
-                crate::bf16_elementwise::transpose2d_bf16(lhs_tensor)?
-            } else {
-                GpuOps::transpose(lhs_tensor)?
-            };
-            let grad_rhs = GpuOps::matmul(&lhs_for_grad, output_grad)?;
+            if need_rhs_grad {
+                let lhs_for_grad = if lhs_tensor.dtype() != og_dtype {
+                    let cast = lhs_tensor.to_dtype_no_grad(og_dtype)?;
+                    GpuOps::transpose(&cast)?
+                } else if og_dtype == DType::BF16 && lhs_tensor.rank() == 2 {
+                    crate::bf16_elementwise::transpose2d_bf16(lhs_tensor)?
+                } else {
+                    GpuOps::transpose(lhs_tensor)?
+                };
+                let grad_rhs = GpuOps::matmul(&lhs_for_grad, output_grad)?;
+                grads.push((*rhs, grad_rhs));
+            }
 
-            Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
+            Ok(grads)
         }
 
         Op::ReLU { input } => {
@@ -3369,11 +3413,37 @@ fn compute_gradients(
             // Each entry's saved tensors are freed immediately after its
             // gradient computation completes → peak VRAM = ONE op's saved
             // tensors, not the entire block's worth.
+            static CKPT_SUBPROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let ckpt_subprofile = *CKPT_SUBPROFILE.get_or_init(|| {
+                std::env::var("FLAME_CKPT_SUBPROFILE")
+                    .ok()
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+            });
+            let mut sub_op_time: Option<
+                std::collections::HashMap<&'static str, (std::time::Duration, usize)>,
+            > = if ckpt_subprofile {
+                Some(std::collections::HashMap::new())
+            } else {
+                None
+            };
+            let mut sub_accum_time = std::time::Duration::ZERO;
             let mut n_bf16_casts = 0u32;
             sub_tape.reverse();
             for sub_entry in sub_tape.drain(..) {
                 if let Some(sg) = sub_grads.take(sub_entry.output_id) {
+                    let sub_tag = op_tag(&sub_entry.op);
+                    let sub_t0 = std::time::Instant::now();
                     let input_grads = compute_gradients(&sub_entry, &sg, device)?;
+                    let sub_dt = sub_t0.elapsed();
+                    if let Some(ref mut times) = sub_op_time {
+                        let e = times
+                            .entry(sub_tag)
+                            .or_insert((std::time::Duration::ZERO, 0));
+                        e.0 += sub_dt;
+                        e.1 += 1;
+                    }
+                    let accum_t0 = std::time::Instant::now();
                     for (tid, g) in input_grads {
                         if all_needed.contains(&tid) {
                             if g.dtype() != DType::F32 {
@@ -3381,6 +3451,9 @@ fn compute_gradients(
                             }
                             sub_grads.accumulate(tid, g)?;
                         }
+                    }
+                    if sub_op_time.is_some() {
+                        sub_accum_time += accum_t0.elapsed();
                     }
                 }
                 // sub_entry dropped → saved tensors freed → GPU memory reclaimed
@@ -3417,6 +3490,30 @@ fn compute_gradients(
                     n_sub_entries,
                     n_bf16_casts
                 );
+                if let Some(times) = sub_op_time {
+                    let mut rows: Vec<_> = times.into_iter().collect();
+                    rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+                    let mut msg = String::new();
+                    for (idx, (tag, (dt, count))) in rows.into_iter().take(6).enumerate() {
+                        if idx > 0 {
+                            msg.push_str("; ");
+                        }
+                        let avg = dt.as_secs_f64() * 1000.0 / count as f64;
+                        msg.push_str(&format!(
+                            "{} {:.1}ms/{} avg {:.2}ms",
+                            tag,
+                            dt.as_secs_f64() * 1000.0,
+                            count,
+                            avg
+                        ));
+                    }
+                    eprintln!(
+                        "[checkpoint:{}:sub] accum={:.1}ms top={}",
+                        entry.output_id.0,
+                        sub_accum_time.as_secs_f64() * 1000.0,
+                        msg
+                    );
+                }
             }
 
             // ── Step 5: Return only chain + trainable gradients ──
@@ -4273,6 +4370,10 @@ fn compute_gradients(
                 "AutogradContext::rmsnorm_backward weight",
                 weight_tensor.as_ref(),
             )?;
+            let need_weight_grad = weight_tensor
+                .as_ref()
+                .map(|w| w.requires_grad())
+                .unwrap_or(false);
 
             let (grad_input, grad_weight) = crate::norm::rms_norm_backward(
                 output_grad,
@@ -4280,12 +4381,16 @@ fn compute_gradients(
                 weight_tensor.as_ref(),
                 &inv_rms_tensor,
                 normalized_shape,
+                need_weight_grad,
             )?;
 
             let mut grads: GradVec = smallvec![(*input, ensure_bf16(grad_input)?)];
 
             if let Some(&w_id) = weight.as_ref() {
-                if let Some(gw) = grad_weight {
+                if need_weight_grad {
+                    let gw = grad_weight.ok_or_else(|| {
+                        Error::InvalidOperation("RMSNorm backward missing weight grad".into())
+                    })?;
                     grads.push((w_id, ensure_bf16(gw)?));
                 }
             }
@@ -4397,6 +4502,11 @@ fn compute_gradients(
         Op::BatchMatMul { lhs, rhs } => {
             let lhs_tensor = &fetch_saved(lhs)?;
             let rhs_tensor = &fetch_saved(rhs)?;
+            let need_lhs_grad = lhs_tensor.requires_grad();
+            let need_rhs_grad = rhs_tensor.requires_grad();
+            if !need_lhs_grad && !need_rhs_grad {
+                return Ok(SmallVec::new());
+            }
 
             // Fast path: BF16 3D. Single cuBLASLt strided-batched call per
             // grad, no materialized transposes. Used when Op::BatchMatMul
@@ -4416,11 +4526,20 @@ fn compute_gradients(
                     grad_bf16_owned = output_grad.to_dtype_no_grad(DType::BF16)?;
                     &grad_bf16_owned
                 };
-                let grad_lhs =
-                    crate::ops::gemm_bf16::matmul_bf16_trans(grad_bf16, rhs_tensor, false, true)?;
-                let grad_rhs =
-                    crate::ops::gemm_bf16::matmul_bf16_trans(lhs_tensor, grad_bf16, true, false)?;
-                return Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)]);
+                let mut grads: GradVec = SmallVec::new();
+                if need_lhs_grad {
+                    let grad_lhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                        grad_bf16, rhs_tensor, false, true,
+                    )?;
+                    grads.push((*lhs, grad_lhs));
+                }
+                if need_rhs_grad {
+                    let grad_rhs = crate::ops::gemm_bf16::matmul_bf16_trans(
+                        lhs_tensor, grad_bf16, true, false,
+                    )?;
+                    grads.push((*rhs, grad_rhs));
+                }
+                return Ok(grads);
             }
 
             // Fallback for non-BF16 3D×3D: cast to BF16, use the fast path above.
@@ -4428,11 +4547,18 @@ fn compute_gradients(
             let lhs_bf16 = lhs_tensor.to_dtype_no_grad(DType::BF16)?;
             let rhs_bf16 = rhs_tensor.to_dtype_no_grad(DType::BF16)?;
             let grad_bf16 = output_grad.to_dtype_no_grad(DType::BF16)?;
-            let grad_lhs =
-                crate::ops::gemm_bf16::matmul_bf16_trans(&grad_bf16, &rhs_bf16, false, true)?;
-            let grad_rhs =
-                crate::ops::gemm_bf16::matmul_bf16_trans(&lhs_bf16, &grad_bf16, true, false)?;
-            Ok(smallvec![(*lhs, grad_lhs), (*rhs, grad_rhs)])
+            let mut grads: GradVec = SmallVec::new();
+            if need_lhs_grad {
+                let grad_lhs =
+                    crate::ops::gemm_bf16::matmul_bf16_trans(&grad_bf16, &rhs_bf16, false, true)?;
+                grads.push((*lhs, grad_lhs));
+            }
+            if need_rhs_grad {
+                let grad_rhs =
+                    crate::ops::gemm_bf16::matmul_bf16_trans(&lhs_bf16, &grad_bf16, true, false)?;
+                grads.push((*rhs, grad_rhs));
+            }
+            Ok(grads)
         }
 
         Op::Reshape { input, .. } => {

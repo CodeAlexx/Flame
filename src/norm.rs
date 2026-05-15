@@ -876,7 +876,7 @@ pub fn rms_norm_backward_for_bench(
     _batch_size: usize,
     norm_size: usize,
 ) -> Result<(Tensor, Option<Tensor>)> {
-    rms_norm_backward(grad_out, input, weight, inv_rms, &[norm_size])
+    rms_norm_backward(grad_out, input, weight, inv_rms, &[norm_size], weight.is_some())
 }
 
 pub(crate) fn rms_norm_backward(
@@ -885,6 +885,7 @@ pub(crate) fn rms_norm_backward(
     weight: Option<&Tensor>,
     inv_rms: &Tensor,
     normalized_shape: &[usize],
+    compute_grad_weight: bool,
 ) -> Result<(Tensor, Option<Tensor>)> {
     let grad_out_bf16_owned;
     let grad_out_bf16: &Tensor =
@@ -943,7 +944,15 @@ pub(crate) fn rms_norm_backward(
     }
 
     let (grad_input, grad_weight_f32) =
-        rms_norm_backward_bf16(grad_out_bf16, input, weight, inv_rms, batch_size, norm_size)?;
+        rms_norm_backward_bf16(
+            grad_out_bf16,
+            input,
+            weight,
+            inv_rms,
+            batch_size,
+            norm_size,
+            compute_grad_weight,
+        )?;
 
     let grad_weight_tensor = if let Some(data) = grad_weight_f32 {
         let device = input.device.clone();
@@ -976,6 +985,7 @@ fn rms_norm_backward_bf16(
     inv_rms: &Tensor,
     batch_size: usize,
     norm_size: usize,
+    compute_grad_weight: bool,
 ) -> Result<(Tensor, Option<CudaSlice<f32>>)> {
     use crate::cuda_kernels::CudaKernels;
     use cudarc::driver::DevicePtr;
@@ -1008,7 +1018,7 @@ fn rms_norm_backward_bf16(
     let grad_input_data =
         crate::cuda_alloc_pool::pool_alloc_u16(device, input.shape().elem_count())
             .map_err(|e| Error::Cuda(format!("rms_norm backward alloc failed: {e:?}")))?;
-    let mut grad_weight_data = if weight.is_some() {
+    let mut grad_weight_data = if compute_grad_weight && weight.is_some() {
         Some(crate::tensor::alloc_zeros_from_pool(device, norm_size)?)
     } else {
         None
@@ -1032,19 +1042,18 @@ fn rms_norm_backward_bf16(
     let input_ptr = input.as_device_ptr_bf16("rms_norm_backward_bf16:input")? as u64;
     let grad_input_ptr = *grad_input_data.device_ptr();
 
-    match (weight, grad_weight_data.as_mut()) {
-        (Some(w), Some(gw)) => {
+    match weight {
+        Some(w) => {
             if w.dtype() != DType::BF16 || w.storage.dtype() != DType::BF16 {
                 return Err(Error::InvalidInput(
                     "RMSNorm backward expects BF16 weight storage".into(),
                 ));
             }
             let weight_ptr = w.as_device_ptr_bf16("rms_norm_backward_bf16:weight")? as u64;
-            // Snapshot the gw device pointer so we can pass it to TWO kernels
-            // (vec backward writes grad_input only; grad_weight kernel does
-            // cross-row reduction). `&mut CudaSlice` would be consumed by the
-            // first launch_kernel! macro.
-            let gw_ptr: u64 = *gw.device_ptr();
+            let gw_ptr: u64 = grad_weight_data
+                .as_mut()
+                .map(|gw| *gw.device_ptr())
+                .unwrap_or(0u64);
             launch_kernel!(
                 f,
                 cfg,
@@ -1065,7 +1074,7 @@ fn rms_norm_backward_bf16(
             // batch_size-row reduction with ~500× fewer atomicAdds via tiling.
             // Only fires in the vec path; the legacy scalar kernel still
             // accumulates grad_weight inline.
-            if use_vec {
+            if use_vec && grad_weight_data.is_some() {
                 CudaKernels::ensure_kernel(
                     device,
                     "rms_norm_grad_weight_bf16_vec",

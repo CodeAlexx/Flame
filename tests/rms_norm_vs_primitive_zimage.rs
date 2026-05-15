@@ -60,8 +60,7 @@ fn rand_bf16(shape: &[usize], seed: u64, scale: f32) -> Result<Tensor> {
         let f = ((s >> 32) as i32 as f32) / (i32::MAX as f32);
         v.push(f * scale);
     }
-    Tensor::from_vec(v, Shape::from_dims(shape), device.clone())?
-        .to_dtype(DType::BF16)
+    Tensor::from_vec(v, Shape::from_dims(shape), device.clone())?.to_dtype(DType::BF16)
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, f32, usize) {
@@ -335,8 +334,7 @@ fn layer_norm_no_affine_forward_parity_zimage_block_shape() -> Result<()> {
 
     let x_bf16 = rand_bf16(shape, 21, 0.5)?;
 
-    let out_fused =
-        flame_core::layer_norm::layer_norm(&x_bf16, weight_shape, None, None, 1e-6)?;
+    let out_fused = flame_core::layer_norm::layer_norm(&x_bf16, weight_shape, None, None, 1e-6)?;
     let out_prim = primitive_layer_norm(&x_bf16, 1e-6)?;
 
     let f = out_fused.to_dtype(DType::F32)?.to_vec()?;
@@ -361,8 +359,7 @@ fn layer_norm_no_affine_backward_parity_zimage_block_shape() -> Result<()> {
     let x_data = rand_bf16(shape, 31, 0.5)?;
 
     let x_f = Parameter::new(x_data.clone().requires_grad_(true)).tensor()?;
-    let out_f =
-        flame_core::layer_norm::layer_norm(&x_f, weight_shape, None, None, 1e-6)?;
+    let out_f = flame_core::layer_norm::layer_norm(&x_f, weight_shape, None, None, 1e-6)?;
     assert!(out_f.requires_grad(), "fused LN must propagate grad");
     let loss_f = out_f.mul(&out_f)?.sum()?;
     let loss_f_val = loss_f.to_dtype(DType::F32)?.to_vec()?[0];
