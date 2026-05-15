@@ -26,6 +26,7 @@ use flame_core::static_slab_v2::{
     slab_v2_return_if_owned, StaticSlabAllocator, StepSlabGuard,
     ENV_USE_STATIC_SLAB,
 };
+use flame_core::{DType, Shape, Tensor};
 
 /// Check if `ptr` is inside the slab's materialized range. Uses public
 /// `slab_base()` + `capacity_bytes()` since the private `ptr_in_slab` is
@@ -722,6 +723,181 @@ fn sk_enter_recovers_from_poisoned_device_map() {
     // Second enter still succeeds.
     let g2 = StepSlabGuard::enter(device.clone()).expect("second enter post-recovery");
     drop(g2);
+
+    reset_device_map_for_testing();
+}
+
+// =====================================================================
+// R2b Bug Fixer — Persistent state lazily allocated inside guard scope
+// =====================================================================
+//
+// This test mirrors the train_klein R2b wiring's interaction with
+// `flame_core::adam::Adam`'s lazy m/v init pattern:
+//
+//   for step in 0..N {
+//       let _slab_step = StepSlabGuard::enter(device)?;
+//       // ...forward, backward, set_grad...
+//       opt.step(&params);   // ← on step 0, lazily allocates F32 m, v
+//                            //   via zeros_like_with_dtype → pool_alloc_f32
+//                            //   → slab. Stored in self.adam.m / self.adam.v
+//                            //   (HashMap fields of the optimizer, kept
+//                            //   alive across the step boundary BY DESIGN).
+//       opt.zero_grad(&params);
+//       AutogradContext::clear();
+//       // _slab_step drops here → strict reset → panic if live_count != 0.
+//   }
+//
+// On step 0, the Adam state tensors survive the guard's Drop. The slab's
+// `live_count` is `2 * num_params` (one for m, one for v) when the guard
+// tries to reset. Per `static_slab_v2.rs::StepSlabGuard::Drop`, this
+// panics with "live_count > 0".
+//
+// This test demonstrates the failure mode with a minimal stand-in for
+// Adam state: an F32 tensor allocated inside the guard and stored in a
+// scope-outer Vec (mirroring `self.adam.m: HashMap<TensorId, Tensor>`).
+//
+// **EXPECTED**: the guard's drop panics with "live" in the message.
+//
+// **FIX**: persistent Adam state is prewarmed before the guard enters via
+// `AdamW::ensure_state_initialized`.
+
+#[test]
+#[should_panic(expected = "live")]
+fn r2b_bf1_persistent_state_in_guard_scope_panics() {
+    let _g = test_serialize();
+    clear_thread_local_guard_state();
+    let device = match CudaDevice::new(0) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("[r2b bf1] no GPU — synthesizing should_panic match");
+            panic!("live (synthetic — no GPU available)");
+        }
+    };
+    reset_device_map_for_testing();
+    let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
+
+    // Vec lives in the test scope — analog of Adam's `self.m` HashMap.
+    // Tensors pushed into this Vec are kept alive across guard scope.
+    let mut persistent_state: Vec<Tensor> = Vec::new();
+
+    {
+        let guard = StepSlabGuard::enter(device.clone()).expect("enter");
+
+        // Transient alloc drops before the guard, so it is not the panic source.
+        let transient_g = Tensor::zeros_dtype(
+            Shape::from_dims(&[1024]),
+            DType::F32,
+            device.clone(),
+        )
+        .expect("transient grad alloc");
+
+        let m = Tensor::zeros_dtype(
+            Shape::from_dims(&[1024]),
+            DType::F32,
+            device.clone(),
+        )
+        .expect("Adam m lazy alloc inside guard");
+        let v = Tensor::zeros_dtype(
+            Shape::from_dims(&[1024]),
+            DType::F32,
+            device.clone(),
+        )
+        .expect("Adam v lazy alloc inside guard");
+        persistent_state.push(m);
+        persistent_state.push(v);
+
+        drop(transient_g);
+        drop(guard);
+    }
+
+    // If we reach here without panicking, the test FAILS. Draining lets
+    // TensorStorage::Drop return the slab ranges through the production hook.
+    persistent_state.clear();
+}
+
+// =====================================================================
+// R2b Bug Fixer — Transient state inside guard scope (positive control)
+// =====================================================================
+
+#[test]
+fn r2b_bf2_transient_only_state_in_guard_scope_succeeds() {
+    let _g = test_serialize();
+    clear_thread_local_guard_state();
+    let Some(device) = skip_if_no_gpu() else { return };
+    reset_device_map_for_testing();
+    let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
+
+    {
+        let guard = StepSlabGuard::enter(device.clone()).expect("enter");
+        let grad = Tensor::zeros_dtype(
+            Shape::from_dims(&[1024]),
+            DType::F32,
+            device.clone(),
+        )
+        .expect("grad alloc");
+        let activation = Tensor::zeros_dtype(
+            Shape::from_dims(&[2048]),
+            DType::F32,
+            device.clone(),
+        )
+        .expect("activation alloc");
+        assert_eq!(grad.shape().elem_count(), 1024);
+        assert_eq!(activation.shape().elem_count(), 2048);
+        drop(activation);
+        drop(grad);
+        guard.finish().expect("clean finish: all transient allocs returned");
+    }
+    reset_device_map_for_testing();
+}
+
+// =====================================================================
+// R2b Bug Fixer — Adam prewarm keeps persistent state outside guard
+// =====================================================================
+
+#[test]
+fn r2b_bf3_adam_prewarm_allows_step_inside_guard() {
+    use flame_core::adam::AdamW;
+    use flame_core::parameter::Parameter;
+
+    let _g = test_serialize();
+    clear_thread_local_guard_state();
+    let Some(device) = skip_if_no_gpu() else { return };
+    reset_device_map_for_testing();
+    let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
+
+    let param = Parameter::new(
+        Tensor::from_vec(
+            vec![1.0_f32, -1.0, 0.5, -0.5],
+            Shape::from_dims(&[4]),
+            device.clone(),
+        )
+        .expect("param alloc")
+        .requires_grad_(true),
+    );
+    let mut opt = AdamW::new(1.0e-3, 0.9, 0.999, 1.0e-8, 0.01);
+
+    opt.ensure_state_initialized(&[param.clone()])
+        .expect("prewarm Adam state outside guard");
+    assert!(
+        opt.state_for(&param).is_some(),
+        "prewarm must materialize m/v before the guarded step"
+    );
+
+    {
+        let guard = StepSlabGuard::enter(device.clone()).expect("enter");
+        let grad = Tensor::from_vec(
+            vec![0.01_f32, -0.02, 0.03, -0.04],
+            Shape::from_dims(&[4]),
+            device.clone(),
+        )
+        .expect("grad alloc");
+        param.set_grad(grad).expect("set grad");
+        opt.step(&[param.clone()]).expect("Adam step");
+        opt.zero_grad(&[param.clone()]);
+        guard
+            .finish()
+            .expect("prewarmed Adam state must not keep slab allocations live");
+    }
 
     reset_device_map_for_testing();
 }

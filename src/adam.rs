@@ -31,7 +31,7 @@
 //!   (1) moments from raw grad, (2) param step from moments, (3) wd on param.
 
 use crate::{parameter::Parameter, DType, Error, Result, Tensor, TensorId};
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashMap;
 
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 use cudarc::driver::{DevicePtr, DevicePtrMut};
@@ -1067,6 +1067,71 @@ impl Adam {
         }
     }
 
+    fn validate_or_init_state_for_param(&mut self, param: &Parameter) -> Result<()> {
+        let param_dtype = param.dtype()?;
+        if param_dtype != DType::BF16 && param_dtype != DType::F32 {
+            return Err(Error::InvalidInput(format!(
+                "Adam::ensure_state_initialized: unsupported param dtype {:?} \
+                 (only BF16 and F32 params are supported)",
+                param_dtype
+            )));
+        }
+
+        let id = param.id();
+        let param_tensor = param.tensor()?;
+        let shape = param_tensor.shape().clone();
+        let device = param_tensor.device().clone();
+
+        let validate_state = |name: &str, state: &Tensor| -> Result<()> {
+            if state.dtype() != DType::F32 {
+                return Err(Error::Training(format!(
+                    "Adam optimizer {name} state for param {:?} has dtype {:?}; expected F32",
+                    id,
+                    state.dtype()
+                )));
+            }
+            if state.shape() != &shape {
+                return Err(Error::Training(format!(
+                    "Adam optimizer {name} state for param {:?} has shape {:?}; expected {:?}",
+                    id,
+                    state.shape().dims(),
+                    shape.dims()
+                )));
+            }
+            Ok(())
+        };
+
+        if let Some(m) = self.m.get(&id) {
+            validate_state("m", m)?;
+        } else {
+            self.m
+                .insert(id, Tensor::zeros_dtype(shape.clone(), DType::F32, device.clone())?);
+        }
+
+        if let Some(v) = self.v.get(&id) {
+            validate_state("v", v)?;
+        } else {
+            self.v
+                .insert(id, Tensor::zeros_dtype(shape.clone(), DType::F32, device)?);
+        }
+
+        Ok(())
+    }
+
+    /// Materialize persistent optimizer state for all parameters without
+    /// advancing the step counter or mutating parameter values.
+    ///
+    /// Trainers that use a transient per-step allocator must call this before
+    /// entering the step scope. Otherwise Adam's first `step()` lazily creates
+    /// `m`/`v` tensors inside that transient scope and stores them on `self`,
+    /// making them outlive the scope by design.
+    pub fn ensure_state_initialized(&mut self, parameters: &[Parameter]) -> Result<()> {
+        for param in parameters {
+            self.validate_or_init_state_for_param(param)?;
+        }
+        Ok(())
+    }
+
     /// Perform a single optimization step.
     ///
     /// All param dtypes except BF16 and F32 return an error — no silent
@@ -1142,19 +1207,11 @@ impl Adam {
             };
 
             if let Some((param_is_bf16, grad_is_bf16)) = mt_dtype {
-                // Lazy m/v init for any new param. Same shape + F32 dtype
+                // Ensure m/v exist for every param. Same shape + F32 dtype
                 // contract as the per-param path so a switch between the
                 // multi-tensor and per-param paths leaves state consistent.
                 for param in parameters {
-                    let id = param.id();
-                    if !self.m.contains_key(&id) {
-                        let g = param.grad().unwrap();
-                        self.m.insert(id, g.zeros_like_with_dtype(DType::F32)?);
-                    }
-                    if !self.v.contains_key(&id) {
-                        let g = param.grad().unwrap();
-                        self.v.insert(id, g.zeros_like_with_dtype(DType::F32)?);
-                    }
+                    self.validate_or_init_state_for_param(param)?;
                 }
 
                 // Build the 5-region packed pointer + size buffer. Region
@@ -1286,15 +1343,7 @@ impl Adam {
                 // Fused path: BF16 param with F32 state — single kernel launch
                 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
                 if param_dtype == DType::BF16 {
-                    let state_dtype = DType::F32;
-
-                    // Initialize m/v on first step
-                    if let Entry::Vacant(entry) = self.m.entry(param_id) {
-                        entry.insert(grad.zeros_like_with_dtype(state_dtype)?);
-                    }
-                    if let Entry::Vacant(entry) = self.v.entry(param_id) {
-                        entry.insert(grad.zeros_like_with_dtype(state_dtype)?);
-                    }
+                    self.validate_or_init_state_for_param(param)?;
 
                     // Compute the per-step stoch seed BEFORE the &mut borrow
                     // of self.m / self.v below; the seed is a &self read of
@@ -1345,7 +1394,6 @@ impl Adam {
                 // gates BF16 m/v for BF16 params — see debug_assert! below.
                 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
                 if param_dtype == DType::F32 {
-                    let state_dtype = DType::F32;
                     debug_assert_eq!(
                         crate::config::select_optimizer_state_dtype(DType::F32),
                         DType::F32,
@@ -1354,12 +1402,7 @@ impl Adam {
                          fused kernel requires F32 m/v"
                     );
 
-                    if let Entry::Vacant(entry) = self.m.entry(param_id) {
-                        entry.insert(grad.zeros_like_with_dtype(state_dtype)?);
-                    }
-                    if let Entry::Vacant(entry) = self.v.entry(param_id) {
-                        entry.insert(grad.zeros_like_with_dtype(state_dtype)?);
-                    }
+                    self.validate_or_init_state_for_param(param)?;
 
                     let m = self
                         .m
@@ -1451,6 +1494,10 @@ impl AdamW {
 
     pub fn step(&mut self, parameters: &[Parameter]) -> Result<()> {
         self.adam.step(parameters)
+    }
+
+    pub fn ensure_state_initialized(&mut self, parameters: &[Parameter]) -> Result<()> {
+        self.adam.ensure_state_initialized(parameters)
     }
 
     pub fn zero_grad(&self, parameters: &[Parameter]) {
