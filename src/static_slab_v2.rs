@@ -815,6 +815,10 @@ thread_local! {
     /// `Some(key)` ⇒ allocations route to `slab_for_device` at that key,
     /// when `FLAME_USE_STATIC_SLAB=1`.
     static ACTIVE_DEVICE_KEY: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Once a step's slab has overflowed, retrying every later allocation
+    /// through the slab only burns CPU and log bandwidth. Fall back directly
+    /// to the legacy pool until the guard resets the slab for the next step.
+    static SLAB_OVERFLOWED_THIS_SCOPE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Env name for the dispatch gate. `=1` enables slab routing when a guard
@@ -873,6 +877,7 @@ impl StepSlabGuard {
                 "StepSlabGuard::enter: a guard is already active on this thread (nested guards forbidden)".to_string(),
             ));
         }
+        SLAB_OVERFLOWED_THIS_SCOPE.with(|cell| cell.set(false));
         // Eagerly register the slab in the device_map so the dispatch
         // helpers (`pool_alloc_*_via_slab`) can find it on the first alloc
         // inside this scope. The slab itself is still lazily materialised
@@ -929,6 +934,7 @@ impl StepSlabGuard {
         // future scope) don't see this guard still active even on the
         // error path.
         ACTIVE_DEVICE_KEY.with(|cell| cell.set(None));
+        SLAB_OVERFLOWED_THIS_SCOPE.with(|cell| cell.set(false));
         self.finished = true;
         // Try to reset the slab. Note: the slab may not have been
         // materialised at all (if no alloc happened during the scope) —
@@ -979,6 +985,7 @@ impl Drop for StepSlabGuard {
         // Always clear the thread-local — even on the panic/error path —
         // so a subsequent guard `enter()` on this thread succeeds.
         ACTIVE_DEVICE_KEY.with(|cell| cell.set(None));
+        SLAB_OVERFLOWED_THIS_SCOPE.with(|cell| cell.set(false));
 
         let reset_result = self.reset_slab();
 
@@ -1031,6 +1038,9 @@ pub fn pool_alloc_u16_via_slab(n: usize) -> Option<CudaSlice<u16>> {
     if !use_static_slab_enabled() {
         return None;
     }
+    if SLAB_OVERFLOWED_THIS_SCOPE.with(|cell| cell.get()) {
+        return None;
+    }
     let key = StepSlabGuard::active_device_key()?;
     // The slab path is the new transient route; if a previous test or
     // operation poisoned the mutex, we still want to USE the slab (a
@@ -1051,10 +1061,12 @@ pub fn pool_alloc_u16_via_slab(n: usize) -> Option<CudaSlice<u16>> {
     match slab.alloc_u16(n) {
         Ok(slice) => Some(slice),
         Err(e) => {
-            // Overflow / bad input — log and fall back to legacy. We don't
-            // want to take down the trainer just because the slab is small.
-            log::warn!(
-                "pool_alloc_u16_via_slab: slab alloc({n}) failed, falling back to legacy pool: {e}"
+            // Overflow / bad input — fall back to legacy for the rest of the
+            // guarded step. Retrying after the cursor is full can otherwise
+            // produce tens of thousands of warnings and measurable step tax.
+            SLAB_OVERFLOWED_THIS_SCOPE.with(|cell| cell.set(true));
+            log::debug!(
+                "pool_alloc_u16_via_slab: slab alloc({n}) failed; using legacy pool for remaining guarded allocations this step: {e}"
             );
             None
         }
@@ -1076,6 +1088,9 @@ pub fn pool_alloc_f32_via_slab(n: usize) -> Option<CudaSlice<f32>> {
     if !use_static_slab_enabled() {
         return None;
     }
+    if SLAB_OVERFLOWED_THIS_SCOPE.with(|cell| cell.get()) {
+        return None;
+    }
     let key = StepSlabGuard::active_device_key()?;
     // Poison-tolerant lookup (see `pool_alloc_u16_via_slab`).
     let device_ref = match device_map().lock() {
@@ -1092,8 +1107,9 @@ pub fn pool_alloc_f32_via_slab(n: usize) -> Option<CudaSlice<f32>> {
     match slab.alloc_f32_zeroed(n) {
         Ok(slice) => Some(slice),
         Err(e) => {
-            log::warn!(
-                "pool_alloc_f32_via_slab: slab alloc({n}) failed, falling back to legacy pool: {e}"
+            SLAB_OVERFLOWED_THIS_SCOPE.with(|cell| cell.set(true));
+            log::debug!(
+                "pool_alloc_f32_via_slab: slab alloc({n}) failed; using legacy pool for remaining guarded allocations this step: {e}"
             );
             None
         }

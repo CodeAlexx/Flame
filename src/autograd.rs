@@ -51,6 +51,34 @@ pub type GradVec = SmallVec<[(TensorId, Tensor); 3]>;
 /// Updated alongside `ctx.enabled` in `record_op`, `checkpoint`, `backward`, etc.
 static AUTOGRAD_ENABLED: AtomicBool = AtomicBool::new(true);
 
+thread_local! {
+    /// Non-zero only while a checkpoint closure is being replayed by backward.
+    /// Model code can use this to issue backward-order prefetches without
+    /// changing normal forward checkpoint behavior.
+    static CHECKPOINT_RECOMPUTE_DEPTH: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+struct CheckpointRecomputeGuard;
+
+impl CheckpointRecomputeGuard {
+    #[inline]
+    fn enter() -> Self {
+        CHECKPOINT_RECOMPUTE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for CheckpointRecomputeGuard {
+    fn drop(&mut self) {
+        CHECKPOINT_RECOMPUTE_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0, "checkpoint recompute depth underflow");
+            depth.set(current.saturating_sub(1));
+        });
+    }
+}
+
 lazy_static::lazy_static! {
     /// Global autograd context - thread-safe
     static ref AUTOGRAD_CONTEXT: Mutex<AutogradContextInner> = Mutex::new(AutogradContextInner::new());
@@ -1088,6 +1116,16 @@ impl AutogradContext {
     #[inline(always)]
     pub fn is_recording() -> bool {
         AUTOGRAD_ENABLED.load(Ordering::Relaxed)
+    }
+
+    /// True only while backward is replaying a checkpoint closure.
+    ///
+    /// This is intentionally narrower than `is_recording()`: recompute records
+    /// a local sub-tape, but ordinary forward paths may also record and should
+    /// not receive backward-order offload hints.
+    #[inline(always)]
+    pub fn is_checkpoint_recompute() -> bool {
+        CHECKPOINT_RECOMPUTE_DEPTH.with(|depth| depth.get() != 0)
     }
 }
 
@@ -2949,7 +2987,10 @@ fn compute_gradients(
             }
 
             let _recomp_t0 = std::time::Instant::now();
-            let recomputed_output = (recompute_fn)()?;
+            let recomputed_output = {
+                let _recompute_guard = CheckpointRecomputeGuard::enter();
+                (recompute_fn)()?
+            };
             let _recomp_dt = _recomp_t0.elapsed();
 
             // Drain the local sub-tape from the global tape
@@ -3101,7 +3142,10 @@ fn compute_gradients(
                 ctx.enabled = true;
                 AUTOGRAD_ENABLED.store(true, Ordering::Relaxed);
             }
-            let recomputed_output = (recompute_fn)()?;
+            let recomputed_output = {
+                let _recompute_guard = CheckpointRecomputeGuard::enter();
+                (recompute_fn)()?
+            };
             let mut sub_tape: Vec<TapeEntry> = {
                 let mut ctx = AUTOGRAD_CONTEXT.lock()
                     .map_err(|_| Error::Training("autograd mutex poisoned".into()))?;
