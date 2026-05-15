@@ -1064,8 +1064,9 @@ impl BlockOffloader {
         // 2026-05-15 trap: record ring-allocated ptr as Live. If the trap
         // history later shows clear_cache/cudaFree on this ptr followed by
         // alloc_bf16_via_ring/external on the SAME ptr, that's the bug.
-        crate::cuda_alloc_pool::trap_record_external(
+        crate::cuda_alloc_pool::trap_record_external_range(
             ptr.device_ptr,
+            num_elems,
             "alloc_bf16_via_ring/ring",
         );
         Ok(slice)

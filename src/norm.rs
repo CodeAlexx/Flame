@@ -767,7 +767,7 @@ fn rms_norm_forward_bf16(
         .get_func(kernel_name, kernel_name)
         .ok_or_else(|| Error::Cuda(format!("Failed to get {kernel_name} kernel")))?;
 
-    let output_data = unsafe { device.alloc::<u16>(input.shape().elem_count()) }
+    let output_data = crate::cuda_alloc_pool::pool_alloc_u16(device, input.shape().elem_count())
         .map_err(|e| Error::Cuda(format!("rms_norm forward alloc failed: {e:?}")))?;
     let inv_rms_data = crate::tensor::alloc_zeros_from_pool(device, batch_size)?;
 
@@ -988,7 +988,7 @@ fn rms_norm_backward_bf16(
         .get_func(kernel_name, kernel_name)
         .ok_or_else(|| Error::Cuda(format!("Failed to get {kernel_name} kernel")))?;
 
-    let grad_input_data = unsafe { device.alloc::<u16>(input.shape().elem_count()) }
+    let grad_input_data = crate::cuda_alloc_pool::pool_alloc_u16(device, input.shape().elem_count())
         .map_err(|e| Error::Cuda(format!("rms_norm backward alloc failed: {e:?}")))?;
     let mut grad_weight_data = if weight.is_some() {
         Some(crate::tensor::alloc_zeros_from_pool(device, norm_size)?)

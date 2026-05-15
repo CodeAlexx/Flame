@@ -818,16 +818,24 @@ unsafe fn make_dummy_slice<T>(device: Arc<CudaDevice>) -> CudaSlice<T> {
 /// the slice (no cudaFree), and return `true` so the caller skips the
 /// rest of pool-return.
 ///
-/// `is_u16` is currently unused (the function signature in static_slab_v2
-/// doesn't need the dtype — the slab tracks live_count irrespective of
-/// element type). We keep the param for documentation / future debug-log
-/// use; it costs nothing.
+/// `is_u16` is used only for the BF16 live-ptr trap. The slab itself tracks
+/// live_count irrespective of element type.
 #[cfg_attr(not(feature = "shared_storage"), inline)]
-fn slab_v2_try_claim<T>(slice: &CudaSlice<T>, _is_u16: bool) -> bool {
+fn slab_v2_try_claim<T>(slice: &CudaSlice<T>, is_u16: bool) -> bool {
     use cudarc::driver::DevicePtr;
     let ptr = *slice.device_ptr();
+    let len = DeviceSlice::len(slice);
     let key = Arc::as_ptr(&slice.device()) as usize;
-    crate::static_slab_v2::slab_v2_return_if_owned(ptr, key)
+    let claimed = crate::static_slab_v2::slab_v2_return_if_owned(ptr, key);
+    if claimed && is_u16 {
+        crate::cuda_alloc_pool::trap_record_bf16_released(
+            ptr,
+            len,
+            "static_slab_v2/TensorStorage::drop",
+            0,
+        );
+    }
+    claimed
 }
 
 impl Drop for TensorStorage {

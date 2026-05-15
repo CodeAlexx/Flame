@@ -172,8 +172,8 @@ struct PtrEvent {
     op: &'static str,
     bucket: usize,
     /// Backtrace of the call site for this event. Captured when
-    /// `FLAME_POOL_TRAP_BACKTRACE=1` and the event op is `pool_return_u16/push`
-    /// — that's the suspect call. Cheap when off (None).
+    /// `FLAME_POOL_TRAP_BACKTRACE=1` and the event marks the ptr non-live.
+    /// Cheap when off (None).
     bt: Option<std::sync::Arc<String>>,
 }
 
@@ -189,6 +189,12 @@ struct PtrHistory {
 }
 
 const TRAP_HISTORY_LEN: usize = 16;
+
+#[derive(Clone, Debug)]
+struct LiveRange {
+    start: u64,
+    end: u64,
+}
 
 #[inline]
 fn pool_trap_bf16_enabled() -> bool {
@@ -208,6 +214,11 @@ fn trap_history() -> &'static Mutex<HashMap<u64, PtrHistory>> {
     H.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn trap_live_ranges() -> &'static Mutex<Vec<LiveRange>> {
+    static R: OnceLock<Mutex<Vec<LiveRange>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 fn trap_seq() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static S: AtomicU64 = AtomicU64::new(0);
@@ -219,8 +230,8 @@ fn trap_record(ptr: u64, state: PtrState, op: &'static str, bucket: usize) {
     if !pool_trap_bf16_enabled() {
         return;
     }
-    // Backtrace only for the suspect ops (push/return) — capture is slow.
-    let bt = if pool_trap_backtrace_enabled() && state == PtrState::InCache {
+    // Backtrace only for non-live transitions — capture is slow.
+    let bt = if pool_trap_backtrace_enabled() && state != PtrState::Live {
         Some(std::sync::Arc::new(
             std::backtrace::Backtrace::force_capture().to_string(),
         ))
@@ -249,6 +260,38 @@ fn trap_record(ptr: u64, state: PtrState, op: &'static str, bucket: usize) {
     }
 }
 
+#[inline]
+fn trap_record_range(ptr: u64, state: PtrState, op: &'static str, bucket: usize, elems: usize) {
+    trap_record(ptr, state, op, bucket);
+    if !pool_trap_bf16_enabled() || elems == 0 {
+        return;
+    }
+    let bytes = (elems as u64).saturating_mul(std::mem::size_of::<u16>() as u64);
+    if bytes == 0 {
+        return;
+    }
+    if let Ok(mut ranges) = trap_live_ranges().lock() {
+        ranges.retain(|r| r.start != ptr);
+        if state == PtrState::Live {
+            ranges.push(LiveRange {
+                start: ptr,
+                end: ptr.saturating_add(bytes),
+            });
+        }
+    }
+}
+
+#[inline]
+fn trap_live_range_contains(ptr: u64) -> bool {
+    if !pool_trap_bf16_enabled() {
+        return false;
+    }
+    trap_live_ranges()
+        .lock()
+        .map(|ranges| ranges.iter().any(|r| ptr >= r.start && ptr < r.end))
+        .unwrap_or(false)
+}
+
 /// Record an externally-sourced BF16 ptr being wrapped into a Tensor
 /// (e.g. via `Tensor::from_bf16_slice_gpu` from a `BlockOffloader`
 /// alloc or ring slice). Sets state to `Live` so subsequent
@@ -258,6 +301,32 @@ fn trap_record(ptr: u64, state: PtrState, op: &'static str, bucket: usize) {
 /// bug pattern).
 pub fn trap_record_external(ptr: u64, call_site: &'static str) {
     trap_record(ptr, PtrState::Live, call_site, 0);
+}
+
+/// Range-aware variant of [`trap_record_external`] for callers that know the
+/// live allocation length. This is needed because tensor views often pass a
+/// mid-allocation pointer into CUDA APIs.
+pub fn trap_record_external_range(ptr: u64, elems: usize, call_site: &'static str) {
+    trap_record_range(ptr, PtrState::Live, call_site, elems, elems);
+}
+
+/// Record a BF16 allocation as live. Used by allocator paths that do not pass
+/// through the BF16 free-list checkout path (direct cudart alloc, external miss
+/// allocators, and the static slab).
+pub(crate) fn trap_record_bf16_live(ptr: u64, elems: usize, call_site: &'static str, bucket: usize) {
+    trap_record_range(ptr, PtrState::Live, call_site, bucket, elems);
+}
+
+/// Record a BF16 allocation as no longer live without implying it was returned
+/// to the legacy free-list. Static slab releases use this when the final owning
+/// TensorStorage drops.
+pub(crate) fn trap_record_bf16_released(
+    ptr: u64,
+    elems: usize,
+    call_site: &'static str,
+    bucket: usize,
+) {
+    trap_record_range(ptr, PtrState::Freed, call_site, bucket, elems);
 }
 
 /// Validate a BF16 ptr right before passing it to a CUDA API. Panics
@@ -271,6 +340,9 @@ pub fn trap_validate_bf16_ptr(ptr: u64, call_site: &str) {
     if let Ok(h) = trap_history().lock() {
         if let Some(hist) = h.get(&ptr) {
             if hist.state != PtrState::Live {
+                if trap_live_range_contains(ptr) {
+                    return;
+                }
                 let state = hist.state;
                 let last_seq = hist.last_seq;
                 let last_op = hist.last_op;
@@ -1378,7 +1450,15 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
         return Ok(slice);
     }
 
-    if pool_disabled() || size == 0 {
+    if size == 0 {
+        return unsafe {
+            device
+                .alloc::<u16>(size)
+                .map_err(|e| crate::Error::CudaDriver(format!("{e:?}")))
+        };
+    }
+
+    if pool_disabled() {
         return unsafe {
             device
                 .alloc::<u16>(size)
@@ -1395,8 +1475,12 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
     //
     // BF16 returns uninitialized (matches the cached path's contract).
     if !bf16_pool_cache_enabled() {
-        return unsafe { device.alloc::<u16>(size) }
-            .map_err(|e| crate::Error::CudaDriver(format!("alloc::<u16>({size}): {e:?}")));
+        let slice = unsafe { device.alloc::<u16>(size) }
+            .map_err(|e| crate::Error::CudaDriver(format!("alloc::<u16>({size}): {e:?}")))?;
+        let ptr = *DevicePtr::device_ptr(&slice);
+        trace_bf16("alloc_direct", ptr, size, size, false, "pool_alloc_u16/direct");
+        trap_record_bf16_live(ptr, size, "pool_alloc_u16/direct", size);
+        return Ok(slice);
     }
 
     let pool = global_pool();
@@ -1412,7 +1496,7 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
             pool.bucket_saves.fetch_add(1, Ordering::Relaxed);
         }
         trace_bf16("alloc_hit", entry.ptr, bucket, size, entry.is_external, "pool_alloc_u16");
-        trap_record(entry.ptr, PtrState::Live, "pool_alloc_u16/hit", bucket);
+        trap_record_bf16_live(entry.ptr, size, "pool_alloc_u16/hit", bucket);
         // Reconstruct with len = requested size, not bucket (see f32 path).
         let slice = unsafe { reconstruct_slice::<u16>(entry.ptr, size, entry.device) };
         log::trace!(
@@ -1442,6 +1526,15 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
                 pool.external_misses.fetch_add(1, Ordering::Relaxed);
                 let (ptr, _, dev) = unsafe { decompose_slice(slice) };
                 pool.register_external_ptr(ptr);
+                trace_bf16(
+                    "alloc_external_miss",
+                    ptr,
+                    bucket,
+                    size,
+                    true,
+                    "pool_alloc_u16/external_miss",
+                );
+                trap_record_bf16_live(ptr, size, "pool_alloc_u16/external_miss", bucket);
                 return Ok(unsafe { reconstruct_slice::<u16>(ptr, size, dev) });
             }
             Err(e) => {
@@ -1474,12 +1567,12 @@ pub fn pool_alloc_u16(device: &Arc<CudaDevice>, size: usize) -> crate::Result<Cu
     if bucket == size {
         let ptr = *DevicePtr::device_ptr(&allocated);
         trace_bf16("alloc_miss", ptr, bucket, size, false, "pool_alloc_u16/fresh");
-        trap_record(ptr, PtrState::Live, "pool_alloc_u16/miss", bucket);
+        trap_record_bf16_live(ptr, size, "pool_alloc_u16/miss", bucket);
         Ok(allocated)
     } else {
         let (ptr, _, dev) = unsafe { decompose_slice(allocated) };
         trace_bf16("alloc_miss", ptr, bucket, size, false, "pool_alloc_u16/fresh-shrunk");
-        trap_record(ptr, PtrState::Live, "pool_alloc_u16/miss-shrunk", bucket);
+        trap_record_bf16_live(ptr, size, "pool_alloc_u16/miss-shrunk", bucket);
         Ok(unsafe { reconstruct_slice::<u16>(ptr, size, dev) })
     }
 }
@@ -1499,10 +1592,10 @@ pub fn pool_return_u16(slice: CudaSlice<u16>) {
             let (p, _, dev) = unsafe { decompose_slice(slice) };
             unsafe { reconstruct_and_forget::<u16>(p, len, dev) };
             global_pool().unregister_external_ptr(ptr);
-            trap_record(p, PtrState::Freed, "pool_return_u16/external_forget", 0);
+            trap_record_bf16_released(p, len, "pool_return_u16/external_forget", 0);
         } else {
             drop(slice);
-            trap_record(ptr, PtrState::Freed, "pool_return_u16/drop", 0);
+            trap_record_bf16_released(ptr, trace_len, "pool_return_u16/drop", 0);
         }
         return;
     }
@@ -1517,7 +1610,7 @@ pub fn pool_return_u16(slice: CudaSlice<u16>) {
     let bucket = round_elems_up::<u16>(elem_len);
     let is_external = global_pool().is_external_ptr(ptr);
     trace_bf16("return_push", ptr, bucket, elem_len, is_external, "pool_return_u16/push");
-    trap_record(ptr, PtrState::InCache, "pool_return_u16/push", bucket);
+    trap_record_range(ptr, PtrState::InCache, "pool_return_u16/push", bucket, elem_len);
 
     global_pool().push_u16(FreeEntry {
         ptr,

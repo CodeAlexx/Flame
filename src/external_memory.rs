@@ -379,7 +379,14 @@ impl ExternalMemoryRegistry {
 /// registry's `should_skip_free_any_device` path because cudarc's hook
 /// signature is `fn(u64) -> bool` (no device parameter).
 fn external_ptr_hook_global(ptr: u64) -> bool {
-    ExternalMemoryRegistry::global().should_skip_free_any_device(ptr)
+    let should_skip = ExternalMemoryRegistry::global().should_skip_free_any_device(ptr);
+    if !should_skip {
+        return false;
+    }
+    if crate::static_slab_v2::slab_v2_return_if_owned_any_device(ptr) {
+        return true;
+    }
+    true
 }
 
 #[cfg(test)]

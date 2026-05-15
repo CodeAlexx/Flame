@@ -36,8 +36,9 @@
 //!     │
 //!     ├── (caller drops the slice)
 //!     │   ├── TensorStorage::Drop → slab_v2_return_if_owned(ptr, dev_key)
-//!     │   ├── slab-range hit → decrement live_count, forget slice (no cudaFree)
-//!     │   └── return true → pool_return_* short-circuited
+//!     │   ├── raw CudaSlice::Drop → cudarc hook → slab_v2_return_if_owned_any_device(ptr)
+//!     │   ├── slab-range hit → decrement live_count, skip cudaFree
+//!     │   └── TensorStorage path returns true → pool_return_* short-circuited
 //!     │
 //!     ├── reset()  // STRICT: errs if live_count != 0
 //!     │   └── cursor → 0, slab + range still alive
@@ -288,6 +289,12 @@ impl StaticSlabAllocator {
         let slice: CudaSlice<u16> =
             unsafe { synth_slice::<u16>(ptr, n, self.device.clone()) };
         self.live_count.fetch_add(1, Ordering::AcqRel);
+        crate::cuda_alloc_pool::trap_record_bf16_live(
+            ptr,
+            n,
+            "static_slab_v2/alloc_u16",
+            n,
+        );
         Ok(slice)
     }
 
@@ -619,16 +626,38 @@ pub fn slab_for_device(device: &Arc<CudaDevice>) -> &'static Mutex<StaticSlabAll
 // Slab return hook
 //
 // Called from `TensorStorage::Drop` BEFORE the existing `pool_return_*`
-// logic. Returns `true` if the slice was slab-owned and live_count was
-// decremented; the caller then SKIPS the rest of pool_return.
+// logic, and from the cudarc external-pointer hook for raw `CudaSlice`
+// drops. Returns `true` if the slice was slab-owned and live_count was
+// claimed; callers then skip cudaFree / pool-return.
 //
 // Why this lives here (not in cuda_alloc_pool.rs): the slab live_count
 // is part of the slab's invariant, not the pool's. The slab must "see"
 // every drop of every slice it handed out, even if the pool's caching
 // path would otherwise reconstruct-and-forget the slice anyway. We
-// centralise the decision here so `TensorStorage::Drop` has ONE
-// per-slab-tensor hook to call.
+// centralise the decision here so `TensorStorage::Drop` and raw `CudaSlice`
+// drop share ONE per-slab hook.
 // ---------------------------------------------------------------------------
+
+fn slab_v2_claim_locked(slab: &StaticSlabAllocator, ptr: u64, caller: &'static str) -> bool {
+    if slab.ptr_in_slab(ptr) {
+        // live_count > 0 by construction (we incremented on alloc; if a
+        // slab-owned slice is being dropped, it MUST have come from an
+        // alloc that incremented). Guard against logic bugs by clamping
+        // at zero.
+        let prev = slab.live_count.fetch_sub(1, Ordering::AcqRel);
+        if prev == 0 {
+            // Drop without matching alloc. Restore and warn — caller
+            // still needs to skip cudaFree (ptr is in slab range).
+            slab.live_count.fetch_add(1, Ordering::AcqRel);
+            log::warn!(
+                "{caller}: ptr 0x{ptr:x} in slab range but live_count was 0; skipping decrement"
+            );
+        }
+        true
+    } else {
+        false
+    }
+}
 
 /// If `ptr` is owned by ANY slab on `device_key`, decrement that slab's
 /// `live_count` and return `true`. The caller MUST then:
@@ -670,24 +699,30 @@ pub fn slab_v2_return_if_owned(ptr: u64, device_key: usize) -> bool {
         Ok(g) => g,
         Err(_) => return false,
     };
-    if g.ptr_in_slab(ptr) {
-        // live_count > 0 by construction (we incremented on alloc; if a
-        // slab-owned slice is being dropped, it MUST have come from an
-        // alloc that incremented). Guard against logic bugs by clamping
-        // at zero.
-        let prev = g.live_count.fetch_sub(1, Ordering::AcqRel);
-        if prev == 0 {
-            // Drop without matching alloc. Restore and warn — caller
-            // still needs to skip cudaFree (ptr is in slab range).
-            g.live_count.fetch_add(1, Ordering::AcqRel);
-            log::warn!(
-                "slab_v2_return_if_owned: ptr 0x{ptr:x} in slab range but live_count was 0; skipping decrement"
-            );
+    slab_v2_claim_locked(&g, ptr, "slab_v2_return_if_owned")
+}
+
+/// Device-key-less variant used by the process-wide cudarc external-pointer
+/// hook. It handles raw `CudaSlice` drops for slab allocations that were not
+/// wrapped in `TensorStorage`.
+pub(crate) fn slab_v2_return_if_owned_any_device(ptr: u64) -> bool {
+    let slabs: Vec<&'static Mutex<StaticSlabAllocator>> = {
+        let g = match device_map().lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        g.values().copied().collect()
+    };
+    for slab_mutex in slabs {
+        let g = match slab_mutex.lock() {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        if slab_v2_claim_locked(&g, ptr, "slab_v2_return_if_owned_any_device") {
+            return true;
         }
-        true
-    } else {
-        false
     }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1707,6 +1742,43 @@ mod tests {
             // _guard drops at end of scope; reset is clean.
         }
         // After drop:
+        let slab_mu = {
+            let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+            g.get(&key).copied()
+        };
+        if let Some(slab_mu) = slab_mu {
+            let g = slab_mu.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(g.live_count(), 0, "live_count cleared");
+            assert_eq!(g.used_bytes(), 0, "cursor rewound by reset");
+        }
+        reset_device_map_for_testing();
+    }
+
+    /// R2c BF: raw slab-backed CudaSlice drops must also decrement live_count.
+    /// Many hot-path scratch buffers use `pool_alloc_*` directly without ever
+    /// being wrapped in TensorStorage.
+    #[test]
+    fn raw_slab_slice_drop_decrements_live_count_via_hook() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_thread_local_guard_state();
+        let Some(device) = skip_if_no_gpu() else { return };
+        reset_device_map_for_testing();
+        let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
+
+        let key = Arc::as_ptr(&device) as usize;
+        {
+            let _guard = StepSlabGuard::enter(device.clone()).expect("enter");
+            let s = crate::cuda_alloc_pool::pool_alloc_u16(&device, 64)
+                .expect("inside-guard raw alloc");
+            let slab_mu = {
+                let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
+                *g.get(&key).unwrap()
+            };
+            assert_eq!(slab_mu.lock().unwrap_or_else(|e| e.into_inner()).live_count(), 1);
+            drop(s);
+            assert_eq!(slab_mu.lock().unwrap_or_else(|e| e.into_inner()).live_count(), 0);
+        }
+
         let slab_mu = {
             let g = device_map().lock().unwrap_or_else(|e| e.into_inner());
             g.get(&key).copied()

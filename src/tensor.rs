@@ -1393,8 +1393,9 @@ extern "C" __global__ void masked_fill_kernel(
         // previously Freed by clear_pool_cache, the trap history will
         // show the alternation — that's a use-after-free smoking gun.
         let trap_ptr = *cudarc::driver::DevicePtr::device_ptr(&data);
-        crate::cuda_alloc_pool::trap_record_external(
+        crate::cuda_alloc_pool::trap_record_external_range(
             trap_ptr,
+            numel,
             "from_bf16_slice_gpu/wrap",
         );
         Tensor {
