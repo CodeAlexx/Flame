@@ -1556,10 +1556,18 @@ with a conductor modelled on OneTrainer's `LayerOffloadConductor`:
 
 Telemetry: `258 AwaitHit / 0 AwaitMiss` on a 6-step Klein 9B run
 confirms the bucket prefetch is landing. Combined with the
-R2c-perf `static_slab_v2` + QKV/SwiGLU backward fixes, Klein 9B +
-`--offload` ran at **2.8 s/step** on a 25-step gate (vs 4.6 s/step
-`FLAME_ALLOC_POOL=0` workaround baseline; vs OneTrainer's 2.07 s/step
-reference).
+R2c-perf `static_slab_v2` + QKV/SwiGLU backward fixes and the
+frozen-weight-gradient skips in `autograd::Op::MatMul` /
+`Op::Mul` / `norm::rms_norm_backward`, Klein 9B + `--offload` ran
+at **2.30 s/step steady (100-step head-to-head)** vs OneTrainer's
+**2.79 s/step** on identical hardware, dataset (118-sample eri2),
+and hyperparameters (LoRA r16/α16, AdamW, lr 3e-5, bs 1, bf16, 512
+resolution with aspect bucketing). Pure-training wall: 229 s vs 280 s
+(EDv2 1.22× faster). Total wall including setup/cache: 271 s vs 574 s
+(EDv2 2.12× faster — OT pays per-epoch latent re-caching that EDv2
+amortizes into a one-time prep step). Pre-redesign baselines for
+context: `FLAME_ALLOC_POOL=0` workaround was 4.6 s/step; 661f9e9
+pre-regression was 3.4-3.8 s/step.
 
 **Three load modes:**
 - `BlockOffloader::load(paths, facilitator, device)` — default pinned
