@@ -1,11 +1,18 @@
 [package]
 name = "flame-core"
-version = "0.1.0"
+version = "26.15.1"
 authors = ["Alex"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/CodeAlexx/Flame"
 description = "Core tensor operations and autograd for FLAME"
+# Versioning: calendar-derived MAJOR.MINOR.PATCH = YEAR(YY).DAY.REV.
+# Bump MAJOR on year rollover, MINOR on any breaking ABI change
+# (modules added/removed, public fn signatures changed, behavior
+# contracts altered — env-var semantics, Drop ordering, etc).
+# 26.15.1 = first release after the R1a–R2c OT-static-slab redesign
+# (2026-05-15). See HANDOFF_2026-05-15_OT_STATIC_SLAB_REDESIGN.md
+# for breaking changes vs the pre-redesign 0.1.0 line.
 
 [dependencies]
 cudarc = { version = "0.11.9", default-features = false, features = ["driver", "cublas", "cublaslt", "nvrtc", "cuda-12050", "f16"] }
