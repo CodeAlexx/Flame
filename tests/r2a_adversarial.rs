@@ -901,3 +901,262 @@ fn r2b_bf3_adam_prewarm_allows_step_inside_guard() {
 
     reset_device_map_for_testing();
 }
+
+// =====================================================================
+// R2b Skeptic — Adam prewarm hook contract: idempotency, ordering,
+//                resume-safety, non-Adam routing.
+// =====================================================================
+//
+// These tests guard the `Optimizer::ensure_state_initialized` contract used
+// by `train_klein.rs` immediately before flipping `FLAME_USE_STATIC_SLAB=1`:
+//
+//   1. Calling it twice must be a strict no-op (no re-alloc, no `t` advance).
+//   2. Empty parameter list must succeed without allocations.
+//   3. Calling it AFTER `step()` has already populated state must NOT
+//      clobber the populated m/v with fresh zeros.
+//   4. Calling it AFTER `--resume` injected non-zero m/v via `set_state`
+//      must NOT overwrite those values.
+//   5. Calling it inside an already-active guard scope with prewarmed state
+//      must be a no-op (no slab allocation, since validate paths short-circuit).
+//   6. The trainer's Optimizer-enum wrapper must route the call only for
+//      AdamW (and no-op for the other 8 variants) — code-level reading is
+//      sufficient, but a unit test catches future regressions when someone
+//      adds a Self::Foo arm to step() but forgets to add it here.
+
+#[test]
+fn sk_r2b_prewarm_is_idempotent_no_realloc() {
+    let _g = test_serialize();
+    clear_thread_local_guard_state();
+    let Some(device) = skip_if_no_gpu() else { return };
+    reset_device_map_for_testing();
+
+    use flame_core::adam::AdamW;
+    use flame_core::parameter::Parameter;
+
+    let param = Parameter::new(
+        Tensor::from_vec(
+            vec![0.1_f32, 0.2, 0.3, 0.4],
+            Shape::from_dims(&[4]),
+            device.clone(),
+        )
+        .expect("param alloc")
+        .requires_grad_(true),
+    );
+    let mut opt = AdamW::new(1.0e-3, 0.9, 0.999, 1.0e-8, 0.01);
+
+    opt.ensure_state_initialized(&[param.clone()]).expect("first prewarm");
+    let t_after_first = opt.t();
+    let (m1, v1) = opt
+        .state_for(&param)
+        .expect("state present after first prewarm");
+    let m_ptr_first = m1.cuda_ptr() as u64;
+    let v_ptr_first = v1.cuda_ptr() as u64;
+
+    opt.ensure_state_initialized(&[param.clone()]).expect("second prewarm");
+
+    assert_eq!(opt.t(), t_after_first, "t must not advance on prewarm");
+    let (m2, v2) = opt
+        .state_for(&param)
+        .expect("state still present after second prewarm");
+    let m_ptr_second = m2.cuda_ptr() as u64;
+    let v_ptr_second = v2.cuda_ptr() as u64;
+    assert_eq!(
+        m_ptr_first, m_ptr_second,
+        "second prewarm must NOT re-allocate m (device ptr should match)"
+    );
+    assert_eq!(
+        v_ptr_first, v_ptr_second,
+        "second prewarm must NOT re-allocate v (device ptr should match)"
+    );
+
+    reset_device_map_for_testing();
+}
+
+#[test]
+fn sk_r2b_prewarm_empty_params_no_op() {
+    let _g = test_serialize();
+    clear_thread_local_guard_state();
+    if skip_if_no_gpu().is_none() {
+        return;
+    }
+
+    use flame_core::adam::AdamW;
+
+    let mut opt = AdamW::new(1.0e-3, 0.9, 0.999, 1.0e-8, 0.01);
+    opt.ensure_state_initialized(&[])
+        .expect("prewarm with empty params must succeed");
+    assert_eq!(opt.t(), 0, "empty prewarm must not advance t");
+}
+
+#[test]
+fn sk_r2b_prewarm_after_step_does_not_clobber() {
+    let _g = test_serialize();
+    clear_thread_local_guard_state();
+    let Some(device) = skip_if_no_gpu() else { return };
+    reset_device_map_for_testing();
+
+    use flame_core::adam::AdamW;
+    use flame_core::parameter::Parameter;
+
+    let param = Parameter::new(
+        Tensor::from_vec(
+            vec![1.0_f32, 1.0, 1.0, 1.0],
+            Shape::from_dims(&[4]),
+            device.clone(),
+        )
+        .expect("param alloc")
+        .requires_grad_(true),
+    );
+    let mut opt = AdamW::new(1.0e-3, 0.9, 0.999, 1.0e-8, 0.01);
+
+    // First real step advances t and populates non-zero m/v.
+    let grad = Tensor::from_vec(
+        vec![0.5_f32, -0.5, 0.25, -0.25],
+        Shape::from_dims(&[4]),
+        device.clone(),
+    )
+    .expect("grad alloc");
+    param.set_grad(grad).expect("set grad");
+    opt.step(&[param.clone()]).expect("real Adam step");
+    assert_eq!(opt.t(), 1, "step should advance t to 1");
+
+    let (m_before, v_before) = opt.state_for(&param).expect("state after step");
+    let m_vals_before = m_before.to_vec().expect("read m");
+    let v_vals_before = v_before.to_vec().expect("read v");
+    assert!(
+        m_vals_before.iter().any(|x| x.abs() > 1.0e-8),
+        "post-step m must be non-zero, got {:?}",
+        m_vals_before
+    );
+
+    // Prewarm AFTER step. Must be a no-op.
+    opt.ensure_state_initialized(&[param.clone()])
+        .expect("prewarm post-step");
+    assert_eq!(opt.t(), 1, "prewarm must not reset t to 0");
+    let (m_after, v_after) = opt.state_for(&param).expect("state after prewarm");
+    let m_vals_after = m_after.to_vec().expect("read m after");
+    let v_vals_after = v_after.to_vec().expect("read v after");
+    assert_eq!(
+        m_vals_before, m_vals_after,
+        "prewarm must NOT clobber populated m"
+    );
+    assert_eq!(
+        v_vals_before, v_vals_after,
+        "prewarm must NOT clobber populated v"
+    );
+
+    reset_device_map_for_testing();
+}
+
+#[test]
+fn sk_r2b_prewarm_preserves_resumed_state() {
+    let _g = test_serialize();
+    clear_thread_local_guard_state();
+    let Some(device) = skip_if_no_gpu() else { return };
+    reset_device_map_for_testing();
+
+    use flame_core::adam::AdamW;
+    use flame_core::parameter::Parameter;
+
+    let param = Parameter::new(
+        Tensor::from_vec(
+            vec![0.0_f32, 0.0, 0.0, 0.0],
+            Shape::from_dims(&[4]),
+            device.clone(),
+        )
+        .expect("param alloc")
+        .requires_grad_(true),
+    );
+    let mut opt = AdamW::new(1.0e-3, 0.9, 0.999, 1.0e-8, 0.01);
+
+    // Simulate `--resume` restoring optimizer state.
+    let resumed_m = Tensor::from_vec(
+        vec![0.7_f32, -0.7, 0.42, -0.42],
+        Shape::from_dims(&[4]),
+        device.clone(),
+    )
+    .expect("resumed m");
+    let resumed_v = Tensor::from_vec(
+        vec![1.0e-3_f32, 2.0e-3, 3.0e-3, 4.0e-3],
+        Shape::from_dims(&[4]),
+        device.clone(),
+    )
+    .expect("resumed v");
+    opt.set_state(&param, resumed_m, resumed_v);
+    opt.set_t(123);
+
+    let (m_before, v_before) = opt.state_for(&param).expect("resumed state present");
+    let m_vals_before = m_before.to_vec().expect("read resumed m");
+    let v_vals_before = v_before.to_vec().expect("read resumed v");
+
+    // Prewarm after resume — the trainer's actual call order.
+    opt.ensure_state_initialized(&[param.clone()])
+        .expect("prewarm post-resume");
+
+    assert_eq!(opt.t(), 123, "prewarm must preserve resumed t");
+    let (m_after, v_after) = opt.state_for(&param).expect("state preserved");
+    let m_vals_after = m_after.to_vec().expect("read m after");
+    let v_vals_after = v_after.to_vec().expect("read v after");
+    assert_eq!(
+        m_vals_before, m_vals_after,
+        "prewarm must NOT overwrite resumed m"
+    );
+    assert_eq!(
+        v_vals_before, v_vals_after,
+        "prewarm must NOT overwrite resumed v"
+    );
+
+    reset_device_map_for_testing();
+}
+
+#[test]
+fn sk_r2b_prewarm_inside_guard_scope_is_noop() {
+    // Pathological case: trainer accidentally calls prewarm INSIDE a guard
+    // scope. With state already populated by an earlier prewarm, the second
+    // call must be a no-op (no slab alloc), so the guard finishes cleanly.
+    let _g = test_serialize();
+    clear_thread_local_guard_state();
+    let Some(device) = skip_if_no_gpu() else { return };
+    reset_device_map_for_testing();
+    let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
+
+    use flame_core::adam::AdamW;
+    use flame_core::parameter::Parameter;
+
+    let param = Parameter::new(
+        Tensor::from_vec(
+            vec![0.1_f32, 0.2, 0.3, 0.4],
+            Shape::from_dims(&[4]),
+            device.clone(),
+        )
+        .expect("param alloc")
+        .requires_grad_(true),
+    );
+    let mut opt = AdamW::new(1.0e-3, 0.9, 0.999, 1.0e-8, 0.01);
+
+    // First prewarm OUTSIDE the guard — production path.
+    opt.ensure_state_initialized(&[param.clone()])
+        .expect("outside-guard prewarm");
+
+    {
+        let guard = StepSlabGuard::enter(device.clone()).expect("enter");
+        // Second prewarm INSIDE the guard. With state already populated,
+        // this hits the validate path — no allocation. Guard must finish
+        // cleanly with live_count == 0.
+        opt.ensure_state_initialized(&[param.clone()])
+            .expect("inside-guard prewarm");
+        guard
+            .finish()
+            .expect("guard must finish cleanly when in-guard prewarm is a no-op");
+    }
+
+    reset_device_map_for_testing();
+}
+
+// NOTE — Q7 (non-Adam optimizer routing): not a flame-core test.
+// `Optimizer::ensure_state_initialized` lives in `eridiffusion-core` and
+// flame-core does not depend on EDv2. Source reading at
+// `EriDiffusion-v2/crates/eridiffusion-core/src/training/training_features/optimizers.rs:211-216`
+// shows the match has exactly two arms — `Self::AdamW(o) => o.ensure_state_initialized(params)`
+// and `_ => Ok(())`. All 8 non-AdamW variants therefore no-op cleanly with
+// no risk of error. Verdict: contract is correct by construction.
