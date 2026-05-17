@@ -8,10 +8,18 @@ fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
     let va = a.to_dtype(DType::F32).unwrap().to_vec().unwrap();
     let vb = b.to_dtype(DType::F32).unwrap().to_vec().unwrap();
     assert_eq!(va.len(), vb.len());
-    va.iter().zip(vb.iter()).map(|(x, y)| (x - y).abs()).fold(0.0_f32, f32::max)
+    va.iter()
+        .zip(vb.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f32, f32::max)
 }
 
-fn check_case(ref_map: &std::collections::HashMap<String, Tensor>, dilation: usize, padding: usize, key: &str) {
+fn check_case(
+    ref_map: &std::collections::HashMap<String, Tensor>,
+    dilation: usize,
+    padding: usize,
+    key: &str,
+) {
     let x = ref_map.get("x").unwrap();
     let w = ref_map.get("w").unwrap();
     let b = ref_map.get("b").unwrap();

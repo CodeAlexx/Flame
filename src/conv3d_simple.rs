@@ -1,24 +1,28 @@
 //! Simple 3D Convolution and normalization layers for video processing
-//! 
+//!
 //! This module provides 3D convolution operations and batch normalization
 //! for processing video data with temporal dimensions.
 //! Contains CPU-oriented 3D conv helpers; CUDA kernels are used elsewhere in active paths.
 
-use crate::{Tensor, Shape, Result, Error, CudaDevice};
+use crate::{CudaDevice, Error, Result, Shape, Tensor};
+use cudarc::driver::{CudaSlice, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
-use cudarc::driver::{LaunchAsync, LaunchConfig, CudaSlice};
 
 // Helper function for allocating and copying to GPU via memory pool
 // NOTE: Do NOT pass int parameters to CUDA kernels through float arrays
 // using plain `as f32` casts. Use f32::from_bits(i32 as u32) + __float_as_int()
 // on the kernel side (see conv3d_forward_v2 for the correct pattern).
-fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(device: &Arc<CudaDevice>, data: T) -> Result<CudaSlice<f32>> {
+fn alloc_and_copy_to_pool<T: AsRef<[f32]>>(
+    device: &Arc<CudaDevice>,
+    data: T,
+) -> Result<CudaSlice<f32>> {
     let slice = data.as_ref();
     let mut cuda_data = crate::tensor::alloc_from_pool(device, slice.len())?;
-    device.htod_copy_into(slice.to_vec(), &mut cuda_data).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
+    device
+        .htod_copy_into(slice.to_vec(), &mut cuda_data)
+        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
     Ok(cuda_data)
 }
-
 
 // Helper macro for kernel launches
 macro_rules! launch_kernel {
@@ -31,17 +35,17 @@ macro_rules! launch_kernel {
 pub struct Conv3d {
     pub in_channels: usize,
     pub out_channels: usize,
-    pub kernel_size: (usize, usize, usize),  // (depth, height, width)
+    pub kernel_size: (usize, usize, usize), // (depth, height, width)
     pub stride: (usize, usize, usize),
     pub padding: (usize, usize, usize),
     pub dilation: (usize, usize, usize),
     pub groups: usize,
     pub bias: bool,
-    
+
     // Parameters
     pub weight: Tensor,
     pub bias_tensor: Option<Tensor>,
-    
+
     // Device
     pub device: Arc<CudaDevice>,
 }
@@ -63,20 +67,22 @@ impl Conv3d {
         let padding = padding.unwrap_or((0, 0, 0));
         let dilation = dilation.unwrap_or((1, 1, 1));
         let groups = groups.unwrap_or(1);
-        
+
         // Validate parameters
         if in_channels % groups != 0 {
-            return Err(Error::InvalidOperation(
-                format!("in_channels {} must be divisible by groups {}", in_channels, groups)
-            ));
+            return Err(Error::InvalidOperation(format!(
+                "in_channels {} must be divisible by groups {}",
+                in_channels, groups
+            )));
         }
-        
+
         if out_channels % groups != 0 {
-            return Err(Error::InvalidOperation(
-                format!("out_channels {} must be divisible by groups {}", out_channels, groups)
-            ));
+            return Err(Error::InvalidOperation(format!(
+                "out_channels {} must be divisible by groups {}",
+                out_channels, groups
+            )));
         }
-        
+
         // Initialize weight: [out_channels, in_channels/groups, kd, kh, kw]
         let weight_shape = Shape::from_dims(&[
             out_channels,
@@ -85,18 +91,21 @@ impl Conv3d {
             kernel_size.1,
             kernel_size.2,
         ]);
-        
+
         let fan_in = (in_channels / groups) * kernel_size.0 * kernel_size.1 * kernel_size.2;
         let scale = (2.0 / fan_in as f32).sqrt();
         let weight = Tensor::randn(weight_shape, 0.0, scale, device.clone())?;
-        
+
         // Initialize bias if needed
         let bias_tensor = if bias {
-            Some(Tensor::zeros(Shape::from_dims(&[out_channels]), device.clone())?)
+            Some(Tensor::zeros(
+                Shape::from_dims(&[out_channels]),
+                device.clone(),
+            )?)
         } else {
             None
         };
-        
+
         Ok(Self {
             in_channels,
             out_channels,
@@ -111,17 +120,18 @@ impl Conv3d {
             device,
         })
     }
-    
+
     /// Forward pass
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
         // Validate input shape: [N, C, D, H, W]
         let input_shape = input.shape().dims();
         if input_shape.len() != 5 {
-            return Err(Error::InvalidOperation(
-                format!("Conv3d expects 5D input [N,C,D,H,W], got {:?}", input_shape)
-            ));
+            return Err(Error::InvalidOperation(format!(
+                "Conv3d expects 5D input [N,C,D,H,W], got {:?}",
+                input_shape
+            )));
         }
-        
+
         let (batch_size, in_channels, d_in, h_in, w_in) = (
             input_shape[0],
             input_shape[1],
@@ -129,20 +139,27 @@ impl Conv3d {
             input_shape[3],
             input_shape[4],
         );
-        
+
         if in_channels != self.in_channels {
-            return Err(Error::InvalidOperation(
-                format!("Expected {} input channels, got {}", self.in_channels, in_channels)
-            ));
+            return Err(Error::InvalidOperation(format!(
+                "Expected {} input channels, got {}",
+                self.in_channels, in_channels
+            )));
         }
-        
+
         // Calculate output dimensions
-        let d_out = (d_in + 2 * self.padding.0 - self.dilation.0 * (self.kernel_size.0 - 1) - 1) / self.stride.0 + 1;
-        let h_out = (h_in + 2 * self.padding.1 - self.dilation.1 * (self.kernel_size.1 - 1) - 1) / self.stride.1 + 1;
-        let w_out = (w_in + 2 * self.padding.2 - self.dilation.2 * (self.kernel_size.2 - 1) - 1) / self.stride.2 + 1;
-        
+        let d_out = (d_in + 2 * self.padding.0 - self.dilation.0 * (self.kernel_size.0 - 1) - 1)
+            / self.stride.0
+            + 1;
+        let h_out = (h_in + 2 * self.padding.1 - self.dilation.1 * (self.kernel_size.1 - 1) - 1)
+            / self.stride.1
+            + 1;
+        let w_out = (w_in + 2 * self.padding.2 - self.dilation.2 * (self.kernel_size.2 - 1) - 1)
+            / self.stride.2
+            + 1;
+
         let output_shape = Shape::from_dims(&[batch_size, self.out_channels, d_out, h_out, w_out]);
-        
+
         // Perform convolution
         let mut output = self.conv3d_cpu(input, &output_shape)?;
 
@@ -153,7 +170,7 @@ impl Conv3d {
 
         Ok(output)
     }
-    
+
     /// CPU implementation of 3D convolution
     fn conv3d_cpu(&self, input: &Tensor, output_shape: &Shape) -> Result<Tensor> {
         // Extract dimensions from shapes
@@ -162,16 +179,16 @@ impl Conv3d {
         let d_in = input_shape[2];
         let h_in = input_shape[3];
         let w_in = input_shape[4];
-        
+
         let output_dims = output_shape.dims();
         let d_out = output_dims[2];
         let h_out = output_dims[3];
         let w_out = output_dims[4];
-        
+
         let (kd, kh, kw) = self.kernel_size;
         let (sd, sh, sw) = self.stride;
         let (pd, ph, pw) = self.padding;
-        
+
         // 3D convolution CUDA kernel.
         //
         // BUG FIX: The original kernel read int parameters from float* arrays
@@ -248,9 +265,15 @@ extern "C" __global__ void conv3d_forward_v2(
 }"#;
 
         // Launch the kernel
-        crate::cuda_kernels_gpu::CudaKernels::ensure_kernel(&self.device, "conv3d_forward_v2", kernel_code)?;
+        crate::cuda_kernels_gpu::CudaKernels::ensure_kernel(
+            &self.device,
+            "conv3d_forward_v2",
+            kernel_code,
+        )?;
 
-        let f = self.device.get_func("conv3d_forward_v2", "conv3d_forward_v2")
+        let f = self
+            .device
+            .get_func("conv3d_forward_v2", "conv3d_forward_v2")
             .ok_or_else(|| crate::Error::Cuda("Failed to get conv3d kernel".into()))?;
 
         let output_numel = output_shape.elem_count();
@@ -262,36 +285,58 @@ extern "C" __global__ void conv3d_forward_v2(
         // Pack all 18 int parameters as bit-cast floats so the kernel can
         // use __float_as_int() to recover them without type-punning issues.
         let params_i32: Vec<i32> = vec![
-            batch as i32, self.in_channels as i32, d_in as i32, h_in as i32, w_in as i32,
-            self.out_channels as i32, d_out as i32, h_out as i32, w_out as i32,
-            kd as i32, kh as i32, kw as i32,
-            sd as i32, sh as i32, sw as i32,
-            pd as i32, ph as i32, pw as i32,
+            batch as i32,
+            self.in_channels as i32,
+            d_in as i32,
+            h_in as i32,
+            w_in as i32,
+            self.out_channels as i32,
+            d_out as i32,
+            h_out as i32,
+            w_out as i32,
+            kd as i32,
+            kh as i32,
+            kw as i32,
+            sd as i32,
+            sh as i32,
+            sw as i32,
+            pd as i32,
+            ph as i32,
+            pw as i32,
         ];
-        let params_f32: Vec<f32> = params_i32.iter().map(|&v| f32::from_bits(v as u32)).collect();
+        let params_f32: Vec<f32> = params_i32
+            .iter()
+            .map(|&v| f32::from_bits(v as u32))
+            .collect();
         let params_gpu = alloc_and_copy_to_pool(&self.device, &params_f32)?;
 
-        launch_kernel!(f, cfg,
+        launch_kernel!(
+            f,
+            cfg,
             &output_data,
             input.storage.try_as_slice_f32()?,
             self.weight.storage.try_as_slice_f32()?,
             &params_gpu
         )?;
-        
-        Ok(crate::cuda_kernels::create_output_tensor(output_data, output_shape.clone(), self.device.clone()))
+
+        Ok(crate::cuda_kernels::create_output_tensor(
+            output_data,
+            output_shape.clone(),
+            self.device.clone(),
+        ))
     }
-    
+
     /// Add bias to output tensor
     fn add_bias_3d(&self, output: &mut Tensor, bias: &Tensor) -> Result<()> {
         // Always use CUDA since we're in a CUDA-only context
         // Use CUDA kernel for efficient bias addition
         let dims = output.shape().dims();
         let out_channels = dims[1];
-        
+
         // Reshape bias for broadcasting and add
         let bias_shape = Shape::from_dims(&[1, out_channels, 1, 1, 1]);
         let bias_reshaped = bias.reshape(bias_shape.dims())?;
-        
+
         // Broadcast and add using CUDA operations
         *output = output.add(&bias_reshaped)?;
         Ok(())
@@ -305,16 +350,16 @@ pub struct BatchNorm3d {
     pub momentum: f32,
     pub affine: bool,
     pub track_running_stats: bool,
-    
+
     // Learnable parameters
     pub weight: Option<Tensor>,
     pub bias: Option<Tensor>,
-    
+
     // Running statistics
     pub running_mean: Option<Tensor>,
     pub running_var: Option<Tensor>,
     pub num_batches_tracked: usize,
-    
+
     // Device
     pub device: Arc<CudaDevice>,
 }
@@ -333,7 +378,7 @@ impl BatchNorm3d {
         let momentum = momentum.unwrap_or(0.1);
         let affine = affine.unwrap_or(true);
         let track_running_stats = track_running_stats.unwrap_or(true);
-        
+
         let (weight, bias) = if affine {
             let weight = Tensor::from_vec(
                 vec![1.0f32; num_features],
@@ -345,7 +390,7 @@ impl BatchNorm3d {
         } else {
             (None, None)
         };
-        
+
         let (running_mean, running_var) = if track_running_stats {
             let running_mean = Tensor::zeros(Shape::from_dims(&[num_features]), device.clone())?;
             let running_var = Tensor::from_vec(
@@ -357,7 +402,7 @@ impl BatchNorm3d {
         } else {
             (None, None)
         };
-        
+
         Ok(Self {
             num_features,
             eps,
@@ -372,24 +417,26 @@ impl BatchNorm3d {
             device,
         })
     }
-    
+
     /// Forward pass
     pub fn forward(&mut self, input: &Tensor, training: bool) -> Result<Tensor> {
         // Validate input shape: [N, C, D, H, W]
         let dims = input.shape().dims();
         if dims.len() != 5 {
-            return Err(Error::InvalidOperation(
-                format!("BatchNorm3d expects 5D input [N,C,D,H,W], got {:?}", dims)
-            ));
+            return Err(Error::InvalidOperation(format!(
+                "BatchNorm3d expects 5D input [N,C,D,H,W], got {:?}",
+                dims
+            )));
         }
-        
+
         let num_channels = dims[1];
         if num_channels != self.num_features {
-            return Err(Error::InvalidOperation(
-                format!("Expected {} channels, got {}", self.num_features, num_channels)
-            ));
+            return Err(Error::InvalidOperation(format!(
+                "Expected {} channels, got {}",
+                self.num_features, num_channels
+            )));
         }
-        
+
         // Now actually tries to perform batch normalization
         let kernel_code = r#"
 extern "C" __global__ void batchnorm3d_forward(
@@ -423,61 +470,83 @@ extern "C" __global__ void batchnorm3d_forward(
         output[idx] = normalized * w + b;
     }
 }"#;
-        
-        crate::cuda_kernels_gpu::CudaKernels::ensure_kernel(&self.device, "batchnorm3d_forward", kernel_code)?;
-        
-        let f = self.device.get_func("batchnorm3d_forward", "batchnorm3d_forward")
+
+        crate::cuda_kernels_gpu::CudaKernels::ensure_kernel(
+            &self.device,
+            "batchnorm3d_forward",
+            kernel_code,
+        )?;
+
+        let f = self
+            .device
+            .get_func("batchnorm3d_forward", "batchnorm3d_forward")
             .ok_or_else(|| Error::Cuda("Failed to get batchnorm3d kernel".into()))?;
-        
+
         let spatial_size = dims[2] * dims[3] * dims[4];
         let numel = input.shape().elem_count();
         let mut output_data = crate::tensor::alloc_from_pool(&self.device, numel)
             .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
-        
+
         // Use running stats if available, otherwise compute batch stats
         let (batch_mean, batch_var);
         let (mean, var) = if let (Some(rm), Some(rv)) = (&self.running_mean, &self.running_var) {
-            (rm.storage.try_as_slice_f32()?, rv.storage.try_as_slice_f32()?)
+            (
+                rm.storage.try_as_slice_f32()?,
+                rv.storage.try_as_slice_f32()?,
+            )
         } else {
             // Compute batch statistics
             batch_mean = self.compute_batch_mean(input)?;
             batch_var = self.compute_batch_var(input, &batch_mean)?;
-            (batch_mean.storage.try_as_slice_f32()?, batch_var.storage.try_as_slice_f32()?)
+            (
+                batch_mean.storage.try_as_slice_f32()?,
+                batch_var.storage.try_as_slice_f32()?,
+            )
         };
-        
+
         let cfg = cudarc::driver::LaunchConfig::for_num_elems(numel as u32);
-        launch_kernel!(f, cfg,
+        launch_kernel!(
+            f,
+            cfg,
             &output_data,
             input.storage.try_as_slice_f32()?,
             mean,
             var,
-            self.weight.as_ref().map(|w| w.storage.try_as_slice_f32()).transpose()?.unwrap_or(mean), // Use mean as dummy for null pointer
-            self.bias.as_ref().map(|b| b.storage.try_as_slice_f32()).transpose()?.unwrap_or(mean),   // Use mean as dummy for null pointer
+            self.weight
+                .as_ref()
+                .map(|w| w.storage.try_as_slice_f32())
+                .transpose()?
+                .unwrap_or(mean), // Use mean as dummy for null pointer
+            self.bias
+                .as_ref()
+                .map(|b| b.storage.try_as_slice_f32())
+                .transpose()?
+                .unwrap_or(mean), // Use mean as dummy for null pointer
             self.eps,
             dims[0] as i32,
             self.num_features as i32,
             spatial_size as i32
         )?;
-        
+
         Ok(Tensor::from_raw(
             Arc::new(output_data),
             input.shape().clone(),
             self.device.clone(),
-            input.requires_grad
+            input.requires_grad,
         )?)
     }
-    
+
     /// Compute batch mean for each channel
     fn compute_batch_mean(&self, input: &Tensor) -> Result<Tensor> {
         let dims = input.shape().dims();
         let batch = dims[0];
         let spatial_size = dims[2] * dims[3] * dims[4];
         let n = (batch * spatial_size) as f32;
-        
+
         // Sum across batch and spatial dimensions for each channel
         let mut channel_sums = vec![0.0f32; self.num_features];
         let data = input.to_vec()?;
-        
+
         for b in 0..batch {
             for c in 0..self.num_features {
                 for i in 0..spatial_size {
@@ -486,28 +555,32 @@ extern "C" __global__ void batchnorm3d_forward(
                 }
             }
         }
-        
+
         // Divide by n to get mean
         for c in 0..self.num_features {
             channel_sums[c] /= n;
         }
-        
-        Tensor::from_vec(channel_sums, Shape::from_dims(&[self.num_features]), self.device.clone())
+
+        Tensor::from_vec(
+            channel_sums,
+            Shape::from_dims(&[self.num_features]),
+            self.device.clone(),
+        )
     }
-    
+
     /// Compute batch variance for each channel
     fn compute_batch_var(&self, input: &Tensor, mean: &Tensor) -> Result<Tensor> {
         let dims = input.shape().dims();
         let batch = dims[0];
         let spatial_size = dims[2] * dims[3] * dims[4];
         let n = (batch * spatial_size) as f32;
-        
+
         let mean_data = mean.to_vec()?;
         let input_data = input.to_vec()?;
-        
+
         // Sum squared differences
         let mut channel_vars = vec![0.0f32; self.num_features];
-        
+
         for b in 0..batch {
             for c in 0..self.num_features {
                 for i in 0..spatial_size {
@@ -517,78 +590,72 @@ extern "C" __global__ void batchnorm3d_forward(
                 }
             }
         }
-        
+
         // Divide by n to get variance
         for c in 0..self.num_features {
             channel_vars[c] /= n;
         }
-        
-        Tensor::from_vec(channel_vars, Shape::from_dims(&[self.num_features]), self.device.clone())
+
+        Tensor::from_vec(
+            channel_vars,
+            Shape::from_dims(&[self.num_features]),
+            self.device.clone(),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_conv3d() -> Result<()> {
         let device = CudaDevice::new(0)?;
-        
+
         let conv = Conv3d::new(
-            3,  // in_channels
-            16, // out_channels
-            (3, 3, 3), // kernel_size
+            3,               // in_channels
+            16,              // out_channels
+            (3, 3, 3),       // kernel_size
             Some((1, 1, 1)), // stride
             Some((1, 1, 1)), // padding
-            None, // dilation
-            None, // groups
-            true, // bias
-            device.clone()
+            None,            // dilation
+            None,            // groups
+            true,            // bias
+            device.clone(),
         )?;
-        
+
         // Test input: [batch=2, channels=3, depth=8, height=32, width=32]
-        let input = Tensor::randn(
-            Shape::from_dims(&[2, 3, 8, 32, 32]),
-            0.0,
-            0.1,
-            device
-        )?;
-        
+        let input = Tensor::randn(Shape::from_dims(&[2, 3, 8, 32, 32]), 0.0, 0.1, device)?;
+
         let output = conv.forward(&input)?;
-        
+
         // Check output shape: [2, 16, 8, 32, 32] with padding
         assert_eq!(output.shape().dims(), &[2, 16, 8, 32, 32]);
-        
+
         Ok(())
     }
-    
+
     #[test]
     fn test_batch_norm_3d() -> Result<()> {
         let device = CudaDevice::new(0)?;
-        
+
         let mut bn = BatchNorm3d::new(
             16, // num_features
             None,
             None,
             None,
             None,
-            device.clone()
+            device.clone(),
         )?;
-        
+
         // Test input: [batch=2, channels=16, depth=4, height=8, width=8]
-        let input = Tensor::randn(
-            Shape::from_dims(&[2, 16, 4, 8, 8]),
-            0.0,
-            1.0,
-            device
-        )?;
-        
+        let input = Tensor::randn(Shape::from_dims(&[2, 16, 4, 8, 8]), 0.0, 1.0, device)?;
+
         let output = bn.forward(&input, true)?;
-        
+
         // Check output shape matches input
         assert_eq!(output.shape().dims(), input.shape().dims());
-        
+
         Ok(())
     }
 }

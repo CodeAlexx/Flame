@@ -62,7 +62,10 @@ fn abs_mean(t: &Tensor) -> Result<f32> {
     Ok((s / v.len() as f64) as f32)
 }
 
-fn run_one(sk: usize, device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<(f32, f32, f32)> {
+fn run_one(
+    sk: usize,
+    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+) -> Result<(f32, f32, f32)> {
     const B: usize = 1;
     const H: usize = 32;
     const SQ: usize = 64;
@@ -175,15 +178,16 @@ fn sdpa_ragged_sk_minimal_repro() -> Result<()> {
     // Multi-tile K regressions. Each must be within BF16 precision of
     // the materialized reference.
     for (label, cs, ratio) in [
-        ("Sk=72",  cs_72,  mag_ratio(am_f_72,  am_r_72)),
-        ("Sk=71",  cs_71,  mag_ratio(am_f_71,  am_r_71)),
+        ("Sk=72", cs_72, mag_ratio(am_f_72, am_r_72)),
+        ("Sk=71", cs_71, mag_ratio(am_f_71, am_r_71)),
         ("Sk=128", cs_128, mag_ratio(am_f_128, am_r_128)),
         ("Sk=200", cs_200, mag_ratio(am_f_200, am_r_200)),
     ] {
         assert!(
             ratio >= 0.95,
             "{label} mag_ratio {:.4} — FA2 under-scales by ~{:.0}% (regression)",
-            ratio, (1.0 - ratio) * 100.0
+            ratio,
+            (1.0 - ratio) * 100.0
         );
         assert!(
             cs >= 0.999,

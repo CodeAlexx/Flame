@@ -96,7 +96,6 @@ impl CudaTensor {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
         let self_tensor = Tensor {
             storage: crate::tensor_storage::TensorStorage::F32 {
@@ -111,7 +110,6 @@ impl CudaTensor {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
         let updated = kernels.update_weights(&self_tensor, &gradient_tensor, lr)?;
         // Extract the data from the Arc - we need to clone it
@@ -191,7 +189,6 @@ impl CudaTensor {
                 view_offset: 0,
                 #[cfg(feature = "autograd_v2")]
                 autograd_meta: None,
-
             };
             let other_tensor = Tensor {
                 storage: crate::tensor_storage::TensorStorage::F32 {
@@ -206,7 +203,6 @@ impl CudaTensor {
                 view_offset: 0,
                 #[cfg(feature = "autograd_v2")]
                 autograd_meta: None,
-
             };
             let result = kernels.add(&self_tensor, &other_tensor)?;
             // Extract data from result's storage
@@ -247,7 +243,6 @@ impl CudaTensor {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
         let other_tensor = Tensor {
             storage: crate::tensor_storage::TensorStorage::F32 {
@@ -262,7 +257,6 @@ impl CudaTensor {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
         let result = kernels.mul(&self_tensor, &other_tensor)?;
         // Extract data from result's storage
@@ -291,7 +285,6 @@ impl CudaTensor {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
         let result = kernels.mul_scalar(&self_tensor, scalar)?;
         // Extract data from result's storage
@@ -320,7 +313,6 @@ impl CudaTensor {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
         let result = kernels.relu(&self_tensor)?;
         // Extract data from result's storage
@@ -375,7 +367,6 @@ impl CudaTensor {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
         let sum_result = kernels.sum_kernel(&self_tensor)?;
 

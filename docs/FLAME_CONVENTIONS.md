@@ -574,6 +574,48 @@ unsafe variant that accepts a raw `*const i32` device pointer rather
 than going through a Tensor — adding a "real i32" dtype path is a
 larger change than is warranted for the few sites that need it.
 
+### `TensorStorage` has no `U8` arm — use raw `CudaSlice<u8>` for U8 device buffers
+
+`DType::U8` is declared in `dtype.rs:10` but `TensorStorage` does not have a
+matching variant — `tensor_storage.rs:418-444` returns
+`Error::InvalidOperation` for `DType::U8` in `zeros` / `empty` / etc. You
+cannot construct a `Tensor` with `DType::U8`; it will fail at storage
+construction.
+
+If you need a U8 device buffer (e.g. for 8-bit quant codes), allocate
+`cudarc::driver::CudaSlice<u8>` directly via
+`device.alloc_zeros::<u8>(n)?` and hold it outside the Tensor / autograd
+graph. The canonical pattern is `adam8bit_kernel::alloc_state` (the bnb
+8-bit AdamW optimizer holds the per-param U8 `m_codes` / `v_codes` as raw
+slices on the optimizer struct, NOT as Tensors). The FFI launcher takes
+the raw `CudaSlice<u8>` and dereferences `*device_ptr_mut()` for the
+kernel arg list.
+
+Plumbing U8 through `Tensor` + the alloc pool + autograd is a full-day
+refactor with no current consumer — don't reach for it just because the
+DType is declared. The escape hatch above is sufficient for kernel-local
+state buffers that never enter the autograd graph.
+
+### `Tensor::from_vec` is F32-only — bypass for non-F32 host uploads
+
+`Tensor::from_vec` (`tensor.rs:1165`) accepts `Vec<f32>` only. If you need
+to upload a small constant vector of a different dtype (e.g. a 256-entry
+LUT, a per-block BF16 absmax table, a `Vec<u8>` codebook), do not try to
+route through `Tensor` — use `device.htod_copy(vec)?` directly. It returns
+a `CudaSlice<T>` for any `T: cudarc::driver::DeviceRepr`.
+
+Canonical example: `adam8bit_kernel::upload_qmap` does
+`device.htod_copy(qmap.to_vec())` to land a `[f32; 256]` LUT on the device
+as a `CudaSlice<f32>`, then passes that slice directly to the NVRTC
+launcher — no Tensor wrapper, no `Storage` allocation, no version
+tracking. Same pattern works for `Vec<bf16>`, `Vec<u8>`, `Vec<i32>`. The
+device slice is owned by the caller; allocate once, reuse across launches.
+
+For F32 vectors that DO need to be a `Tensor` (because they will be
+broadcast against tracked tensors or enter the autograd graph),
+`Tensor::from_vec` is still correct — but the LUT / state-buffer case
+above is none of those.
+
 ### cuBLAS leaves `cudaErrorInvalidValue` latched after first GEMM call
 
 cuBLAS GEMM's first invocation per process probes device capabilities
@@ -1482,6 +1524,29 @@ lr·m̂/(√v̂+ε) / p -= lr·wd·p` shape is load-bearing. Folding `wd` into
 `~sign(param)` for freshly-initialized LoRA_A matrices (whose B partner
 is zero) and unlearns them at uniform `lr·sign(p)` per step. That bug
 destroyed Klein 4B LoRA_A training in April 2026 — do not reintroduce it.
+
+### Optimizer kernel placement: `<optimizer>_kernel.rs`, not `bf16_*.rs`
+
+NVRTC kernels for OPTIMIZERS go in their own top-level file,
+e.g. `src/adam8bit_kernel.rs`, NOT in `bf16_ops.rs` / `bf16_elementwise.rs`
+/ `bf16_reduce.rs`. The `bf16_*` naming convention is reserved for
+forward-pass inference primitives — pointwise, fused, single dtype-class
+in/out. Optimizer kernels:
+- Touch multiple dtype classes per launch (F32 master param + F32 or BF16
+  grad + U8 quant state + F32 absmax scales). The `bf16_*` files assume a
+  BF16-dominant dtype contract.
+- Mutate persistent optimizer-owned state (`m_codes`, `v_codes`, `absmax`
+  buffers) that lives outside the autograd graph and outside the
+  `cuda_alloc_pool` — not a fit for the inference-primitive contract.
+- Are launched once per param per step from `Optimizer::step`, not
+  per-forward — different cache / launch-storm profile.
+
+Pattern: one file per optimizer kernel + its Rust launcher, named
+`<optimizer>_kernel.rs`. Re-export the public surface (`pub use
+cuda_impl::*` under the `cuda + bf16_u16` feature gate). Examples:
+`src/adam.rs` (the multi-variant AdamW family — historical, slightly
+larger surface) and `src/adam8bit_kernel.rs` (the bnb 8-bit AdamW kernel,
+added 2026-05-17 — the canonical shape for any new optimizer kernel).
 
 ### Multi-tensor reductions: launch all, sync once
 

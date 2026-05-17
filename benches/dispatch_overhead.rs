@@ -52,8 +52,7 @@ fn median_us(samples: &mut [f64]) -> f64 {
 
 fn make_input(shape: &[usize], rg: bool) -> Result<Tensor> {
     let dev = global_cuda_device();
-    let t = Tensor::randn(Shape::from_dims(shape), 0.0, 0.5, dev.clone())?
-        .to_dtype(DType::BF16)?;
+    let t = Tensor::randn(Shape::from_dims(shape), 0.0, 0.5, dev.clone())?.to_dtype(DType::BF16)?;
     Ok(t.requires_grad_(rg))
 }
 
@@ -148,7 +147,10 @@ fn run_shape(label: &str, shape: &[usize]) -> Result<()> {
     );
     let dm = (a_mean - b_mean) / a_mean * 100.0;
     let dM = (a_med - b_med) / a_med * 100.0;
-    println!("  Path A overhead vs Path B: mean={:>5.1}%   median={:>5.1}%", dm, dM);
+    println!(
+        "  Path A overhead vs Path B: mean={:>5.1}%   median={:>5.1}%",
+        dm, dM
+    );
     println!(
         "  (Path A includes: Tensor::method dispatch + autograd::record_op per op + tape walk + backward kernels;"
     );

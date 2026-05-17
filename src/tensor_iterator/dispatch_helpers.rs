@@ -65,11 +65,7 @@ where
 /// else fall back. Used by silu/gelu/square/abs/relu/neg/sigmoid/tanh/
 /// exp/log/sqrt/rsqrt/recip.
 #[inline]
-pub fn dispatch_unary_bf16<F1, F2>(
-    x: &Tensor,
-    bf16_fn: F1,
-    fallback_fn: F2,
-) -> Result<Tensor>
+pub fn dispatch_unary_bf16<F1, F2>(x: &Tensor, bf16_fn: F1, fallback_fn: F2) -> Result<Tensor>
 where
     F1: FnOnce(&Tensor) -> Result<Tensor>,
     F2: FnOnce(&Tensor) -> Result<Tensor>,

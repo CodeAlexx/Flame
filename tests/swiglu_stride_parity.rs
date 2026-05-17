@@ -48,7 +48,9 @@ fn swiglu_contig_matches_strided_on_split_gate_up() {
             a.to_bits(),
             b.to_bits(),
             "swiglu strided vs contig diverges at idx {}: strided={} contig={}",
-            i, a, b
+            i,
+            a,
+            b
         );
     }
 }
@@ -94,9 +96,87 @@ fn swiglu_strided_on_klein_mlp_shape() {
         assert!(
             diff < 0.02 * expected.abs().max(1.0),
             "swiglu mismatch at idx {}: got={} expected={} (g={}, u={})",
-            i, got, expected, g_back, u_back
+            i,
+            got,
+            expected,
+            g_back,
+            u_back
         );
     }
+}
+
+#[test]
+fn swiglu_split_lastdim_matches_view_path() {
+    let (b, n, full) = (1, 64, 256);
+    let half = full / 2;
+    let device = global_cuda_device();
+
+    let data = hash_fill(&[b, n, full]);
+    let gate_up = Tensor::from_vec(data, Shape::from_dims(&[b, n, full]), device.clone())
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+
+    let gate = gate_up.narrow(2, 0, half).unwrap();
+    let up = gate_up.narrow(2, half, half).unwrap();
+    let old_path = flame_core::bf16_ops::swiglu_fused_bf16(&gate, &up).unwrap();
+    let packed_path = flame_core::bf16_ops::swiglu_split_lastdim_bf16(&gate_up).unwrap();
+
+    let va = old_path.to_vec().unwrap();
+    let vb = packed_path.to_vec().unwrap();
+    assert_eq!(va.len(), vb.len());
+    for (i, (a, b)) in va.iter().zip(vb.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "packed swiglu forward diverges at idx {}: old={} packed={}",
+            i,
+            a,
+            b
+        );
+    }
+}
+
+#[test]
+fn swiglu_split_lastdim_backward_matches_view_path() {
+    fn run(use_packed: bool) -> flame_core::Result<Vec<f32>> {
+        flame_core::autograd::AutogradContext::clear();
+        let (b, n, full) = (1, 8, 64);
+        let half = full / 2;
+        let device = global_cuda_device();
+        let data = hash_fill(&[b, n, full]);
+        let leaf = Tensor::from_vec(data, Shape::from_dims(&[b, n, full]), device.clone())?
+            .to_dtype(DType::BF16)?
+            .requires_grad_(true);
+        let gate_up = leaf.reshape(&[b, n, full])?;
+
+        let out = if use_packed {
+            flame_core::bf16_ops::swiglu_split_lastdim_bf16(&gate_up)?
+        } else {
+            let gate = gate_up.narrow(2, 0, half)?;
+            let up = gate_up.narrow(2, half, half)?;
+            flame_core::bf16_ops::swiglu_fused_bf16(&gate, &up)?
+        };
+        let loss = out.to_dtype(DType::F32)?.sum()?;
+        let grads = flame_core::autograd::backward(&loss, false)?;
+        let grad = grads.get(leaf.id()).expect("leaf grad");
+        grad.to_vec()
+    }
+
+    let old_grad = run(false).unwrap();
+    let packed_grad = run(true).unwrap();
+    assert_eq!(old_grad.len(), packed_grad.len());
+    for (i, (a, b)) in old_grad.iter().zip(packed_grad.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "packed swiglu backward diverges at idx {}: old={} packed={}",
+            i,
+            a,
+            b
+        );
+    }
+    flame_core::autograd::AutogradContext::clear();
 }
 
 fn half_from_f32(x: f32) -> u16 {

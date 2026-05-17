@@ -198,6 +198,72 @@ reassociation). BF16 stays within BF16 atol/rtol across 100 steps.
 Multi-tensor only changes launch shape — kernel math is identical
 including the DECOUPLED-WD ordering receipt.
 
+### `adam8bit_kernel.rs` — block-wise 8-bit AdamW (bnb 0.49.2 parity)
+
+Two NVRTC kernels in one translation unit, compiled once on first call,
+loaded into the `adam8bit_fused` module:
+
+| Kernel | Grad dtype | Purpose |
+|---|---|---|
+| `adam8bit_blockwise_kernel` | F32 grad | Per-parameter fused dequant + AdamW step + requant for one parameter tensor. F32 param required. |
+| `adam8bit_blockwise_bf16grad_kernel` | BF16 grad | Same but reads grads as `__nv_bfloat16` and widens to F32 inside the kernel. Output (param F32, m/v u8 codes + F32 absmax) identical to F32-grad path modulo BF16 noise on `g`. |
+
+**Launch geometry** (per parameter, per step):
+
+- `grid_dim = (ceil(n / 256), 1, 1)` — one block per 256-element slab.
+- `block_dim = (256, 1, 1)` — one thread per element.
+- `shared_mem = 4096 bytes` = `2 × qmap[256] + s_m[256] + s_v[256]`, all `f32`.
+
+**Per-block flow** (single launch, no host round-trip):
+
+1. Co-load both 256-entry qmaps (signed for `m`, unsigned for `v`) into
+   shared memory.
+2. Each active thread dequants `(m_old, v_old)` via `qmap[code] * absmax[blk]`,
+   runs AdamW math (`m_new = β₁·m_old + (1-β₁)·g`; `v_new = β₂·v_old + (1-β₂)·g²`;
+   `p -= lr · m̂/(√v̂ + ε); p -= lr·wd·p`), writes back `param[i]`.
+3. Stash `(m_new, v_new)` in shared, run block-wide max-abs tree reduction
+   (`__syncthreads` + halving stride 128→64→…→1) to compute
+   `(absmax_m_new, absmax_v_new)`.
+4. Thread 0 stores the new absmax into `m_absmax[blk] / v_absmax[blk]`.
+5. Each active thread requants by **linear scan** over the 256-entry
+   shared qmap (256 abs-diff compares per element per moment, picks
+   argmin). Linear scan because the signed qmap is monotonic but the
+   unsigned one has a long flat-near-zero region from the negative
+   half being absent (verified against bnb output); binary search would
+   require care on tiebreaks and the scan is fast enough at this size.
+6. Writes the chosen `u8` codes to `m_codes[i] / v_codes[i]`.
+
+**Edge cases**:
+- **Tail block** (when `n % 256 ≠ 0`): inactive threads load from the
+  block base index (any in-range index — they don't write anywhere), and
+  contribute `0` into the shared `s_m / s_v`, so they cannot drag the
+  block absmax. Writes are guarded by the `active` predicate.
+- **All-zero block**: post-reduction absmax falls back to `1e-12f` to
+  avoid NaN on the normalize divide before requant (codes degrade to
+  whatever LUT entry best approximates 0).
+- **BF16 grad**: upcast via `__bfloat162float` once at load; all internal
+  math is F32. No autograd hook (state slices are raw `CudaSlice`s; only
+  the F32 param tensor bumps its version counter).
+
+**Bit-exact equivalence** to bitsandbytes 0.49.2 `optim.AdamW8bit(block_wise=True)`
+(non-paged) for the AdamW algorithm, modulo BF16 noise on the grad load.
+Validates with `eridiffusion_core::AdamW8bit`'s `adamw8bit_close_to_adamw`
+test (within 5e-4 abs vs F32 AdamW after 3 steps on a 4-elem param).
+Decoupled WD ordering matches the receipt at `src/adam.rs:1-32`.
+
+**Perf**: one kernel launch per parameter per step, no PCIe round-trips
+(qmaps live on-device across all steps, state buffers are on-device for
+the entire run). Roughly equivalent to plain `adam_fused_f32param_*` per
+the 30-step real-data validation in `eridiffusion-core::AdamW8bit`'s
+parity suite — the extra dequant / reduce / requant in shared memory is
+small vs. the param/grad global-mem traffic.
+
+**See also**: `FLAME_CONVENTIONS.md` — "Optimizer kernel placement"
+(why this file sits at `src/adam8bit_kernel.rs` and not in `bf16_*.rs`),
+"`TensorStorage` has no `U8` arm" (why the per-param U8 state is held as
+raw `CudaSlice<u8>` rather than `Tensor`), "`Tensor::from_vec` is
+F32-only" (how `upload_qmap` lands the 256-entry LUT on the device).
+
 ### `ops/multi_tensor.rs` — foreach-style primitives (Phase 3, 2026-05-12)
 
 | Kernel | Purpose |

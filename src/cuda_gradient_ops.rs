@@ -10,8 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// caching this was called ~124× per step during gradient clipping,
 /// adding ~5s/step of pure PTX compile overhead to Klein training.
 /// Now it's called once per device per process.
-static GRADIENT_OPS_CACHE: OnceLock<Mutex<Vec<(usize, Arc<CudaGradientOps>)>>> =
-    OnceLock::new();
+static GRADIENT_OPS_CACHE: OnceLock<Mutex<Vec<(usize, Arc<CudaGradientOps>)>>> = OnceLock::new();
 
 /// Return a cached `CudaGradientOps` for the given device, compiling the
 /// PTX on first use. Safe to call from any callsite — no per-step overhead
@@ -19,9 +18,9 @@ static GRADIENT_OPS_CACHE: OnceLock<Mutex<Vec<(usize, Arc<CudaGradientOps>)>>> =
 pub fn cached_gradient_ops(device: &Arc<CudaDevice>) -> Result<Arc<CudaGradientOps>> {
     let cache = GRADIENT_OPS_CACHE.get_or_init(|| Mutex::new(Vec::new()));
     let ordinal = device.ordinal();
-    let mut guard = cache.lock().map_err(|_| {
-        Error::InvalidOperation("cached_gradient_ops: poisoned mutex".into())
-    })?;
+    let mut guard = cache
+        .lock()
+        .map_err(|_| Error::InvalidOperation("cached_gradient_ops: poisoned mutex".into()))?;
     if let Some((_, ops)) = guard.iter().find(|(ord, _)| *ord == ordinal) {
         return Ok(ops.clone());
     }

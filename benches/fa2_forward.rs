@@ -41,12 +41,7 @@ fn time_one<F: FnMut() -> Result<()>>(mut f: F) -> Result<f64> {
     Ok(t.elapsed().as_secs_f64() * 1000.0)
 }
 
-fn bench_fa2(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    out: &Tensor,
-) -> Result<(f64, f64)> {
+fn bench_fa2(q: &Tensor, k: &Tensor, v: &Tensor, out: &Tensor) -> Result<(f64, f64)> {
     let dims = q.shape().dims();
     let bh = dims[0] as i32;
     let sq = dims[1] as i32;
@@ -63,8 +58,16 @@ fn bench_fa2(
     let run_once = || -> Result<()> {
         let ret = unsafe {
             flame_core::cuda::ffi::flame_flash_attention_bf16(
-                q_ptr, k_ptr, v_ptr, o_ptr, core::ptr::null_mut(),
-                bh, sq, sk, hd, stream,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                o_ptr,
+                core::ptr::null_mut(),
+                bh,
+                sq,
+                sk,
+                hd,
+                stream,
             )
         };
         if ret != 0 {
@@ -102,12 +105,27 @@ fn run_shape(
     head_dim: usize,
 ) -> Result<()> {
     let bh = batch * num_heads;
-    let q = Tensor::randn(Shape::from_dims(&[bh, seq_len, head_dim]), 0.0, 1.0, device.clone())?
-        .to_dtype(DType::BF16)?;
-    let k = Tensor::randn(Shape::from_dims(&[bh, seq_len, head_dim]), 0.0, 1.0, device.clone())?
-        .to_dtype(DType::BF16)?;
-    let v = Tensor::randn(Shape::from_dims(&[bh, seq_len, head_dim]), 0.0, 1.0, device.clone())?
-        .to_dtype(DType::BF16)?;
+    let q = Tensor::randn(
+        Shape::from_dims(&[bh, seq_len, head_dim]),
+        0.0,
+        1.0,
+        device.clone(),
+    )?
+    .to_dtype(DType::BF16)?;
+    let k = Tensor::randn(
+        Shape::from_dims(&[bh, seq_len, head_dim]),
+        0.0,
+        1.0,
+        device.clone(),
+    )?
+    .to_dtype(DType::BF16)?;
+    let v = Tensor::randn(
+        Shape::from_dims(&[bh, seq_len, head_dim]),
+        0.0,
+        1.0,
+        device.clone(),
+    )?
+    .to_dtype(DType::BF16)?;
 
     let out = Tensor::empty_dtype(
         Shape::from_dims(&[bh, seq_len, head_dim]),
@@ -115,9 +133,7 @@ fn run_shape(
         device.clone(),
     )?;
 
-    println!(
-        "\n=== B={batch} H={num_heads} N={seq_len} D={head_dim} ===  (BH={bh})"
-    );
+    println!("\n=== B={batch} H={num_heads} N={seq_len} D={head_dim} ===  (BH={bh})");
     println!(
         "{:<12}  {:>12}  {:>12}  {:>10}",
         "path", "median (ms)", "GB/s", "% peak"

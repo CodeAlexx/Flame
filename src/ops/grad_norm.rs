@@ -103,18 +103,16 @@ pub fn global_l2_norm(grads: &[&Tensor]) -> Result<Tensor> {
                 let mut cache = MT_L2_CACHE
                     .lock()
                     .map_err(|_| Error::Training("MT_L2_CACHE mutex poisoned".into()))?;
-                let total_sq = crate::ops::multi_tensor::multi_tensor_l2_norm_sq_f32(
-                    &mut cache, grads,
-                )?;
+                let total_sq =
+                    crate::ops::multi_tensor::multi_tensor_l2_norm_sq_f32(&mut cache, grads)?;
                 return total_sq.sqrt();
             }
             if all_bf16_contig {
                 let mut cache = MT_L2_CACHE
                     .lock()
                     .map_err(|_| Error::Training("MT_L2_CACHE mutex poisoned".into()))?;
-                let total_sq = crate::ops::multi_tensor::multi_tensor_l2_norm_sq_bf16(
-                    &mut cache, grads,
-                )?;
+                let total_sq =
+                    crate::ops::multi_tensor::multi_tensor_l2_norm_sq_bf16(&mut cache, grads)?;
                 return total_sq.sqrt();
             }
         }
@@ -143,7 +141,11 @@ pub fn global_l2_norm(grads: &[&Tensor]) -> Result<Tensor> {
     let zero = Tensor::from_vec(vec![0.0_f32], Shape::from_dims(&[1]), dev.clone())?;
     let total_sq = sq_sums.into_iter().try_fold(zero, |acc, s| {
         // s is shape [1] FP32; acc is shape [1] FP32. Direct add works.
-        let s_flat = if s.shape().dims() == [1] { s } else { s.reshape(&[1])? };
+        let s_flat = if s.shape().dims() == [1] {
+            s
+        } else {
+            s.reshape(&[1])?
+        };
         acc.add(&s_flat)
     })?;
 

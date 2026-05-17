@@ -115,8 +115,8 @@ fn ensure_module(dev: &Arc<CudaDevice>) -> Result<(), Error> {
             .unwrap_or_else(|_| "/usr/local/cuda/include".to_string());
         let mut opts = CompileOptions::default();
         opts.include_paths.push(include_path);
-        let ptx =
-            compile_ptx_with_opts(CUDA_SRC, opts).map_err(|e| Error::KernelError(format!("{e:?}")))?;
+        let ptx = compile_ptx_with_opts(CUDA_SRC, opts)
+            .map_err(|e| Error::KernelError(format!("{e:?}")))?;
         #[cfg(feature = "bf16_u16")]
         let symbols: &[&str] = &["fill_rand_f32", "fill_rand_bf16"];
         #[cfg(not(feature = "bf16_u16"))]

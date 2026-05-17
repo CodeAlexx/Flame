@@ -31,15 +31,15 @@ pub enum AutogradV2Error {
     SavedTensorReleased,
 
     /// `InputBuffer::add` called with a slot index out of bounds.
-    #[error(
-        "autograd_v2: input buffer slot {slot} out of bounds (num_inputs={num_inputs})"
-    )]
+    #[error("autograd_v2: input buffer slot {slot} out of bounds (num_inputs={num_inputs})")]
     InputSlotOutOfBounds { slot: usize, num_inputs: usize },
 
     /// Incoming gradient's dtype does not match the existing buffered grad.
     /// Under the Phase 4 Option A policy, gradients are stored at the
     /// parameter's dtype end-to-end; a mismatch indicates a caller bug.
-    #[error("autograd_v2: dtype mismatch in accumulation: existing {existing:?}, incoming {incoming:?}")]
+    #[error(
+        "autograd_v2: dtype mismatch in accumulation: existing {existing:?}, incoming {incoming:?}"
+    )]
     DtypeMismatch { existing: DType, incoming: DType },
 
     /// A Phase 1 placeholder for engine code that lands in Phase 2.

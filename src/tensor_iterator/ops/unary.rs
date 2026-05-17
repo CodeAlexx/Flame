@@ -142,7 +142,11 @@ pub(crate) fn square_bf16_kernel(_iter: &mut TensorIteratorBase<'_>) -> Result<(
 }
 
 pub fn square_bf16_iter(x: &Tensor) -> Result<Tensor> {
-    debug_assert_eq!(x.dtype(), crate::DType::BF16, "square_bf16_iter expects BF16");
+    debug_assert_eq!(
+        x.dtype(),
+        crate::DType::BF16,
+        "square_bf16_iter expects BF16"
+    );
     let mut iter = TensorIteratorBase::build_unary_op(None, x)?;
     square_bf16_kernel(&mut iter)?;
     iter.take_output(0)
@@ -268,7 +272,11 @@ pub(crate) fn sigmoid_bf16_kernel(_iter: &mut TensorIteratorBase<'_>) -> Result<
 }
 
 pub fn sigmoid_bf16_iter(x: &Tensor) -> Result<Tensor> {
-    debug_assert_eq!(x.dtype(), crate::DType::BF16, "sigmoid_bf16_iter expects BF16");
+    debug_assert_eq!(
+        x.dtype(),
+        crate::DType::BF16,
+        "sigmoid_bf16_iter expects BF16"
+    );
     let mut iter = TensorIteratorBase::build_unary_op(None, x)?;
     sigmoid_bf16_kernel(&mut iter)?;
     iter.take_output(0)

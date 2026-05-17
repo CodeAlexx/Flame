@@ -5,9 +5,9 @@
 use crate::cuda::device_lt;
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 use crate::DType;
+use crate::{Error, Result, Shape, Tensor};
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 use cudarc::driver::DevicePtr;
-use crate::{Error, Result, Shape, Tensor};
 
 /// Persistent per-device cuBLASLt workspace for `fused_linear3d*`.
 ///
@@ -52,15 +52,15 @@ mod linear_workspace {
 
         let needs_alloc = match guard.as_ref() {
             None => true,
-            Some(entry) => {
-                !Arc::ptr_eq(&entry.device, device) || entry.slice.len() < min_bytes
-            }
+            Some(entry) => !Arc::ptr_eq(&entry.device, device) || entry.slice.len() < min_bytes,
         };
         if needs_alloc {
-            let new_slice: cudarc::driver::CudaSlice<u8> =
-                unsafe { device.alloc(min_bytes) }
-                    .map_err(|e| Error::Cuda(format!("linear workspace alloc failed: {e:?}")))?;
-            *guard = Some(Entry { device: device.clone(), slice: new_slice });
+            let new_slice: cudarc::driver::CudaSlice<u8> = unsafe { device.alloc(min_bytes) }
+                .map_err(|e| Error::Cuda(format!("linear workspace alloc failed: {e:?}")))?;
+            *guard = Some(Entry {
+                device: device.clone(),
+                slice: new_slice,
+            });
         }
         // SAFETY: guard now holds a Some(Entry) that satisfies the size.
         // We store the raw pointer + size; the guard keeps the mutex held
@@ -68,7 +68,11 @@ mod linear_workspace {
         let entry = guard.as_ref().unwrap();
         let ptr = *entry.slice.device_ptr() as *mut u8;
         let size = entry.slice.len();
-        Ok(Guard { _guard: guard, ptr, size })
+        Ok(Guard {
+            _guard: guard,
+            ptr,
+            size,
+        })
     }
 
     pub(super) struct Guard<'a> {
@@ -78,8 +82,12 @@ mod linear_workspace {
     }
 
     impl<'a> Guard<'a> {
-        pub(super) fn ptr(&self) -> *mut u8 { self.ptr }
-        pub(super) fn size(&self) -> usize { self.size }
+        pub(super) fn ptr(&self) -> *mut u8 {
+            self.ptr
+        }
+        pub(super) fn size(&self) -> usize {
+            self.size
+        }
     }
 }
 
@@ -110,7 +118,11 @@ pub fn dequant_fp8_to_bf16(
         return Err(Error::Cuda(format!("fp8_to_bf16 CUDA error: {ret}")));
     }
 
-    Ok(Tensor::from_bf16_slice_gpu(bf16_out, shape, std::sync::Arc::clone(device)))
+    Ok(Tensor::from_bf16_slice_gpu(
+        bf16_out,
+        shape,
+        std::sync::Arc::clone(device),
+    ))
 }
 
 /// GPU-side FP8 E4M3 → BF16 dequantization INTO an existing Tensor.
@@ -195,9 +207,9 @@ pub fn fused_rms_norm(input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tenso
     }
 
     let dims = input.shape().dims();
-    let cols = *dims.last().ok_or_else(|| {
-        Error::InvalidInput("fused_rms_norm: empty shape".into())
-    })?;
+    let cols = *dims
+        .last()
+        .ok_or_else(|| Error::InvalidInput("fused_rms_norm: empty shape".into()))?;
     let rows = input.shape().elem_count() / cols;
 
     let output = Tensor::empty_dtype(input.shape().clone(), DType::BF16, input.device().clone())?;
@@ -261,11 +273,7 @@ pub fn fused_modulate(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tens
 /// Weight must be PRE-TRANSPOSED to [Cin, Cout] (same as existing linear3d).
 /// Replaces 4 launches (reshape + gemm + reshape + bias_add) with 1 cublasLt call.
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-pub fn fused_linear3d(
-    input: &Tensor,
-    weight: &Tensor,
-    bias: Option<&Tensor>,
-) -> Result<Tensor> {
+pub fn fused_linear3d(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     if input.dtype() != DType::BF16 || weight.dtype() != DType::BF16 {
         return Err(Error::InvalidInput(
             "fused_linear3d: input and weight must be BF16".into(),
@@ -412,7 +420,9 @@ pub fn fused_linear3d_native(
     drop(ws);
 
     if ret != 0 {
-        return Err(Error::Cuda(format!("fused_linear3d_native cublasLt error: {ret}")));
+        return Err(Error::Cuda(format!(
+            "fused_linear3d_native cublasLt error: {ret}"
+        )));
     }
 
     // CRITICAL: this used to be inference-only — `output` was created via
@@ -425,15 +435,13 @@ pub fn fused_linear3d_native(
     // grad and an autograd tape is recording, set `output.requires_grad`
     // and record `Op::Linear` — the existing matmul-style backward at
     // `autograd.rs::Op::Linear` handles it.
-    let need_grad = input.requires_grad || weight.requires_grad
+    let need_grad = input.requires_grad
+        || weight.requires_grad
         || bias.map(|b| b.requires_grad).unwrap_or(false);
     if need_grad && crate::autograd::AutogradContext::is_recording() {
         let mut output = output;
         output.requires_grad = true;
-        let mut saved = vec![
-            (input.id, input.clone()),
-            (weight.id, weight.clone()),
-        ];
+        let mut saved = vec![(input.id, input.clone()), (weight.id, weight.clone())];
         if let Some(b) = bias {
             saved.push((b.id, b.clone()));
         }
@@ -452,6 +460,92 @@ pub fn fused_linear3d_native(
     Ok(output)
 }
 
+/// Fused 3D linear with optional LoRA pair.
+///
+/// When `lora_a` and `lora_b` are both `None`, behavior is byte-identical to
+/// `fused_linear3d_native(input, weight, bias)` — same kernel, same autograd
+/// recording (`Op::Linear` when training-context).
+///
+/// When provided, computes:
+///   `out = fused_native(x, weight, bias) + lora_scale * ((x @ A^T) @ B^T)`
+/// where `A = lora_a [rank, Cin]` and `B = lora_b [Cout, rank]`.
+///
+/// Autograd: the base path records `Op::Linear` (already wired). The LoRA
+/// residual uses `Tensor::matmul` + `Tensor::transpose` + `Tensor::mul_scalar`
+/// + `Tensor::add`, each of which is already autograd-registered. As long as
+/// `lora_a.requires_grad` / `lora_b.requires_grad` are set by the caller
+/// and an `AutogradContext` is recording, gradients will flow into A and B
+/// (and not into the frozen base `weight`).
+///
+/// `weight`/`bias` should be `requires_grad=false` (base frozen).
+/// `lora_a`/`lora_b` should be `requires_grad=true` (trainable).
+///
+/// Note: the per-call `a.transpose()` / `b.transpose()` are harmless zero-copy
+/// views; the downstream `Tensor::matmul` lowers them into `gemm_bf16` which
+/// detects transposed-view operands (`transpose_view_underlying_2d`) and uses
+/// cuBLASLt `TRANSA=T` directly without materializing. The Op::MatMul backward
+/// path likewise calls `matmul_bf16_trans` (zero-transpose), so neither
+/// forward nor backward pays a copy for the view. Don't "optimize" this away.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub fn fused_linear3d_native_lora(
+    input: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    lora_a: Option<&Tensor>,
+    lora_b: Option<&Tensor>,
+    lora_scale: f32,
+) -> Result<Tensor> {
+    // Base path — identical to non-LoRA call.
+    let base = fused_linear3d_native(input, weight, bias)?;
+
+    // No LoRA → byte-identical to base.
+    let (a, b) = match (lora_a, lora_b) {
+        (Some(a), Some(b)) => (a, b),
+        (None, None) => return Ok(base),
+        _ => {
+            return Err(Error::InvalidInput(
+                "fused_linear3d_native_lora: lora_a and lora_b must both be Some or both None"
+                    .into(),
+            ));
+        }
+    };
+
+    // Shape checks: A is [rank, Cin], B is [Cout, rank].
+    let in_dims = input.shape().dims();
+    let cin = in_dims[in_dims.len() - 1];
+    let cout = weight.shape().dims()[0];
+    let a_dims = a.shape().dims();
+    let b_dims = b.shape().dims();
+    if a_dims.len() != 2 || a_dims[1] != cin {
+        return Err(Error::InvalidShape(format!(
+            "fused_linear3d_native_lora: lora_a must be [rank, Cin={cin}], got {:?}",
+            a_dims
+        )));
+    }
+    if b_dims.len() != 2 || b_dims[0] != cout || b_dims[1] != a_dims[0] {
+        return Err(Error::InvalidShape(format!(
+            "fused_linear3d_native_lora: lora_b must be [Cout={cout}, rank={}], got {:?}",
+            a_dims[0], b_dims
+        )));
+    }
+    if a.dtype() != DType::BF16 || b.dtype() != DType::BF16 {
+        return Err(Error::InvalidInput(
+            "fused_linear3d_native_lora: lora_a and lora_b must be BF16".into(),
+        ));
+    }
+
+    // LoRA residual: (x @ A^T) @ B^T * scale.
+    // `matmul` handles 3D@2D natively (see tensor.rs:1694 — flattens to 2D
+    // GEMM, reshapes back). Autograd is recorded by Op::MatMul + Op::Transpose
+    // + Op::MulScalar.
+    let lora_a_t = a.transpose()?; // [Cin, rank]
+    let lora_b_t = b.transpose()?; // [rank, Cout]
+    let xa = input.matmul(&lora_a_t)?; // [B, S, rank]
+    let xab = xa.matmul(&lora_b_t)?; // [B, S, Cout]
+    let residual = xab.mul_scalar(lora_scale)?;
+    base.add(&residual)
+}
+
 /// Fused RMS norm + modulation in one kernel.
 /// out = rms_norm(x, weight) * (1 + scale) + shift
 /// Replaces fused_rms_norm + fused_modulate (2 launches → 1).
@@ -464,11 +558,15 @@ pub fn fused_rms_norm_modulate(
     eps: f32,
 ) -> Result<Tensor> {
     if x.dtype() != DType::BF16 {
-        return Err(Error::InvalidInput("fused_rms_norm_modulate: inputs must be BF16".into()));
+        return Err(Error::InvalidInput(
+            "fused_rms_norm_modulate: inputs must be BF16".into(),
+        ));
     }
 
     let dims = x.shape().dims();
-    let cols = *dims.last().ok_or_else(|| Error::InvalidInput("empty shape".into()))?;
+    let cols = *dims
+        .last()
+        .ok_or_else(|| Error::InvalidInput("empty shape".into()))?;
     let rows = x.shape().elem_count() / cols;
 
     let output = Tensor::empty_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
@@ -481,12 +579,17 @@ pub fn fused_rms_norm_modulate(
             scale.as_device_ptr_bf16("fused_norm_mod:scale")? as *const _,
             shift.as_device_ptr_bf16("fused_norm_mod:shift")? as *const _,
             output.as_device_ptr_bf16("fused_norm_mod:out")? as *mut _,
-            rows as i32, cols as i32, eps, stream,
+            rows as i32,
+            cols as i32,
+            eps,
+            stream,
         )
     };
 
     if ret != 0 {
-        return Err(Error::Cuda(format!("fused_rms_norm_modulate CUDA error: {ret}")));
+        return Err(Error::Cuda(format!(
+            "fused_rms_norm_modulate CUDA error: {ret}"
+        )));
     }
     Ok(output)
 }
@@ -494,13 +597,11 @@ pub fn fused_rms_norm_modulate(
 /// Fused residual + gating: out = x + gate * attn_out.
 /// Replaces mul + add (2 launches → 1).
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-pub fn fused_residual_gate(
-    x: &Tensor,
-    attn_out: &Tensor,
-    gate: &Tensor,
-) -> Result<Tensor> {
+pub fn fused_residual_gate(x: &Tensor, attn_out: &Tensor, gate: &Tensor) -> Result<Tensor> {
     if x.dtype() != DType::BF16 {
-        return Err(Error::InvalidInput("fused_residual_gate: inputs must be BF16".into()));
+        return Err(Error::InvalidInput(
+            "fused_residual_gate: inputs must be BF16".into(),
+        ));
     }
 
     let n = x.shape().elem_count();
@@ -513,12 +614,15 @@ pub fn fused_residual_gate(
             attn_out.as_device_ptr_bf16("fused_res_gate:attn")? as *const _,
             gate.as_device_ptr_bf16("fused_res_gate:gate")? as *const _,
             output.as_device_ptr_bf16("fused_res_gate:out")? as *mut _,
-            n, stream,
+            n,
+            stream,
         )
     };
 
     if ret != 0 {
-        return Err(Error::Cuda(format!("fused_residual_gate CUDA error: {ret}")));
+        return Err(Error::Cuda(format!(
+            "fused_residual_gate CUDA error: {ret}"
+        )));
     }
     Ok(output)
 }

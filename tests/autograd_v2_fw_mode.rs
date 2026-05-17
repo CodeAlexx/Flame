@@ -45,7 +45,13 @@ fn default_ctx() -> DispatchCtx {
 }
 
 fn approx_eq(got: &[f32], want: &[f32], tol: f32) {
-    assert_eq!(got.len(), want.len(), "length mismatch: {} vs {}", got.len(), want.len());
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "length mismatch: {} vs {}",
+        got.len(),
+        want.len()
+    );
     for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
         assert!(
             (g - w).abs() < tol,
@@ -75,7 +81,9 @@ fn add_v2_forward_mode_jvp() {
     let ctx = default_ctx();
     let out = flame_core::autograd_v2::ops::add::add_v2(&a, &b, &ctx).expect("add_v2");
 
-    let out_fw = out.fw_grad().expect("fw_grad must be set after add_v2 with tangents");
+    let out_fw = out
+        .fw_grad()
+        .expect("fw_grad must be set after add_v2 with tangents");
     let got = out_fw.to_vec1::<f32>().expect("to_vec1");
     // Expected JVP: a_dot + b_dot = [1.1, 2.2, 3.3]
     approx_eq(&got, &[1.1, 2.2, 3.3], 1e-5);
@@ -190,8 +198,8 @@ fn reshape_v2_forward_mode_jvp() {
     a.set_fw_grad(a_dot);
 
     let ctx = default_ctx();
-    let out = flame_core::autograd_v2::ops::reshape::reshape_v2(&a, &[3, 2], &ctx)
-        .expect("reshape_v2");
+    let out =
+        flame_core::autograd_v2::ops::reshape::reshape_v2(&a, &[3, 2], &ctx).expect("reshape_v2");
 
     let out_fw = out.fw_grad().expect("fw_grad must be set");
     assert_eq!(out_fw.shape().dims(), &[3, 2]);
@@ -233,8 +241,8 @@ fn transpose_v2_forward_mode_jvp() {
     a.set_fw_grad(a_dot);
 
     let ctx = default_ctx();
-    let out = flame_core::autograd_v2::ops::transpose::transpose_v2(&a, &ctx)
-        .expect("transpose_v2");
+    let out =
+        flame_core::autograd_v2::ops::transpose::transpose_v2(&a, &ctx).expect("transpose_v2");
 
     let out_fw = out.fw_grad().expect("fw_grad must be set");
     assert_eq!(out_fw.shape().dims(), &[3, 2]);
@@ -257,13 +265,17 @@ fn narrow_v2_forward_mode_jvp() {
     a.set_fw_grad(a_dot);
 
     let ctx = default_ctx();
-    let out = flame_core::autograd_v2::ops::narrow::narrow_v2(&a, 0, 1, 2, &ctx)
-        .expect("narrow_v2");
+    let out =
+        flame_core::autograd_v2::ops::narrow::narrow_v2(&a, 0, 1, 2, &ctx).expect("narrow_v2");
 
     let out_fw = out.fw_grad().expect("fw_grad must be set");
     assert_eq!(out_fw.shape().dims(), &[2]);
     // Narrow returns a view; materialise contiguous before reading.
-    let got = out_fw.contiguous().expect("contiguous").to_vec1::<f32>().expect("to_vec1");
+    let got = out_fw
+        .contiguous()
+        .expect("contiguous")
+        .to_vec1::<f32>()
+        .expect("to_vec1");
     // a_dot.narrow(0, 1, 2) = [20.0, 30.0]
     approx_eq(&got, &[20.0, 30.0], 1e-5);
 }
@@ -281,8 +293,7 @@ fn squeeze_v2_forward_mode_jvp() {
     a.set_fw_grad(a_dot);
 
     let ctx = default_ctx();
-    let out = flame_core::autograd_v2::ops::squeeze::squeeze_v2(&a, 0, &ctx)
-        .expect("squeeze_v2");
+    let out = flame_core::autograd_v2::ops::squeeze::squeeze_v2(&a, 0, &ctx).expect("squeeze_v2");
 
     let out_fw = out.fw_grad().expect("fw_grad must be set");
     assert_eq!(out_fw.shape().dims(), &[3]);
@@ -303,8 +314,8 @@ fn unsqueeze_v2_forward_mode_jvp() {
     a.set_fw_grad(a_dot);
 
     let ctx = default_ctx();
-    let out = flame_core::autograd_v2::ops::unsqueeze::unsqueeze_v2(&a, 0, &ctx)
-        .expect("unsqueeze_v2");
+    let out =
+        flame_core::autograd_v2::ops::unsqueeze::unsqueeze_v2(&a, 0, &ctx).expect("unsqueeze_v2");
 
     let out_fw = out.fw_grad().expect("fw_grad must be set");
     assert_eq!(out_fw.shape().dims(), &[1, 3]);
@@ -326,8 +337,8 @@ fn permute_v2_forward_mode_jvp() {
     a.set_fw_grad(a_dot);
 
     let ctx = default_ctx();
-    let out = flame_core::autograd_v2::ops::permute::permute_v2(&a, &[1, 0], &ctx)
-        .expect("permute_v2");
+    let out =
+        flame_core::autograd_v2::ops::permute::permute_v2(&a, &[1, 0], &ctx).expect("permute_v2");
 
     let out_fw = out.fw_grad().expect("fw_grad must be set");
     assert_eq!(out_fw.shape().dims(), &[3, 2]);

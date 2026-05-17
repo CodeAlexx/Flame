@@ -85,14 +85,12 @@ pub fn gradient_edge_for_tensor(t: &Tensor) -> Edge {
 /// recording entirely when it returns `false`. The inference path pays
 /// zero overhead.
 pub fn needs_grad(inputs: &[&Tensor]) -> bool {
-    inputs.iter().any(|t| {
-        match t.autograd_meta() {
-            None => false,
-            Some(meta) => match meta.lock() {
-                Ok(m) => m.requires_grad || m.grad_fn.is_some(),
-                Err(_) => false,
-            },
-        }
+    inputs.iter().any(|t| match t.autograd_meta() {
+        None => false,
+        Some(meta) => match meta.lock() {
+            Ok(m) => m.requires_grad || m.grad_fn.is_some(),
+            Err(_) => false,
+        },
     })
 }
 

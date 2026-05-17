@@ -138,8 +138,7 @@ fn manager_state_machine_walks_all_phases() -> anyhow::Result<()> {
     // Seed the profile cache so `profile()` doesn't have to run the
     // full PCIe sweep. Use a per-test path so we don't fight any other
     // test (or a real cache) on disk.
-    let cache_path =
-        std::env::temp_dir().join("flame_core_offload_manager_smoke_profile.json");
+    let cache_path = std::env::temp_dir().join("flame_core_offload_manager_smoke_profile.json");
     let _ = std::fs::remove_file(&cache_path);
     state::save_profile(&cache_path, &fake_profile(), "manager_state_machine_smoke")?;
 
@@ -215,10 +214,14 @@ fn manager_forced_adaptive_installs_adaptive() -> anyhow::Result<()> {
     let device = cuda_device()?;
     let offloader = make_empty_offloader(device.clone())?;
 
-    let cache_path = std::env::temp_dir()
-        .join("flame_core_offload_manager_smoke_adaptive_profile.json");
+    let cache_path =
+        std::env::temp_dir().join("flame_core_offload_manager_smoke_adaptive_profile.json");
     let _ = std::fs::remove_file(&cache_path);
-    state::save_profile(&cache_path, &fake_profile(), "manager_forced_adaptive_smoke")?;
+    state::save_profile(
+        &cache_path,
+        &fake_profile(),
+        "manager_forced_adaptive_smoke",
+    )?;
 
     let cfg = ManagerConfig {
         profile_cache_path: Some(cache_path.clone()),
@@ -245,8 +248,8 @@ fn manager_auto_selects_two_slot_when_empty_model() -> anyhow::Result<()> {
     let device = cuda_device()?;
     let offloader = make_empty_offloader(device.clone())?;
 
-    let cache_path = std::env::temp_dir()
-        .join("flame_core_offload_manager_smoke_auto_profile.json");
+    let cache_path =
+        std::env::temp_dir().join("flame_core_offload_manager_smoke_auto_profile.json");
     let _ = std::fs::remove_file(&cache_path);
     state::save_profile(&cache_path, &fake_profile(), "manager_auto_select_smoke")?;
 
@@ -316,7 +319,13 @@ fn state_save_load_round_trip_predictions_match() -> anyhow::Result<()> {
     state::save_profile(&path, &p, "round_trip_smoke")?;
     let loaded = state::load_profile(&path)?;
 
-    for &bytes in &[1024usize, 64 * 1024, 1 << 20, 4 * 1024 * 1024, 16 * 1024 * 1024] {
+    for &bytes in &[
+        1024usize,
+        64 * 1024,
+        1 << 20,
+        4 * 1024 * 1024,
+        16 * 1024 * 1024,
+    ] {
         let a = p.predict_h2d(bytes);
         let b = loaded.predict_h2d(bytes);
         let rel = state::relative_error(a, b);
@@ -354,7 +363,10 @@ fn state_load_corrupt_file_errors() {
 /// override.
 #[test]
 fn state_default_profile_path_env_override() {
-    std::env::set_var(state::PROFILE_PATH_ENV, "/tmp/flame_test_explicit_smoke.json");
+    std::env::set_var(
+        state::PROFILE_PATH_ENV,
+        "/tmp/flame_test_explicit_smoke.json",
+    );
     let p = state::default_profile_path();
     assert_eq!(
         p,
@@ -378,8 +390,7 @@ fn manager_falls_back_to_bench_and_writes_cache() -> anyhow::Result<()> {
     let device = cuda_device()?;
     let offloader = make_empty_offloader(device.clone())?;
 
-    let cache_path = std::env::temp_dir()
-        .join("flame_core_offload_manager_smoke_writeback.json");
+    let cache_path = std::env::temp_dir().join("flame_core_offload_manager_smoke_writeback.json");
     let _ = std::fs::remove_file(&cache_path);
 
     let cfg = ManagerConfig {
@@ -402,10 +413,7 @@ fn manager_falls_back_to_bench_and_writes_cache() -> anyhow::Result<()> {
         cache_path.exists(),
         "run_profile() must persist the bench result back to the cache"
     );
-    let bench_p = mgr
-        .bandwidth_profile()
-        .expect("profile present")
-        .clone();
+    let bench_p = mgr.bandwidth_profile().expect("profile present").clone();
 
     // Drop the manager so we have a clean slate, then construct a new
     // one against the same cache. The new manager should pick up the

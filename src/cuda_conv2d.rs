@@ -14,8 +14,8 @@ use crate::cuda_conv2d_kernels::CONV2D_KERNELS;
 // Helper to copy i32 array to GPU as f32
 fn copy_i32_to_gpu(device: &Arc<CudaDevice>, data: &[i32]) -> Result<CudaSlice<f32>> {
     let f32_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
-    let mut gpu_data =
-        unsafe { device.alloc::<f32>(f32_data.len()) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
+    let mut gpu_data = unsafe { device.alloc::<f32>(f32_data.len()) }
+        .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
     device
         .htod_copy_into(f32_data, &mut gpu_data)
         .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
@@ -173,7 +173,6 @@ impl CudaConv2d {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
 
         let weight_matrix = weight
@@ -436,7 +435,6 @@ impl CudaConv2d {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
 
         // grad_weight = grad_output^T @ input_col
@@ -448,8 +446,7 @@ impl CudaConv2d {
         // Gradient w.r.t. input using col2im.
         // grad_input_col[b*oh*ow, ic*kh*kw] = sum_oc grad_col[b*oh*ow, oc] * weight[oc, ic*kh*kw]
         // i.e. grad_col @ weight_2d (no transpose).
-        let weight_2d = weight
-            .reshape(&[out_channels, in_channels * kernel_h * kernel_w])?;
+        let weight_2d = weight.reshape(&[out_channels, in_channels * kernel_h * kernel_w])?;
         let grad_input_col = grad_col.matmul(&weight_2d)?;
 
         // Now use col2im to get grad_input
@@ -507,7 +504,6 @@ impl CudaConv2d {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
 
         // Bias gradient is sum over batch and spatial dimensions
@@ -542,7 +538,6 @@ impl CudaConv2d {
                 view_offset: 0,
                 #[cfg(feature = "autograd_v2")]
                 autograd_meta: None,
-
             })
         } else {
             None

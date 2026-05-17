@@ -63,7 +63,11 @@ fn make_bf16_nonzero_tensor(dev: Arc<CudaDevice>, n: usize) -> Result<Tensor> {
         let u = (s >> 40) as u32 as f32 / (1u32 << 24) as f32;
         let v = (u - 0.5) * 10.0;
         // Avoid near-zero.
-        data.push(if v.abs() < 0.5 { v.signum() * 0.5 + v } else { v });
+        data.push(if v.abs() < 0.5 {
+            v.signum() * 0.5 + v
+        } else {
+            v
+        });
     }
     let t = Tensor::from_vec(data, Shape::from_dims(&[n]), dev)?;
     t.to_dtype(DType::BF16)

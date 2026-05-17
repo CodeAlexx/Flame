@@ -15,7 +15,7 @@
 use std::collections::VecDeque;
 
 use flame_core::offload::strategy::{
-    Adaptive, Knapsack, OffloaderState, Strategy, TwoSlot, AccessHints,
+    AccessHints, Adaptive, Knapsack, OffloaderState, Strategy, TwoSlot,
 };
 
 // ---------------------------------------------------------------------------
@@ -317,7 +317,9 @@ fn telemetry_strategy_counters_record() {
     t.set_enabled(true);
 
     let before = t.snapshot();
-    t.record_strategy_decision("TwoSlot", /* evicted */ 1, /* kept */ 2, /* target */ 4096);
+    t.record_strategy_decision(
+        "TwoSlot", /* evicted */ 1, /* kept */ 2, /* target */ 4096,
+    );
     t.record_strategy_decision("Knapsack", 3, 5, 8192);
     let after = t.snapshot();
 

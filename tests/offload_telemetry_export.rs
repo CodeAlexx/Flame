@@ -31,10 +31,7 @@ fn telemetry_export_smoke() {
     let base: PathBuf = std::env::var_os("CARGO_TARGET_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join(format!(
-        "flame_telemetry_export_{}",
-        std::process::id()
-    ));
+    let dir = base.join(format!("flame_telemetry_export_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -121,10 +118,7 @@ fn telemetry_export_smoke() {
     let snap_in_periodic = periodic_dir.join(DUMP_SNAPSHOT_FILENAME);
 
     // SAFETY: tests are run serially so setting env is local-scope safe.
-    std::env::set_var(
-        "FLAME_OFFLOAD_TELEMETRY_DUMP_DIR",
-        periodic_dir.as_os_str(),
-    );
+    std::env::set_var("FLAME_OFFLOAD_TELEMETRY_DUMP_DIR", periodic_dir.as_os_str());
 
     t.reset();
     t.set_periodic_dump_interval(3);

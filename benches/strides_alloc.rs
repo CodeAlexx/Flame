@@ -100,7 +100,10 @@ fn bench_tensor_strides_view(rank: usize) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    println!("strides_alloc — {}M iterations per case\n", ITERS / 1_000_000);
+    println!(
+        "strides_alloc — {}M iterations per case\n",
+        ITERS / 1_000_000
+    );
     for &rank in &[2usize, 3, 4, 5] {
         bench_shape_strides(rank, 16);
     }

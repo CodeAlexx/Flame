@@ -825,9 +825,25 @@ impl BlockOffloader {
         }
     }
 
+    fn wait_slot_reusable_for_evict(&self, slot_idx: usize) -> anyhow::Result<()> {
+        match &self.slots[slot_idx] {
+            SlotState::Prepared { events, .. }
+                if events.compute_recorded.load(Ordering::Acquire)
+                    && self.use_slot_buffer_allocator()
+                    && self.native_layout
+                    && std::env::var("FLAME_OT_EVICT_HOST_SYNC").as_deref() != Ok("1") =>
+            {
+                stream_wait_event(
+                    self.transfer_stream.stream as *mut c_void,
+                    &events.compute_done,
+                )
+            }
+            _ => self.wait_slot_reusable(slot_idx),
+        }
+    }
+
     fn use_slot_buffer_allocator(&self) -> bool {
-        self.streaming.is_none()
-            && self.slots.len() != 2
+        (self.streaming.is_some() || self.slots.len() != 2)
             && std::env::var("FLAME_OFFLOAD_SLOT_SLAB_DISABLE").as_deref() != Ok("1")
     }
 
@@ -1606,22 +1622,15 @@ impl BlockOffloader {
             return self.prefetch_block(layer_index);
         }
 
-        // Do not eagerly evict stale residents here. The prefetch path can
-        // reuse an unprotected Prepared slot by placing a GPU-side wait on
-        // `compute_done`; eager eviction used `cudaEventSynchronize` on the
-        // host for every stale slot and showed up as ~2s/step of API stall in
-        // Klein 9B. Keep a legacy escape hatch for bisecting.
-        if std::env::var("FLAME_OT_EAGER_EVICT").as_deref() == Ok("1") {
-            for slot_idx in 0..self.slots.len() {
-                let Some(block_idx) = self.slots[slot_idx].block_idx() else {
-                    continue;
-                };
-                if block_idx == layer_index || desired.contains(&block_idx) {
-                    continue;
-                }
-                self.wait_slot_reusable(slot_idx)?;
-                self.slots[slot_idx] = SlotState::Empty;
+        for slot_idx in 0..self.slots.len() {
+            let Some(block_idx) = self.slots[slot_idx].block_idx() else {
+                continue;
+            };
+            if block_idx == layer_index || desired.contains(&block_idx) {
+                continue;
             }
+            self.wait_slot_reusable_for_evict(slot_idx)?;
+            self.slots[slot_idx] = SlotState::Empty;
         }
 
         let loaded = self.resident_blocks();
@@ -2116,6 +2125,7 @@ impl BlockOffloader {
         let staging_ptr: *mut u8;
         let mut recs: Vec<StagingRec>;
         let max_bf16_bytes_in_block: usize;
+        let total_bf16_bytes_in_block: usize;
         {
             let stream_state = self
                 .streaming
@@ -2142,6 +2152,7 @@ impl BlockOffloader {
             tensors.reserve(block_entries.len());
             let mut cursor: usize = 0;
             let mut max_bytes_seen: usize = 0;
+            let mut total_bytes_seen: usize = 0;
             for entry in block_entries {
                 let bf16_bytes = entry.num_elems * 2;
                 if cursor + bf16_bytes > staging_capacity_local {
@@ -2158,6 +2169,7 @@ impl BlockOffloader {
                 if bf16_bytes > max_bytes_seen {
                     max_bytes_seen = bf16_bytes;
                 }
+                total_bytes_seen = total_bytes_seen.saturating_add(bf16_bytes);
 
                 // Phase A — CPU memcpy/convert from mmap → staging at offset.
                 let raw_end = entry.file_offset + entry.src_byte_len;
@@ -2210,27 +2222,51 @@ impl BlockOffloader {
                 cursor += bf16_bytes;
             }
             max_bf16_bytes_in_block = max_bytes_seen;
+            total_bf16_bytes_in_block = total_bytes_seen;
         }
 
         // Pass 2 — `self.streaming` borrow released; safe to call
         // `&mut self` methods. Ensure ring, then alloc + async H2D for
         // each staging record.
-        if max_bf16_bytes_in_block > 0 {
+        let use_slot_buffer_allocator = self.use_slot_buffer_allocator();
+        if use_slot_buffer_allocator {
+            self.ensure_slot_buffer_capacity(target, total_bf16_bytes_in_block)?;
+        } else if max_bf16_bytes_in_block > 0 {
             self.ensure_ring(max_bf16_bytes_in_block)?;
         }
         for rec in recs.into_iter() {
-            let gpu_buf = self.alloc_bf16_via_ring(rec.num_elems).map_err(|e| {
-                let (free, total) = crate::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
-                anyhow::anyhow!(
-                    "GPU alloc (streaming, ring) for {} ({} elems, need={} MiB) failed; \
-                     free={} MiB total={} MiB: {e:?}",
-                    rec.name,
-                    rec.num_elems,
-                    rec.bf16_bytes / (1024 * 1024),
-                    free / (1024 * 1024),
-                    total / (1024 * 1024)
-                )
-            })?;
+            let gpu_buf = if use_slot_buffer_allocator {
+                self.slot_buffers[target]
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("streaming slot buffer missing for slot {target}"))?
+                    .alloc_u16(rec.num_elems)
+                    .map_err(|e| {
+                        let (free, total) =
+                            crate::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
+                        anyhow::anyhow!(
+                            "GPU alloc (streaming slot slab) for {} ({} elems, need={} MiB) failed; \
+                             free={} MiB total={} MiB: {e:?}",
+                            rec.name,
+                            rec.num_elems,
+                            rec.bf16_bytes / (1024 * 1024),
+                            free / (1024 * 1024),
+                            total / (1024 * 1024)
+                        )
+                    })?
+            } else {
+                self.alloc_bf16_via_ring(rec.num_elems).map_err(|e| {
+                    let (free, total) = crate::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
+                    anyhow::anyhow!(
+                        "GPU alloc (streaming, ring) for {} ({} elems, need={} MiB) failed; \
+                         free={} MiB total={} MiB: {e:?}",
+                        rec.name,
+                        rec.num_elems,
+                        rec.bf16_bytes / (1024 * 1024),
+                        free / (1024 * 1024),
+                        total / (1024 * 1024)
+                    )
+                })?
+            };
             let gpu_dst = (*gpu_buf.device_ptr() as u64) as *mut c_void;
             let host_src = unsafe { staging_ptr.add(rec.cursor) } as *const c_void;
             memcpy_async_host_to_device(gpu_dst, host_src, rec.bf16_bytes, stream_ptr)

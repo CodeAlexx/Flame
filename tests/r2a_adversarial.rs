@@ -23,8 +23,7 @@ use cudarc::driver::{CudaDevice, DevicePtr, DeviceSlice};
 use flame_core::cuda_alloc_pool::pool_alloc_u16;
 use flame_core::static_slab_v2::{
     pool_alloc_u16_via_slab, reset_device_map_for_testing, slab_for_device,
-    slab_v2_return_if_owned, StaticSlabAllocator, StepSlabGuard,
-    ENV_USE_STATIC_SLAB,
+    slab_v2_return_if_owned, StaticSlabAllocator, StepSlabGuard, ENV_USE_STATIC_SLAB,
 };
 use flame_core::{DType, Shape, Tensor};
 
@@ -123,8 +122,12 @@ fn clear_thread_local_guard_state() {
 fn bf2_enter_default_arc_identity_footgun() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(trainer_device) = skip_if_no_gpu() else { return };
-    let Ok(guard_device) = CudaDevice::new(0) else { return };
+    let Some(trainer_device) = skip_if_no_gpu() else {
+        return;
+    };
+    let Ok(guard_device) = CudaDevice::new(0) else {
+        return;
+    };
 
     // The footgun only manifests if the two Arcs are distinct (different
     // pointer identity). If cudarc returns the same Arc both times,
@@ -198,7 +201,9 @@ fn bf2_enter_default_arc_identity_footgun() {
 fn bf3_worker_thread_alloc_bypasses_slab() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
     let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
 
@@ -228,8 +233,7 @@ fn bf3_worker_thread_alloc_bypasses_slab() {
             "worker thread must NOT inherit main's guard"
         );
         // Allocate on the worker. Should fall through to legacy pool path.
-        let worker_alloc =
-            pool_alloc_u16(&worker_device, 128).expect("worker alloc");
+        let worker_alloc = pool_alloc_u16(&worker_device, 128).expect("worker alloc");
         let worker_ptr = *worker_alloc.device_ptr();
         (worker_ptr, worker_alloc)
     });
@@ -273,7 +277,9 @@ fn bf3_worker_thread_alloc_bypasses_slab() {
 fn sk_env_change_mid_scope_flips_dispatch() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
     let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
 
@@ -344,8 +350,12 @@ fn sk_env_change_mid_scope_flips_dispatch() {
 fn sk_slice_device_arc_matches_guard_not_caller() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device_a) = skip_if_no_gpu() else { return };
-    let Ok(device_b) = CudaDevice::new(0) else { return };
+    let Some(device_a) = skip_if_no_gpu() else {
+        return;
+    };
+    let Ok(device_b) = CudaDevice::new(0) else {
+        return;
+    };
     if Arc::as_ptr(&device_a) == Arc::as_ptr(&device_b) {
         eprintln!("[sk_slice_device_arc] runtime shares Arc — can't test");
         return;
@@ -395,7 +405,9 @@ fn sk_slice_device_arc_matches_guard_not_caller() {
 fn sk_finish_ok_then_drop_is_noop() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
 
     let guard = StepSlabGuard::enter(device.clone()).expect("enter");
@@ -417,7 +429,9 @@ fn sk_finish_ok_then_drop_is_noop() {
 fn sk_finish_err_then_drop_is_noop() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
     let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
 
@@ -459,7 +473,9 @@ fn sk_finish_err_then_drop_is_noop() {
 fn sk_failed_nested_enter_does_not_split_allocs() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
     let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
 
@@ -513,15 +529,16 @@ fn sk_failed_nested_enter_does_not_split_allocs() {
 fn sk_via_slab_zero_alloc_returns_some_empty_slice() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
     let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
 
     let _guard = StepSlabGuard::enter(device.clone()).expect("enter");
 
     // Direct dispatch helper call.
-    let s = pool_alloc_u16_via_slab(0)
-        .expect("via_slab(0) returns Some — n=0 no-op fast path");
+    let s = pool_alloc_u16_via_slab(0).expect("via_slab(0) returns Some — n=0 no-op fast path");
     assert_eq!(DeviceSlice::len(&s), 0);
 
     // live_count must be 0 (the n=0 fast path skips the increment).
@@ -554,7 +571,9 @@ fn sk_via_slab_zero_alloc_returns_some_empty_slice() {
 fn sk_send_across_threads_corrupts_enter_thread_local() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
 
     // Run the entire experiment inside an "enter thread" so that whichever
@@ -562,8 +581,7 @@ fn sk_send_across_threads_corrupts_enter_thread_local() {
     let device_for_enter = device.clone();
     let enter_thread = thread::spawn(move || -> (bool, bool) {
         // 1. Enter on this (the "enter") thread.
-        let guard =
-            StepSlabGuard::enter(device_for_enter.clone()).expect("enter on T_enter");
+        let guard = StepSlabGuard::enter(device_for_enter.clone()).expect("enter on T_enter");
         assert!(
             StepSlabGuard::active_on_thread(),
             "enter thread TL set Some(..)"
@@ -629,7 +647,9 @@ fn sk_send_across_threads_corrupts_enter_thread_local() {
 fn sk_concurrent_enter_same_device_shares_slab() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
     let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
 
@@ -700,7 +720,9 @@ fn sk_concurrent_enter_same_device_shares_slab() {
 fn sk_enter_recovers_from_poisoned_device_map() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
 
     // First enter materializes the device_map entry.
@@ -784,25 +806,14 @@ fn r2b_bf1_persistent_state_in_guard_scope_panics() {
         let guard = StepSlabGuard::enter(device.clone()).expect("enter");
 
         // Transient alloc drops before the guard, so it is not the panic source.
-        let transient_g = Tensor::zeros_dtype(
-            Shape::from_dims(&[1024]),
-            DType::F32,
-            device.clone(),
-        )
-        .expect("transient grad alloc");
+        let transient_g =
+            Tensor::zeros_dtype(Shape::from_dims(&[1024]), DType::F32, device.clone())
+                .expect("transient grad alloc");
 
-        let m = Tensor::zeros_dtype(
-            Shape::from_dims(&[1024]),
-            DType::F32,
-            device.clone(),
-        )
-        .expect("Adam m lazy alloc inside guard");
-        let v = Tensor::zeros_dtype(
-            Shape::from_dims(&[1024]),
-            DType::F32,
-            device.clone(),
-        )
-        .expect("Adam v lazy alloc inside guard");
+        let m = Tensor::zeros_dtype(Shape::from_dims(&[1024]), DType::F32, device.clone())
+            .expect("Adam m lazy alloc inside guard");
+        let v = Tensor::zeros_dtype(Shape::from_dims(&[1024]), DType::F32, device.clone())
+            .expect("Adam v lazy alloc inside guard");
         persistent_state.push(m);
         persistent_state.push(v);
 
@@ -823,29 +834,25 @@ fn r2b_bf1_persistent_state_in_guard_scope_panics() {
 fn r2b_bf2_transient_only_state_in_guard_scope_succeeds() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
     let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
 
     {
         let guard = StepSlabGuard::enter(device.clone()).expect("enter");
-        let grad = Tensor::zeros_dtype(
-            Shape::from_dims(&[1024]),
-            DType::F32,
-            device.clone(),
-        )
-        .expect("grad alloc");
-        let activation = Tensor::zeros_dtype(
-            Shape::from_dims(&[2048]),
-            DType::F32,
-            device.clone(),
-        )
-        .expect("activation alloc");
+        let grad = Tensor::zeros_dtype(Shape::from_dims(&[1024]), DType::F32, device.clone())
+            .expect("grad alloc");
+        let activation = Tensor::zeros_dtype(Shape::from_dims(&[2048]), DType::F32, device.clone())
+            .expect("activation alloc");
         assert_eq!(grad.shape().elem_count(), 1024);
         assert_eq!(activation.shape().elem_count(), 2048);
         drop(activation);
         drop(grad);
-        guard.finish().expect("clean finish: all transient allocs returned");
+        guard
+            .finish()
+            .expect("clean finish: all transient allocs returned");
     }
     reset_device_map_for_testing();
 }
@@ -861,7 +868,9 @@ fn r2b_bf3_adam_prewarm_allows_step_inside_guard() {
 
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
     let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
 
@@ -927,7 +936,9 @@ fn r2b_bf3_adam_prewarm_allows_step_inside_guard() {
 fn sk_r2b_prewarm_is_idempotent_no_realloc() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
 
     use flame_core::adam::AdamW;
@@ -944,7 +955,8 @@ fn sk_r2b_prewarm_is_idempotent_no_realloc() {
     );
     let mut opt = AdamW::new(1.0e-3, 0.9, 0.999, 1.0e-8, 0.01);
 
-    opt.ensure_state_initialized(&[param.clone()]).expect("first prewarm");
+    opt.ensure_state_initialized(&[param.clone()])
+        .expect("first prewarm");
     let t_after_first = opt.t();
     let (m1, v1) = opt
         .state_for(&param)
@@ -952,7 +964,8 @@ fn sk_r2b_prewarm_is_idempotent_no_realloc() {
     let m_ptr_first = m1.cuda_ptr() as u64;
     let v_ptr_first = v1.cuda_ptr() as u64;
 
-    opt.ensure_state_initialized(&[param.clone()]).expect("second prewarm");
+    opt.ensure_state_initialized(&[param.clone()])
+        .expect("second prewarm");
 
     assert_eq!(opt.t(), t_after_first, "t must not advance on prewarm");
     let (m2, v2) = opt
@@ -992,7 +1005,9 @@ fn sk_r2b_prewarm_empty_params_no_op() {
 fn sk_r2b_prewarm_after_step_does_not_clobber() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
 
     use flame_core::adam::AdamW;
@@ -1052,7 +1067,9 @@ fn sk_r2b_prewarm_after_step_does_not_clobber() {
 fn sk_r2b_prewarm_preserves_resumed_state() {
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
 
     use flame_core::adam::AdamW;
@@ -1116,7 +1133,9 @@ fn sk_r2b_prewarm_inside_guard_scope_is_noop() {
     // call must be a no-op (no slab alloc), so the guard finishes cleanly.
     let _g = test_serialize();
     clear_thread_local_guard_state();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
     let _env = EnvGuard::set(ENV_USE_STATIC_SLAB, "1");
 

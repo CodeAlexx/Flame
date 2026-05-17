@@ -161,8 +161,8 @@ impl PyRMSNorm {
         let w = &weight.inner;
         let normalized_shape: Vec<usize> = w.shape().dims().to_vec();
         let device = w.device();
-        let mut rms =
-            crate::norm::RMSNorm::new(normalized_shape, eps, true, device.clone()).map_err(flame_err)?;
+        let mut rms = crate::norm::RMSNorm::new(normalized_shape, eps, true, device.clone())
+            .map_err(flame_err)?;
         rms.copy_weight_from(w).map_err(flame_err)?;
         Ok(Self { inner: rms })
     }
@@ -243,9 +243,8 @@ impl PyConv2d {
             groups,
         };
 
-        let mut conv =
-            crate::conv::Conv2d::from_config_with_bias(config, device.clone(), has_bias)
-                .map_err(flame_err)?;
+        let mut conv = crate::conv::Conv2d::from_config_with_bias(config, device.clone(), has_bias)
+            .map_err(flame_err)?;
         conv.copy_weight_from(w).map_err(flame_err)?;
         if let Some(b) = bias {
             conv.copy_bias_from(&b.inner).map_err(flame_err)?;
@@ -329,10 +328,7 @@ impl PyGroupNorm {
     fn __repr__(&self) -> String {
         format!(
             "flame_core.GroupNorm(groups={}, channels={}, eps={}, affine={})",
-            self.inner.num_groups,
-            self.inner.num_channels,
-            self.inner.eps,
-            self.inner.affine,
+            self.inner.num_groups, self.inner.num_channels, self.inner.eps, self.inner.affine,
         )
     }
 }
@@ -355,10 +351,9 @@ impl PyUpsample2d {
     #[new]
     #[pyo3(signature = (scale_factor))]
     fn new(scale_factor: usize) -> PyResult<Self> {
-        let config = crate::upsampling::Upsample2dConfig::new(
-            crate::upsampling::UpsampleMode::Nearest,
-        )
-        .with_scale_factor((scale_factor as f32, scale_factor as f32));
+        let config =
+            crate::upsampling::Upsample2dConfig::new(crate::upsampling::UpsampleMode::Nearest)
+                .with_scale_factor((scale_factor as f32, scale_factor as f32));
         Ok(Self {
             inner: crate::upsampling::Upsample2d::new(config),
         })
@@ -414,7 +409,7 @@ pub fn scaled_dot_product_attention(
         &q.inner,
         &k.inner,
         &v.inner,
-        None,   // no explicit mask
+        None, // no explicit mask
         chunk,
         causal,
         Some(scale),

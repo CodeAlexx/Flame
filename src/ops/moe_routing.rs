@@ -385,10 +385,7 @@ mod tests {
         // Each pick's gate before renorm = 0.5, token score sum = 0.5+0.5=1.0,
         // so renormalised = 0.5/1.0 = 0.5.
         for &g in &plan.gating_flat {
-            assert!(
-                (g - 0.5).abs() < 1e-6,
-                "expected gating ≈ 0.5, got {g}"
-            );
+            assert!((g - 0.5).abs() < 1e-6, "expected gating ≈ 0.5, got {g}");
         }
 
         // offsets = [B*C, 2*B*C] = [4, 8]

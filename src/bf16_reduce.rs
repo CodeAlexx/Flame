@@ -150,7 +150,11 @@ pub fn sum_bf16(x: &Tensor) -> Result<Tensor> {
 
     let xs = match &x.storage {
         TensorStorage::BF16 { data, .. } => data,
-        _ => return Err(Error::InvalidOperation("sum_bf16 expects BF16 storage".into())),
+        _ => {
+            return Err(Error::InvalidOperation(
+                "sum_bf16 expects BF16 storage".into(),
+            ))
+        }
     };
 
     // Grid sizing: aim for one block per ~ITEMS_PER_THREAD*BLOCK_SIZE
@@ -242,7 +246,11 @@ pub fn mean_bf16(x: &Tensor) -> Result<Tensor> {
         .ok_or_else(|| Error::Cuda("sum_bf16_to_f32_scalar_kernel missing".into()))?;
     let xs = match &x.storage {
         TensorStorage::BF16 { data, .. } => data,
-        _ => return Err(Error::InvalidOperation("mean_bf16 expects BF16 storage".into())),
+        _ => {
+            return Err(Error::InvalidOperation(
+                "mean_bf16 expects BF16 storage".into(),
+            ))
+        }
     };
     let work_per_block = (BLOCK_SIZE * ITEMS_PER_THREAD) as usize;
     let raw_grid = n.div_ceil(work_per_block).max(1);

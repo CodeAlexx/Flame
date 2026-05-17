@@ -21,9 +21,7 @@ use crate::Result;
 use super::super::dispatch::DispatchCtx;
 use super::super::error::AutogradV2Error;
 use super::super::node::{Edge, GradFn, NodeId};
-use super::super::recording::{
-    gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
-};
+use super::super::recording::{gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2};
 use super::fw_mode::{any_fw_grad, tangent_or_zero};
 
 #[derive(Debug)]

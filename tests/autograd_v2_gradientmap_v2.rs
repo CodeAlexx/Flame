@@ -77,8 +77,7 @@ fn gradient_map_with_index_v2_uses_match_inserted_dtype_policy() {
 #[test]
 fn gradient_map_v1_insert_upcasts_bf16_to_f32() {
     let mut g = GradientMap::new(dev());
-    let bf16_grad =
-        Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
+    let bf16_grad = Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
     let id = TensorId::new();
     g.insert(id, bf16_grad).unwrap();
     let stored = g.get(id).expect("insert must store the grad");
@@ -92,8 +91,7 @@ fn gradient_map_v1_insert_upcasts_bf16_to_f32() {
 #[test]
 fn gradient_map_v2_insert_preserves_bf16_dtype() {
     let mut g = GradientMap::new_v2(dev());
-    let bf16_grad =
-        Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
+    let bf16_grad = Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
     let id = TensorId::new();
     g.insert(id, bf16_grad).unwrap();
     let stored = g.get(id).expect("insert must store the grad");
@@ -107,8 +105,7 @@ fn gradient_map_v2_insert_preserves_bf16_dtype() {
 #[test]
 fn gradient_map_v2_insert_preserves_f32_dtype() {
     let mut g = GradientMap::new_v2(dev());
-    let f32_grad =
-        Tensor::ones_dtype(Shape::from_dims(&[4]), DType::F32, dev()).unwrap();
+    let f32_grad = Tensor::ones_dtype(Shape::from_dims(&[4]), DType::F32, dev()).unwrap();
     let id = TensorId::new();
     g.insert(id, f32_grad).unwrap();
     let stored = g.get(id).expect("insert must store the grad");
@@ -124,12 +121,10 @@ fn gradient_map_v2_accumulate_preserves_bf16_dtype() {
     let mut g = GradientMap::new_v2(dev());
     let id = TensorId::new();
 
-    let g1 =
-        Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
+    let g1 = Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
     g.accumulate(id, g1).unwrap();
 
-    let g2 =
-        Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
+    let g2 = Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
     g.accumulate(id, g2).unwrap();
 
     let stored = g.get(id).expect("accumulate must keep the entry");
@@ -150,14 +145,12 @@ fn gradient_map_v1_accumulate_upcasts_on_second_grad() {
     let mut g = GradientMap::new(dev());
     let id = TensorId::new();
 
-    let g1 =
-        Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
+    let g1 = Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
     g.accumulate(id, g1).unwrap();
     // v1 deferred-upcast: first grad stored as-is (BF16).
     assert_eq!(g.get(id).unwrap().dtype(), DType::BF16);
 
-    let g2 =
-        Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
+    let g2 = Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
     g.accumulate(id, g2).unwrap();
     // v1 upcasts existing on second-grad arrival.
     assert_eq!(
@@ -172,19 +165,16 @@ fn gradient_map_v2_accumulate_errors_on_dtype_mismatch() {
     let mut g = GradientMap::new_v2(dev());
     let id = TensorId::new();
 
-    let bf16 =
-        Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
+    let bf16 = Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
     g.accumulate(id, bf16).unwrap();
 
-    let f32 =
-        Tensor::ones_dtype(Shape::from_dims(&[4]), DType::F32, dev()).unwrap();
-    let err = g.accumulate(id, f32).expect_err(
-        "MatchInsertedDtype must error on dtype-mismatched accumulation",
-    );
+    let f32 = Tensor::ones_dtype(Shape::from_dims(&[4]), DType::F32, dev()).unwrap();
+    let err = g
+        .accumulate(id, f32)
+        .expect_err("MatchInsertedDtype must error on dtype-mismatched accumulation");
     let msg = format!("{:?}", err);
     assert!(
-        msg.contains("MatchInsertedDtype")
-            || msg.contains("does not match"),
+        msg.contains("MatchInsertedDtype") || msg.contains("does not match"),
         "expected dtype-mismatch error, got: {msg}"
     );
 }
@@ -197,8 +187,7 @@ fn gradient_map_v2_accumulate_errors_on_dtype_mismatch() {
 fn gradient_map_v2_get_public_grad_preserves_bf16() {
     let mut g = GradientMap::new_v2(dev());
     let id = TensorId::new();
-    let bf16 =
-        Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
+    let bf16 = Tensor::ones_dtype(Shape::from_dims(&[4]), DType::BF16, dev()).unwrap();
     g.insert(id, bf16).unwrap();
     let public = g.get_public_grad(id).unwrap();
     assert_eq!(
@@ -213,8 +202,7 @@ fn gradient_map_v1_get_public_grad_returns_bf16_cast() {
     // v1 invariant: internally F32, publicly cast to BF16.
     let mut g = GradientMap::new(dev());
     let id = TensorId::new();
-    let f32 =
-        Tensor::ones_dtype(Shape::from_dims(&[4]), DType::F32, dev()).unwrap();
+    let f32 = Tensor::ones_dtype(Shape::from_dims(&[4]), DType::F32, dev()).unwrap();
     g.insert(id, f32).unwrap();
     let public = g.get_public_grad(id).unwrap();
     assert_eq!(

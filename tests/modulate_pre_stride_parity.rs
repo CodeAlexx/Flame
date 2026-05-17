@@ -36,10 +36,14 @@ fn modulate_pre_contig_matches_strided_on_shared_mod_narrow() {
     // Shared modulation: 2D [B, mod_dim*dim] contig. MSA pair at chunks (0,1).
     let shift_idx = 0;
     let mod_data = hash_fill(&[b, mod_dim * dim]);
-    let shared_mod = Tensor::from_vec(mod_data, Shape::from_dims(&[b, mod_dim * dim]), device.clone())
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+    let shared_mod = Tensor::from_vec(
+        mod_data,
+        Shape::from_dims(&[b, mod_dim * dim]),
+        device.clone(),
+    )
+    .unwrap()
+    .to_dtype(DType::BF16)
+    .unwrap();
 
     // A: strided path — direct narrow on dim 1. Produces [B, dim] with
     // stride[0] = mod_dim*dim (the un-narrowed inner stride).
@@ -47,13 +51,18 @@ fn modulate_pre_contig_matches_strided_on_shared_mod_narrow() {
     let scale_strided = shared_mod.narrow(1, (shift_idx + 1) * dim, dim).unwrap();
     assert_eq!(shift_strided.shape().dims(), &[b, dim]);
     assert_eq!(scale_strided.shape().dims(), &[b, dim]);
-    assert!(!shift_strided.is_contiguous(), "shift-view should be strided");
-    assert!(!scale_strided.is_contiguous(), "scale-view should be strided");
+    assert!(
+        !shift_strided.is_contiguous(),
+        "shift-view should be strided"
+    );
+    assert!(
+        !scale_strided.is_contiguous(),
+        "scale-view should be strided"
+    );
 
-    let out_strided = flame_core::bf16_ops::modulate_pre_fused_bf16(
-        &x, &shift_strided, &scale_strided, 1e-5,
-    )
-    .unwrap();
+    let out_strided =
+        flame_core::bf16_ops::modulate_pre_fused_bf16(&x, &shift_strided, &scale_strided, 1e-5)
+            .unwrap();
 
     // B: contig path — materialize the views first.
     let shift_contig = shift_strided.contiguous().unwrap();
@@ -61,10 +70,9 @@ fn modulate_pre_contig_matches_strided_on_shared_mod_narrow() {
     assert!(shift_contig.is_contiguous());
     assert!(scale_contig.is_contiguous());
 
-    let out_contig = flame_core::bf16_ops::modulate_pre_fused_bf16(
-        &x, &shift_contig, &scale_contig, 1e-5,
-    )
-    .unwrap();
+    let out_contig =
+        flame_core::bf16_ops::modulate_pre_fused_bf16(&x, &shift_contig, &scale_contig, 1e-5)
+            .unwrap();
 
     let va = out_strided.to_vec().unwrap();
     let vb = out_contig.to_vec().unwrap();
@@ -74,7 +82,9 @@ fn modulate_pre_contig_matches_strided_on_shared_mod_narrow() {
             a.to_bits(),
             b.to_bits(),
             "modulate_pre strided vs contig diverges at idx {}: strided={} contig={}",
-            i, a, b
+            i,
+            a,
+            b
         );
     }
 }
@@ -89,19 +99,35 @@ fn modulate_pre_strided_math_on_klein_like_shape() {
     let device = global_cuda_device();
 
     let x_data = hash_fill(&[b, n, dim]);
-    let x = Tensor::from_vec(x_data.clone(), Shape::from_dims(&[b, n, dim]), device.clone())
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+    let x = Tensor::from_vec(
+        x_data.clone(),
+        Shape::from_dims(&[b, n, dim]),
+        device.clone(),
+    )
+    .unwrap()
+    .to_dtype(DType::BF16)
+    .unwrap();
 
     let mod_data = hash_fill(&[b, mod_dim, dim]);
-    let shared_mod = Tensor::from_vec(mod_data.clone(), Shape::from_dims(&[b, mod_dim, dim]), device.clone())
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+    let shared_mod = Tensor::from_vec(
+        mod_data.clone(),
+        Shape::from_dims(&[b, mod_dim, dim]),
+        device.clone(),
+    )
+    .unwrap()
+    .to_dtype(DType::BF16)
+    .unwrap();
 
-    let shift = shared_mod.narrow(1, shift_idx, 1).unwrap().squeeze(Some(1)).unwrap();
-    let scale = shared_mod.narrow(1, shift_idx + 1, 1).unwrap().squeeze(Some(1)).unwrap();
+    let shift = shared_mod
+        .narrow(1, shift_idx, 1)
+        .unwrap()
+        .squeeze(Some(1))
+        .unwrap();
+    let scale = shared_mod
+        .narrow(1, shift_idx + 1, 1)
+        .unwrap()
+        .squeeze(Some(1))
+        .unwrap();
 
     let out = flame_core::bf16_ops::modulate_pre_fused_bf16(&x, &shift, &scale, eps).unwrap();
     let out_vec = out.to_vec().unwrap();

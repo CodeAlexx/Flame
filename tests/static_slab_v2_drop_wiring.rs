@@ -113,7 +113,9 @@ fn wrap_slab_slice_as_bf16_storage(slice: CudaSlice<u16>) -> TensorStorage {
 fn bug2_regression_slab_drop_under_pool_disabled() {
     force_pool_disabled();
 
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
 
     // Build a slab in isolation.
     let slab = StaticSlabAllocator::new(device.clone(), 1 * 1024 * 1024);
@@ -121,8 +123,7 @@ fn bug2_regression_slab_drop_under_pool_disabled() {
     // Register the slab in the global device_map so
     // `slab_v2_return_if_owned` can find it via the slice's device key.
     let key = Arc::as_ptr(&device) as usize;
-    let slab_static: &'static Mutex<StaticSlabAllocator> =
-        Box::leak(Box::new(Mutex::new(slab)));
+    let slab_static: &'static Mutex<StaticSlabAllocator> = Box::leak(Box::new(Mutex::new(slab)));
 
     // Inject the slab under the production device key. (Test-shim
     // approach mirroring `slab_alloc_advances_cursor`.)

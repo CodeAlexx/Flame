@@ -159,8 +159,8 @@ fn ensure(dev: &Arc<CudaDevice>, nm: &'static str, code: &'static str) -> Result
         .unwrap_or_else(|_| "/usr/local/cuda/include".into());
     let mut opts = CompileOptions::default();
     opts.include_paths.push(include_dir);
-    let ptx = compile_ptx_with_opts(code, opts)
-        .map_err(|e| Error::Cuda(format!("nvrtc {nm}: {e:?}")))?;
+    let ptx =
+        compile_ptx_with_opts(code, opts).map_err(|e| Error::Cuda(format!("nvrtc {nm}: {e:?}")))?;
     dev.load_ptx(ptx, nm, &[nm])
         .map_err(|e| Error::Cuda(format!("load {nm}: {e:?}")))?;
     Ok(())
@@ -216,7 +216,10 @@ impl Conv3dBF16 {
         groups: usize,
     ) -> Self {
         let w = weight.shape().dims();
-        assert!(w.len() == 5, "Conv3dBF16 weight must be 5D [C_out, C_in/groups, kD, kH, kW]");
+        assert!(
+            w.len() == 5,
+            "Conv3dBF16 weight must be 5D [C_out, C_in/groups, kD, kH, kW]"
+        );
         assert!(groups >= 1, "Conv3dBF16 groups must be >= 1");
         Conv3dBF16 {
             out_channels: w[0],
@@ -281,7 +284,9 @@ impl Conv3dBF16 {
                         return Err(err);
                     }
                     if std::env::var_os("BF16_CONV_DEBUG").is_some() {
-                        eprintln!("[conv3d_bf16] cuDNN path failed, falling back to im2vol+gemm: {err}");
+                        eprintln!(
+                            "[conv3d_bf16] cuDNN path failed, falling back to im2vol+gemm: {err}"
+                        );
                     }
                 }
             }
@@ -318,7 +323,6 @@ impl Conv3dBF16 {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
 
         // ---- allocate output [N, C_out, D_out, H_out, W_out] ----
@@ -339,7 +343,6 @@ impl Conv3dBF16 {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
 
         // ---- compile kernels ----

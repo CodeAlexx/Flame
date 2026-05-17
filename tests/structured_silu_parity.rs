@@ -31,7 +31,9 @@ fn make_bf16_tensor(dev: Arc<CudaDevice>, dims: &[usize], seed: u64) -> Result<T
     let mut data = Vec::with_capacity(n);
     let mut s = seed;
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 40) as u32 as f32 / (1u32 << 24) as f32;
         data.push((u - 0.5) * 8.0);
     }
@@ -88,7 +90,9 @@ fn structured_silu_backward_matches_silu() -> Result<()> {
         let grads = AutogradContext::backward(&loss)?;
         let g = grads
             .get(xid)
-            .ok_or_else(|| flame_core::Error::InvalidOperation("no grad for x in silu path".into()))?
+            .ok_or_else(|| {
+                flame_core::Error::InvalidOperation("no grad for x in silu path".into())
+            })?
             .clone();
         AutogradContext::set_enabled(false);
         g
@@ -103,9 +107,12 @@ fn structured_silu_backward_matches_silu() -> Result<()> {
         let y = x.silu_structured()?;
         let loss = y.sum()?;
         let grads = AutogradContext::backward(&loss)?;
-        let g = grads.get(xid).ok_or_else(|| {
-            flame_core::Error::InvalidOperation("no grad for x in silu_structured path".into())
-        })?.clone();
+        let g = grads
+            .get(xid)
+            .ok_or_else(|| {
+                flame_core::Error::InvalidOperation("no grad for x in silu_structured path".into())
+            })?
+            .clone();
         AutogradContext::set_enabled(false);
         g
     };

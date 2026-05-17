@@ -103,12 +103,7 @@ fn to_fp32_pair(got: &Tensor, expected: &Tensor) -> (Vec<f32>, Vec<f32>) {
 ///
 /// Returns a `CompareReport`. Caller decides whether to assert; this lets
 /// you log on success and panic with `report.pretty()` on failure.
-pub fn compare_tensor(
-    got: &Tensor,
-    expected: &Tensor,
-    atol: f64,
-    rtol: f64,
-) -> CompareReport {
+pub fn compare_tensor(got: &Tensor, expected: &Tensor, atol: f64, rtol: f64) -> CompareReport {
     let (g, e) = to_fp32_pair(got, expected);
     let n = g.len();
 
@@ -191,7 +186,10 @@ pub fn assert_parity_bf16(name: &str, got: &Tensor, expected: &Tensor) {
     if !r.passed {
         panic!("parity FAIL [{name}]\n{}", r.pretty());
     } else {
-        eprintln!("parity ok  [{name}]: max_abs={:.4e} cos={:.8}", r.max_abs_diff, r.cos_sim);
+        eprintln!(
+            "parity ok  [{name}]: max_abs={:.4e} cos={:.8}",
+            r.max_abs_diff, r.cos_sim
+        );
     }
 }
 
@@ -199,8 +197,8 @@ pub fn assert_parity_bf16(name: &str, got: &Tensor, expected: &Tensor) {
 /// silent regeneration / corruption. Hex-encoded lowercase.
 pub fn sha256_file(path: &std::path::Path) -> String {
     use std::io::Read;
-    let mut f = std::fs::File::open(path)
-        .unwrap_or_else(|e| panic!("sha256_file: open {path:?}: {e}"));
+    let mut f =
+        std::fs::File::open(path).unwrap_or_else(|e| panic!("sha256_file: open {path:?}: {e}"));
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)
         .unwrap_or_else(|e| panic!("sha256_file: read {path:?}: {e}"));

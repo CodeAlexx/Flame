@@ -27,24 +27,29 @@ fn bench(name: &str, dims: &[usize]) -> Result<()> {
     for _ in 0..50 {
         let _ = black_box(cuda_ops_bf16::rms_norm_bf16(&x, Some(&w), 1e-6)?);
     }
-    dev.synchronize().map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
 
     let t0 = Instant::now();
     for _ in 0..ITERS {
         let _ = black_box(cuda_ops_bf16::rms_norm_bf16(&x, Some(&w), 1e-6)?);
     }
-    dev.synchronize().map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
     let per_us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
-    println!("  {:<20} dims={:?}  norm={:<5} → {:>7.2} us/iter", name, dims, last, per_us);
+    println!(
+        "  {:<20} dims={:?}  norm={:<5} → {:>7.2} us/iter",
+        name, dims, last, per_us
+    );
     Ok(())
 }
 
 fn main() -> Result<()> {
     println!("=== rms_norm_bf16 (cuda_ops_bf16 inference path, post-unification) ===");
-    bench("rmsnorm_small",  &[1, 4096, 1280])?;   // matches inference-flame bench
+    bench("rmsnorm_small", &[1, 4096, 1280])?; // matches inference-flame bench
     bench("rmsnorm_medium", &[1, 4096, 3072])?;
-    bench("rmsnorm_large",  &[1, 4096, 4096])?;
-    bench("zimage 2560",    &[1, 4096, 2560])?;
-    bench("klein 4096",     &[1, 4096, 4096])?;
+    bench("rmsnorm_large", &[1, 4096, 4096])?;
+    bench("zimage 2560", &[1, 4096, 2560])?;
+    bench("klein 4096", &[1, 4096, 4096])?;
     Ok(())
 }

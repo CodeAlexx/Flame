@@ -30,8 +30,8 @@
 use std::sync::Arc;
 
 use flame_core::autograd_v2::{
-    gradient_edge_for_tensor, new_meta_ref, needs_grad, next_sequence_nr,
-    AutogradMetaV2, AutogradV2Error, DeviceStream, DispatchCtx, Engine, GraphRoot,
+    gradient_edge_for_tensor, needs_grad, new_meta_ref, next_sequence_nr, AutogradMetaV2,
+    AutogradV2Error, DeviceStream, DispatchCtx, Engine, GraphRoot,
 };
 use flame_core::{global_cuda_device, Device, Shape, Tensor};
 
@@ -162,10 +162,8 @@ fn add_v2_backward_distributes_grad() {
     let out = flame_core::autograd_v2::ops::add::add_v2(&a, &b, &ctx).unwrap();
 
     // Backprop with grad_outputs = ones (default — pass None).
-    let root = GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(make_f32(
-        vec![1.0, 1.0],
-        &[2],
-    ))]);
+    let root =
+        GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(make_f32(vec![1.0, 1.0], &[2]))]);
     Engine::new().execute(root, &ctx).expect("execute");
 
     let a_meta = a.autograd_meta().unwrap().lock().unwrap();
@@ -187,17 +185,21 @@ fn mul_v2_backward_chain_rule() {
     let ctx = default_ctx();
     let out = flame_core::autograd_v2::ops::mul::mul_v2(&a, &b, &ctx).unwrap();
 
-    let root = GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(make_f32(
-        vec![1.0, 1.0, 1.0],
-        &[3],
-    ))]);
+    let root = GraphRoot::new(vec![out])
+        .with_grad_outputs(vec![Some(make_f32(vec![1.0, 1.0, 1.0], &[3]))]);
     Engine::new().execute(root, &ctx).expect("execute");
 
     let a_meta = a.autograd_meta().unwrap().lock().unwrap();
     let b_meta = b.autograd_meta().unwrap().lock().unwrap();
     // da = g * b = b ; db = g * a = a
-    assert_eq!(a_meta.grad.as_ref().unwrap().to_vec().unwrap(), vec![10.0, 20.0, 30.0]);
-    assert_eq!(b_meta.grad.as_ref().unwrap().to_vec().unwrap(), vec![1.0, 2.0, 3.0]);
+    assert_eq!(
+        a_meta.grad.as_ref().unwrap().to_vec().unwrap(),
+        vec![10.0, 20.0, 30.0]
+    );
+    assert_eq!(
+        b_meta.grad.as_ref().unwrap().to_vec().unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -234,10 +236,7 @@ fn sum_v2_backward_broadcasts() {
 #[test]
 fn matmul_v2_backward_correct_shapes() {
     // A: 2x3, B: 3x4 → out: 2x4
-    let a = make_leaf_requires_grad(
-        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        &[2, 3],
-    );
+    let a = make_leaf_requires_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
     let b = make_leaf_requires_grad(
         vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0],
         &[3, 4],
@@ -311,10 +310,7 @@ fn matmul_v2_backward_per_element_correct() {
     //                 d_b[k, j] = sum_i a[i,k] * 1 = column-sum of a.
     //                 col-sums(a) = [5, 7, 9].
     //                 d_b = [[5,5,5,5],[7,7,7,7],[9,9,9,9]].
-    let a = make_leaf_requires_grad(
-        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        &[2, 3],
-    );
+    let a = make_leaf_requires_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
     let b = make_leaf_requires_grad(
         vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0],
         &[3, 4],
@@ -369,10 +365,7 @@ fn silu_v2_backward_at_zero() {
     let x_meta = x.autograd_meta().unwrap().lock().unwrap();
     let dx = x_meta.grad.as_ref().unwrap().to_vec().unwrap();
     for v in &dx {
-        assert!(
-            (v - 0.5).abs() < 1e-5,
-            "silu'(0) should be 0.5, got {v}"
-        );
+        assert!((v - 0.5).abs() < 1e-5, "silu'(0) should be 0.5, got {v}");
     }
 }
 
@@ -524,7 +517,9 @@ fn engine_rejects_mismatched_grad_output_shape() {
     let res = Engine::new().execute(root, &ctx);
     match res {
         Err(AutogradV2Error::GradOutputShapeMismatch {
-            index, out_shape, grad_shape,
+            index,
+            out_shape,
+            grad_shape,
         }) => {
             assert_eq!(index, 0);
             assert_eq!(out_shape, vec![2]);
@@ -561,9 +556,11 @@ fn with_inputs_returns_non_leaf_grad() {
 
     // result[0] is the grad flowing into `intermediate` (the non-leaf input).
     // For y = intermediate * c with g=ones, d/d_intermediate = c.
-    let captured = result.into_iter().next().flatten().expect(
-        "non-leaf grad should be captured, not None",
-    );
+    let captured = result
+        .into_iter()
+        .next()
+        .flatten()
+        .expect("non-leaf grad should be captured, not None");
     assert_eq!(captured.to_vec().unwrap(), vec![100.0, 200.0]);
 }
 
@@ -619,7 +616,11 @@ fn reshape_v2_backward_returns_input_shape() {
 
     let a_meta = a.autograd_meta().unwrap().lock().unwrap();
     let da = a_meta.grad.as_ref().unwrap();
-    assert_eq!(da.shape().dims(), &[4], "backward grad must match input shape");
+    assert_eq!(
+        da.shape().dims(),
+        &[4],
+        "backward grad must match input shape"
+    );
     assert_eq!(da.to_vec().unwrap(), vec![10.0, 20.0, 30.0, 40.0]);
 }
 
@@ -810,7 +811,10 @@ fn view_ops_skip_recording_when_no_grad() {
 
     let t = make_f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
     let r3 = flame_core::autograd_v2::ops::transpose::transpose_v2(&t, &ctx).unwrap();
-    assert!(r3.autograd_meta().is_none(), "transpose inference must skip");
+    assert!(
+        r3.autograd_meta().is_none(),
+        "transpose inference must skip"
+    );
 
     let r4 = flame_core::autograd_v2::ops::narrow::narrow_v2(&a, 0, 1, 2, &ctx).unwrap();
     assert!(r4.autograd_meta().is_none(), "narrow inference must skip");
@@ -820,7 +824,10 @@ fn view_ops_skip_recording_when_no_grad() {
     assert!(r5.autograd_meta().is_none(), "squeeze inference must skip");
 
     let r6 = flame_core::autograd_v2::ops::unsqueeze::unsqueeze_v2(&a, 0, &ctx).unwrap();
-    assert!(r6.autograd_meta().is_none(), "unsqueeze inference must skip");
+    assert!(
+        r6.autograd_meta().is_none(),
+        "unsqueeze inference must skip"
+    );
 
     let r7 = flame_core::autograd_v2::ops::permute::permute_v2(&t, &[1, 0], &ctx).unwrap();
     assert!(r7.autograd_meta().is_none(), "permute inference must skip");
@@ -938,7 +945,8 @@ fn hazard_view_inplace_does_not_mutate_parent_under_shared_storage() {
 fn make_bf16(values: Vec<f32>, dims: &[usize]) -> Tensor {
     let device = global_cuda_device().clone();
     let f32 = Tensor::from_vec(values, Shape::from_dims(dims), device).expect("from_vec");
-    f32.to_dtype(flame_core::DType::BF16).expect("to_dtype bf16")
+    f32.to_dtype(flame_core::DType::BF16)
+        .expect("to_dtype bf16")
 }
 
 fn make_leaf_bf16_requires_grad(values: Vec<f32>, dims: &[usize]) -> Tensor {
@@ -957,10 +965,7 @@ fn make_leaf_bf16_requires_grad(values: Vec<f32>, dims: &[usize]) -> Tensor {
 
 #[test]
 fn layer_norm_v2_forward_backward_shapes() {
-    let x = make_leaf_bf16_requires_grad(
-        vec![1.0, 2.0, 3.0, 4.0, 0.5, 1.5, 2.5, 3.5],
-        &[2, 4],
-    );
+    let x = make_leaf_bf16_requires_grad(vec![1.0, 2.0, 3.0, 4.0, 0.5, 1.5, 2.5, 3.5], &[2, 4]);
     let w = make_leaf_bf16_requires_grad(vec![1.0, 1.0, 1.0, 1.0], &[4]);
     let b = make_leaf_bf16_requires_grad(vec![0.0, 0.0, 0.0, 0.0], &[4]);
     let ctx = default_ctx();
@@ -980,14 +985,39 @@ fn layer_norm_v2_forward_backward_shapes() {
     let root = GraphRoot::new(vec![y]).with_grad_outputs(vec![Some(g)]);
     Engine::new().execute(root, &ctx).expect("backward");
 
-    let x_grad = x.autograd_meta().unwrap().lock().unwrap().grad.clone().unwrap();
-    let w_grad = w.autograd_meta().unwrap().lock().unwrap().grad.clone().unwrap();
-    let b_grad = b.autograd_meta().unwrap().lock().unwrap().grad.clone().unwrap();
+    let x_grad = x
+        .autograd_meta()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .grad
+        .clone()
+        .unwrap();
+    let w_grad = w
+        .autograd_meta()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .grad
+        .clone()
+        .unwrap();
+    let b_grad = b
+        .autograd_meta()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .grad
+        .clone()
+        .unwrap();
     assert_eq!(x_grad.shape().dims(), &[2, 4]);
     assert_eq!(w_grad.shape().dims(), &[4]);
     assert_eq!(b_grad.shape().dims(), &[4]);
     // Bias backward = sum(g, batch_axes); g is all-ones (2x4) so d_b = [2,2,2,2].
-    let b_grad_f32 = b_grad.to_dtype(flame_core::DType::F32).unwrap().to_vec().unwrap();
+    let b_grad_f32 = b_grad
+        .to_dtype(flame_core::DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap();
     for v in &b_grad_f32 {
         assert!(
             (v - 2.0).abs() < 1e-2,
@@ -1006,15 +1036,9 @@ fn layer_norm_v2_forward_backward_shapes() {
 fn layer_norm_v2_no_grad_skips_recording() {
     let x = make_bf16(vec![1.0, 2.0, 3.0, 4.0], &[1, 4]);
     let ctx = default_ctx();
-    let y = flame_core::autograd_v2::ops::layer_norm::layer_norm_v2(
-        &x,
-        &[4],
-        None,
-        None,
-        1e-5,
-        &ctx,
-    )
-    .expect("layer_norm_v2 forward (no grad)");
+    let y =
+        flame_core::autograd_v2::ops::layer_norm::layer_norm_v2(&x, &[4], None, None, 1e-5, &ctx)
+            .expect("layer_norm_v2 forward (no grad)");
     assert!(
         y.autograd_meta().is_none(),
         "no requires_grad → no autograd_meta on output"
@@ -1087,16 +1111,18 @@ fn layer_norm_v2_weight_only() {
 
 #[test]
 fn layer_norm_v2_analytical_dweight_dbias() {
-    let x = make_leaf_bf16_requires_grad(
-        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        &[2, 3],
-    );
+    let x = make_leaf_bf16_requires_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
     let w = make_leaf_bf16_requires_grad(vec![1.0, 1.0, 1.0], &[3]);
     let b = make_leaf_bf16_requires_grad(vec![0.0, 0.0, 0.0], &[3]);
     let ctx = default_ctx();
 
     let y = flame_core::autograd_v2::ops::layer_norm::layer_norm_v2(
-        &x, &[3], Some(&w), Some(&b), 1e-5, &ctx,
+        &x,
+        &[3],
+        Some(&w),
+        Some(&b),
+        1e-5,
+        &ctx,
     )
     .expect("forward");
     let g = make_bf16(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
@@ -1183,16 +1209,18 @@ fn layer_norm_v2_analytical_dweight_dbias() {
 fn layer_norm_v2_dx_symmetry_uniform_grad() {
     // 2x4 input with varied values (non-uniform x is the harder case);
     // weight=1, bias=0; grad_output all-1 → d_x must be ~0 per element.
-    let x = make_leaf_bf16_requires_grad(
-        vec![1.0, 2.0, 3.0, 4.0, 0.5, 1.5, 2.5, 3.5],
-        &[2, 4],
-    );
+    let x = make_leaf_bf16_requires_grad(vec![1.0, 2.0, 3.0, 4.0, 0.5, 1.5, 2.5, 3.5], &[2, 4]);
     let w = make_leaf_bf16_requires_grad(vec![1.0, 1.0, 1.0, 1.0], &[4]);
     let b = make_leaf_bf16_requires_grad(vec![0.0, 0.0, 0.0, 0.0], &[4]);
     let ctx = default_ctx();
 
     let y = flame_core::autograd_v2::ops::layer_norm::layer_norm_v2(
-        &x, &[4], Some(&w), Some(&b), 1e-5, &ctx,
+        &x,
+        &[4],
+        Some(&w),
+        Some(&b),
+        1e-5,
+        &ctx,
     )
     .expect("forward");
     let g = make_bf16(vec![1.0; 8], &[2, 4]);

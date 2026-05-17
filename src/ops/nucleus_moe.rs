@@ -113,8 +113,7 @@ pub fn nucleus_moe_expert_forward(
     let x_perm = permute_tokens(x_flat, &plan)?; // (E*B*C, D) BF16
 
     // ---- 3. Grouped GEMM: gate-up projection --------------------------
-    let gate_up =
-        grouped_mm_bf16(&x_perm, gate_up_w, &plan.offsets, t_max)?; // (E*B*C, 2*inter) BF16
+    let gate_up = grouped_mm_bf16(&x_perm, gate_up_w, &plan.offsets, t_max)?; // (E*B*C, 2*inter) BF16
 
     // ---- 4. SwiGLU split + activation ---------------------------------
     let gate = gate_up.narrow(1, 0, inter)?;
@@ -154,12 +153,17 @@ mod tests {
     /// rounding applied at every cast site to match the GPU pipeline.
     #[allow(clippy::too_many_arguments)]
     fn scalar_ref(
-        x_flat_bf16: &[f32],   // (B*S, D), pre-rounded to BF16
-        affinity: &[f32],       // (B, E, S) F32
-        gate_up_bf16: &[f32],   // (E, D, 2*inter), pre-rounded BF16
-        down_bf16: &[f32],      // (E, inter, D), pre-rounded BF16
-        b: usize, e: usize, s: usize, d: usize, inter: usize,
-        capacity: usize, route_scale: f32,
+        x_flat_bf16: &[f32],  // (B*S, D), pre-rounded to BF16
+        affinity: &[f32],     // (B, E, S) F32
+        gate_up_bf16: &[f32], // (E, D, 2*inter), pre-rounded BF16
+        down_bf16: &[f32],    // (E, inter, D), pre-rounded BF16
+        b: usize,
+        e: usize,
+        s: usize,
+        d: usize,
+        inter: usize,
+        capacity: usize,
+        route_scale: f32,
     ) -> Vec<f32> {
         // Top-C per (batch, expert) — same as expert_choice_route.
         // top_idx: (B, E, C) and top_w: (B, E, C).
@@ -263,8 +267,7 @@ mod tests {
                 for di in 0..d {
                     let mut acc = 0.0f32;
                     for ki in 0..inter {
-                        acc += act[row * inter + ki]
-                            * down_bf16[ei * inter * d + ki * d + di];
+                        acc += act[row * inter + ki] * down_bf16[ei * inter * d + ki * d + di];
                     }
                     down[row * d + di] = bf16_round(acc);
                 }
@@ -330,10 +333,19 @@ mod tests {
         let fix = crate::serialization::load_file(fixture_path, &device)?;
 
         let x_flat = fix.get("x_flat").expect("fixture missing x_flat").clone();
-        let affinity = fix.get("affinity").expect("fixture missing affinity").clone();
-        let gate_up_w = fix.get("gate_up_w").expect("fixture missing gate_up_w").clone();
+        let affinity = fix
+            .get("affinity")
+            .expect("fixture missing affinity")
+            .clone();
+        let gate_up_w = fix
+            .get("gate_up_w")
+            .expect("fixture missing gate_up_w")
+            .clone();
         let down_w = fix.get("down_w").expect("fixture missing down_w").clone();
-        let expected = fix.get("expected_y").expect("fixture missing expected_y").clone();
+        let expected = fix
+            .get("expected_y")
+            .expect("fixture missing expected_y")
+            .clone();
 
         // Pull capacity + route_scale out of 0-D metadata tensors. They
         // were saved as int32 / float32 so to_vec() gives us f32 with the
@@ -351,7 +363,12 @@ mod tests {
         let route_scale = route_scale_v[0];
 
         let y = nucleus_moe_expert_forward(
-            &x_flat, &affinity, &gate_up_w, &down_w, capacity, route_scale,
+            &x_flat,
+            &affinity,
+            &gate_up_w,
+            &down_w,
+            capacity,
+            route_scale,
         )?;
 
         let got = y.to_vec()?;
@@ -407,7 +424,7 @@ mod tests {
         let b = 1usize;
         let e = 4usize;
         let s = 8usize;
-        let d = 64usize;     // hidden — multiple of 16 for WMMA
+        let d = 64usize; // hidden — multiple of 16 for WMMA
         let inter = 64usize; // expert intermediate
         let capacity = 4usize; // each expert picks 4 of 8 tokens
 
@@ -415,7 +432,9 @@ mod tests {
         // sees the same values the kernel will see.
         let mut rng_state = 12345u64;
         let mut next = || -> f32 {
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let v = (rng_state >> 33) as u32;
             // Map u32 → roughly Uniform(-0.5, 0.5)
             (v as f32 / u32::MAX as f32) - 0.5
@@ -423,10 +442,12 @@ mod tests {
 
         let x_data: Vec<f32> = (0..b * s * d).map(|_| bf16_round(next() * 0.5)).collect();
         let aff_data: Vec<f32> = (0..b * e * s).map(|_| next() * 2.0).collect(); // F32 affinity
-        let gate_up_data: Vec<f32> =
-            (0..e * d * (2 * inter)).map(|_| bf16_round(next() * 0.1)).collect();
-        let down_data: Vec<f32> =
-            (0..e * inter * d).map(|_| bf16_round(next() * 0.1)).collect();
+        let gate_up_data: Vec<f32> = (0..e * d * (2 * inter))
+            .map(|_| bf16_round(next() * 0.1))
+            .collect();
+        let down_data: Vec<f32> = (0..e * inter * d)
+            .map(|_| bf16_round(next() * 0.1))
+            .collect();
 
         let x = Tensor::from_vec_dtype(
             x_data.clone(),
@@ -458,8 +479,17 @@ mod tests {
         let got = y.to_vec()?;
 
         let expected = scalar_ref(
-            &x_data, &aff_data, &gate_up_data, &down_data,
-            b, e, s, d, inter, capacity, route_scale,
+            &x_data,
+            &aff_data,
+            &gate_up_data,
+            &down_data,
+            b,
+            e,
+            s,
+            d,
+            inter,
+            capacity,
+            route_scale,
         );
 
         assert_eq!(got.len(), expected.len());
@@ -473,8 +503,12 @@ mod tests {
         for (g, r) in got.iter().zip(expected.iter()) {
             let abs = (g - r).abs();
             let rel = if r.abs() > 1e-3 { abs / r.abs() } else { 0.0 };
-            if abs > max_abs { max_abs = abs; }
-            if rel > max_rel { max_rel = rel; }
+            if abs > max_abs {
+                max_abs = abs;
+            }
+            if rel > max_rel {
+                max_rel = rel;
+            }
         }
         assert!(
             max_abs < 0.10,

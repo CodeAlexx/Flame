@@ -679,7 +679,6 @@ pub fn group_norm_backward(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
     let grad_weight = grad_weight_data.map(|data| Tensor {
@@ -695,7 +694,6 @@ pub fn group_norm_backward(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     });
 
     let grad_bias = Some(Tensor {
@@ -711,7 +709,6 @@ pub fn group_norm_backward(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     });
 
     let grad_input = ensure_bf16(grad_input)?;

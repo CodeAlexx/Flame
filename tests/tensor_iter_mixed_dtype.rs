@@ -94,8 +94,8 @@ fn promote_dtypes_matches_pytorch() {
     assert_eq!(promote_dtypes(F16, F32), F32); // f2+f4 = f4
     assert_eq!(promote_dtypes(F16, F64), F64); // f2+f8 = f8
     assert_eq!(promote_dtypes(F16, Bool), F16); // f2+b1 = f2
-    // f2+bf = f4 — the famous PyTorch "smaller types don't promote to
-    // each other" rule. Must NOT return F16 or BF16.
+                                                // f2+bf = f4 — the famous PyTorch "smaller types don't promote to
+                                                // each other" rule. Must NOT return F16 or BF16.
     assert_eq!(promote_dtypes(F16, BF16), F32);
 
     // --- f4 (F32) row ------------------------------------------------
@@ -131,18 +131,8 @@ fn promote_many_folds_left() {
 fn bf16_bf16_add_preserves_bf16() -> Result<()> {
     let dev = cuda_device();
     let shape = Shape::from_dims(&[4, 8]);
-    let a = Tensor::from_vec_dtype(
-        vec![0.5f32; 32],
-        shape.clone(),
-        dev.clone(),
-        DType::BF16,
-    )?;
-    let b = Tensor::from_vec_dtype(
-        vec![0.25f32; 32],
-        shape.clone(),
-        dev.clone(),
-        DType::BF16,
-    )?;
+    let a = Tensor::from_vec_dtype(vec![0.5f32; 32], shape.clone(), dev.clone(), DType::BF16)?;
+    let b = Tensor::from_vec_dtype(vec![0.25f32; 32], shape.clone(), dev.clone(), DType::BF16)?;
     let out = a.add(&b)?;
     assert_eq!(out.dtype(), DType::BF16);
     assert_eq!(out.storage_dtype(), DType::BF16);
@@ -169,18 +159,8 @@ fn bf16_f32_add_promotes_to_f32_via_gpuops() -> Result<()> {
     let shape = Shape::from_dims(&[4, 8]);
 
     // a = BF16 filled with 1.0, b = F32 filled with 2.5 → expect 3.5 F32.
-    let a = Tensor::from_vec_dtype(
-        vec![1.0f32; 32],
-        shape.clone(),
-        cuda.clone(),
-        DType::BF16,
-    )?;
-    let b = Tensor::from_vec_dtype(
-        vec![2.5f32; 32],
-        shape.clone(),
-        cuda.clone(),
-        DType::F32,
-    )?;
+    let a = Tensor::from_vec_dtype(vec![1.0f32; 32], shape.clone(), cuda.clone(), DType::BF16)?;
+    let b = Tensor::from_vec_dtype(vec![2.5f32; 32], shape.clone(), cuda.clone(), DType::F32)?;
 
     // Confirm the promoted common dtype matches PyTorch's table.
     assert_eq!(promote_dtypes(DType::BF16, DType::F32), DType::F32);
@@ -211,18 +191,8 @@ fn bf16_f32_add_promotes_to_f32_via_gpuops() -> Result<()> {
 fn f16_bf16_add_promotes_to_f32() -> Result<()> {
     let cuda = cuda_device();
     let shape = Shape::from_dims(&[4, 8]);
-    let a = Tensor::from_vec_dtype(
-        vec![1.0f32; 32],
-        shape.clone(),
-        cuda.clone(),
-        DType::F16,
-    )?;
-    let b = Tensor::from_vec_dtype(
-        vec![2.0f32; 32],
-        shape.clone(),
-        cuda.clone(),
-        DType::BF16,
-    )?;
+    let a = Tensor::from_vec_dtype(vec![1.0f32; 32], shape.clone(), cuda.clone(), DType::F16)?;
+    let b = Tensor::from_vec_dtype(vec![2.0f32; 32], shape.clone(), cuda.clone(), DType::BF16)?;
 
     // Pin the target dtype picked by promote_dtypes.
     assert_eq!(promote_dtypes(DType::F16, DType::BF16), DType::F32);

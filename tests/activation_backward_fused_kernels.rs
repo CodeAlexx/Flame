@@ -112,8 +112,18 @@ where
     let n = x_vals.len();
     assert_eq!(g_vals.len(), n);
 
-    let x = Tensor::from_vec_dtype(x_vals.to_vec(), Shape::from_dims(&[n]), dev.clone(), DType::F32)?;
-    let g = Tensor::from_vec_dtype(g_vals.to_vec(), Shape::from_dims(&[n]), dev.clone(), DType::F32)?;
+    let x = Tensor::from_vec_dtype(
+        x_vals.to_vec(),
+        Shape::from_dims(&[n]),
+        dev.clone(),
+        DType::F32,
+    )?;
+    let g = Tensor::from_vec_dtype(
+        g_vals.to_vec(),
+        Shape::from_dims(&[n]),
+        dev.clone(),
+        DType::F32,
+    )?;
     let mut out = Tensor::zeros_dtype(Shape::from_dims(&[n]), DType::F32, dev.clone())?;
 
     let stream = dev.cuda_stream_raw_ptr();
@@ -173,8 +183,18 @@ where
     let n = x_vals.len();
     assert_eq!(g_vals.len(), n);
 
-    let x_f32 = Tensor::from_vec_dtype(x_vals.to_vec(), Shape::from_dims(&[n]), dev.clone(), DType::F32)?;
-    let g_f32 = Tensor::from_vec_dtype(g_vals.to_vec(), Shape::from_dims(&[n]), dev.clone(), DType::F32)?;
+    let x_f32 = Tensor::from_vec_dtype(
+        x_vals.to_vec(),
+        Shape::from_dims(&[n]),
+        dev.clone(),
+        DType::F32,
+    )?;
+    let g_f32 = Tensor::from_vec_dtype(
+        g_vals.to_vec(),
+        Shape::from_dims(&[n]),
+        dev.clone(),
+        DType::F32,
+    )?;
     let x = x_f32.to_dtype(DType::BF16)?;
     let g = g_f32.to_dtype(DType::BF16)?;
     let mut out = Tensor::zeros_dtype(Shape::from_dims(&[n]), DType::BF16, dev.clone())?;
@@ -235,7 +255,9 @@ fn make_inputs(n: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
     let mut g = Vec::with_capacity(n);
     let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15);
     for _ in 0..n {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (state >> 32) as u32;
         g.push((u as f32 / u32::MAX as f32) * 2.0 - 1.0);
     }

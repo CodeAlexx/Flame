@@ -32,7 +32,11 @@ fn cuda_device() -> Arc<CudaDevice> {
 }
 
 /// CPU reference: sum along `dim`, keepdim=true, F32 accumulation cast back to BF16.
-fn sum_dim_keepdim_cpu_ref(input_f32: &[f32], shape: &[usize], dim: usize) -> (Vec<f32>, Vec<usize>) {
+fn sum_dim_keepdim_cpu_ref(
+    input_f32: &[f32],
+    shape: &[usize],
+    dim: usize,
+) -> (Vec<f32>, Vec<usize>) {
     let mut out_shape = shape.to_vec();
     out_shape[dim] = 1;
     let out_elems: usize = out_shape.iter().product();
@@ -156,9 +160,9 @@ fn sum_dim_keepdim_bf16_parity_battery() -> Result<()> {
     // axes ≤ 32 to engage the single-warp short path).
     let cases: &[(&[usize], usize)] = &[
         // Rank 2
-        (&[4, 4096], 1),       // last-dim reduce, sized to engage 256-thread block
-        (&[4, 4096], 0),       // first-dim reduce, strided access pattern
-        (&[8, 17], 0),         // axis < warp, single-warp short path
+        (&[4, 4096], 1), // last-dim reduce, sized to engage 256-thread block
+        (&[4, 4096], 0), // first-dim reduce, strided access pattern
+        (&[8, 17], 0),   // axis < warp, single-warp short path
         (&[8, 17], 1),
         // Rank 3
         (&[1, 4096, 1024], 1), // middle-dim reduce (klein-like attention reduce)

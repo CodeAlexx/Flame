@@ -114,7 +114,9 @@ fn checkpoint_v2_same_grads_as_no_checkpoint() {
 
     let g_ckpt = make_f32(vec![1.0, 1.0, 1.0], &[3]);
     let root_ckpt = GraphRoot::new(vec![y_ckpt]).with_grad_outputs(vec![Some(g_ckpt)]);
-    Engine::new().execute(root_ckpt, &ctx).expect("ckpt backward");
+    Engine::new()
+        .execute(root_ckpt, &ctx)
+        .expect("ckpt backward");
     let da_ckpt = a_ckpt
         .autograd_meta()
         .unwrap()
@@ -210,16 +212,14 @@ fn checkpoint_v2_reentrant_nested() {
         move |inputs: &[Tensor], ctx: &DispatchCtx| -> flame_core::Result<Vec<Tensor>> {
             let a = &inputs[0];
             let b = &inputs[1];
-            let inner_outs =
-                checkpoint_v2(inner_clone.clone(), &[a.clone(), b.clone()], ctx)?;
+            let inner_outs = checkpoint_v2(inner_clone.clone(), &[a.clone(), b.clone()], ctx)?;
             let s = inner_outs.into_iter().next().unwrap();
             let y = flame_core::autograd_v2::ops::mul::mul_v2(&s, a, ctx)?;
             Ok(vec![y])
         },
     );
 
-    let outs = checkpoint_v2(outer, &[a.clone(), b.clone()], &ctx)
-        .expect("outer checkpoint_v2");
+    let outs = checkpoint_v2(outer, &[a.clone(), b.clone()], &ctx).expect("outer checkpoint_v2");
     let y = outs.into_iter().next().unwrap();
     assert_eq!(y.shape().dims(), &[2]);
     // y = (a+b) * a = [4, 12]
@@ -277,8 +277,8 @@ fn checkpoint_v2_multi_output() {
         },
     );
 
-    let outs = checkpoint_v2(forward, &[a.clone(), b.clone()], &ctx)
-        .expect("multi-output checkpoint");
+    let outs =
+        checkpoint_v2(forward, &[a.clone(), b.clone()], &ctx).expect("multi-output checkpoint");
     assert_eq!(outs.len(), 2);
     let s = outs[0].clone();
     let p = outs[1].clone();
@@ -295,7 +295,9 @@ fn checkpoint_v2_multi_output() {
     let gs = make_f32(vec![1.0, 1.0], &[2]);
     let gp = make_f32(vec![1.0, 1.0], &[2]);
     let root = GraphRoot::new(vec![s, p]).with_grad_outputs(vec![Some(gs), Some(gp)]);
-    Engine::new().execute(root, &ctx).expect("multi-output backward");
+    Engine::new()
+        .execute(root, &ctx)
+        .expect("multi-output backward");
 
     // Expected (with gs=gp=1):
     //   s = a+b → d_s/d_a=1, d_s/d_b=1

@@ -151,11 +151,9 @@ impl GradFn for AccumulateGrad {
             Some(m) => m,
         };
 
-        let mut meta = meta_arc
-            .lock()
-            .map_err(|_| AutogradV2Error::NotImplementedYet(
-                "AccumulateGrad: poisoned meta mutex",
-            ))?;
+        let mut meta = meta_arc.lock().map_err(|_| {
+            AutogradV2Error::NotImplementedYet("AccumulateGrad: poisoned meta mutex")
+        })?;
 
         match meta.grad.take() {
             None => {
@@ -181,11 +179,7 @@ impl GradFn for AccumulateGrad {
                     // the accumulation recorded regardless.
                     let summed = existing.add(&g).map_err(AutogradV2Error::FlameCore)?;
                     let grad_fn = super::ops::add::AddGradFn::new(&existing, &g);
-                    let recorded = super::recording::record_v2(
-                        grad_fn,
-                        vec![summed],
-                        ctx,
-                    );
+                    let recorded = super::recording::record_v2(grad_fn, vec![summed], ctx);
                     let summed = recorded.into_iter().next().unwrap();
                     meta.grad = Some(summed);
                 } else {

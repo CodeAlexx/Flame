@@ -45,10 +45,14 @@ fn make_shapes() -> Vec<Shape> {
 fn deterministic_data(n: usize, seed: u64, scale: f32) -> Vec<f32> {
     // Simple LCG. We only need a stable, reproducible byte stream — not a
     // good RNG.
-    let mut x = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut x = seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
     (0..n)
         .map(|_| {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let bits = (x >> 32) as u32;
             // Map to [-1, 1) * scale.
             let normalized = (bits as f32 / u32::MAX as f32) * 2.0 - 1.0;
@@ -135,14 +139,9 @@ fn multi_tensor_matches_per_tensor_one_step_bit_exact() {
 
     let mut cache = MultiTensorMetaCache::new();
     adam_fused_multi_tensor_step(
-        &mut cache,
-        &dev,
-        n,
-        true,  // param_is_bf16: BF16 params
+        &mut cache, &dev, n, true,  // param_is_bf16: BF16 params
         false, // grad_is_bf16: F32 grads
-        &packed,
-        lr, beta1, beta2, eps, wd,
-        bc1, bc2,
+        &packed, lr, beta1, beta2, eps, wd, bc1, bc2,
         None, // stoch_seed: round-to-nearest path, parity test
     )
     .expect("multi-tensor launch");
@@ -162,8 +161,13 @@ fn multi_tensor_matches_per_tensor_one_step_bit_exact() {
             &g_b[i],
             &mut m_b[i],
             &mut v_b[i],
-            lr, beta1, beta2, eps, wd,
-            bc1, bc2,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            wd,
+            bc1,
+            bc2,
             None,
         )
         .expect("per-tensor launch");
@@ -178,19 +182,22 @@ fn multi_tensor_matches_per_tensor_one_step_bit_exact() {
     for i in 0..n {
         // BF16 params: bit-exact (same kernel, same input → same u16 bits).
         assert_eq!(
-            p_a_snap[i], p_b_snap[i],
+            p_a_snap[i],
+            p_b_snap[i],
             "param[{i}] (shape={:?}): multi-tensor and per-tensor diverged",
             shapes[i].dims()
         );
         // F32 m: bit-exact.
         assert_eq!(
-            m_a_snap[i], m_b_snap[i],
+            m_a_snap[i],
+            m_b_snap[i],
             "m[{i}] (shape={:?}) diverged",
             shapes[i].dims()
         );
         // F32 v: bit-exact.
         assert_eq!(
-            v_a_snap[i], v_b_snap[i],
+            v_a_snap[i],
+            v_b_snap[i],
             "v[{i}] (shape={:?}) diverged",
             shapes[i].dims()
         );
@@ -233,9 +240,7 @@ fn multi_tensor_matches_per_tensor_100_steps() {
             packed.push(shape.elem_count() as u64);
         }
         adam_fused_multi_tensor_step(
-            &mut cache, &dev, n, true, false, &packed,
-            lr, beta1, beta2, eps, wd, bc1, bc2,
-            None,
+            &mut cache, &dev, n, true, false, &packed, lr, beta1, beta2, eps, wd, bc1, bc2, None,
         )
         .unwrap();
     }
@@ -248,8 +253,17 @@ fn multi_tensor_matches_per_tensor_100_steps() {
         let bc2 = 1.0 - beta2.powi(t as i32);
         for i in 0..n {
             adam_fused_step(
-                &mut p_b[i], &g_b[i], &mut m_b[i], &mut v_b[i],
-                lr, beta1, beta2, eps, wd, bc1, bc2,
+                &mut p_b[i],
+                &g_b[i],
+                &mut m_b[i],
+                &mut v_b[i],
+                lr,
+                beta1,
+                beta2,
+                eps,
+                wd,
+                bc1,
+                bc2,
                 None,
             )
             .unwrap();
@@ -336,15 +350,9 @@ fn multi_tensor_f32param_matches_per_tensor_one_step_bit_exact() {
 
     let mut cache = MultiTensorMetaCache::new();
     adam_fused_multi_tensor_step(
-        &mut cache,
-        &dev,
-        n,
-        false, // param_is_bf16 = false → F32 params
+        &mut cache, &dev, n, false, // param_is_bf16 = false → F32 params
         false, // grad_is_bf16 = false
-        &packed,
-        lr, beta1, beta2, eps, wd,
-        bc1, bc2,
-        None,
+        &packed, lr, beta1, beta2, eps, wd, bc1, bc2, None,
     )
     .expect("multi-tensor F32 launch");
     dev.synchronize().expect("sync after multi-tensor F32");
@@ -361,8 +369,13 @@ fn multi_tensor_f32param_matches_per_tensor_one_step_bit_exact() {
             &g_b[i],
             &mut m_b[i],
             &mut v_b[i],
-            lr, beta1, beta2, eps, wd,
-            bc1, bc2,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            wd,
+            bc1,
+            bc2,
         )
         .expect("per-tensor F32 launch");
     }
@@ -374,17 +387,20 @@ fn multi_tensor_f32param_matches_per_tensor_one_step_bit_exact() {
 
     for i in 0..n {
         assert_eq!(
-            p_a_snap[i], p_b_snap[i],
+            p_a_snap[i],
+            p_b_snap[i],
             "F32 param[{i}] (shape={:?}): multi-tensor and per-tensor diverged",
             shapes[i].dims()
         );
         assert_eq!(
-            m_a_snap[i], m_b_snap[i],
+            m_a_snap[i],
+            m_b_snap[i],
             "F32 m[{i}] (shape={:?}) diverged",
             shapes[i].dims()
         );
         assert_eq!(
-            v_a_snap[i], v_b_snap[i],
+            v_a_snap[i],
+            v_b_snap[i],
             "F32 v[{i}] (shape={:?}) diverged",
             shapes[i].dims()
         );
@@ -426,9 +442,7 @@ fn multi_tensor_f32param_matches_per_tensor_100_steps() {
             packed.push(shape.elem_count() as u64);
         }
         adam_fused_multi_tensor_step(
-            &mut cache, &dev, n, false, false, &packed,
-            lr, beta1, beta2, eps, wd, bc1, bc2,
-            None,
+            &mut cache, &dev, n, false, false, &packed, lr, beta1, beta2, eps, wd, bc1, bc2, None,
         )
         .unwrap();
     }
@@ -440,8 +454,17 @@ fn multi_tensor_f32param_matches_per_tensor_100_steps() {
         let bc2 = 1.0 - beta2.powi(t as i32);
         for i in 0..n {
             adam_fused_step_f32(
-                &mut p_b[i], &g_b[i], &mut m_b[i], &mut v_b[i],
-                lr, beta1, beta2, eps, wd, bc1, bc2,
+                &mut p_b[i],
+                &g_b[i],
+                &mut m_b[i],
+                &mut v_b[i],
+                lr,
+                beta1,
+                beta2,
+                eps,
+                wd,
+                bc1,
+                bc2,
             )
             .unwrap();
         }

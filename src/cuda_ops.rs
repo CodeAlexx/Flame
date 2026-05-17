@@ -121,9 +121,8 @@ impl GpuOps {
         let kernels = Self::get_kernels(&a_cast.device)?;
         let result_f32 = if a_cast.shape() != b_cast.shape() {
             static BC_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *BC_TRACE.get_or_init(|| {
-                std::env::var("FLAME_BC_TRACE").ok().as_deref() == Some("1")
-            })
+            if *BC_TRACE
+                .get_or_init(|| std::env::var("FLAME_BC_TRACE").ok().as_deref() == Some("1"))
             {
                 eprintln!(
                     "[bc-trace] add lhs={:?} rhs={:?}",
@@ -246,12 +245,16 @@ impl GpuOps {
         let a_ref = if a.shape() != &target {
             a_bc_owned = a.broadcast_to(&target)?;
             &a_bc_owned
-        } else { a };
+        } else {
+            a
+        };
         let b_bc_owned;
         let b_ref = if b.shape() != &target {
             b_bc_owned = b.broadcast_to(&target)?;
             &b_bc_owned
-        } else { b };
+        } else {
+            b
+        };
         crate::ops::elt::add_same_dtype(a_ref, b_ref)
     }
 
@@ -274,9 +277,8 @@ impl GpuOps {
         let kernels = Self::get_kernels(&a_cast.device)?;
         let result_f32 = if a_cast.shape() != b_cast.shape() {
             static BC_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *BC_TRACE.get_or_init(|| {
-                std::env::var("FLAME_BC_TRACE").ok().as_deref() == Some("1")
-            })
+            if *BC_TRACE
+                .get_or_init(|| std::env::var("FLAME_BC_TRACE").ok().as_deref() == Some("1"))
             {
                 eprintln!(
                     "[bc-trace] mul lhs={:?} rhs={:?}",
@@ -307,12 +309,16 @@ impl GpuOps {
         let a_ref = if a.shape() != &target {
             a_bc_owned = a.broadcast_to(&target)?;
             &a_bc_owned
-        } else { a };
+        } else {
+            a
+        };
         let b_bc_owned;
         let b_ref = if b.shape() != &target {
             b_bc_owned = b.broadcast_to(&target)?;
             &b_bc_owned
-        } else { b };
+        } else {
+            b
+        };
         crate::ops::elt::mul_same_dtype(a_ref, b_ref)
     }
 
@@ -447,9 +453,7 @@ impl GpuOps {
         // bisection.
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
         {
-            if tensor.dtype() == crate::DType::BF16
-                && !crate::env_flags::bf16_reduce_legacy()
-            {
+            if tensor.dtype() == crate::DType::BF16 && !crate::env_flags::bf16_reduce_legacy() {
                 return crate::bf16_reduce::sum_bf16(tensor);
             }
         }
@@ -670,9 +674,9 @@ impl GpuOps {
         let device = tensor.device();
         let stream: *mut c_void = device.cuda_stream_raw_ptr();
 
-        // Output stays in the source dtype so Flux never observes a surprise BF16
-        // promotion/demotion.  The layout swap only changes axes.
-        let mut output = Tensor::zeros_dtype(
+        // The CUDA permute kernels cover every output element, so avoid a
+        // redundant memset before the overwrite.
+        let mut output = Tensor::empty_dtype(
             Shape::from_dims(&[dims[0], dims[2], dims[1], dims[3]]),
             tensor.dtype(),
             device.clone(),
@@ -739,7 +743,9 @@ impl GpuOps {
         let device = tensor.device();
         let stream: *mut c_void = device.cuda_stream_raw_ptr();
 
-        let mut output = Tensor::zeros_dtype(
+        // The CUDA permute kernels cover every output element, so avoid a
+        // redundant memset before the overwrite.
+        let mut output = Tensor::empty_dtype(
             Shape::from_dims(&[dims[0], dims[2], dims[1]]),
             tensor.dtype(),
             device.clone(),

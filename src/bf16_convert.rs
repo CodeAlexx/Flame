@@ -170,10 +170,7 @@ mod stoch_tests {
         let lower = bits & 0xFFFF;
         let upper = (bits >> 16) as u16;
         assert!(lower > 0, "test value should have nonzero low-16 bits");
-        assert_eq!(
-            stochastic_round_to_bf16_cpu(f, 0),
-            upper.wrapping_add(1)
-        );
+        assert_eq!(stochastic_round_to_bf16_cpu(f, 0), upper.wrapping_add(1));
     }
 
     #[test]

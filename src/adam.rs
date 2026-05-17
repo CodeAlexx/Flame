@@ -822,7 +822,10 @@ mod fused {
 
     impl MultiTensorMetaCache {
         pub const fn new() -> Self {
-            Self { buf: None, capacity_n: 0 }
+            Self {
+                buf: None,
+                capacity_n: 0,
+            }
         }
 
         fn ensure(&mut self, dev: &Arc<CudaDevice>, n: usize) -> Result<()> {
@@ -957,17 +960,17 @@ mod fused {
 
         let seed_u64: u64 = stoch_seed.unwrap_or(0);
         let mut k_params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(14);
-        k_params.push(&params_arr_ptr  as *const u64 as *mut std::ffi::c_void);
-        k_params.push(&grads_arr_ptr   as *const u64 as *mut std::ffi::c_void);
-        k_params.push(&ms_arr_ptr      as *const u64 as *mut std::ffi::c_void);
-        k_params.push(&vs_arr_ptr      as *const u64 as *mut std::ffi::c_void);
-        k_params.push(&sizes_arr_ptr   as *const u64 as *mut std::ffi::c_void);
-        k_params.push(&n_tensors_i32   as *const i32 as *mut std::ffi::c_void);
-        k_params.push(&lr              as *const f32 as *mut std::ffi::c_void);
-        k_params.push(&beta1           as *const f32 as *mut std::ffi::c_void);
-        k_params.push(&beta2           as *const f32 as *mut std::ffi::c_void);
-        k_params.push(&eps             as *const f32 as *mut std::ffi::c_void);
-        k_params.push(&weight_decay    as *const f32 as *mut std::ffi::c_void);
+        k_params.push(&params_arr_ptr as *const u64 as *mut std::ffi::c_void);
+        k_params.push(&grads_arr_ptr as *const u64 as *mut std::ffi::c_void);
+        k_params.push(&ms_arr_ptr as *const u64 as *mut std::ffi::c_void);
+        k_params.push(&vs_arr_ptr as *const u64 as *mut std::ffi::c_void);
+        k_params.push(&sizes_arr_ptr as *const u64 as *mut std::ffi::c_void);
+        k_params.push(&n_tensors_i32 as *const i32 as *mut std::ffi::c_void);
+        k_params.push(&lr as *const f32 as *mut std::ffi::c_void);
+        k_params.push(&beta1 as *const f32 as *mut std::ffi::c_void);
+        k_params.push(&beta2 as *const f32 as *mut std::ffi::c_void);
+        k_params.push(&eps as *const f32 as *mut std::ffi::c_void);
+        k_params.push(&weight_decay as *const f32 as *mut std::ffi::c_void);
         k_params.push(&bias_correction1 as *const f32 as *mut std::ffi::c_void);
         k_params.push(&bias_correction2 as *const f32 as *mut std::ffi::c_void);
         if stoch_active {
@@ -1104,8 +1107,10 @@ impl Adam {
         if let Some(m) = self.m.get(&id) {
             validate_state("m", m)?;
         } else {
-            self.m
-                .insert(id, Tensor::zeros_dtype(shape.clone(), DType::F32, device.clone())?);
+            self.m.insert(
+                id,
+                Tensor::zeros_dtype(shape.clone(), DType::F32, device.clone())?,
+            );
         }
 
         if let Some(v) = self.v.get(&id) {
@@ -1223,9 +1228,8 @@ impl Adam {
                 // Region 0: param data pointers (dtype switch per param_is_bf16).
                 if param_is_bf16 {
                     for param in parameters {
-                        let p_ptr: u64 = param.with_data_mut(|t| {
-                            Ok(t.as_mut_device_ptr_bf16("adam_mt:p")? as u64)
-                        })?;
+                        let p_ptr: u64 = param
+                            .with_data_mut(|t| Ok(t.as_mut_device_ptr_bf16("adam_mt:p")? as u64))?;
                         packed.push(p_ptr);
                     }
                 } else {
@@ -1295,7 +1299,11 @@ impl Adam {
                 // so the dispatcher doesn't even consider it. The BF16-grad
                 // multi-tensor kernel itself currently keeps round-to-nearest
                 // (see dispatch matrix comment in `adam_fused_multi_tensor_step`).
-                let seed = if param_is_bf16 { self.stoch_seed() } else { None };
+                let seed = if param_is_bf16 {
+                    self.stoch_seed()
+                } else {
+                    None
+                };
                 fused::adam_fused_multi_tensor_step(
                     &mut self.multi_tensor_meta,
                     &device,
@@ -1510,12 +1518,24 @@ impl AdamW {
     // current run's Parameter ids (TensorIds are per-run unique, not stable
     // on reload).
 
-    pub fn t(&self) -> u32 { self.adam.t }
-    pub fn lr(&self) -> f32 { self.adam.lr }
-    pub fn beta1(&self) -> f32 { self.adam.beta1 }
-    pub fn beta2(&self) -> f32 { self.adam.beta2 }
-    pub fn eps(&self) -> f32 { self.adam.eps }
-    pub fn weight_decay(&self) -> f32 { self.adam.weight_decay }
+    pub fn t(&self) -> u32 {
+        self.adam.t
+    }
+    pub fn lr(&self) -> f32 {
+        self.adam.lr
+    }
+    pub fn beta1(&self) -> f32 {
+        self.adam.beta1
+    }
+    pub fn beta2(&self) -> f32 {
+        self.adam.beta2
+    }
+    pub fn eps(&self) -> f32 {
+        self.adam.eps
+    }
+    pub fn weight_decay(&self) -> f32 {
+        self.adam.weight_decay
+    }
 
     /// Read m and v for a given parameter, if state has been initialized
     /// (i.e. the parameter has had at least one step).
@@ -1535,7 +1555,9 @@ impl AdamW {
         self.adam.v.insert(id, v);
     }
 
-    pub fn set_t(&mut self, t: u32) { self.adam.t = t; }
+    pub fn set_t(&mut self, t: u32) {
+        self.adam.t = t;
+    }
 }
 
 impl Default for AdamW {
@@ -1641,7 +1663,11 @@ mod f32param_bf16grad_kernel_test {
 
         let init: Vec<f32> = (0..n).map(|i| (i as f32 * 0.0137).cos() * 0.1).collect();
         let grads: Vec<Vec<f32>> = (0..10)
-            .map(|k| (0..n).map(|i| ((i + k * 17) as f32 * 0.021).sin() * 0.01).collect())
+            .map(|k| {
+                (0..n)
+                    .map(|i| ((i + k * 17) as f32 * 0.021).sin() * 0.01)
+                    .collect()
+            })
             .collect();
 
         let mut param = Tensor::from_vec(init.clone(), shape.clone(), device.clone())?;
@@ -1665,8 +1691,8 @@ mod f32param_bf16grad_kernel_test {
             let bc2 = 1.0f32 - beta2.powi(t1);
 
             // GPU fused step with BF16 grad
-            let grad_bf16 =
-                Tensor::from_vec(gvec.clone(), shape.clone(), device.clone())?.to_dtype(DType::BF16)?;
+            let grad_bf16 = Tensor::from_vec(gvec.clone(), shape.clone(), device.clone())?
+                .to_dtype(DType::BF16)?;
             fused::adam_fused_step_f32(
                 &mut param, &grad_bf16, &mut m, &mut v, lr, beta1, beta2, eps, wd, bc1, bc2,
             )?;

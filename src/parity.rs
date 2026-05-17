@@ -55,7 +55,10 @@ pub struct ParityTolerance {
 
 impl Default for ParityTolerance {
     fn default() -> Self {
-        Self { min_cos: 0.9999, max_abs_ratio: 0.05 }
+        Self {
+            min_cos: 0.9999,
+            max_abs_ratio: 0.05,
+        }
     }
 }
 
@@ -97,7 +100,11 @@ impl ParityHarness {
     /// loader so dtype + device handling matches the rest of the stack.
     pub fn load(path: impl AsRef<Path>, device: Arc<CudaDevice>) -> Result<Self> {
         let refs = load_tensors(path.as_ref(), device, SerializationFormat::SafeTensors)?;
-        Ok(Self { refs, tol: ParityTolerance::default(), results: Vec::new() })
+        Ok(Self {
+            refs,
+            tol: ParityTolerance::default(),
+            results: Vec::new(),
+        })
     }
 
     /// Override the default tolerance.  Chainable on construction.
@@ -195,16 +202,19 @@ impl ParityHarness {
         } else {
             f32::NAN
         };
-        let mean_abs = if n > 0 { (sum_abs / n as f64) as f32 } else { 0.0 };
+        let mean_abs = if n > 0 {
+            (sum_abs / n as f64) as f32
+        } else {
+            0.0
+        };
         let max_abs_ratio = if max_abs_ref > 0.0 {
             max_abs / max_abs_ref
         } else {
             0.0
         };
 
-        let passed = cos.is_finite()
-            && cos >= self.tol.min_cos
-            && max_abs_ratio <= self.tol.max_abs_ratio;
+        let passed =
+            cos.is_finite() && cos >= self.tol.min_cos && max_abs_ratio <= self.tol.max_abs_ratio;
 
         Ok(ParityResult {
             name: name.to_string(),

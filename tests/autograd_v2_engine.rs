@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use flame_core::autograd_v2::{
-    gradient_edge, new_meta_ref, AutogradMetaRef, AutogradMetaV2,
-    AutogradV2Error, DispatchCtx, Edge, Engine, GradFn, GraphRoot, Hooks, NodeId, SavedTensor,
+    gradient_edge, new_meta_ref, AutogradMetaRef, AutogradMetaV2, AutogradV2Error, DispatchCtx,
+    Edge, Engine, GradFn, GraphRoot, Hooks, NodeId, SavedTensor,
 };
 use flame_core::{global_cuda_device, Device, Shape, Tensor};
 
@@ -332,9 +332,8 @@ impl GradFn for ReentrantGradFn {
         let mut inner_out = make_f32(vec![100.0, 200.0], &[2]);
         link_tensor_to_grad_fn(&mut inner_out, inner_identity.clone() as Arc<dyn GradFn>, 0);
 
-        let inner_root = GraphRoot::new(vec![inner_out]).with_grad_outputs(vec![Some(
-            make_f32(vec![1.0, 1.0], &[2]),
-        )]);
+        let inner_root = GraphRoot::new(vec![inner_out])
+            .with_grad_outputs(vec![Some(make_f32(vec![1.0, 1.0], &[2]))]);
         // Recursion: outer Engine + inner Engine are independent.
         Engine::new().execute(inner_root, ctx)?;
         self.inner_call_count.fetch_add(1, Ordering::Relaxed);
@@ -531,8 +530,8 @@ fn diamond_accumulation() {
     link_tensor_to_grad_fn(&mut out, add.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
-    let root = GraphRoot::new(vec![out])
-        .with_grad_outputs(vec![Some(make_f32(vec![5.0, 7.0], &[2]))]);
+    let root =
+        GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(make_f32(vec![5.0, 7.0], &[2]))]);
     Engine::new().execute(root, &ctx).expect("execute");
 
     let m = leaf_meta.lock().unwrap();
@@ -560,9 +559,10 @@ fn undefined_grad_slot() {
     link_tensor_to_grad_fn(&mut out, none_op.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
-    let root = GraphRoot::new(vec![out])
-        .with_grad_outputs(vec![Some(make_f32(vec![1.0], &[1]))]);
-    Engine::new().execute(root, &ctx).expect("execute must not panic");
+    let root = GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(make_f32(vec![1.0], &[1]))]);
+    Engine::new()
+        .execute(root, &ctx)
+        .expect("execute must not panic");
 
     let m = leaf_meta.lock().unwrap();
     assert!(m.grad.is_none(), "None grad should not populate leaf");
@@ -587,8 +587,8 @@ fn released_saved_tensor_error() {
     link_tensor_to_grad_fn(&mut out, op.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
-    let root = GraphRoot::new(vec![out])
-        .with_grad_outputs(vec![Some(make_f32(vec![1.0, 1.0], &[2]))]);
+    let root =
+        GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(make_f32(vec![1.0, 1.0], &[2]))]);
 
     let res = Engine::new().execute(root, &ctx);
     match res {
@@ -619,8 +619,8 @@ fn version_mismatch_error() {
     link_tensor_to_grad_fn(&mut out, op.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
-    let root = GraphRoot::new(vec![out])
-        .with_grad_outputs(vec![Some(make_f32(vec![1.0, 1.0], &[2]))]);
+    let root =
+        GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(make_f32(vec![1.0, 1.0], &[2]))]);
 
     let res = Engine::new().execute(root, &ctx);
     match res {
@@ -694,8 +694,8 @@ fn reentrant_nested_execute() {
     link_tensor_to_grad_fn(&mut out, reentrant.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
-    let root = GraphRoot::new(vec![out])
-        .with_grad_outputs(vec![Some(make_f32(vec![7.0, 9.0], &[2]))]);
+    let root =
+        GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(make_f32(vec![7.0, 9.0], &[2]))]);
 
     Engine::new()
         .execute(root, &ctx)
@@ -764,8 +764,8 @@ fn hooks_fire_in_order() {
     link_tensor_to_grad_fn(&mut out, hooked.clone() as Arc<dyn GradFn>, 0);
 
     let ctx = default_ctx();
-    let root = GraphRoot::new(vec![out])
-        .with_grad_outputs(vec![Some(make_f32(vec![1.0, 1.0], &[2]))]);
+    let root =
+        GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(make_f32(vec![1.0, 1.0], &[2]))]);
 
     Engine::new().execute(root, &ctx).expect("execute");
 
@@ -800,8 +800,8 @@ fn engine_finishes_when_leaf_never_receives_grad() {
         link_tensor_to_grad_fn(&mut out, none_op.clone() as Arc<dyn GradFn>, 0);
 
         let ctx = default_ctx();
-        let root = GraphRoot::new(vec![out])
-            .with_grad_outputs(vec![Some(make_f32(vec![1.0], &[1]))]);
+        let root =
+            GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(make_f32(vec![1.0], &[1]))]);
 
         Engine::new().execute(root, &ctx).expect("execute");
 
@@ -849,11 +849,7 @@ struct CountingIdentityGradFn {
 }
 
 impl CountingIdentityGradFn {
-    fn new(
-        next_edges: Vec<Edge>,
-        topological_nr: u64,
-        apply_count: Arc<AtomicU>,
-    ) -> Arc<Self> {
+    fn new(next_edges: Vec<Edge>, topological_nr: u64, apply_count: Arc<AtomicU>) -> Arc<Self> {
         Arc::new(Self {
             next_edges,
             sequence_nr: next_seq(),
@@ -977,7 +973,8 @@ fn accumulate_grad_uses_empty_sentinel_when_no_hooks() {
 
     // Install a hooks bundle; pointer must now diverge from sentinel.
     let installed = Hooks::new();
-    acc.install_hooks(installed).expect("install_hooks should succeed once");
+    acc.install_hooks(installed)
+        .expect("install_hooks should succeed once");
     let h_ref_after = acc.hooks();
     assert!(
         !std::ptr::eq(h_ref_after as *const Hooks, empty_ref as *const Hooks),
@@ -987,5 +984,8 @@ fn accumulate_grad_uses_empty_sentinel_when_no_hooks() {
 
     // Second install_hooks call returns Err (single-shot).
     let res = acc.install_hooks(Hooks::new());
-    assert!(res.is_err(), "second install_hooks must be Err (single-shot)");
+    assert!(
+        res.is_err(),
+        "second install_hooks must be Err (single-shot)"
+    );
 }

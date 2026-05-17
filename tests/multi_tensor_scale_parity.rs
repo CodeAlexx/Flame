@@ -10,13 +10,13 @@
 
 #![cfg(all(feature = "cuda", feature = "bf16_u16"))]
 
-use flame_core::ops::multi_tensor::{
-    multi_tensor_scale_inplace_packed, MultiTensorMetaCache,
-};
+use flame_core::ops::multi_tensor::{multi_tensor_scale_inplace_packed, MultiTensorMetaCache};
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
 
 fn deterministic_data(n: usize, seed: u64, scale: f32) -> Vec<f32> {
-    let mut x = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut x = seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
     (0..n)
         .map(|_| {
             x = x
@@ -113,10 +113,7 @@ fn mt_scale_f32_matches_per_tensor_bit_exact() {
         false, // F32
     )
     .expect("mt scale f32");
-    let mt_host: Vec<Vec<f32>> = mt_tensors
-        .iter()
-        .map(|t| t.to_vec_f32().unwrap())
-        .collect();
+    let mt_host: Vec<Vec<f32>> = mt_tensors.iter().map(|t| t.to_vec_f32().unwrap()).collect();
 
     // Bit-exact byte comparison on the raw f32 representations.
     for (i, (a, b)) in per_tensor_host.iter().zip(mt_host.iter()).enumerate() {
@@ -240,8 +237,7 @@ fn mt_scale_empty_is_ok() {
     let dev = global_cuda_device();
     let mut cache = MultiTensorMetaCache::new();
     // n=0 short-circuits before allocating or launching.
-    multi_tensor_scale_inplace_packed(&mut cache, &dev, 0, &[], 0.5, false)
-        .expect("empty must Ok");
+    multi_tensor_scale_inplace_packed(&mut cache, &dev, 0, &[], 0.5, false).expect("empty must Ok");
     multi_tensor_scale_inplace_packed(&mut cache, &dev, 0, &[], 0.5, true)
         .expect("empty bf16 must Ok");
 }

@@ -21,10 +21,10 @@
 //!   up.3 (512->512, has upsample) processed FIRST
 //!   up.0 (256->128, no upsample) processed LAST
 
-use crate::sdpa::forward as sdpa_forward;
 use crate::conv::Conv2d;
 use crate::cuda_kernels::CudaKernels;
 use crate::group_norm::group_norm;
+use crate::sdpa::forward as sdpa_forward;
 use crate::serialization::load_file_filtered;
 use crate::{DType, Error, Result, Shape, Tensor};
 use std::collections::HashMap;
@@ -83,7 +83,8 @@ impl ResBlock {
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
         let get = |key: &str| -> Result<&Tensor> {
-            w.get(key).ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
+            w.get(key)
+                .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
         };
 
         let mut conv1 = Conv2d::new(in_ch, out_ch, 3, 1, 1, device.clone())?;
@@ -176,13 +177,10 @@ fn linear_3d(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
 }
 
 impl AttnBlock {
-    fn from_weights(
-        w: &HashMap<String, Tensor>,
-        prefix: &str,
-        channels: usize,
-    ) -> Result<Self> {
+    fn from_weights(w: &HashMap<String, Tensor>, prefix: &str, channels: usize) -> Result<Self> {
         let get = |key: &str| -> Result<&Tensor> {
-            w.get(key).ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
+            w.get(key)
+                .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
         };
 
         Ok(Self {
@@ -253,9 +251,21 @@ impl MidBlock {
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
         Ok(Self {
-            resnet0: ResBlock::from_weights(w, &format!("{prefix}.block_1"), channels, channels, device)?,
+            resnet0: ResBlock::from_weights(
+                w,
+                &format!("{prefix}.block_1"),
+                channels,
+                channels,
+                device,
+            )?,
             attn: AttnBlock::from_weights(w, &format!("{prefix}.attn_1"), channels)?,
-            resnet1: ResBlock::from_weights(w, &format!("{prefix}.block_2"), channels, channels, device)?,
+            resnet1: ResBlock::from_weights(
+                w,
+                &format!("{prefix}.block_2"),
+                channels,
+                channels,
+                device,
+            )?,
         })
     }
 
@@ -286,7 +296,8 @@ impl UpBlock {
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
         let get = |key: &str| -> Result<&Tensor> {
-            w.get(key).ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
+            w.get(key)
+                .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
         };
 
         let mut resnets = Vec::new();
@@ -349,10 +360,7 @@ pub struct ZImageVAEDecoder {
 
 impl ZImageVAEDecoder {
     /// Load decoder from safetensors file (mmap, decoder keys only).
-    pub fn from_safetensors(
-        path: &str,
-        device: &Arc<cudarc::driver::CudaDevice>,
-    ) -> Result<Self> {
+    pub fn from_safetensors(path: &str, device: &Arc<cudarc::driver::CudaDevice>) -> Result<Self> {
         let w = load_file_filtered(path, device, |key| {
             key.starts_with("decoder.") || key == "decoder.conv_in.weight"
         })?;
@@ -366,7 +374,8 @@ impl ZImageVAEDecoder {
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
         let get = |key: &str| -> Result<&Tensor> {
-            w.get(key).ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
+            w.get(key)
+                .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
         };
 
         let ch: usize = 128;
@@ -425,7 +434,9 @@ impl ZImageVAEDecoder {
     /// Output: `[B, 3, H*8, W*8]` RGB tensor.
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
         // Undo VAE encode-time normalization
-        let z = z.add_scalar(-SHIFT_FACTOR)?.mul_scalar(1.0 / SCALING_FACTOR)?;
+        let z = z
+            .add_scalar(-SHIFT_FACTOR)?
+            .mul_scalar(1.0 / SCALING_FACTOR)?;
 
         // decoder.conv_in
         let mut h = self.conv_in.forward(&z)?;

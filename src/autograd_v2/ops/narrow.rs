@@ -22,17 +22,15 @@
 
 use std::sync::Arc;
 
-use crate::shape::Shape;
 use crate::dtype::DType;
+use crate::shape::Shape;
 use crate::tensor::Tensor;
 use crate::Result;
 
 use super::super::dispatch::DispatchCtx;
 use super::super::error::AutogradV2Error;
 use super::super::node::{Edge, GradFn, NodeId};
-use super::super::recording::{
-    gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
-};
+use super::super::recording::{gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2};
 use super::fw_mode::{any_fw_grad, tangent_or_zero};
 
 #[derive(Debug)]
@@ -82,12 +80,8 @@ impl GradFn for NarrowGradFn {
         // The kernel writes through the unique `&mut grad_in` handle
         // — no aliasing risk.
         let target_shape = Shape::from_dims(&self.input_shape);
-        let mut grad_in = Tensor::zeros_dtype(
-            target_shape,
-            self.input_dtype,
-            g.device().clone(),
-        )
-        .map_err(AutogradV2Error::FlameCore)?;
+        let mut grad_in = Tensor::zeros_dtype(target_shape, self.input_dtype, g.device().clone())
+            .map_err(AutogradV2Error::FlameCore)?;
         // Ensure grad dtype matches (the kernel is byte-copy and would
         // copy wrong-sized elements if the dtypes differed).
         let g_typed = if g.dtype() == self.input_dtype {

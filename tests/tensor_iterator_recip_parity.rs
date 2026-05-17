@@ -5,7 +5,9 @@
 //! Recip uses f32 opmath inside the functor (__frcp_rn). The reference is
 //! computed on the host in f32 (`1.0 / v`) then rounded to BF16.
 
-use flame_core::{tensor_iterator::ops::transcendentals::recip_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{
+    tensor_iterator::ops::transcendentals::recip_bf16_iter, DType, Result, Shape, Tensor,
+};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
@@ -55,11 +57,17 @@ fn make_bf16_nonzero_tensor(dev: Arc<CudaDevice>, dims: &[usize], seed: u64) -> 
     let mut data = Vec::with_capacity(n);
     let mut s = seed;
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 40) as u32 as f32 / (1u32 << 24) as f32;
         // Recip domain: [-10, -0.1] U [0.1, 10], avoid near-zero for cos_sim.
         let v = (u - 0.5) * 20.0;
-        let v = if v.abs() < 0.1 { v.signum() * 0.1 + v } else { v };
+        let v = if v.abs() < 0.1 {
+            v.signum() * 0.1 + v
+        } else {
+            v
+        };
         data.push(v);
     }
     let t_f32 = Tensor::from_vec(data, shape, dev)?;
@@ -79,7 +87,10 @@ fn recip_iter_contig_cos_sim() -> Result<()> {
     let new_f32 = new_out.to_vec_f32()?;
 
     let cs = cos_sim_f32(&ref_f32, &new_f32);
-    assert!(cs >= 0.9999, "recip contig cos_sim {cs} below threshold 0.9999");
+    assert!(
+        cs >= 0.9999,
+        "recip contig cos_sim {cs} below threshold 0.9999"
+    );
     Ok(())
 }
 
@@ -100,7 +111,10 @@ fn recip_iter_permuted_view_cos_sim() -> Result<()> {
     let new_out = recip_bf16_iter(&permuted)?;
     let new_f32 = new_out.to_vec_f32()?;
     let cs = cos_sim_f32(&ref_f32, &new_f32);
-    assert!(cs >= 0.9999, "recip permuted view cos_sim {cs} below threshold 0.9999");
+    assert!(
+        cs >= 0.9999,
+        "recip permuted view cos_sim {cs} below threshold 0.9999"
+    );
     Ok(())
 }
 
@@ -121,7 +135,10 @@ fn recip_iter_narrow_view_cos_sim() -> Result<()> {
     let new_out = recip_bf16_iter(&narrow_view)?;
     let new_f32 = new_out.to_vec_f32()?;
     let cs = cos_sim_f32(&ref_f32, &new_f32);
-    assert!(cs >= 0.9999, "recip narrow view cos_sim {cs} below threshold 0.9999");
+    assert!(
+        cs >= 0.9999,
+        "recip narrow view cos_sim {cs} below threshold 0.9999"
+    );
     Ok(())
 }
 
@@ -141,6 +158,10 @@ fn recip_iter_edge_values() -> Result<()> {
     assert_eq!(y_f32[2], -1.0, "recip(-1) expected -1, got {}", y_f32[2]);
     assert_eq!(y_f32[3], 2.0, "recip(0.5) expected 2, got {}", y_f32[3]);
     assert_eq!(y_f32[4], -2.0, "recip(-0.5) expected -2, got {}", y_f32[4]);
-    assert!(y_f32[5].is_infinite() && y_f32[5] > 0.0, "recip(0) expected +inf, got {}", y_f32[5]);
+    assert!(
+        y_f32[5].is_infinite() && y_f32[5] > 0.0,
+        "recip(0) expected +inf, got {}",
+        y_f32[5]
+    );
     Ok(())
 }

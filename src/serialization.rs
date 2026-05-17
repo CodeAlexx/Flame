@@ -25,7 +25,11 @@ fn fp8_e4m3_to_f32(bits: u8) -> f32 {
         (exp as i32 - 7, 1.0 + mant as f32 / 8.0)
     };
     let mag = m * (2.0f32).powi(e);
-    if sign == 1 { -mag } else { mag }
+    if sign == 1 {
+        -mag
+    } else {
+        mag
+    }
 }
 
 /// Format for saving tensors
@@ -360,8 +364,20 @@ fn save_tensors_safetensors<T: AsRef<Tensor>>(
 ) -> Result<()> {
     use serde_json::{json, Value};
 
-    let file =
-        File::create(path).map_err(|e| Error::Io(format!("Failed to create file: {:?}", e)))?;
+    // Atomic write: stage to `{path}.tmp`, then `rename` to `path` once the
+    // full payload + flush succeeds. On the same filesystem `rename` is an
+    // atomic directory-entry swap, so a Ctrl-C / crash mid-write leaves
+    // either the old file (if any) or no final file — never a truncated
+    // half-byte `.safetensors` that downstream loaders / `--skip-existing`
+    // caches would treat as valid. Fixes the corruption window flagged in
+    // the HiDream-O1 M2 skeptic review for every `prepare_*` binary at once.
+    let tmp_path = {
+        let mut s = path.as_os_str().to_owned();
+        s.push(".tmp");
+        std::path::PathBuf::from(s)
+    };
+    let file = File::create(&tmp_path)
+        .map_err(|e| Error::Io(format!("Failed to create file '{}': {:?}", tmp_path.display(), e)))?;
     let mut writer = BufWriter::new(file);
 
     // Create metadata
@@ -422,6 +438,18 @@ fn save_tensors_safetensors<T: AsRef<Tensor>>(
     }
 
     writer.flush().map_err(|e| Error::Io(e.to_string()))?;
+    // Drop the BufWriter (and the underlying File) before renaming so all
+    // bytes are committed to the OS page cache.
+    drop(writer);
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        // Best-effort cleanup of the staged file if rename fails.
+        let _ = std::fs::remove_file(&tmp_path);
+        Error::Io(format!(
+            "atomic rename '{}' -> '{}': {e}",
+            tmp_path.display(),
+            path.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -555,11 +583,8 @@ fn decode_tensors_from_mmap(
                     let f = fp8_e4m3_to_f32(byte) * scale;
                     *value = half::bf16::from_f32(f).to_bits();
                 }
-                let mut tensor = Tensor::zeros_dtype(
-                    Shape::from_dims(&shape),
-                    DType::BF16,
-                    device.clone(),
-                )?;
+                let mut tensor =
+                    Tensor::zeros_dtype(Shape::from_dims(&shape), DType::BF16, device.clone())?;
                 tensor.copy_from_bf16_slice(&bf16_u16)?;
                 tensor
             }

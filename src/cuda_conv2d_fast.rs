@@ -324,7 +324,6 @@ extern "C" __global__ void conv2d_3x3_s1_p1(
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         })
     }
 }

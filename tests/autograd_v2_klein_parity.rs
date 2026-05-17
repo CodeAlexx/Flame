@@ -137,8 +137,7 @@ fn scenario_head_rms_norm_toy() {
         .reshape(&[b_d, n_d, h_d, hd_d])
         .and_then(|t| t.permute(&[0, 2, 1, 3]))
         .expect("reshape/permute");
-    let out =
-        flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6).expect("rms_norm");
+    let out = flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6).expect("rms_norm");
 
     let loss = out.sum().expect("sum");
     let grads = AutogradContext::backward_v2(&loss).expect("backward_v2");
@@ -152,11 +151,7 @@ fn scenario_head_rms_norm_toy() {
     let dscale = grads.get(scale.id()).expect("missing dscale (v2 toy)");
 
     // Bridge contract: grads land at loss.dtype() (BF16 here).
-    assert_eq!(
-        loss.dtype(),
-        DType::BF16,
-        "toy fixture loss should be BF16"
-    );
+    assert_eq!(loss.dtype(), DType::BF16, "toy fixture loss should be BF16");
     assert_eq!(
         dx.dtype(),
         DType::BF16,
@@ -217,8 +212,7 @@ fn scenario_head_rms_norm_prod() {
         .reshape(&[b_d, n_d, h_d, hd_d])
         .and_then(|t| t.permute(&[0, 2, 1, 3]))
         .expect("reshape/permute");
-    let out =
-        flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6).expect("rms_norm");
+    let out = flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6).expect("rms_norm");
 
     let loss = out.sum().expect("sum");
     let grads = AutogradContext::backward_v2(&loss).expect("backward_v2");
@@ -270,8 +264,8 @@ fn scenario_apply_rope_prod() {
 
     let out = {
         use flame_core::autograd::{AutogradContext, Op};
-        let mut o = flame_core::bf16_ops::rope_fused_bf16(&x, &pe_cos, &pe_sin)
-            .expect("rope_fused_bf16");
+        let mut o =
+            flame_core::bf16_ops::rope_fused_bf16(&x, &pe_cos, &pe_sin).expect("rope_fused_bf16");
         if x.requires_grad() {
             o = o.requires_grad_(true);
             if AutogradContext::is_recording() {
@@ -346,14 +340,15 @@ fn scenario_rms_norm_direct_4d() {
         .expect("reshape (no-grad)")
         .requires_grad_(true);
 
-    let out = flame_core::norm::rms_norm(&x_4d, &[hd_d], Some(&scale), 1.0e-6)
-        .expect("rms_norm");
+    let out = flame_core::norm::rms_norm(&x_4d, &[hd_d], Some(&scale), 1.0e-6).expect("rms_norm");
 
     let loss = out.sum().expect("sum");
     let grads = AutogradContext::backward_v2(&loss).expect("backward_v2");
 
     let dx = grads.get(x_4d.id()).expect("missing dx (v2 4D direct)");
-    let _dscale = grads.get(scale.id()).expect("missing dscale (v2 4D direct)");
+    let _dscale = grads
+        .get(scale.id())
+        .expect("missing dscale (v2 4D direct)");
 
     assert_eq!(dx.dtype(), DType::BF16, "v2 dx must be BF16");
     eprintln!(
@@ -393,8 +388,7 @@ fn scenario_rms_norm_contig_prod() {
 
     // Reshape ONLY (no permute) → tensor is still contiguous.
     let h = x.reshape(&[b_d, n_d, h_d, hd_d]).expect("reshape");
-    let out = flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6)
-        .expect("rms_norm");
+    let out = flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6).expect("rms_norm");
 
     let loss = out.sum().expect("sum");
     let grads = AutogradContext::backward_v2(&loss).expect("backward_v2");
@@ -482,8 +476,8 @@ fn scenario_attn_chain_prod() {
 
     let rope = |x_in: &Tensor| -> Tensor {
         use flame_core::autograd::{AutogradContext, Op};
-        let mut o = flame_core::bf16_ops::rope_fused_bf16(x_in, &pe_cos, &pe_sin)
-            .expect("rope_fused_bf16");
+        let mut o =
+            flame_core::bf16_ops::rope_fused_bf16(x_in, &pe_cos, &pe_sin).expect("rope_fused_bf16");
         if x_in.requires_grad() {
             o = o.requires_grad_(true);
             if AutogradContext::is_recording() {

@@ -75,7 +75,9 @@ fn install_fresh_slab(
 #[test]
 fn bf1_release_then_stale_return_is_safe() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let (slab_mu, key) = install_fresh_slab(device, 1 * 1024 * 1024);
 
     // Allocate one slice, capture its ptr, then forget the slice and
@@ -121,7 +123,9 @@ fn bf1_concurrent_release_blocks_inflight_return() {
     // decremented), and try release() on thread B with timeout — it must
     // BLOCK (return_if_owned will eventually complete and decrement, then
     // release succeeds).
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let (slab_mu, key) = install_fresh_slab(device, 1 * 1024 * 1024);
 
     // Allocate.
@@ -186,7 +190,9 @@ fn bf1_concurrent_release_blocks_inflight_return() {
 #[test]
 fn bf2_arc_forget_strands_live_count() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     // Ensure pool_disabled is not stuck on — we want the normal pool path
     // for this test (the bug surfaces independent of pool_off, but cleaner
     // env helps reasoning).
@@ -268,10 +274,8 @@ fn bf3_drop_wiring_test_loudly_fails_on_cache_race() {
     // function MUST contain an `assert!` that reads `pool_disabled()` and
     // panics if it's false. Source-text inspection guards this property
     // against accidental deletion.
-    let src = std::fs::read_to_string(
-        "tests/static_slab_v2_drop_wiring.rs",
-    )
-    .expect("read drop_wiring source");
+    let src = std::fs::read_to_string("tests/static_slab_v2_drop_wiring.rs")
+        .expect("read drop_wiring source");
     assert!(
         src.contains("force_pool_disabled"),
         "drop_wiring test must keep force_pool_disabled fn"
@@ -319,8 +323,7 @@ fn bf3_drop_wiring_test_loudly_fails_on_cache_race() {
 #[test]
 fn bf4_non_slab_dtype_drop_arms_documented() {
     let _test_lock = test_serialize();
-    let src = std::fs::read_to_string("src/tensor_storage.rs")
-        .expect("read tensor_storage source");
+    let src = std::fs::read_to_string("src/tensor_storage.rs").expect("read tensor_storage source");
 
     // Pull out the impl Drop body.
     let drop_idx = src
@@ -430,7 +433,9 @@ fn bf4_non_slab_dtype_storage_drops_cleanly() {
     // slab. We allocate one through the normal constructor (which goes
     // through alloc_aligned_f32, NOT the slab), drop it, and assert the
     // slab's live_count is unchanged.
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     reset_device_map_for_testing();
     let (slab_mu, key) = install_fresh_slab(device.clone(), 1 * 1024 * 1024);
 
@@ -486,7 +491,9 @@ fn bf4_non_slab_dtype_storage_drops_cleanly() {
 #[test]
 fn bf5_release_strict_check_returns_err_with_live_tensors() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let (slab_mu, key) = install_fresh_slab(device, 1 * 1024 * 1024);
 
     let ptr = {
@@ -505,7 +512,10 @@ fn bf5_release_strict_check_returns_err_with_live_tensors() {
         assert!(msg.contains("refusing"));
         assert!(msg.contains("live"));
         // Slab MUST still be alive (release was rejected).
-        assert!(g.slab_base().is_some(), "rejected release must NOT tear down slab");
+        assert!(
+            g.slab_base().is_some(),
+            "rejected release must NOT tear down slab"
+        );
     }
 
     // Cleanup.
@@ -528,7 +538,9 @@ fn bf5_release_strict_check_returns_err_with_live_tensors() {
 #[test]
 fn sk_multi_arc_for_same_device_get_distinct_slabs() {
     let _test_lock = test_serialize();
-    let Some(dev_a) = skip_if_no_gpu() else { return };
+    let Some(dev_a) = skip_if_no_gpu() else {
+        return;
+    };
     let Ok(dev_b) = CudaDevice::new(0) else {
         eprintln!("[adversarial] second CudaDevice::new(0) failed — skipping");
         return;
@@ -552,7 +564,9 @@ fn sk_multi_arc_for_same_device_get_distinct_slabs() {
 #[test]
 fn sk_alloc_size_overflow_is_checked() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let mut slab = StaticSlabAllocator::new(device, 4096);
 
     // n * 2 overflows usize.
@@ -588,17 +602,21 @@ fn sk_alloc_size_overflow_is_checked() {
 #[test]
 fn sk_release_unmaterialised_slab_is_noop() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let mut slab = StaticSlabAllocator::new(device, 1 * 1024 * 1024);
     assert!(slab.slab_base().is_none());
     assert_eq!(slab.live_count(), 0);
 
     // Release without any allocation: must succeed (live_count=0).
-    slab.release().expect("release of unmaterialised slab must be OK");
+    slab.release()
+        .expect("release of unmaterialised slab must be OK");
     assert!(slab.slab_base().is_none());
 
     // Release again — still OK.
-    slab.release().expect("double release of unmaterialised slab must be OK");
+    slab.release()
+        .expect("double release of unmaterialised slab must be OK");
 }
 
 /// What if `release()` is called twice on a materialized slab after all
@@ -607,7 +625,9 @@ fn sk_release_unmaterialised_slab_is_noop() {
 #[test]
 fn sk_double_release_after_alloc_is_noop() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let (slab_mu, key) = install_fresh_slab(device, 1 * 1024 * 1024);
     let ptr = {
         let mut g = slab_mu.lock().unwrap();
@@ -661,11 +681,16 @@ fn sk_return_hook_zero_ptr_zero_key_safe() {
 #[test]
 fn sk_reset_unmaterialised_slab_is_noop() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let mut slab = StaticSlabAllocator::new(device, 1 * 1024 * 1024);
     assert!(slab.slab_base().is_none());
     slab.reset().expect("reset before any alloc is OK");
-    assert!(slab.slab_base().is_none(), "reset must not materialise slab");
+    assert!(
+        slab.slab_base().is_none(),
+        "reset must not materialise slab"
+    );
 }
 
 /// alloc_u16(0)/alloc_f32_*(0) on a brand-new slab must NOT materialise
@@ -675,7 +700,9 @@ fn sk_reset_unmaterialised_slab_is_noop() {
 #[test]
 fn sk_zero_alloc_does_not_materialise_slab() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let mut slab = StaticSlabAllocator::new(device, 1 * 1024 * 1024);
     let s = slab.alloc_u16(0).unwrap();
     assert!(
@@ -707,7 +734,9 @@ fn sk_zero_alloc_does_not_materialise_slab() {
 #[test]
 fn sk_capacity_overflow_returns_oom_err() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let mut slab = StaticSlabAllocator::new(device, 4 * 1024); // 4 KiB
 
     // 4 KiB / 4 bytes/f32 = 1024 f32. Request 2048 f32 = 8 KiB — overflow.
@@ -726,7 +755,9 @@ fn sk_capacity_overflow_returns_oom_err() {
 #[test]
 fn sk_release_then_alloc_relazy_materialises() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let (slab_mu, key) = install_fresh_slab(device, 1 * 1024 * 1024);
 
     let ptr1 = {
@@ -751,7 +782,10 @@ fn sk_release_then_alloc_relazy_materialises() {
     let ptr2 = {
         let mut g = slab_mu.lock().unwrap();
         let s = g.alloc_u16(64).unwrap();
-        assert!(g.slab_base().is_some(), "alloc after release must re-materialise");
+        assert!(
+            g.slab_base().is_some(),
+            "alloc after release must re-materialise"
+        );
         let p = *s.device_ptr();
         std::mem::forget(s);
         p
@@ -778,7 +812,9 @@ fn sk_release_then_alloc_relazy_materialises() {
 #[test]
 fn sk_return_hook_offrange_ptr_matching_device_returns_false() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let (slab_mu, key) = install_fresh_slab(device, 1 * 1024 * 1024);
 
     // Materialise slab.
@@ -813,7 +849,9 @@ fn sk_return_hook_offrange_ptr_matching_device_returns_false() {
 #[test]
 fn sk_storage_drop_on_other_thread_decrements_correctly() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     // Don't disturb the production device key map by other tests — install
     // under the device's own key (matches the storage's slice device).
     reset_device_map_for_testing();
@@ -863,7 +901,9 @@ fn sk_storage_drop_on_other_thread_decrements_correctly() {
 #[test]
 fn sk_subsequent_allocs_do_not_re_register_range() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let (slab_mu, key) = install_fresh_slab(device, 1 * 1024 * 1024);
 
     let pre = ExternalMemoryRegistry::global().range_count();
@@ -906,7 +946,9 @@ fn sk_subsequent_allocs_do_not_re_register_range() {
 #[test]
 fn sk_return_hook_serializes_through_device_map_lock() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let (slab_mu, key) = install_fresh_slab(device.clone(), 1 * 1024 * 1024);
 
     let ptr = {
@@ -936,7 +978,9 @@ fn sk_return_hook_serializes_through_device_map_lock() {
 #[test]
 fn sk_return_hook_wrong_device_key_returns_false() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let (slab_mu, real_key) = install_fresh_slab(device, 1 * 1024 * 1024);
 
     let ptr = {
@@ -971,7 +1015,9 @@ fn sk_return_hook_wrong_device_key_returns_false() {
 #[test]
 fn sk_reset_idempotent_on_fresh_slab() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let mut slab = StaticSlabAllocator::new(device, 1 * 1024 * 1024);
     slab.reset().expect("reset on fresh slab is OK");
     slab.reset().expect("reset is idempotent");
@@ -985,7 +1031,9 @@ fn sk_reset_idempotent_on_fresh_slab() {
 #[test]
 fn sk_device_key_matches_arc_as_ptr() {
     let _test_lock = test_serialize();
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
     let key_expected = Arc::as_ptr(&device) as usize;
     let slab = StaticSlabAllocator::new(device, 1 * 1024 * 1024);
     assert_eq!(slab.device_key(), key_expected);

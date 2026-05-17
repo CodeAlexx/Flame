@@ -348,7 +348,10 @@ impl Conv2d {
                 ) {
                     Ok(output) => return Ok(output),
                     Err(e) => {
-                        log::warn!("cuDNN conv2d failed, falling back to custom kernel: {:?}", e);
+                        log::warn!(
+                            "cuDNN conv2d failed, falling back to custom kernel: {:?}",
+                            e
+                        );
                     }
                 }
             }

@@ -34,26 +34,26 @@ fn gate_residual_contig_matches_strided_on_shared_mod_narrow() {
         .unwrap();
 
     let mod_data = hash_fill(&[b, mod_dim * dim]);
-    let shared_mod = Tensor::from_vec(mod_data, Shape::from_dims(&[b, mod_dim * dim]), device.clone())
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+    let shared_mod = Tensor::from_vec(
+        mod_data,
+        Shape::from_dims(&[b, mod_dim * dim]),
+        device.clone(),
+    )
+    .unwrap()
+    .to_dtype(DType::BF16)
+    .unwrap();
 
     let gate_strided = shared_mod.narrow(1, gate_idx * dim, dim).unwrap();
     assert_eq!(gate_strided.shape().dims(), &[b, dim]);
     assert!(!gate_strided.is_contiguous(), "gate-view should be strided");
 
-    let out_strided = flame_core::bf16_ops::gate_residual_fused_bf16(
-        &residual, &gate_strided, &x,
-    )
-    .unwrap();
+    let out_strided =
+        flame_core::bf16_ops::gate_residual_fused_bf16(&residual, &gate_strided, &x).unwrap();
 
     let gate_contig = gate_strided.contiguous().unwrap();
     assert!(gate_contig.is_contiguous());
-    let out_contig = flame_core::bf16_ops::gate_residual_fused_bf16(
-        &residual, &gate_contig, &x,
-    )
-    .unwrap();
+    let out_contig =
+        flame_core::bf16_ops::gate_residual_fused_bf16(&residual, &gate_contig, &x).unwrap();
 
     let va = out_strided.to_vec().unwrap();
     let vb = out_contig.to_vec().unwrap();
@@ -63,7 +63,9 @@ fn gate_residual_contig_matches_strided_on_shared_mod_narrow() {
             a.to_bits(),
             b.to_bits(),
             "gate_residual strided vs contig diverges at idx {}: strided={} contig={}",
-            i, a, b
+            i,
+            a,
+            b
         );
     }
 }
@@ -76,22 +78,34 @@ fn gate_residual_strided_math_check() {
     let device = global_cuda_device();
 
     let r_data = hash_fill(&[b, n, dim]);
-    let residual = Tensor::from_vec(r_data.clone(), Shape::from_dims(&[b, n, dim]), device.clone())
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+    let residual = Tensor::from_vec(
+        r_data.clone(),
+        Shape::from_dims(&[b, n, dim]),
+        device.clone(),
+    )
+    .unwrap()
+    .to_dtype(DType::BF16)
+    .unwrap();
 
     let x_data = hash_fill(&[b, n, dim]);
-    let x = Tensor::from_vec(x_data.clone(), Shape::from_dims(&[b, n, dim]), device.clone())
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+    let x = Tensor::from_vec(
+        x_data.clone(),
+        Shape::from_dims(&[b, n, dim]),
+        device.clone(),
+    )
+    .unwrap()
+    .to_dtype(DType::BF16)
+    .unwrap();
 
     let mod_data = hash_fill(&[b, mod_dim * dim]);
-    let shared_mod = Tensor::from_vec(mod_data.clone(), Shape::from_dims(&[b, mod_dim * dim]), device.clone())
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+    let shared_mod = Tensor::from_vec(
+        mod_data.clone(),
+        Shape::from_dims(&[b, mod_dim * dim]),
+        device.clone(),
+    )
+    .unwrap()
+    .to_dtype(DType::BF16)
+    .unwrap();
 
     let gate = shared_mod.narrow(1, gate_idx * dim, dim).unwrap();
     let out = flame_core::bf16_ops::gate_residual_fused_bf16(&residual, &gate, &x).unwrap();
@@ -110,7 +124,11 @@ fn gate_residual_strided_math_check() {
                 assert!(
                     diff < tol,
                     "gate_residual math mismatch at (b={},n={},d={}): got={} expected={}",
-                    bi, ni, di, got, expected
+                    bi,
+                    ni,
+                    di,
+                    got,
+                    expected
                 );
             }
         }

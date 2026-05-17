@@ -18,9 +18,8 @@ use std::sync::Arc;
 use std::thread;
 
 fn cuda_device() -> Arc<CudaDevice> {
-    CudaDevice::new(0).expect(
-        "CUDA GPU required. Set CUDA_HOME and LD_LIBRARY_PATH per project docs.",
-    )
+    CudaDevice::new(0)
+        .expect("CUDA GPU required. Set CUDA_HOME and LD_LIBRARY_PATH per project docs.")
 }
 
 /// Boundary: size=0. Goes through `pool_disabled() || size == 0` short-

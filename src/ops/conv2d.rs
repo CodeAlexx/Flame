@@ -732,9 +732,7 @@ pub fn conv2d_forward(
     // autograd is recording (cuDNN forward doesn't produce the intermediates
     // the im2col backward uses).
     #[cfg(feature = "cudnn")]
-    if input.dtype() == crate::DType::BF16
-        && !crate::autograd::AutogradContext::is_recording()
-    {
+    if input.dtype() == crate::DType::BF16 && !crate::autograd::AutogradContext::is_recording() {
         // cudnn_conv2d_bf16 reads raw BF16 pointers via as_device_ptr_bf16
         // which requires contiguous storage. Materialize strided views
         // once here so every conv call gets the winograd/implicit_gemm
@@ -750,7 +748,13 @@ pub fn conv2d_forward(
             None => None,
         };
         match crate::cudnn::conv2d::cudnn_conv2d_bf16(
-            &i, &w, b_ref, stride, padding, (1, 1), groups,
+            &i,
+            &w,
+            b_ref,
+            stride,
+            padding,
+            (1, 1),
+            groups,
         ) {
             Ok(out) => return Ok(out),
             Err(e) => {
@@ -846,8 +850,7 @@ pub fn conv2d_forward(
     if needs_grad {
         output.requires_grad = true;
         if crate::autograd::AutogradContext::is_recording() {
-            let mut saved =
-                vec![(input.id, input.alias()), (weight.id, weight.alias())];
+            let mut saved = vec![(input.id, input.alias()), (weight.id, weight.alias())];
             if let Some(b) = bias {
                 saved.push((b.id, b.alias()));
             }

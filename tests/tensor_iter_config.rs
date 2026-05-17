@@ -29,7 +29,6 @@ use smallvec::{smallvec, SmallVec};
 
 type I64StrideVec = SmallVec<[i64; 6]>;
 
-
 // ---------- 1. Broadcast shape ----------
 
 #[test]
@@ -42,12 +41,23 @@ fn broadcast_shape_left_align_41x3_and_2x3() {
     let b_shape = [2usize, 3];
     let b_strides = [3usize, 1];
     let ops = [
-        OperandView { shape: &a_shape, element_strides: &a_strides, elem_size: 2 },
-        OperandView { shape: &b_shape, element_strides: &b_strides, elem_size: 2 },
+        OperandView {
+            shape: &a_shape,
+            element_strides: &a_strides,
+            elem_size: 2,
+        },
+        OperandView {
+            shape: &b_shape,
+            element_strides: &b_strides,
+            elem_size: 2,
+        },
     ];
     let (shape, all_same) = compute_shape(&ops).unwrap();
     assert_eq!(shape.as_slice(), &[4, 2, 3]);
-    assert!(!all_same, "operands differ in shape, compute_shape must set all_ops_same_shape=false");
+    assert!(
+        !all_same,
+        "operands differ in shape, compute_shape must set all_ops_same_shape=false"
+    );
 }
 
 #[test]
@@ -59,8 +69,16 @@ fn broadcast_shape_rejects_mismatched_nonone_dim() {
     let a_strides = [3usize, 1];
     let b_strides = [2usize, 1];
     let ops = [
-        OperandView { shape: &a_shape, element_strides: &a_strides, elem_size: 2 },
-        OperandView { shape: &b_shape, element_strides: &b_strides, elem_size: 2 },
+        OperandView {
+            shape: &a_shape,
+            element_strides: &a_strides,
+            elem_size: 2,
+        },
+        OperandView {
+            shape: &b_shape,
+            element_strides: &b_strides,
+            elem_size: 2,
+        },
     ];
     match compute_shape(&ops) {
         Err(Error::BroadcastIncompatible { .. }) => {}
@@ -81,8 +99,16 @@ fn compute_strides_stride_zero_on_broadcast_dim() {
     let b_shape = [2usize, 3];
     let b_strides = [3usize, 1];
     let ops = [
-        OperandView { shape: &a_shape, element_strides: &a_strides, elem_size: 2 },
-        OperandView { shape: &b_shape, element_strides: &b_strides, elem_size: 2 },
+        OperandView {
+            shape: &a_shape,
+            element_strides: &a_strides,
+            elem_size: 2,
+        },
+        OperandView {
+            shape: &b_shape,
+            element_strides: &b_strides,
+            elem_size: 2,
+        },
     ];
     let bcast = [4usize, 2, 3];
     let s = compute_strides(&bcast, &ops);
@@ -106,7 +132,11 @@ fn reorder_contig_perm_matches_pytorch_reverse() {
     let mut strides: Vec<I64StrideVec> = vec![smallvec![24i64, 8i64, 2i64]];
     let perm = reorder_dimensions(&mut shape, &mut strides);
 
-    assert_eq!(perm.as_slice(), &[2, 1, 0], "PyTorch reverses C-contig perm");
+    assert_eq!(
+        perm.as_slice(),
+        &[2, 1, 0],
+        "PyTorch reverses C-contig perm"
+    );
     // Apply: new_shape[i] = old_shape[perm[i]] → [4, 3, 2]; strides [2, 8, 24].
     assert_eq!(shape.as_slice(), &[4, 3, 2]);
     assert_eq!(strides[0].as_slice(), &[2, 8, 24]);
@@ -208,7 +238,7 @@ fn coalesce_blocked_by_stride_zero_broadcast() {
     // coalesce must preserve ndim > 1.
     let mut shape: SmallVec<[usize; 6]> = smallvec![3usize, 2, 4];
     let mut strides: Vec<I64StrideVec> = vec![
-        smallvec![2i64, 0i64, 6i64], // op0 with broadcast middle
+        smallvec![2i64, 0i64, 6i64],  // op0 with broadcast middle
         smallvec![2i64, 6i64, 12i64], // op1 plain (shape[0]*stride[0]=6=stride[1]; shape[1]*stride[1]=12=stride[2])
     ];
     let _ = coalesce_dimensions(&mut shape, &mut strides);
@@ -341,8 +371,16 @@ fn is_contiguous_true_on_row_major_bf16_input() {
     let x_strides = x.strides();
     let elem = DType::BF16.size_in_bytes();
     let operands = [
-        OperandView { shape: y_store.shape().dims(), element_strides: y_strides.as_slice(), elem_size: elem },
-        OperandView { shape: x.shape().dims(), element_strides: x_strides.as_slice(), elem_size: elem },
+        OperandView {
+            shape: y_store.shape().dims(),
+            element_strides: y_strides.as_slice(),
+            elem_size: elem,
+        },
+        OperandView {
+            shape: x.shape().dims(),
+            element_strides: x_strides.as_slice(),
+            elem_size: elem,
+        },
     ];
     let (shape, flat) = run_geometry_pipeline(&operands);
     let elem_sizes = [elem, elem];
@@ -388,8 +426,16 @@ fn is_contiguous_false_on_permuted_as_strided_view() {
     let view_strides = view.strides();
     let elem = DType::BF16.size_in_bytes();
     let operands = [
-        OperandView { shape: y_store.shape().dims(), element_strides: y_strides.as_slice(), elem_size: elem },
-        OperandView { shape: view.shape().dims(), element_strides: view_strides.as_slice(), elem_size: elem },
+        OperandView {
+            shape: y_store.shape().dims(),
+            element_strides: y_strides.as_slice(),
+            elem_size: elem,
+        },
+        OperandView {
+            shape: view.shape().dims(),
+            element_strides: view_strides.as_slice(),
+            elem_size: elem,
+        },
     ];
     let (shape, flat) = run_geometry_pipeline(&operands);
     let elem_sizes = [elem, elem];

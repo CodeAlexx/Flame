@@ -77,7 +77,6 @@ pub fn normal_bf16(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
     if device
         .get_func("normal_bf16_kernel", "normal_bf16_kernel")

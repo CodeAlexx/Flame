@@ -141,10 +141,7 @@ impl SavedTensor {
     /// True iff `release_variables()` / `reset()` has been called and
     /// the data slot is empty.
     pub fn is_released(&self) -> bool {
-        self.data
-            .lock()
-            .map(|g| g.is_none())
-            .unwrap_or(true)
+        self.data.lock().map(|g| g.is_none()).unwrap_or(true)
     }
 
     /// Test-only: bump the underlying saved version counter directly,
@@ -160,8 +157,7 @@ impl SavedTensor {
     /// genuinely shared (e.g. via a view created by `narrow()`).
     #[doc(hidden)]
     pub fn _test_bump_saved_version(&self) {
-        self.saved_version
-            .fetch_add(1, Ordering::Relaxed);
+        self.saved_version.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -171,10 +167,7 @@ impl std::fmt::Debug for SavedTensor {
             .field("id", &self.id)
             .field("op_name", &self.op_name)
             .field("expected_version", &self.expected_version)
-            .field(
-                "live_version",
-                &self.saved_version.load(Ordering::Relaxed),
-            )
+            .field("live_version", &self.saved_version.load(Ordering::Relaxed))
             .field("released", &self.is_released())
             .finish()
     }

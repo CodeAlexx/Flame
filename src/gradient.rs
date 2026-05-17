@@ -31,7 +31,10 @@ impl CompactIndex {
             id_to_idx.entry(id).or_insert(next);
         }
         let capacity = id_to_idx.len();
-        Self { id_to_idx, capacity }
+        Self {
+            id_to_idx,
+            capacity,
+        }
     }
 
     #[inline]
@@ -150,12 +153,7 @@ impl GradientMap {
     /// under `MatchInsertedDtype`). Permitted under both policies; the
     /// `InternalFP32_PublicBF16` policy converts the seed to F32
     /// internally on insert so behavior is unchanged for v3 callers.
-    pub fn set_ones_dtype(
-        &mut self,
-        id: TensorId,
-        shape: Shape,
-        dtype: DType,
-    ) -> Result<()> {
+    pub fn set_ones_dtype(&mut self, id: TensorId, shape: Shape, dtype: DType) -> Result<()> {
         let ones = Tensor::ones_dtype(shape, dtype, self.device.clone())?;
         match self.policy {
             GradStorePolicy::InternalFP32_PublicBF16 => {
@@ -199,15 +197,11 @@ impl GradientMap {
 
     pub fn iter_fp32(&self) -> Result<impl Iterator<Item = (TensorId, &Tensor)> + '_> {
         // Chain Vec entries (with their original TensorId) and overflow entries
-        let vec_iter = self
-            .index
-            .as_ref()
-            .into_iter()
-            .flat_map(|idx| {
-                idx.id_to_idx.iter().filter_map(|(tid, &i)| {
-                    self.vec_store[i].as_ref().map(|t| (*tid, t))
-                })
-            });
+        let vec_iter = self.index.as_ref().into_iter().flat_map(|idx| {
+            idx.id_to_idx
+                .iter()
+                .filter_map(|(tid, &i)| self.vec_store[i].as_ref().map(|t| (*tid, t)))
+        });
         let overflow_iter = self.overflow.iter().map(|(tid, t)| (*tid, t));
         Ok(vec_iter.chain(overflow_iter))
     }
@@ -342,12 +336,16 @@ impl GradientMap {
         if let Some(idx) = self.resolve(id) {
             match &mut self.vec_store[idx] {
                 Some(existing) => add_to_existing(existing, grad)?,
-                slot @ None => { *slot = Some(grad); }
+                slot @ None => {
+                    *slot = Some(grad);
+                }
             }
         } else {
             match self.overflow.get_mut(&id) {
                 Some(existing) => add_to_existing(existing, grad)?,
-                None => { self.overflow.insert(id, grad); }
+                None => {
+                    self.overflow.insert(id, grad);
+                }
             }
         }
         Ok(())
@@ -375,12 +373,16 @@ impl GradientMap {
         if let Some(idx) = self.resolve(id) {
             match &mut self.vec_store[idx] {
                 Some(existing) => add_to_existing(existing, grad)?,
-                slot @ None => { *slot = Some(grad); }
+                slot @ None => {
+                    *slot = Some(grad);
+                }
             }
         } else {
             match self.overflow.get_mut(&id) {
                 Some(existing) => add_to_existing(existing, grad)?,
-                None => { self.overflow.insert(id, grad); }
+                None => {
+                    self.overflow.insert(id, grad);
+                }
             }
         }
         Ok(())
@@ -415,17 +417,17 @@ impl GradientMap {
                 let zeros = Tensor::zeros_dtype(shape, alloc_dtype, self.device.clone())?;
                 self.vec_store[idx] = Some(zeros);
             }
-            self.vec_store[idx]
-                .as_mut()
-                .ok_or_else(|| crate::Error::InvalidOperation("gradient missing after insert".into()))
+            self.vec_store[idx].as_mut().ok_or_else(|| {
+                crate::Error::InvalidOperation("gradient missing after insert".into())
+            })
         } else {
             if !self.overflow.contains_key(&id) {
                 let zeros = Tensor::zeros_dtype(shape, alloc_dtype, self.device.clone())?;
                 self.overflow.insert(id, zeros);
             }
-            self.overflow
-                .get_mut(&id)
-                .ok_or_else(|| crate::Error::InvalidOperation("gradient missing after insert".into()))
+            self.overflow.get_mut(&id).ok_or_else(|| {
+                crate::Error::InvalidOperation("gradient missing after insert".into())
+            })
         }
     }
 
@@ -506,15 +508,11 @@ impl GradientMap {
 
     /// Iterate over gradients
     pub fn iter(&self) -> impl Iterator<Item = (TensorId, &Tensor)> + '_ {
-        let vec_iter = self
-            .index
-            .as_ref()
-            .into_iter()
-            .flat_map(|idx| {
-                idx.id_to_idx.iter().filter_map(|(tid, &i)| {
-                    self.vec_store[i].as_ref().map(|t| (*tid, t))
-                })
-            });
+        let vec_iter = self.index.as_ref().into_iter().flat_map(|idx| {
+            idx.id_to_idx
+                .iter()
+                .filter_map(|(tid, &i)| self.vec_store[i].as_ref().map(|t| (*tid, t)))
+        });
         let overflow_iter = self.overflow.iter().map(|(tid, t)| (*tid, t));
         vec_iter.chain(overflow_iter)
     }

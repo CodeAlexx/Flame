@@ -36,16 +36,25 @@ fn bench_stream_causal(name: &str, dims: &[usize], chunk: usize) -> Result<()> {
     let v = rand_bf16(dims, 3)?;
 
     for _ in 0..5 {
-        let _ = black_box(cuda_ops_bf16::sdpa_stream_bf16(&q, &k, &v, None, chunk, true, None)?);
+        let _ = black_box(cuda_ops_bf16::sdpa_stream_bf16(
+            &q, &k, &v, None, chunk, true, None,
+        )?);
     }
-    dev.synchronize().map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
     let t0 = Instant::now();
     for _ in 0..ITERS {
-        let _ = black_box(cuda_ops_bf16::sdpa_stream_bf16(&q, &k, &v, None, chunk, true, None)?);
+        let _ = black_box(cuda_ops_bf16::sdpa_stream_bf16(
+            &q, &k, &v, None, chunk, true, None,
+        )?);
     }
-    dev.synchronize().map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
     let per_ms = t0.elapsed().as_secs_f64() * 1e3 / ITERS as f64;
-    println!("  STREAM(chunk={}, causal=true)  {:<14} dims={:?} → {:>9.3} ms/iter", chunk, name, dims, per_ms);
+    println!(
+        "  STREAM(chunk={}, causal=true)  {:<14} dims={:?} → {:>9.3} ms/iter",
+        chunk, name, dims, per_ms
+    );
     Ok(())
 }
 
@@ -58,14 +67,19 @@ fn bench_attention_impl_causal(name: &str, dims: &[usize]) -> Result<()> {
     for _ in 0..5 {
         let _ = black_box(attention::attention_impl(&q, &k, &v, None, true, None)?);
     }
-    dev.synchronize().map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
     let t0 = Instant::now();
     for _ in 0..ITERS {
         let _ = black_box(attention::attention_impl(&q, &k, &v, None, true, None)?);
     }
-    dev.synchronize().map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
     let per_ms = t0.elapsed().as_secs_f64() * 1e3 / ITERS as f64;
-    println!("  ATTENTION_IMPL(causal=true)    {:<14} dims={:?} → {:>9.3} ms/iter", name, dims, per_ms);
+    println!(
+        "  ATTENTION_IMPL(causal=true)    {:<14} dims={:?} → {:>9.3} ms/iter",
+        name, dims, per_ms
+    );
     Ok(())
 }
 

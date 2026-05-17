@@ -17,8 +17,7 @@
 
 use flame_core::{
     tensor_iterator::ops::comparison::{
-        eq_bf16_iter, ge_bf16_iter, gt_bf16_iter,
-        le_bf16_iter, lt_bf16_iter, ne_bf16_iter,
+        eq_bf16_iter, ge_bf16_iter, gt_bf16_iter, le_bf16_iter, lt_bf16_iter, ne_bf16_iter,
     },
     DType, Result, Shape, Tensor,
 };
@@ -37,7 +36,9 @@ fn make_bf16_tensor(dev: Arc<CudaDevice>, dims: &[usize], seed: u64) -> Result<T
     let mut data = Vec::with_capacity(n);
     let mut s = seed;
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 40) as u32 as f32 / (1u32 << 24) as f32;
         data.push((u - 0.5) * 8.0);
     }
@@ -53,7 +54,9 @@ fn make_bf16_tensor_collide(dev: Arc<CudaDevice>, dims: &[usize], seed: u64) -> 
     let mut data = Vec::with_capacity(n);
     let mut s = seed;
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // 8 discrete values: {-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0}
         let k = ((s >> 40) & 0x7) as u32;
         data.push(-1.5f32 + k as f32 * 0.5);
@@ -79,8 +82,11 @@ fn assert_bit_eq_f32(got: &[f32], expected: &[f32], tag: &str) {
         if g.to_bits() != e.to_bits() {
             fails += 1;
             if fails < 5 {
-                eprintln!("{tag}: idx {i}: got {g} ({:#010x}) expected {e} ({:#010x})",
-                         g.to_bits(), e.to_bits());
+                eprintln!(
+                    "{tag}: idx {i}: got {g} ({:#010x}) expected {e} ({:#010x})",
+                    g.to_bits(),
+                    e.to_bits()
+                );
             }
         }
     }
@@ -153,8 +159,10 @@ fn cmp_iter_eq_contig_bit_exact() -> Result<()> {
     let got = eq_bf16_iter(&a, &b)?.to_vec_f32()?;
     // Sanity: at least some matches so we're really testing.
     let num_true = expected.iter().filter(|&&v| v == 1.0).count();
-    assert!(num_true > 100,
-        "eq test fixture should produce >100 matches, got {num_true}");
+    assert!(
+        num_true > 100,
+        "eq test fixture should produce >100 matches, got {num_true}"
+    );
     assert_bit_eq_f32(&got, &expected, "eq contig");
     Ok(())
 }
@@ -215,7 +223,11 @@ fn cmp_iter_broadcast_ge() -> Result<()> {
             }
         }
     }
-    assert_bit_eq_f32(&got.to_vec_f32()?, &expected, "ge broadcast [4,3,1] vs [1,3,2]");
+    assert_bit_eq_f32(
+        &got.to_vec_f32()?,
+        &expected,
+        "ge broadcast [4,3,1] vs [1,3,2]",
+    );
     Ok(())
 }
 
@@ -264,8 +276,7 @@ fn cmp_iter_nan_edge_values() -> Result<()> {
     let b_data = vec![nan, one, nan, one, nan, nan];
     let a = Tensor::from_vec(a_data.clone(), Shape::from_dims(&[6]), dev.clone())?
         .to_dtype(DType::BF16)?;
-    let b = Tensor::from_vec(b_data.clone(), Shape::from_dims(&[6]), dev)?
-        .to_dtype(DType::BF16)?;
+    let b = Tensor::from_vec(b_data.clone(), Shape::from_dims(&[6]), dev)?.to_dtype(DType::BF16)?;
 
     // Readback & verify NaNs survived the BF16 round-trip; if not, the rest
     // of the test isn't meaningful.

@@ -26,8 +26,8 @@ pub fn zeros_bf16(shape: Shape, device: Arc<CudaDevice>) -> Result<Tensor> {
             );
         }
     }
-    let mut buf =
-        unsafe { device.alloc::<u16>(n) }.map_err(|e| Error::Cuda(format!("alloc bf16: {:?}", e)))?;
+    let mut buf = unsafe { device.alloc::<u16>(n) }
+        .map_err(|e| Error::Cuda(format!("alloc bf16: {:?}", e)))?;
     device.memset_zeros(&mut buf)?;
     Ok(Tensor {
         storage: TensorStorage::BF16 {
@@ -42,7 +42,6 @@ pub fn zeros_bf16(shape: Shape, device: Arc<CudaDevice>) -> Result<Tensor> {
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     })
 }
 
@@ -105,7 +104,6 @@ pub fn uniform_bf16(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
     // Compile once and launch

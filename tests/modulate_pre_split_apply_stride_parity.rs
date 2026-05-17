@@ -31,25 +31,30 @@ fn modulate_pre_split_apply_contig_matches_strided_permute_view() {
     // permute (1,2) → [B, mod_dim, dim] with strides (mod_dim*dim, 1, mod_dim).
     // Then contig_reference = mod_strided.contiguous().
     let packed_data = hash_fill(&[b, dim, mod_dim]);
-    let packed = Tensor::from_vec(packed_data, Shape::from_dims(&[b, dim, mod_dim]), device.clone())
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+    let packed = Tensor::from_vec(
+        packed_data,
+        Shape::from_dims(&[b, dim, mod_dim]),
+        device.clone(),
+    )
+    .unwrap()
+    .to_dtype(DType::BF16)
+    .unwrap();
     let mod_strided = packed.transpose_dims(1, 2).unwrap();
     assert_eq!(mod_strided.shape().dims(), &[b, mod_dim, dim]);
-    assert!(!mod_strided.is_contiguous(), "permute view should not be contig");
+    assert!(
+        !mod_strided.is_contiguous(),
+        "permute view should not be contig"
+    );
 
-    let out_strided = flame_core::bf16_ops::modulate_pre_split_apply_bf16(
-        &x, &mod_strided, shift_idx, 1e-5,
-    )
-    .unwrap();
+    let out_strided =
+        flame_core::bf16_ops::modulate_pre_split_apply_bf16(&x, &mod_strided, shift_idx, 1e-5)
+            .unwrap();
 
     let mod_contig = mod_strided.contiguous().unwrap();
     assert!(mod_contig.is_contiguous());
-    let out_contig = flame_core::bf16_ops::modulate_pre_split_apply_bf16(
-        &x, &mod_contig, shift_idx, 1e-5,
-    )
-    .unwrap();
+    let out_contig =
+        flame_core::bf16_ops::modulate_pre_split_apply_bf16(&x, &mod_contig, shift_idx, 1e-5)
+            .unwrap();
 
     let va = out_strided.to_vec().unwrap();
     let vb = out_contig.to_vec().unwrap();
@@ -59,7 +64,9 @@ fn modulate_pre_split_apply_contig_matches_strided_permute_view() {
             a.to_bits(),
             b.to_bits(),
             "split_apply strided vs contig diverges at idx {}: strided={} contig={}",
-            i, a, b
+            i,
+            a,
+            b
         );
     }
 }
@@ -73,20 +80,29 @@ fn modulate_pre_split_apply_strided_math_on_klein_like_shape() {
     let device = global_cuda_device();
 
     let x_data = hash_fill(&[b, n, dim]);
-    let x = Tensor::from_vec(x_data.clone(), Shape::from_dims(&[b, n, dim]), device.clone())
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+    let x = Tensor::from_vec(
+        x_data.clone(),
+        Shape::from_dims(&[b, n, dim]),
+        device.clone(),
+    )
+    .unwrap()
+    .to_dtype(DType::BF16)
+    .unwrap();
 
     // Permute view modulation.
     let packed_data = hash_fill(&[b, dim, mod_dim]);
-    let packed = Tensor::from_vec(packed_data.clone(), Shape::from_dims(&[b, dim, mod_dim]), device.clone())
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+    let packed = Tensor::from_vec(
+        packed_data.clone(),
+        Shape::from_dims(&[b, dim, mod_dim]),
+        device.clone(),
+    )
+    .unwrap()
+    .to_dtype(DType::BF16)
+    .unwrap();
     let mod_view = packed.transpose_dims(1, 2).unwrap();
 
-    let out = flame_core::bf16_ops::modulate_pre_split_apply_bf16(&x, &mod_view, shift_idx, eps).unwrap();
+    let out =
+        flame_core::bf16_ops::modulate_pre_split_apply_bf16(&x, &mod_view, shift_idx, eps).unwrap();
     let out_vec = out.to_vec().unwrap();
 
     // Reference: for each (b, n), LN over dim then (1+sc)*normed + sh.
@@ -104,7 +120,8 @@ fn modulate_pre_split_apply_strided_math_on_klein_like_shape() {
                 // mod_view[bi, shift_idx, d]     == packed[bi, d, shift_idx]
                 // mod_view[bi, shift_idx + 1, d] == packed[bi, d, shift_idx + 1]
                 let sh = bf16_roundtrip(packed_data[bi * dim * mod_dim + d * mod_dim + shift_idx]);
-                let sc = bf16_roundtrip(packed_data[bi * dim * mod_dim + d * mod_dim + shift_idx + 1]);
+                let sc =
+                    bf16_roundtrip(packed_data[bi * dim * mod_dim + d * mod_dim + shift_idx + 1]);
                 let expected = (1.0 + sc) * (x_row[d] - mean) * inv_std + sh;
                 let got = out_vec[bi * n * dim + ni * dim + d];
                 let tol = 0.02 * expected.abs().max(1.0);
@@ -112,7 +129,13 @@ fn modulate_pre_split_apply_strided_math_on_klein_like_shape() {
                 assert!(
                     diff < tol,
                     "split_apply math mismatch at (b={},n={},d={}): got={} expected={} sh={} sc={}",
-                    bi, ni, d, got, expected, sh, sc
+                    bi,
+                    ni,
+                    d,
+                    got,
+                    expected,
+                    sh,
+                    sc
                 );
             }
         }

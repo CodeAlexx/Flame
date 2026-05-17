@@ -167,8 +167,18 @@ fn adam_fused_step_bumps_versions() {
     let v_v0 = v.storage_version();
 
     adam_fused_step(
-        &mut param, &grad, &mut m, &mut v, 1e-3, 0.9, 0.999, 1e-8, 0.0, 1.0 - 0.9_f32.powi(1),
-        1.0 - 0.999_f32.powi(1), None,
+        &mut param,
+        &grad,
+        &mut m,
+        &mut v,
+        1e-3,
+        0.9,
+        0.999,
+        1e-8,
+        0.0,
+        1.0 - 0.9_f32.powi(1),
+        1.0 - 0.999_f32.powi(1),
+        None,
     )
     .expect("adam_fused_step");
 
@@ -198,7 +208,16 @@ fn adam_fused_step_f32_bumps_versions() {
     let v_v0 = v.storage_version();
 
     adam_fused_step_f32(
-        &mut param, &grad, &mut m, &mut v, 1e-3, 0.9, 0.999, 1e-8, 0.0, 1.0 - 0.9_f32.powi(1),
+        &mut param,
+        &grad,
+        &mut m,
+        &mut v,
+        1e-3,
+        0.9,
+        0.999,
+        1e-8,
+        0.0,
+        1.0 - 0.9_f32.powi(1),
         1.0 - 0.999_f32.powi(1),
     )
     .expect("adam_fused_step_f32");
@@ -265,7 +284,10 @@ fn sgd_step_inplace_bumps_version_f32() {
     let v0 = param.storage_version();
     step_inplace(&mut param, &grad, 0.01).expect("sgd::step_inplace");
     let v1 = param.storage_version();
-    assert!(v1 > v0, "sgd::step_inplace (F32) did not bump version: v0={v0}, v1={v1}");
+    assert!(
+        v1 > v0,
+        "sgd::step_inplace (F32) did not bump version: v0={v0}, v1={v1}"
+    );
 }
 
 #[test]
@@ -276,7 +298,10 @@ fn sgd_step_inplace_bumps_version_bf16() {
     let v0 = param.storage_version();
     step_inplace(&mut param, &grad, 0.01).expect("sgd::step_inplace");
     let v1 = param.storage_version();
-    assert!(v1 > v0, "sgd::step_inplace (BF16) did not bump version: v0={v0}, v1={v1}");
+    assert!(
+        v1 > v0,
+        "sgd::step_inplace (BF16) did not bump version: v0={v0}, v1={v1}"
+    );
 }
 
 #[test]
@@ -285,7 +310,10 @@ fn rng_rand_fill_bumps_version_f32() {
     let v0 = t.storage_version();
     flame_core::rng::rand_fill_(&mut t, 42).expect("rng::rand_fill_");
     let v1 = t.storage_version();
-    assert!(v1 > v0, "rng::rand_fill_ (F32) did not bump version: v0={v0}, v1={v1}");
+    assert!(
+        v1 > v0,
+        "rng::rand_fill_ (F32) did not bump version: v0={v0}, v1={v1}"
+    );
 }
 
 #[test]
@@ -294,5 +322,8 @@ fn rng_rand_fill_bumps_version_bf16() {
     let v0 = t.storage_version();
     flame_core::rng::rand_fill_(&mut t, 42).expect("rng::rand_fill_");
     let v1 = t.storage_version();
-    assert!(v1 > v0, "rng::rand_fill_ (BF16) did not bump version: v0={v0}, v1={v1}");
+    assert!(
+        v1 > v0,
+        "rng::rand_fill_ (BF16) did not bump version: v0={v0}, v1={v1}"
+    );
 }

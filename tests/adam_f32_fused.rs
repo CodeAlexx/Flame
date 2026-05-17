@@ -85,7 +85,14 @@ impl Xor32 {
     }
 }
 
-fn run_case(n: usize, steps: usize, lr: f32, wd: f32, init_seed: u32, grad_seed: u32) -> Result<()> {
+fn run_case(
+    n: usize,
+    steps: usize,
+    lr: f32,
+    wd: f32,
+    init_seed: u32,
+    grad_seed: u32,
+) -> Result<()> {
     let device = global_cuda_device();
     let shape = Shape::from_dims(&[n]);
 
@@ -96,7 +103,8 @@ fn run_case(n: usize, steps: usize, lr: f32, wd: f32, init_seed: u32, grad_seed:
     let grads: Vec<Vec<f32>> = (0..steps).map(|_| rng_grad.vec(n, 0.01)).collect();
 
     // Fused F32 path
-    let tensor = Tensor::from_vec(init.clone(), shape.clone(), device.clone())?.requires_grad_(true);
+    let tensor =
+        Tensor::from_vec(init.clone(), shape.clone(), device.clone())?.requires_grad_(true);
     let param = Parameter::new(tensor);
     let mut opt = AdamW::new(lr, 0.9, 0.999, 1e-8, wd);
     for g in &grads {

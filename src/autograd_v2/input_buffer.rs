@@ -104,8 +104,7 @@ impl InputBuffer {
             });
         }
 
-        let existing_shape_ok =
-            self.buffer[slot].as_ref().unwrap().shape() == grad.shape();
+        let existing_shape_ok = self.buffer[slot].as_ref().unwrap().shape() == grad.shape();
         if !existing_shape_ok {
             // Shapes differ — out-of-place add is the only correct
             // behavior; the underlying op may broadcast.

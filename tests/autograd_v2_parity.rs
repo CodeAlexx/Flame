@@ -45,9 +45,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use flame_core::autograd_v2::{
-    new_meta_ref, AutogradMetaV2, DispatchCtx, Engine, GraphRoot,
-};
+use flame_core::autograd_v2::{new_meta_ref, AutogradMetaV2, DispatchCtx, Engine, GraphRoot};
 use flame_core::parity::{ParityHarness, ParityTolerance};
 use flame_core::serialization::{load_tensors, SerializationFormat};
 use flame_core::{global_cuda_device, DType, Device, Tensor};
@@ -126,7 +124,9 @@ fn load_fixture(name: &str) -> std::collections::HashMap<String, Tensor> {
 /// `requires_grad` meta.
 fn run_backward(out: Tensor, grad_output: Tensor, ctx: &DispatchCtx) {
     let root = GraphRoot::new(vec![out]).with_grad_outputs(vec![Some(grad_output)]);
-    Engine::new().execute(root, ctx).expect("backward engine execute");
+    Engine::new()
+        .execute(root, ctx)
+        .expect("backward engine execute");
 }
 
 /// Take a fixture tensor and ensure it's the dtype the op expects.
@@ -362,58 +362,92 @@ fn with_tangent(primal: &Tensor, tangent: &Tensor) -> Tensor {
 #[test]
 fn add_jvp_matches_pytorch() {
     let f = load_fixture("add_jvp.safetensors");
-    let a = with_tangent(&cast_to(&f["input_0"], DType::F32), &cast_to(&f["tangent_0"], DType::F32));
-    let b = with_tangent(&cast_to(&f["input_1"], DType::F32), &cast_to(&f["tangent_1"], DType::F32));
+    let a = with_tangent(
+        &cast_to(&f["input_0"], DType::F32),
+        &cast_to(&f["tangent_0"], DType::F32),
+    );
+    let b = with_tangent(
+        &cast_to(&f["input_1"], DType::F32),
+        &cast_to(&f["tangent_1"], DType::F32),
+    );
     let ctx = default_ctx();
     let out = flame_core::autograd_v2::ops::add::add_v2(&a, &b, &ctx).unwrap();
     let mut h = harness("add_jvp.safetensors", tol_f32_tight());
-    let _ = h.compare("out_fw", &out.fw_grad().expect("out_fw")).unwrap();
+    let _ = h
+        .compare("out_fw", &out.fw_grad().expect("out_fw"))
+        .unwrap();
     h.assert_clean();
 }
 
 #[test]
 fn mul_jvp_matches_pytorch() {
     let f = load_fixture("mul_jvp.safetensors");
-    let a = with_tangent(&cast_to(&f["input_0"], DType::F32), &cast_to(&f["tangent_0"], DType::F32));
-    let b = with_tangent(&cast_to(&f["input_1"], DType::F32), &cast_to(&f["tangent_1"], DType::F32));
+    let a = with_tangent(
+        &cast_to(&f["input_0"], DType::F32),
+        &cast_to(&f["tangent_0"], DType::F32),
+    );
+    let b = with_tangent(
+        &cast_to(&f["input_1"], DType::F32),
+        &cast_to(&f["tangent_1"], DType::F32),
+    );
     let ctx = default_ctx();
     let out = flame_core::autograd_v2::ops::mul::mul_v2(&a, &b, &ctx).unwrap();
     let mut h = harness("mul_jvp.safetensors", tol_f32_tight());
-    let _ = h.compare("out_fw", &out.fw_grad().expect("out_fw")).unwrap();
+    let _ = h
+        .compare("out_fw", &out.fw_grad().expect("out_fw"))
+        .unwrap();
     h.assert_clean();
 }
 
 #[test]
 fn sum_jvp_matches_pytorch() {
     let f = load_fixture("sum_jvp.safetensors");
-    let a = with_tangent(&cast_to(&f["input_0"], DType::F32), &cast_to(&f["tangent_0"], DType::F32));
+    let a = with_tangent(
+        &cast_to(&f["input_0"], DType::F32),
+        &cast_to(&f["tangent_0"], DType::F32),
+    );
     let ctx = default_ctx();
     let out = flame_core::autograd_v2::ops::sum::sum_v2(&a, &ctx).unwrap();
     let mut h = harness("sum_jvp.safetensors", tol_f32_loose());
-    let _ = h.compare("out_fw", &out.fw_grad().expect("out_fw")).unwrap();
+    let _ = h
+        .compare("out_fw", &out.fw_grad().expect("out_fw"))
+        .unwrap();
     h.assert_clean();
 }
 
 #[test]
 fn matmul_jvp_matches_pytorch() {
     let f = load_fixture("matmul_jvp.safetensors");
-    let a = with_tangent(&cast_to(&f["input_0"], DType::F32), &cast_to(&f["tangent_0"], DType::F32));
-    let b = with_tangent(&cast_to(&f["input_1"], DType::F32), &cast_to(&f["tangent_1"], DType::F32));
+    let a = with_tangent(
+        &cast_to(&f["input_0"], DType::F32),
+        &cast_to(&f["tangent_0"], DType::F32),
+    );
+    let b = with_tangent(
+        &cast_to(&f["input_1"], DType::F32),
+        &cast_to(&f["tangent_1"], DType::F32),
+    );
     let ctx = default_ctx();
     let out = flame_core::autograd_v2::ops::matmul::matmul_v2(&a, &b, &ctx).unwrap();
     let mut h = harness("matmul_jvp.safetensors", tol_f32_loose());
-    let _ = h.compare("out_fw", &out.fw_grad().expect("out_fw")).unwrap();
+    let _ = h
+        .compare("out_fw", &out.fw_grad().expect("out_fw"))
+        .unwrap();
     h.assert_clean();
 }
 
 #[test]
 fn silu_jvp_matches_pytorch() {
     let f = load_fixture("silu_jvp.safetensors");
-    let a = with_tangent(&cast_to(&f["input_0"], DType::F32), &cast_to(&f["tangent_0"], DType::F32));
+    let a = with_tangent(
+        &cast_to(&f["input_0"], DType::F32),
+        &cast_to(&f["tangent_0"], DType::F32),
+    );
     let ctx = default_ctx();
     let out = flame_core::autograd_v2::ops::silu::silu_v2(&a, &ctx).unwrap();
     let mut h = harness("silu_jvp.safetensors", tol_f32_loose());
-    let _ = h.compare("out_fw", &out.fw_grad().expect("out_fw")).unwrap();
+    let _ = h
+        .compare("out_fw", &out.fw_grad().expect("out_fw"))
+        .unwrap();
     h.assert_clean();
 }
 
@@ -444,87 +478,124 @@ fn layer_norm_jvp_matches_pytorch() {
     )
     .unwrap();
     let mut h = harness("layer_norm_jvp.safetensors", tol_bf16_ln());
-    let _ = h.compare("out_fw", &out.fw_grad().expect("out_fw")).unwrap();
+    let _ = h
+        .compare("out_fw", &out.fw_grad().expect("out_fw"))
+        .unwrap();
     h.assert_clean();
 }
 
 #[test]
 fn reshape_jvp_matches_pytorch() {
     let f = load_fixture("reshape_jvp.safetensors");
-    let a = with_tangent(&cast_to(&f["input_0"], DType::F32), &cast_to(&f["tangent_0"], DType::F32));
+    let a = with_tangent(
+        &cast_to(&f["input_0"], DType::F32),
+        &cast_to(&f["tangent_0"], DType::F32),
+    );
     let new_shape: Vec<usize> = f["out_fw"].shape().dims().to_vec();
     let ctx = default_ctx();
     let out = flame_core::autograd_v2::ops::reshape::reshape_v2(&a, &new_shape, &ctx).unwrap();
     let mut h = harness("reshape_jvp.safetensors", tol_f32_tight());
-    let _ = h.compare("out_fw", &out.fw_grad().expect("out_fw")).unwrap();
+    let _ = h
+        .compare("out_fw", &out.fw_grad().expect("out_fw"))
+        .unwrap();
     h.assert_clean();
 }
 
 #[test]
 fn view_jvp_matches_pytorch() {
     let f = load_fixture("view_jvp.safetensors");
-    let a = with_tangent(&cast_to(&f["input_0"], DType::F32), &cast_to(&f["tangent_0"], DType::F32));
+    let a = with_tangent(
+        &cast_to(&f["input_0"], DType::F32),
+        &cast_to(&f["tangent_0"], DType::F32),
+    );
     let new_shape: Vec<usize> = f["out_fw"].shape().dims().to_vec();
     let ctx = default_ctx();
     let out = flame_core::autograd_v2::ops::reshape::view_v2(&a, &new_shape, &ctx).unwrap();
     let mut h = harness("view_jvp.safetensors", tol_f32_tight());
-    let _ = h.compare("out_fw", &out.fw_grad().expect("out_fw")).unwrap();
+    let _ = h
+        .compare("out_fw", &out.fw_grad().expect("out_fw"))
+        .unwrap();
     h.assert_clean();
 }
 
 #[test]
 fn transpose_jvp_matches_pytorch() {
     let f = load_fixture("transpose_jvp.safetensors");
-    let a = with_tangent(&cast_to(&f["input_0"], DType::F32), &cast_to(&f["tangent_0"], DType::F32));
+    let a = with_tangent(
+        &cast_to(&f["input_0"], DType::F32),
+        &cast_to(&f["tangent_0"], DType::F32),
+    );
     let ctx = default_ctx();
     let out = flame_core::autograd_v2::ops::transpose::transpose_v2(&a, &ctx).unwrap();
     let mut h = harness("transpose_jvp.safetensors", tol_f32_tight());
-    let _ = h.compare("out_fw", &out.fw_grad().expect("out_fw")).unwrap();
+    let _ = h
+        .compare("out_fw", &out.fw_grad().expect("out_fw"))
+        .unwrap();
     h.assert_clean();
 }
 
 #[test]
 fn narrow_jvp_matches_pytorch() {
     let f = load_fixture("narrow_jvp.safetensors");
-    let a = with_tangent(&cast_to(&f["input_0"], DType::F32), &cast_to(&f["tangent_0"], DType::F32));
+    let a = with_tangent(
+        &cast_to(&f["input_0"], DType::F32),
+        &cast_to(&f["tangent_0"], DType::F32),
+    );
     let ctx = default_ctx();
     let out = flame_core::autograd_v2::ops::narrow::narrow_v2(&a, 1, 2, 5, &ctx).unwrap();
     let mut h = harness("narrow_jvp.safetensors", tol_f32_tight());
-    let _ = h.compare("out_fw", &out.fw_grad().expect("out_fw")).unwrap();
+    let _ = h
+        .compare("out_fw", &out.fw_grad().expect("out_fw"))
+        .unwrap();
     h.assert_clean();
 }
 
 #[test]
 fn squeeze_jvp_matches_pytorch() {
     let f = load_fixture("squeeze_jvp.safetensors");
-    let a = with_tangent(&cast_to(&f["input_0"], DType::F32), &cast_to(&f["tangent_0"], DType::F32));
+    let a = with_tangent(
+        &cast_to(&f["input_0"], DType::F32),
+        &cast_to(&f["tangent_0"], DType::F32),
+    );
     let ctx = default_ctx();
     let out = flame_core::autograd_v2::ops::squeeze::squeeze_v2(&a, 1, &ctx).unwrap();
     let mut h = harness("squeeze_jvp.safetensors", tol_f32_tight());
-    let _ = h.compare("out_fw", &out.fw_grad().expect("out_fw")).unwrap();
+    let _ = h
+        .compare("out_fw", &out.fw_grad().expect("out_fw"))
+        .unwrap();
     h.assert_clean();
 }
 
 #[test]
 fn unsqueeze_jvp_matches_pytorch() {
     let f = load_fixture("unsqueeze_jvp.safetensors");
-    let a = with_tangent(&cast_to(&f["input_0"], DType::F32), &cast_to(&f["tangent_0"], DType::F32));
+    let a = with_tangent(
+        &cast_to(&f["input_0"], DType::F32),
+        &cast_to(&f["tangent_0"], DType::F32),
+    );
     let ctx = default_ctx();
     let out = flame_core::autograd_v2::ops::unsqueeze::unsqueeze_v2(&a, 1, &ctx).unwrap();
     let mut h = harness("unsqueeze_jvp.safetensors", tol_f32_tight());
-    let _ = h.compare("out_fw", &out.fw_grad().expect("out_fw")).unwrap();
+    let _ = h
+        .compare("out_fw", &out.fw_grad().expect("out_fw"))
+        .unwrap();
     h.assert_clean();
 }
 
 #[test]
 fn permute_jvp_matches_pytorch() {
     let f = load_fixture("permute_jvp.safetensors");
-    let a = with_tangent(&cast_to(&f["input_0"], DType::F32), &cast_to(&f["tangent_0"], DType::F32));
+    let a = with_tangent(
+        &cast_to(&f["input_0"], DType::F32),
+        &cast_to(&f["tangent_0"], DType::F32),
+    );
     let ctx = default_ctx();
     let perm = [2usize, 0, 1];
     let out = flame_core::autograd_v2::ops::permute::permute_v2(&a, &perm, &ctx).unwrap();
     let mut h = harness("permute_jvp.safetensors", tol_f32_tight());
-    let _ = h.compare("out_fw", &out.fw_grad().expect("out_fw")).unwrap();
+    let _ = h
+        .compare("out_fw", &out.fw_grad().expect("out_fw"))
+        .unwrap();
     h.assert_clean();
 }
 

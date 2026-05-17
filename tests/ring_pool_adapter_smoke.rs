@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
 use flame_core::cuda_alloc_pool::{
-    clear_pool_cache, global_pool, install_miss_allocator, pool_alloc_u16,
-    pool_return_u16, uninstall_miss_allocator,
+    clear_pool_cache, global_pool, install_miss_allocator, pool_alloc_u16, pool_return_u16,
+    uninstall_miss_allocator,
 };
 use flame_core::ring_alloc::{RingAllocator, RingPoolAdapter};
 
@@ -35,7 +35,9 @@ fn skip_if_no_cuda() -> Option<Arc<CudaDevice>> {
 
 #[test]
 fn install_and_alloc_routes_through_ring() {
-    let Some(device) = skip_if_no_cuda() else { return };
+    let Some(device) = skip_if_no_cuda() else {
+        return;
+    };
 
     // 8 slabs × 4 MiB = 32 MiB ring — plenty for a single 1 MiB alloc
     let ring = RingAllocator::new(device.clone(), 8, 4 * 1024 * 1024).unwrap();
@@ -83,7 +85,11 @@ fn install_and_alloc_routes_through_ring() {
     let slabs_mid = adapter.slabs_allocated();
     let cudamalloc_mid = adapter.cuda_malloc_count();
     let slice2 = pool_alloc_u16(&device, elems).expect("pool_alloc_u16 post-reset");
-    assert_eq!(adapter.slabs_allocated(), slabs_mid, "no new slab after reset");
+    assert_eq!(
+        adapter.slabs_allocated(),
+        slabs_mid,
+        "no new slab after reset"
+    );
     assert_eq!(
         adapter.cuda_malloc_count(),
         cudamalloc_mid,
@@ -99,7 +105,9 @@ fn install_and_alloc_routes_through_ring() {
 
 #[test]
 fn fallback_when_no_allocator_installed() {
-    let Some(device) = skip_if_no_cuda() else { return };
+    let Some(device) = skip_if_no_cuda() else {
+        return;
+    };
 
     // Ensure no allocator is installed at test start.
     let _ = uninstall_miss_allocator();
@@ -136,7 +144,9 @@ fn alloc_f32_falls_back_to_device_alloc() {
     // This test verifies the f32 miss path: external_miss_count does NOT
     // bump (the ring is not used), a subsequent direct-drop does NOT
     // panic (the slice came from `device.alloc` and `cudaFree` is valid).
-    let Some(device) = skip_if_no_cuda() else { return };
+    let Some(device) = skip_if_no_cuda() else {
+        return;
+    };
 
     let ring = RingAllocator::new(device.clone(), 4, 4 * 1024 * 1024).unwrap();
     let adapter = Arc::new(RingPoolAdapter::new(ring));
@@ -146,8 +156,7 @@ fn alloc_f32_falls_back_to_device_alloc() {
     let pool = global_pool();
     let ext_before = pool.external_miss_count();
 
-    let slice = flame_core::cuda_alloc_pool::pool_alloc_f32(&device, 1024)
-        .expect("pool_alloc_f32");
+    let slice = flame_core::cuda_alloc_pool::pool_alloc_f32(&device, 1024).expect("pool_alloc_f32");
     assert_eq!(cudarc::driver::DeviceSlice::len(&slice), 1024);
 
     // f32 path does NOT route through the ring (adapter returns Err).

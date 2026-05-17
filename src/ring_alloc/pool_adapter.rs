@@ -115,7 +115,9 @@ impl RingPoolAdapter {
     /// Wrap a freshly-constructed `RingAllocator` so it can be installed
     /// as the pool's cache-miss backend.
     pub fn new(ring: RingAllocator) -> Self {
-        Self { ring: Mutex::new(ring) }
+        Self {
+            ring: Mutex::new(ring),
+        }
     }
 
     /// Reset the wrapped ring's cursors. Slabs stay mapped. Call after
@@ -157,19 +159,16 @@ impl RingPoolAdapter {
 }
 
 impl PoolMissAllocator for RingPoolAdapter {
-    fn alloc_u16(
-        &self,
-        _device: &Arc<CudaDevice>,
-        bucket_elems: usize,
-    ) -> Result<CudaSlice<u16>> {
+    fn alloc_u16(&self, _device: &Arc<CudaDevice>, bucket_elems: usize) -> Result<CudaSlice<u16>> {
         let bytes = bucket_elems
             .checked_mul(std::mem::size_of::<u16>())
-            .ok_or_else(|| Error::InvalidInput(
-                "RingPoolAdapter::alloc_u16: bucket_elems * 2 overflows".into(),
-            ))?;
-        let mut ring = self.ring.lock().map_err(|_| {
-            Error::Cuda("RingPoolAdapter: ring mutex poisoned".into())
-        })?;
+            .ok_or_else(|| {
+                Error::InvalidInput("RingPoolAdapter::alloc_u16: bucket_elems * 2 overflows".into())
+            })?;
+        let mut ring = self
+            .ring
+            .lock()
+            .map_err(|_| Error::Cuda("RingPoolAdapter: ring mutex poisoned".into()))?;
         let RingPtr { device_ptr, .. } = ring.alloc_forward(bytes)?;
         let dev = ring.device().clone();
         // SAFETY: `device_ptr` points into a ring slab valid until the
@@ -179,11 +178,7 @@ impl PoolMissAllocator for RingPoolAdapter {
         Ok(slice)
     }
 
-    fn alloc_f32(
-        &self,
-        _device: &Arc<CudaDevice>,
-        _bucket_elems: usize,
-    ) -> Result<CudaSlice<f32>> {
+    fn alloc_f32(&self, _device: &Arc<CudaDevice>, _bucket_elems: usize) -> Result<CudaSlice<f32>> {
         // Phase 2a bug-fix (post-Builder): f32 routing DISABLED.
         //
         // The Builder's first commit (f82ab9b) attempted f32 routing through

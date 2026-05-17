@@ -40,15 +40,10 @@ fn pseudo_stream(seed: u64, n: usize) -> Vec<f32> {
 
 fn bf16_tensor(shape: &[usize], data: Vec<f32>) -> Tensor {
     let dev = global_cuda_device();
-    Tensor::from_vec_dtype(
-        data,
-        Shape::from_dims(shape),
-        dev.clone(),
-        DType::F32,
-    )
-    .expect("from_vec_dtype")
-    .to_dtype(DType::BF16)
-    .expect("to bf16")
+    Tensor::from_vec_dtype(data, Shape::from_dims(shape), dev.clone(), DType::F32)
+        .expect("from_vec_dtype")
+        .to_dtype(DType::BF16)
+        .expect("to bf16")
 }
 
 fn compare(tag: &str, a: &Tensor, b: &Tensor) {
@@ -99,14 +94,8 @@ fn compare(tag: &str, a: &Tensor, b: &Tensor) {
     );
 
     assert_eq!(nan_count, 0, "{tag}: NaN in output");
-    assert!(
-        cos_sim >= 0.9999,
-        "{tag}: cos_sim {cos_sim:.6} < 0.9999"
-    );
-    assert!(
-        mean_rel <= 5e-3,
-        "{tag}: mean_rel {mean_rel:.4e} > 5e-3"
-    );
+    assert!(cos_sim >= 0.9999, "{tag}: cos_sim {cos_sim:.6} < 0.9999");
+    assert!(mean_rel <= 5e-3, "{tag}: mean_rel {mean_rel:.4e} > 5e-3");
     assert!(
         max_abs_diff <= max_abs_ceiling,
         "{tag}: max_abs {max_abs_diff:.4e} > ref_max/16 ({max_abs_ceiling:.4e})"
@@ -118,7 +107,10 @@ fn compare(tag: &str, a: &Tensor, b: &Tensor) {
 fn run_native_parity(b: usize, n: usize, cin: usize, cout: usize, with_bias: bool) {
     println!("== native  B={b} N={n} Cin={cin} Cout={cout} bias={with_bias}");
 
-    let w_data = pseudo_stream(0xC0FFEE_u64.wrapping_add(cin as u64 * 131 + cout as u64), cout * cin);
+    let w_data = pseudo_stream(
+        0xC0FFEE_u64.wrapping_add(cin as u64 * 131 + cout as u64),
+        cout * cin,
+    );
     let weight = bf16_tensor(&[cout, cin], w_data); // PyTorch layout [Cout, Cin]
 
     let bias = if with_bias {
@@ -129,19 +121,15 @@ fn run_native_parity(b: usize, n: usize, cin: usize, cout: usize, with_bias: boo
     };
 
     let x_data = pseudo_stream(
-        0x1234_5678_u64
-            .wrapping_add(b as u64 * 1009 + n as u64 * 17 + cin as u64),
+        0x1234_5678_u64.wrapping_add(b as u64 * 1009 + n as u64 * 17 + cin as u64),
         b * n * cin,
     );
     let input_b = bf16_tensor(&[b, n, cin], x_data.clone());
 
     // --- single B>1 call (this used to return err 7) ---
-    let out_b = flame_core::ops::fused_inference::fused_linear3d_native(
-        &input_b,
-        &weight,
-        bias.as_ref(),
-    )
-    .expect("fused_linear3d_native B>1 must succeed");
+    let out_b =
+        flame_core::ops::fused_inference::fused_linear3d_native(&input_b, &weight, bias.as_ref())
+            .expect("fused_linear3d_native B>1 must succeed");
     assert_eq!(out_b.shape().dims(), &[b, n, cout]);
 
     // --- reference: split into B slices of [1, N, Cin], stitch results ---
@@ -151,12 +139,9 @@ fn run_native_parity(b: usize, n: usize, cin: usize, cout: usize, with_bias: boo
     for i in 0..b {
         let slice = x_data[i * slice_len..(i + 1) * slice_len].to_vec();
         let x_i = bf16_tensor(&[1, n, cin], slice);
-        let out_i = flame_core::ops::fused_inference::fused_linear3d_native(
-            &x_i,
-            &weight,
-            bias.as_ref(),
-        )
-        .expect("fused_linear3d_native B=1 slice");
+        let out_i =
+            flame_core::ops::fused_inference::fused_linear3d_native(&x_i, &weight, bias.as_ref())
+                .expect("fused_linear3d_native B=1 slice");
         let part = out_i.to_dtype(DType::F32).unwrap().to_vec().unwrap();
         ref_parts.extend_from_slice(&part);
     }
@@ -183,7 +168,10 @@ fn run_pretrans_parity(b: usize, n: usize, cin: usize, cout: usize, with_bias: b
     println!("== pretrans B={b} N={n} Cin={cin} Cout={cout} bias={with_bias}");
 
     // Pre-transposed weight: [Cin, Cout]
-    let w_data = pseudo_stream(0xFEEDBEEF_u64.wrapping_add(cin as u64 * 131 + cout as u64), cin * cout);
+    let w_data = pseudo_stream(
+        0xFEEDBEEF_u64.wrapping_add(cin as u64 * 131 + cout as u64),
+        cin * cout,
+    );
     let weight = bf16_tensor(&[cin, cout], w_data);
 
     let bias = if with_bias {
@@ -199,12 +187,8 @@ fn run_pretrans_parity(b: usize, n: usize, cin: usize, cout: usize, with_bias: b
     );
     let input_b = bf16_tensor(&[b, n, cin], x_data.clone());
 
-    let out_b = flame_core::ops::fused_inference::fused_linear3d(
-        &input_b,
-        &weight,
-        bias.as_ref(),
-    )
-    .expect("fused_linear3d B>1 must succeed");
+    let out_b = flame_core::ops::fused_inference::fused_linear3d(&input_b, &weight, bias.as_ref())
+        .expect("fused_linear3d B>1 must succeed");
     assert_eq!(out_b.shape().dims(), &[b, n, cout]);
 
     let dev = global_cuda_device();
@@ -213,12 +197,8 @@ fn run_pretrans_parity(b: usize, n: usize, cin: usize, cout: usize, with_bias: b
     for i in 0..b {
         let slice = x_data[i * slice_len..(i + 1) * slice_len].to_vec();
         let x_i = bf16_tensor(&[1, n, cin], slice);
-        let out_i = flame_core::ops::fused_inference::fused_linear3d(
-            &x_i,
-            &weight,
-            bias.as_ref(),
-        )
-        .expect("fused_linear3d B=1 slice");
+        let out_i = flame_core::ops::fused_inference::fused_linear3d(&x_i, &weight, bias.as_ref())
+            .expect("fused_linear3d B=1 slice");
         let part = out_i.to_dtype(DType::F32).unwrap().to_vec().unwrap();
         ref_parts.extend_from_slice(&part);
     }
@@ -301,16 +281,11 @@ fn ffi_b2_returns_zero() {
     let x = bf16_tensor(&[b, n, cin], pseudo_stream(0x11, b * n * cin));
     let w = bf16_tensor(&[cout, cin], pseudo_stream(0x22, cout * cin));
     let bias = bf16_tensor(&[cout], pseudo_stream(0x33, cout));
-    let out = Tensor::empty_dtype(
-        Shape::from_dims(&[b, n, cout]),
-        DType::BF16,
-        dev.clone(),
-    )
-    .unwrap();
+    let out =
+        Tensor::empty_dtype(Shape::from_dims(&[b, n, cout]), DType::BF16, dev.clone()).unwrap();
 
     let workspace_size: usize = 4 * 1024 * 1024;
-    let workspace: cudarc::driver::CudaSlice<u8> =
-        unsafe { dev.alloc(workspace_size).unwrap() };
+    let workspace: cudarc::driver::CudaSlice<u8> = unsafe { dev.alloc(workspace_size).unwrap() };
 
     let ret = unsafe {
         flame_core::cuda::ffi::flame_linear3d_bf16_native(

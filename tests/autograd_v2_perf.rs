@@ -191,18 +191,38 @@ fn build_synthetic_mlp() -> (Tensor, Vec<flame_core::TensorId>) {
     let shape = Shape::from_dims(&[2, 8]);
     let n = shape.elem_count();
 
-    let x = Tensor::from_vec_dtype(mk_bf16(101, n, 1.0), shape.clone(), device.clone(), DType::BF16)
-        .unwrap()
-        .requires_grad_(true);
-    let w1 = Tensor::from_vec_dtype(mk_bf16(103, n, 0.5), shape.clone(), device.clone(), DType::BF16)
-        .unwrap()
-        .requires_grad_(true);
-    let w2 = Tensor::from_vec_dtype(mk_bf16(107, n, 0.5), shape.clone(), device.clone(), DType::BF16)
-        .unwrap()
-        .requires_grad_(true);
-    let bias = Tensor::from_vec_dtype(mk_bf16(109, n, 0.1), shape.clone(), device.clone(), DType::BF16)
-        .unwrap()
-        .requires_grad_(true);
+    let x = Tensor::from_vec_dtype(
+        mk_bf16(101, n, 1.0),
+        shape.clone(),
+        device.clone(),
+        DType::BF16,
+    )
+    .unwrap()
+    .requires_grad_(true);
+    let w1 = Tensor::from_vec_dtype(
+        mk_bf16(103, n, 0.5),
+        shape.clone(),
+        device.clone(),
+        DType::BF16,
+    )
+    .unwrap()
+    .requires_grad_(true);
+    let w2 = Tensor::from_vec_dtype(
+        mk_bf16(107, n, 0.5),
+        shape.clone(),
+        device.clone(),
+        DType::BF16,
+    )
+    .unwrap()
+    .requires_grad_(true);
+    let bias = Tensor::from_vec_dtype(
+        mk_bf16(109, n, 0.1),
+        shape.clone(),
+        device.clone(),
+        DType::BF16,
+    )
+    .unwrap()
+    .requires_grad_(true);
 
     let leaves = vec![x.id(), w1.id(), w2.id(), bias.id()];
 
@@ -279,8 +299,8 @@ fn build_klein_attn_chain(fix: &HashMap<String, Tensor>) -> (Tensor, Vec<flame_c
     // Inline RoPE recording (matches scenario 6 in autograd_v2_klein_parity.rs).
     let rope = |x_in: &Tensor| -> Tensor {
         use flame_core::autograd::{AutogradContext, Op};
-        let mut o = flame_core::bf16_ops::rope_fused_bf16(x_in, &pe_cos, &pe_sin)
-            .expect("rope_fused_bf16");
+        let mut o =
+            flame_core::bf16_ops::rope_fused_bf16(x_in, &pe_cos, &pe_sin).expect("rope_fused_bf16");
         if x_in.requires_grad() {
             o = o.requires_grad_(true);
             if AutogradContext::is_recording() {
@@ -425,8 +445,7 @@ impl CellResult {
         if self.v3_grad_bytes == 0 {
             return 0.0;
         }
-        ((self.v3_grad_bytes as f64 - self.class_a_grad_bytes as f64)
-            / (self.v3_grad_bytes as f64))
+        ((self.v3_grad_bytes as f64 - self.class_a_grad_bytes as f64) / (self.v3_grad_bytes as f64))
             * 100.0
     }
 }
@@ -490,14 +509,14 @@ fn run_cell<F: FnMut() -> (Tensor, Vec<flame_core::TensorId>)>(
             let (loss, leaves) = build();
             let g = AutogradContext::backward_v2(&loss).expect("v2 backward_v2 (class A)");
             let mut total = 0usize;
-                // Wrap each leaf-id's grad into a Parameter::new_v2 and
-                // exercise set_grad. We don't have the original Tensor
-                // here (only ids), so we construct a small placeholder
-                // Parameter from the grad's shape/dtype for the
-                // set_grad call. The byte count comes from the
-                // Parameter's stored grad dtype, which under
-                // MatchParamDtype preserves whatever backward_v2
-                // emitted.
+            // Wrap each leaf-id's grad into a Parameter::new_v2 and
+            // exercise set_grad. We don't have the original Tensor
+            // here (only ids), so we construct a small placeholder
+            // Parameter from the grad's shape/dtype for the
+            // set_grad call. The byte count comes from the
+            // Parameter's stored grad dtype, which under
+            // MatchParamDtype preserves whatever backward_v2
+            // emitted.
             for id in &leaves {
                 if let Some(grad_ref) = g.get(*id) {
                     let grad_owned = grad_ref.clone();
@@ -511,15 +530,11 @@ fn run_cell<F: FnMut() -> (Tensor, Vec<flame_core::TensorId>)>(
                     let param = Parameter::new_v2(placeholder);
                     param.set_grad(grad_owned).expect("class A set_grad");
                     if let Some(stored) = param.grad() {
-                        total += stored.shape().elem_count()
-                            * stored.dtype().size_in_bytes();
+                        total += stored.shape().elem_count() * stored.dtype().size_in_bytes();
                     }
                     // Sanity: under MatchParamDtype the stored dtype
                     // is the inserted dtype (BF16 for BF16 graph).
-                    debug_assert_eq!(
-                        param.grad_dtype_policy(),
-                        GradDtypePolicy::MatchParamDtype
-                    );
+                    debug_assert_eq!(param.grad_dtype_policy(), GradDtypePolicy::MatchParamDtype);
                 }
             }
             last_class_a_bytes = total;
@@ -544,7 +559,9 @@ fn run_cell<F: FnMut() -> (Tensor, Vec<flame_core::TensorId>)>(
 fn print_summary(rows: &[CellResult]) {
     eprintln!();
     eprintln!("=================================================================================================");
-    eprintln!("Phase 5c — autograd_v2 perf bench results (median wall-clock per backward iteration)");
+    eprintln!(
+        "Phase 5c — autograd_v2 perf bench results (median wall-clock per backward iteration)"
+    );
     eprintln!("=================================================================================================");
     eprintln!();
     eprintln!("| Workload                  | v3 (ms)   | bridge (ms) | Class A (ms) | bridge Δ% | Class A Δ% |");
@@ -724,4 +741,3 @@ fn perf_klein_double_block() {
 //
 // The `## Verification` section of the Phase 5c commit body captures
 // the verbatim output of that command.
-

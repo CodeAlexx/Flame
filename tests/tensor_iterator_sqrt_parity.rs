@@ -5,7 +5,9 @@
 //! Sqrt uses f32 opmath inside the functor (__fsqrt_rn). The reference is
 //! computed on the host in f32 then rounded to BF16 (__float2bfloat16_rn).
 
-use flame_core::{tensor_iterator::ops::transcendentals::sqrt_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{
+    tensor_iterator::ops::transcendentals::sqrt_bf16_iter, DType, Result, Shape, Tensor,
+};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
@@ -57,7 +59,9 @@ fn make_bf16_positive_tensor(dev: Arc<CudaDevice>, dims: &[usize], seed: u64) ->
     let mut data = Vec::with_capacity(n);
     let mut s = seed;
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 40) as u32 as f32 / (1u32 << 24) as f32;
         // sqrt domain: [0, ~100)
         data.push(u * 100.0);
@@ -79,7 +83,10 @@ fn sqrt_iter_contig_cos_sim() -> Result<()> {
     let new_f32 = new_out.to_vec_f32()?;
 
     let cs = cos_sim_f32(&ref_f32, &new_f32);
-    assert!(cs >= 0.9999, "sqrt contig cos_sim {cs} below threshold 0.9999");
+    assert!(
+        cs >= 0.9999,
+        "sqrt contig cos_sim {cs} below threshold 0.9999"
+    );
     Ok(())
 }
 
@@ -100,7 +107,10 @@ fn sqrt_iter_permuted_view_cos_sim() -> Result<()> {
     let new_out = sqrt_bf16_iter(&permuted)?;
     let new_f32 = new_out.to_vec_f32()?;
     let cs = cos_sim_f32(&ref_f32, &new_f32);
-    assert!(cs >= 0.9999, "sqrt permuted view cos_sim {cs} below threshold 0.9999");
+    assert!(
+        cs >= 0.9999,
+        "sqrt permuted view cos_sim {cs} below threshold 0.9999"
+    );
     Ok(())
 }
 
@@ -121,7 +131,10 @@ fn sqrt_iter_narrow_view_cos_sim() -> Result<()> {
     let new_out = sqrt_bf16_iter(&narrow_view)?;
     let new_f32 = new_out.to_vec_f32()?;
     let cs = cos_sim_f32(&ref_f32, &new_f32);
-    assert!(cs >= 0.9999, "sqrt narrow view cos_sim {cs} below threshold 0.9999");
+    assert!(
+        cs >= 0.9999,
+        "sqrt narrow view cos_sim {cs} below threshold 0.9999"
+    );
     Ok(())
 }
 

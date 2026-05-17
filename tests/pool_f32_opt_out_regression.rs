@@ -19,15 +19,12 @@
 //!    preserved across the opt-out branch).
 
 use cudarc::driver::{CudaDevice, DevicePtr, DeviceSlice};
-use flame_core::cuda_alloc_pool::{
-    global_pool, pool_alloc_f32, pool_return_f32,
-};
+use flame_core::cuda_alloc_pool::{global_pool, pool_alloc_f32, pool_return_f32};
 use std::sync::Arc;
 
 fn cuda_device() -> Arc<CudaDevice> {
-    CudaDevice::new(0).expect(
-        "CUDA GPU required. Set CUDA_HOME and LD_LIBRARY_PATH per project docs.",
-    )
+    CudaDevice::new(0)
+        .expect("CUDA GPU required. Set CUDA_HOME and LD_LIBRARY_PATH per project docs.")
 }
 
 /// F32 alloc succeeds on the opt-out path (FLAME_F32_POOL_CACHE unset).
@@ -117,10 +114,7 @@ fn pool_return_f32_external_ptr_path_under_opt_out() {
     // done by ring_alloc::RingPoolAdapter; here we synthesize it.)
     pool.register_external_ptr(ptr);
     let refcount_before = pool.external_ptr_refcount(ptr);
-    assert_eq!(
-        refcount_before, 1,
-        "after register, refcount should be 1"
-    );
+    assert_eq!(refcount_before, 1, "after register, refcount should be 1");
     // Return through the opt-out path. The external-ptr branch should
     // unregister and skip cudaFree.
     pool_return_f32(s);

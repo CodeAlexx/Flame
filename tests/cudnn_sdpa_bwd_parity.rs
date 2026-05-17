@@ -29,7 +29,11 @@ fn ptr_bf16_mut(t: &Tensor, tag: &str) -> *mut core::ffi::c_void {
 /// Returns (O, dQ, dK, dV) as 4D BF16 tensors. Exposing the forward output
 /// lets callers isolate forward-vs-backward parity failures.
 fn reference_sdpa_forward_and_backward(
-    q: &Tensor, k: &Tensor, v: &Tensor, d_o: &Tensor, scale: f32,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    d_o: &Tensor,
+    scale: f32,
 ) -> (Tensor, Tensor, Tensor, Tensor) {
     let dims = q.shape().dims();
     let (b, h, n_q, d) = (dims[0], dims[1], dims[2], dims[3]);
@@ -39,10 +43,26 @@ fn reference_sdpa_forward_and_backward(
     // to_dtype(F32) on a permuted/reshaped BF16 view goes through a reshape
     // that may not be contiguous. Normalize via clone_result() first (which
     // materializes) then cast.
-    let q32 = q.to_dtype(DType::F32).unwrap().reshape(&[bh, n_q, d]).unwrap();
-    let k32 = k.to_dtype(DType::F32).unwrap().reshape(&[bh, n_kv, d]).unwrap();
-    let v32 = v.to_dtype(DType::F32).unwrap().reshape(&[bh, n_kv, d]).unwrap();
-    let do32 = d_o.to_dtype(DType::F32).unwrap().reshape(&[bh, n_q, d]).unwrap();
+    let q32 = q
+        .to_dtype(DType::F32)
+        .unwrap()
+        .reshape(&[bh, n_q, d])
+        .unwrap();
+    let k32 = k
+        .to_dtype(DType::F32)
+        .unwrap()
+        .reshape(&[bh, n_kv, d])
+        .unwrap();
+    let v32 = v
+        .to_dtype(DType::F32)
+        .unwrap()
+        .reshape(&[bh, n_kv, d])
+        .unwrap();
+    let do32 = d_o
+        .to_dtype(DType::F32)
+        .unwrap()
+        .reshape(&[bh, n_q, d])
+        .unwrap();
 
     // Forward recompute: S = Q@K^T * scale; P = softmax(S); O = P @ V.
     //
@@ -75,9 +95,7 @@ fn reference_sdpa_forward_and_backward(
     let dp = do32.bmm(&v_t).unwrap();
 
     // D[bh, i] = sum_d dO[bh, i, d] * O[bh, i, d]; keepdim to broadcast.
-    let d_row = do32
-        .mul(&o_ref).unwrap()
-        .sum_dim_keepdim(2).unwrap(); // [bh, n_q, 1]
+    let d_row = do32.mul(&o_ref).unwrap().sum_dim_keepdim(2).unwrap(); // [bh, n_q, 1]
 
     let dp_minus_d = dp.sub(&d_row).unwrap(); // broadcasts [bh,nq,nkv] - [bh,nq,1]
     let ds = attn.mul(&dp_minus_d).unwrap();
@@ -86,22 +104,39 @@ fn reference_sdpa_forward_and_backward(
     let ds_t = ds.transpose_dims(1, 2).unwrap().contiguous().unwrap();
     let dk3 = ds_t.bmm(&q32).unwrap().mul_scalar(scale).unwrap();
 
-    let o_bf16 = o_ref.reshape(&[b, h, n_q, d]).unwrap()
-        .to_dtype(DType::BF16).unwrap();
-    let dq = dq3.reshape(&[b, h, n_q, d]).unwrap()
-        .to_dtype(DType::BF16).unwrap();
-    let dk = dk3.reshape(&[b, h, n_kv, d]).unwrap()
-        .to_dtype(DType::BF16).unwrap();
-    let dv = dv3.reshape(&[b, h, n_kv, d]).unwrap()
-        .to_dtype(DType::BF16).unwrap();
+    let o_bf16 = o_ref
+        .reshape(&[b, h, n_q, d])
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+    let dq = dq3
+        .reshape(&[b, h, n_q, d])
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+    let dk = dk3
+        .reshape(&[b, h, n_kv, d])
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+    let dv = dv3
+        .reshape(&[b, h, n_kv, d])
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
     (o_bf16, dq, dk, dv)
 }
 
 fn compare_grads(name: &str, got: &Tensor, reference: &Tensor) {
-    let got_f32  = got.to_dtype(DType::F32).unwrap().to_vec().unwrap();
-    let ref_f32  = reference.to_dtype(DType::F32).unwrap().to_vec().unwrap();
-    assert_eq!(got_f32.len(), ref_f32.len(),
-        "{name}: length mismatch ({} vs {})", got_f32.len(), ref_f32.len());
+    let got_f32 = got.to_dtype(DType::F32).unwrap().to_vec().unwrap();
+    let ref_f32 = reference.to_dtype(DType::F32).unwrap().to_vec().unwrap();
+    assert_eq!(
+        got_f32.len(),
+        ref_f32.len(),
+        "{name}: length mismatch ({} vs {})",
+        got_f32.len(),
+        ref_f32.len()
+    );
 
     let mut dot = 0.0f64;
     let mut got_n2 = 0.0f64;
@@ -113,17 +148,24 @@ fn compare_grads(name: &str, got: &Tensor, reference: &Tensor) {
     let mut nans = 0usize;
     for (a, b) in got_f32.iter().zip(ref_f32.iter()) {
         let (a, b) = (*a as f64, *b as f64);
-        if a.is_nan() || b.is_nan() { nans += 1; continue; }
-        dot    += a * b;
+        if a.is_nan() || b.is_nan() {
+            nans += 1;
+            continue;
+        }
+        dot += a * b;
         got_n2 += a * a;
         ref_n2 += b * b;
         let ab_ref = b.abs();
-        if ab_ref > ref_abs_max { ref_abs_max = ab_ref; }
+        if ab_ref > ref_abs_max {
+            ref_abs_max = ab_ref;
+        }
         let diff = (a - b).abs();
         sum_abs_diff += diff;
-        sum_abs_ref  += ab_ref;
+        sum_abs_ref += ab_ref;
         let rel = diff / b.abs().max(ref_abs_max.max(1e-6) / 128.0);
-        if rel > max_rel { max_rel = rel; }
+        if rel > max_rel {
+            max_rel = rel;
+        }
     }
     let cos_sim = dot / (got_n2.sqrt() * ref_n2.sqrt() + 1e-20);
     let mean_rel = sum_abs_diff / sum_abs_ref.max(1e-20);
@@ -151,21 +193,26 @@ fn run_bwd_parity(b: usize, h: usize, n: usize, d: usize) {
     // an attention distribution sharp enough that gradients have real
     // magnitude (not buried in BF16 rounding noise).
     let q = Tensor::randn_seeded(shape4.clone(), 0.0, 1.0, 11, device.clone())
-        .unwrap().to_dtype(DType::BF16).unwrap();
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
     let k = Tensor::randn_seeded(shape4.clone(), 0.0, 1.0, 22, device.clone())
-        .unwrap().to_dtype(DType::BF16).unwrap();
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
     let v = Tensor::randn_seeded(shape4.clone(), 0.0, 1.0, 33, device.clone())
-        .unwrap().to_dtype(DType::BF16).unwrap();
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
     let d_o = Tensor::randn_seeded(shape4.clone(), 0.0, 1.0, 44, device.clone())
-        .unwrap().to_dtype(DType::BF16).unwrap();
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
 
     // ---- cuDNN forward-train → (O, Stats) ----
     let o = Tensor::zeros_dtype(shape4.clone(), DType::BF16, device.clone()).unwrap();
-    let stats = Tensor::zeros_dtype(
-        Shape::from_dims(&[b * h, n]),
-        DType::F32,
-        device.clone(),
-    ).unwrap();
+    let stats =
+        Tensor::zeros_dtype(Shape::from_dims(&[b * h, n]), DType::F32, device.clone()).unwrap();
 
     // Contiguous [B, H, N, D] strides: [H*N*D, N*D, D, 1].
     let strides4: [i64; 4] = [(h * n * d) as i64, (n * d) as i64, d as i64, 1];
@@ -183,11 +230,21 @@ fn run_bwd_parity(b: usize, h: usize, n: usize, d: usize) {
             ptr_bf16(&v, "v"),
             ptr_bf16_mut(&o, "o"),
             stats_ptr,
-            b as i32, h as i32, n as i32, n as i32, d as i32,
+            b as i32,
+            h as i32,
+            n as i32,
+            n as i32,
+            d as i32,
             scale,
-            strides4.as_ptr(), strides4.as_ptr(),
-            strides4.as_ptr(), strides4.as_ptr(),
-            0, 0, 0, 0, 0,
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
             stream,
         )
     };
@@ -215,13 +272,29 @@ fn run_bwd_parity(b: usize, h: usize, n: usize, d: usize) {
             ptr_bf16_mut(&dq, "dq"),
             ptr_bf16_mut(&dk, "dk"),
             ptr_bf16_mut(&dv, "dv"),
-            b as i32, h as i32, n as i32, n as i32, d as i32,
+            b as i32,
+            h as i32,
+            n as i32,
+            n as i32,
+            d as i32,
             scale,
-            strides4.as_ptr(), strides4.as_ptr(),
-            strides4.as_ptr(), strides4.as_ptr(),
             strides4.as_ptr(),
-            strides4.as_ptr(), strides4.as_ptr(), strides4.as_ptr(),
-            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             stream,
         )
     };
@@ -233,9 +306,7 @@ fn run_bwd_parity(b: usize, h: usize, n: usize, d: usize) {
     let (o_ref, dq_ref, dk_ref, dv_ref) =
         reference_sdpa_forward_and_backward(&q, &k, &v, &d_o, scale);
 
-    println!(
-        "[sdpa_bwd_parity] shape B={b} H={h} N={n} D={d} (seeds q=11 k=22 v=33 dO=44)"
-    );
+    println!("[sdpa_bwd_parity] shape B={b} H={h} N={n} D={d} (seeds q=11 k=22 v=33 dO=44)");
     // Forward parity first — if this fails the backward comparison is noise.
     compare_grads("O", &o, &o_ref);
     compare_grads("dQ", &dq, &dq_ref);
@@ -256,15 +327,22 @@ fn cudnn_sdpa_train_fwd_matches_inference_fwd() {
     let shape4 = Shape::from_dims(&[b, h, n, d]);
 
     let q = Tensor::randn_seeded(shape4.clone(), 0.0, 1.0, 11, device.clone())
-        .unwrap().to_dtype(DType::BF16).unwrap();
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
     let k = Tensor::randn_seeded(shape4.clone(), 0.0, 1.0, 22, device.clone())
-        .unwrap().to_dtype(DType::BF16).unwrap();
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
     let v = Tensor::randn_seeded(shape4.clone(), 0.0, 1.0, 33, device.clone())
-        .unwrap().to_dtype(DType::BF16).unwrap();
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
 
     let o_inf = Tensor::zeros_dtype(shape4.clone(), DType::BF16, device.clone()).unwrap();
-    let o_tr  = Tensor::zeros_dtype(shape4.clone(), DType::BF16, device.clone()).unwrap();
-    let stats = Tensor::zeros_dtype(Shape::from_dims(&[b * h, n]), DType::F32, device.clone()).unwrap();
+    let o_tr = Tensor::zeros_dtype(shape4.clone(), DType::BF16, device.clone()).unwrap();
+    let stats =
+        Tensor::zeros_dtype(Shape::from_dims(&[b * h, n]), DType::F32, device.clone()).unwrap();
     let strides4: [i64; 4] = [(h * n * d) as i64, (n * d) as i64, d as i64, 1];
 
     let stats_ptr = {
@@ -275,13 +353,24 @@ fn cudnn_sdpa_train_fwd_matches_inference_fwd() {
     // Inference fwd
     let ret = unsafe {
         flame_core::cuda::ffi::flame_cudnn_sdpa_bf16(
-            ptr_bf16(&q, "q"), ptr_bf16(&k, "k"), ptr_bf16(&v, "v"),
+            ptr_bf16(&q, "q"),
+            ptr_bf16(&k, "k"),
+            ptr_bf16(&v, "v"),
             ptr_bf16_mut(&o_inf, "o_inf"),
-            b as i32, h as i32, n as i32, n as i32, d as i32,
+            b as i32,
+            h as i32,
+            n as i32,
+            n as i32,
+            d as i32,
             scale,
-            strides4.as_ptr(), strides4.as_ptr(),
-            strides4.as_ptr(), strides4.as_ptr(),
-            0, 0, 0, 0,
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            0,
+            0,
+            0,
+            0,
             stream,
         )
     };
@@ -290,14 +379,26 @@ fn cudnn_sdpa_train_fwd_matches_inference_fwd() {
     // Train fwd
     let ret = unsafe {
         flame_core::cuda::ffi::flame_cudnn_sdpa_bf16_train_fwd(
-            ptr_bf16(&q, "q"), ptr_bf16(&k, "k"), ptr_bf16(&v, "v"),
+            ptr_bf16(&q, "q"),
+            ptr_bf16(&k, "k"),
+            ptr_bf16(&v, "v"),
             ptr_bf16_mut(&o_tr, "o_tr"),
             stats_ptr,
-            b as i32, h as i32, n as i32, n as i32, d as i32,
+            b as i32,
+            h as i32,
+            n as i32,
+            n as i32,
+            d as i32,
             scale,
-            strides4.as_ptr(), strides4.as_ptr(),
-            strides4.as_ptr(), strides4.as_ptr(),
-            0, 0, 0, 0, 0,
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            strides4.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
             stream,
         )
     };

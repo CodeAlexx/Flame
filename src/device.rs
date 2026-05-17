@@ -36,12 +36,13 @@ pub fn cuda_probe(tag: &str) -> i32 {
     let sync_code = unsafe { cudaDeviceSynchronize() };
     let last_code = unsafe { cudaGetLastError() };
     if sync_code != 0 || last_code != 0 {
-        eprintln!(
-            "[cuda_probe] {tag}: sync={} last={}",
-            sync_code, last_code
-        );
+        eprintln!("[cuda_probe] {tag}: sync={} last={}", sync_code, last_code);
     }
-    if sync_code != 0 { sync_code } else { last_code }
+    if sync_code != 0 {
+        sync_code
+    } else {
+        last_code
+    }
 }
 
 /// Trim the CUDA mempool: release cached (freed) GPU memory back to the driver.
@@ -87,7 +88,10 @@ fn configure_cuda_mempool(device_ordinal: i32) {
             &mut threshold as *mut u64 as *mut c_void,
         );
         if status != 0 {
-            log::warn!("Failed to set mempool release threshold (status={})", status);
+            log::warn!(
+                "Failed to set mempool release threshold (status={})",
+                status
+            );
         } else {
             log::info!("CUDA mempool: release threshold set to MAX (infinite caching)");
         }
@@ -151,7 +155,9 @@ impl Device {
 
     /// Synchronize the device
     pub fn synchronize(&self) -> Result<()> {
-        self.inner.synchronize().map_err(|e| Error::CudaDriver(format!("{e:?}")))
+        self.inner
+            .synchronize()
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))
     }
 
     /// Set random seed for the device

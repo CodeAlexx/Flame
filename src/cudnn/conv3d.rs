@@ -98,11 +98,19 @@ fn workspace_limit_bytes() -> usize {
         * 1024
 }
 
-fn output_dim(in_size: usize, pad: usize, dilation: usize, kernel: usize, stride: usize) -> Result<usize> {
+fn output_dim(
+    in_size: usize,
+    pad: usize,
+    dilation: usize,
+    kernel: usize,
+    stride: usize,
+) -> Result<usize> {
     let effective_kernel = dilation
         .checked_mul(kernel.saturating_sub(1))
         .and_then(|x| x.checked_add(1))
-        .ok_or_else(|| Error::InvalidShape("cudnn_conv3d_bf16: effective kernel overflow".into()))?;
+        .ok_or_else(|| {
+            Error::InvalidShape("cudnn_conv3d_bf16: effective kernel overflow".into())
+        })?;
 
     let padded = in_size
         .checked_add(pad.saturating_mul(2))
@@ -132,7 +140,12 @@ fn select_algo(
 ) -> Result<(c_int, usize, bool)> {
     let limit = workspace_limit_bytes();
 
-    if let Some(cached) = ALGO_CACHE.lock().map_err(|_| Error::CudaError("conv3d algo cache mutex poisoned".into()))?.get(key).copied() {
+    if let Some(cached) = ALGO_CACHE
+        .lock()
+        .map_err(|_| Error::CudaError("conv3d algo cache mutex poisoned".into()))?
+        .get(key)
+        .copied()
+    {
         if cached.1 <= limit {
             return Ok((cached.0, cached.1, true));
         }
@@ -245,17 +258,24 @@ pub fn cudnn_conv3d_bf16(
         )));
     }
     if groups == 0 {
-        return Err(Error::InvalidInput("cudnn_conv3d_bf16: groups must be >= 1".into()));
+        return Err(Error::InvalidInput(
+            "cudnn_conv3d_bf16: groups must be >= 1".into(),
+        ));
     }
     if stride.0 == 0 || stride.1 == 0 || stride.2 == 0 {
-        return Err(Error::InvalidInput("cudnn_conv3d_bf16: stride must be >= 1".into()));
+        return Err(Error::InvalidInput(
+            "cudnn_conv3d_bf16: stride must be >= 1".into(),
+        ));
     }
     if dilation.0 == 0 || dilation.1 == 0 || dilation.2 == 0 {
-        return Err(Error::InvalidInput("cudnn_conv3d_bf16: dilation must be >= 1".into()));
+        return Err(Error::InvalidInput(
+            "cudnn_conv3d_bf16: dilation must be >= 1".into(),
+        ));
     }
 
     let (n, c_in, d_in, h_in, w_in) = (x_dims[0], x_dims[1], x_dims[2], x_dims[3], x_dims[4]);
-    let (c_out, c_per_group, k_d, k_h, k_w) = (w_dims[0], w_dims[1], w_dims[2], w_dims[3], w_dims[4]);
+    let (c_out, c_per_group, k_d, k_h, k_w) =
+        (w_dims[0], w_dims[1], w_dims[2], w_dims[3], w_dims[4]);
 
     if c_in % groups != 0 {
         return Err(Error::InvalidShape(format!(
@@ -319,8 +339,20 @@ pub fn cudnn_conv3d_bf16(
 
     let key = AlgoKey {
         x_dims: [n as i32, c_in as i32, d_in as i32, h_in as i32, w_in as i32],
-        w_dims: [c_out as i32, c_per_group as i32, k_d as i32, k_h as i32, k_w as i32],
-        y_dims: [n as i32, c_out as i32, d_out as i32, h_out as i32, w_out as i32],
+        w_dims: [
+            c_out as i32,
+            c_per_group as i32,
+            k_d as i32,
+            k_h as i32,
+            k_w as i32,
+        ],
+        y_dims: [
+            n as i32,
+            c_out as i32,
+            d_out as i32,
+            h_out as i32,
+            w_out as i32,
+        ],
         pad: [padding.0 as i32, padding.1 as i32, padding.2 as i32],
         stride: [stride.0 as i32, stride.1 as i32, stride.2 as i32],
         dilation: [dilation.0 as i32, dilation.1 as i32, dilation.2 as i32],

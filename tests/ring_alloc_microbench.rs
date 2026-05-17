@@ -54,14 +54,12 @@ fn forward_only_sequence_advances_monotonically_and_aligns() {
     // 4 slabs × 256 KiB = 1 MiB total.
     let slab_bytes = 256 * 1024;
     let num_slabs = 4;
-    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes)
-        .expect("RingAllocator::new");
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes).expect("RingAllocator::new");
 
     // Mix of sizes — none of which is a multiple of 16 — to stress
     // ceil_16 alignment.
     let sizes: &[usize] = &[
-        1_000, 7_777, 31_111, 65_536, 100_000, 130_000,
-        17, 333, 4_096, 8_193, 50_000,
+        1_000, 7_777, 31_111, 65_536, 100_000, 130_000, 17, 333, 4_096, 8_193, 50_000,
     ];
 
     let mut last_global_end = 0_usize;
@@ -98,7 +96,11 @@ fn forward_only_sequence_advances_monotonically_and_aligns() {
 
     // Cursors moved.
     assert!(ring.allocation_end() > 0, "forward cursor advanced");
-    assert_eq!(ring.allocation_start(), ring.total_bytes(), "backward cursor untouched");
+    assert_eq!(
+        ring.allocation_start(),
+        ring.total_bytes(),
+        "backward cursor untouched"
+    );
 
     // Lazy allocation: cuda_malloc_count equals slabs_allocated and
     // matches the count of distinct slabs we landed on.
@@ -109,7 +111,11 @@ fn forward_only_sequence_advances_monotonically_and_aligns() {
         v.len()
     };
     assert_eq!(ring.slabs_allocated(), distinct_slabs, "lazy alloc count");
-    assert_eq!(ring.cuda_malloc_count(), distinct_slabs as u64, "cudaMalloc count matches slabs touched");
+    assert_eq!(
+        ring.cuda_malloc_count(),
+        distinct_slabs as u64,
+        "cudaMalloc count matches slabs touched"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -121,8 +127,7 @@ fn backward_only_sequence_retreats_monotonically_and_aligns() {
     let device = cuda_device();
     let slab_bytes = 256 * 1024;
     let num_slabs = 4;
-    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes)
-        .expect("RingAllocator::new");
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes).expect("RingAllocator::new");
 
     let sizes: &[usize] = &[
         1_000, 7_777, 31_111, 65_536, 100_000, 17, 4_096, 8_193, 50_000,
@@ -150,7 +155,10 @@ fn backward_only_sequence_retreats_monotonically_and_aligns() {
                         p.intra_offset + n <= prev_intra_top,
                         "backward: alloc overlaps previous in slab {} \
                          (new {}+{} > prev top {})",
-                        p.slab_idx, p.intra_offset, n, prev_intra_top,
+                        p.slab_idx,
+                        p.intra_offset,
+                        n,
+                        prev_intra_top,
                     );
                 } else {
                     // Crossed boundary to previous slab — new alloc's top
@@ -163,7 +171,10 @@ fn backward_only_sequence_retreats_monotonically_and_aligns() {
         }
     }
 
-    assert!(ring.allocation_start() < initial_start, "backward cursor advanced");
+    assert!(
+        ring.allocation_start() < initial_start,
+        "backward cursor advanced"
+    );
     assert_eq!(ring.allocation_end(), 0, "forward cursor untouched");
 
     let distinct_slabs: usize = {
@@ -186,8 +197,7 @@ fn bidirectional_alternating_preserves_invariant_and_errors_on_meet() {
     // Smaller ring to make it easy to fill: 2 slabs × 64 KiB = 128 KiB.
     let slab_bytes = 64 * 1024;
     let num_slabs = 2;
-    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes)
-        .expect("RingAllocator::new");
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes).expect("RingAllocator::new");
 
     // Alternate forward(n) / backward(n) until one of them errors
     // (ring exhausted). At every step, allocation_end ≤ allocation_start.
@@ -264,8 +274,7 @@ fn slab_boundary_stress_advances_slab_idx() {
     // a jump (40 + 40 > 64) and so on.
     let slab_bytes = 64 * 1024;
     let num_slabs = 5;
-    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes)
-        .expect("RingAllocator::new");
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes).expect("RingAllocator::new");
 
     let alloc_size = 40 * 1024;
 
@@ -349,8 +358,7 @@ fn klein_pattern_32_block_fwd_bwd_bidirectional_invariant() {
     // = 16 * 49_807_360 ≈ 760 MiB.
     let slab_bytes = 4 * bytes_per_tensor;
     let num_slabs = 16;
-    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes)
-        .expect("RingAllocator::new");
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes).expect("RingAllocator::new");
 
     let total_mb = (ring.total_bytes() as f64) / (1024.0 * 1024.0);
     println!(
@@ -365,7 +373,8 @@ fn klein_pattern_32_block_fwd_bwd_bidirectional_invariant() {
     {
         let mut h = ring.forward_handle(0);
         for block in 0..32_usize {
-            let p = h.alloc(bytes_per_tensor)
+            let p = h
+                .alloc(bytes_per_tensor)
                 .unwrap_or_else(|e| panic!("fwd alloc for block {block} failed: {e:?}"));
             assert_aligned_16(&p);
             fwd_ptrs.push(p);
@@ -394,7 +403,8 @@ fn klein_pattern_32_block_fwd_bwd_bidirectional_invariant() {
     {
         let mut h = ring.backward_handle(0);
         for block in 0..32_usize {
-            let p = h.alloc(bytes_per_tensor)
+            let p = h
+                .alloc(bytes_per_tensor)
                 .unwrap_or_else(|e| panic!("bwd alloc for block {block} failed: {e:?}"));
             assert_aligned_16(&p);
             bwd_ptrs.push(p);
@@ -428,7 +438,8 @@ fn klein_pattern_32_block_fwd_bwd_bidirectional_invariant() {
         assert!(
             global + fp.len_bytes <= end_after_fwd,
             "fwd ptr beyond forward cursor: global+len={} > end_after_fwd={}",
-            global + fp.len_bytes, end_after_fwd,
+            global + fp.len_bytes,
+            end_after_fwd,
         );
     }
     for bp in &bwd_ptrs {
@@ -436,7 +447,8 @@ fn klein_pattern_32_block_fwd_bwd_bidirectional_invariant() {
         assert!(
             global >= start_after_bwd,
             "bwd ptr below backward cursor: global={} < start_after_bwd={}",
-            global, start_after_bwd,
+            global,
+            start_after_bwd,
         );
     }
 
@@ -565,8 +577,7 @@ fn forward_wrap_with_backward_active_does_not_lap_silently() {
     let device = cuda_device();
     let slab_bytes = 1024;
     let num_slabs = 2;
-    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes)
-        .expect("new");
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes).expect("new");
 
     // Backward alloc 100 → cur=(_,_), special-case to (1, 1024). 1024 >=
     // 100 no jump. new_intra = floor_16(1024-100)=912. allocation_start =
@@ -608,8 +619,13 @@ fn forward_wrap_with_backward_active_does_not_lap_silently() {
         "forward wrap-with-backward-active that would silently overlap \
          a live forward allocation must error. Got Ok({:?}); p0 was at \
          (slab {}, intra {}, len {}); cursor before was end=1524, start=1936.",
-        lapping_result.as_ref().map(|p| (p.slab_idx, p.intra_offset, p.len_bytes)).ok(),
-        p0.slab_idx, p0.intra_offset, p0.len_bytes,
+        lapping_result
+            .as_ref()
+            .map(|p| (p.slab_idx, p.intra_offset, p.len_bytes))
+            .ok(),
+        p0.slab_idx,
+        p0.intra_offset,
+        p0.len_bytes,
     );
 }
 
@@ -630,8 +646,7 @@ fn backward_wrap_with_forward_active_does_not_lap_silently() {
     let device = cuda_device();
     let slab_bytes = 1024;
     let num_slabs = 2;
-    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes)
-        .expect("new");
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes).expect("new");
 
     // Forward alloc 100 → (0, 0), end=100. allocation_end=100.
     {
@@ -669,8 +684,13 @@ fn backward_wrap_with_forward_active_does_not_lap_silently() {
         "backward wrap-with-forward-active that would silently overlap \
          a live backward allocation must error. Got Ok({:?}); p_n was at \
          (slab {}, intra {}, len {}); cursor before was start=512, end=100.",
-        lapping_result.as_ref().map(|p| (p.slab_idx, p.intra_offset, p.len_bytes)).ok(),
-        p_n.slab_idx, p_n.intra_offset, p_n.len_bytes,
+        lapping_result
+            .as_ref()
+            .map(|p| (p.slab_idx, p.intra_offset, p.len_bytes))
+            .ok(),
+        p_n.slab_idx,
+        p_n.intra_offset,
+        p_n.len_bytes,
     );
 }
 
@@ -684,8 +704,7 @@ fn lazy_slab_alloc_from_backward_only() {
     let device = cuda_device();
     let slab_bytes = 1024;
     let num_slabs = 4;
-    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes)
-        .expect("new");
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes).expect("new");
 
     // No forward allocations at all.
     assert_eq!(ring.cuda_malloc_count(), 0);
@@ -708,7 +727,11 @@ fn lazy_slab_alloc_from_backward_only() {
         let mut hb = ring.backward_handle(0);
         hb.alloc(256).expect("backward first alloc")
     };
-    assert_eq!(p.slab_idx, num_slabs - 1, "first backward lands in last slab");
+    assert_eq!(
+        p.slab_idx,
+        num_slabs - 1,
+        "first backward lands in last slab"
+    );
     assert_eq!(ring.cuda_malloc_count(), 1, "cudaMalloc fired exactly once");
     assert_eq!(ring.slabs_allocated(), 1);
 
@@ -716,9 +739,14 @@ fn lazy_slab_alloc_from_backward_only() {
     let _ = {
         let mut hb = ring.backward_handle(0);
         // Fill rest of last slab to force jump.
-        hb.alloc(slab_bytes - 256).expect("bwd fills rest of last slab")
+        hb.alloc(slab_bytes - 256)
+            .expect("bwd fills rest of last slab")
     };
-    assert_eq!(ring.cuda_malloc_count(), 1, "still in last slab; no new malloc");
+    assert_eq!(
+        ring.cuda_malloc_count(),
+        1,
+        "still in last slab; no new malloc"
+    );
     let _ = {
         let mut hb = ring.backward_handle(0);
         hb.alloc(256).expect("bwd into previous slab")
@@ -745,7 +773,8 @@ fn alloc_size_boundary_at_slab_bytes_exact_and_off_by_one() {
     // Exactly slab_bytes — must fit.
     {
         let mut h = ring.forward_handle(0);
-        let p = h.alloc(slab_bytes)
+        let p = h
+            .alloc(slab_bytes)
             .expect("alloc of exactly slab_bytes must succeed (fills one slab)");
         assert_eq!(p.len_bytes, slab_bytes);
         assert_eq!(p.intra_offset, 0);
@@ -783,7 +812,11 @@ fn forward_handle_drop_is_noop_for_cursors() {
         // Drop here on scope exit.
     }
     assert_eq!(ring.allocation_end(), end_before, "drop must not move end");
-    assert_eq!(ring.allocation_start(), start_before, "drop must not move start");
+    assert_eq!(
+        ring.allocation_start(),
+        start_before,
+        "drop must not move start"
+    );
 
     // Same for backward.
     {
@@ -800,7 +833,11 @@ fn forward_handle_drop_is_noop_for_cursors() {
         let _p = h.alloc(256).expect("fwd alloc");
         post_alloc_end = h.allocation_end();
     }
-    assert_eq!(ring.allocation_end(), post_alloc_end, "alloc persists after handle drop");
+    assert_eq!(
+        ring.allocation_end(),
+        post_alloc_end,
+        "alloc persists after handle drop"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -830,8 +867,7 @@ fn forward_wrap_after_forward_then_backward_also_errors() {
     let device = cuda_device();
     let slab_bytes = 1024;
     let num_slabs = 2;
-    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes)
-        .expect("new");
+    let mut ring = RingAllocator::new(device, num_slabs, slab_bytes).expect("new");
 
     // Forward fills slab 0 partially.
     {
@@ -849,8 +885,10 @@ fn forward_wrap_after_forward_then_backward_also_errors() {
         let _ = hb.alloc(100).expect("backward after forward");
     }
     let start_before_wrap_attempt = ring.allocation_start();
-    assert!(start_before_wrap_attempt < ring.total_bytes(),
-        "backward must have moved cursor down");
+    assert!(
+        start_before_wrap_attempt < ring.total_bytes(),
+        "backward must have moved cursor down"
+    );
 
     // Forward attempts a 700-byte alloc that forces wrap.
     // Per Bug Fixer's invariant, this must error (allocation_start <
@@ -864,8 +902,12 @@ fn forward_wrap_after_forward_then_backward_also_errors() {
         "forward wrap with backward having previously fired must error \
          regardless of fwd-bwd interleaving order. Got Ok({:?}); \
          allocation_start={}, allocation_end={}",
-        result.as_ref().map(|p| (p.slab_idx, p.intra_offset, p.len_bytes)).ok(),
-        ring.allocation_start(), ring.allocation_end(),
+        result
+            .as_ref()
+            .map(|p| (p.slab_idx, p.intra_offset, p.len_bytes))
+            .ok(),
+        ring.allocation_start(),
+        ring.allocation_end(),
     );
 }
 
@@ -898,7 +940,7 @@ fn ot_parity_backward_sequence_byte_positions() {
         // (slab_idx, intra_offset, allocation_start AFTER alloc)
         (3, 816, 3888),
         (3, 512, 3584),
-        (2, 416, 2464),  // jumped
+        (2, 416, 2464), // jumped
         (2, 304, 2352),
     ];
     let sizes = [200, 300, 600, 100];
@@ -915,7 +957,8 @@ fn ot_parity_backward_sequence_byte_positions() {
             p.slab_idx, p.intra_offset
         );
         assert_eq!(
-            h.allocation_start(), exp_start,
+            h.allocation_start(),
+            exp_start,
             "step {i}: allocation_start mismatch — got {}, expected {exp_start}",
             h.allocation_start()
         );
@@ -953,10 +996,16 @@ fn reset_after_both_cursors_moved_restores_invariants() {
     // Reset.
     ring.reset();
     assert_eq!(ring.allocation_end(), 0, "reset puts fwd cursor at 0");
-    assert_eq!(ring.allocation_start(), ring.total_bytes(),
-        "reset puts bwd cursor at total_bytes");
-    assert_eq!(ring.cuda_malloc_count(), slab_count_before_reset,
-        "reset does not free or alloc slabs");
+    assert_eq!(
+        ring.allocation_start(),
+        ring.total_bytes(),
+        "reset puts bwd cursor at total_bytes"
+    );
+    assert_eq!(
+        ring.cuda_malloc_count(),
+        slab_count_before_reset,
+        "reset does not free or alloc slabs"
+    );
 
     // Step 2: invariants must hold cleanly again.
     {
@@ -965,21 +1014,26 @@ fn reset_after_both_cursors_moved_restores_invariants() {
         assert_aligned_16(&p);
         // Forward starts fresh at slab 0, intra 0 — confirms reset cleared
         // mid-state and didn't leave stale wrap-related state behind.
-        assert_eq!((p.slab_idx, p.intra_offset), (0, 0),
-            "step-2 fwd starts at fresh slab 0, intra 0");
+        assert_eq!(
+            (p.slab_idx, p.intra_offset),
+            (0, 0),
+            "step-2 fwd starts at fresh slab 0, intra 0"
+        );
     }
     {
         let mut hb = ring.backward_handle(0);
         let p = hb.alloc(500).expect("step-2 bwd alloc");
         assert_aligned_16(&p);
         // Backward starts fresh at top of last slab.
-        assert_eq!(p.slab_idx, num_slabs - 1,
-            "step-2 bwd starts at last slab");
+        assert_eq!(p.slab_idx, num_slabs - 1, "step-2 bwd starts at last slab");
     }
 
     // Step-2 cudaMalloc count unchanged (slabs already materialized).
-    assert_eq!(ring.cuda_malloc_count(), slab_count_before_reset,
-        "step-2 reuses existing slabs");
+    assert_eq!(
+        ring.cuda_malloc_count(),
+        slab_count_before_reset,
+        "step-2 reuses existing slabs"
+    );
 }
 
 /// The "forward-only wrap silently laps live forward" hazard is documented
@@ -1013,15 +1067,22 @@ fn forward_only_wrap_aliases_prior_forward_alloc_without_reset() {
     // Returns (slab 0, intra 0): EXACTLY p0's range.
     let wrap = {
         let mut hf = ring.forward_handle(2);
-        hf.alloc(512).expect("wrap-around succeeds in forward-only mode")
+        hf.alloc(512)
+            .expect("wrap-around succeeds in forward-only mode")
     };
-    assert_eq!(wrap.slab_idx, 0,
-        "wrap returns to slab 0 (Phase 1 documented OT-faithful behavior)");
-    assert_eq!(wrap.intra_offset, 0,
-        "wrap returns to intra 0 — silently overwrites p0's range");
-    assert_eq!(wrap.device_ptr, p0.device_ptr,
+    assert_eq!(
+        wrap.slab_idx, 0,
+        "wrap returns to slab 0 (Phase 1 documented OT-faithful behavior)"
+    );
+    assert_eq!(
+        wrap.intra_offset, 0,
+        "wrap returns to intra 0 — silently overwrites p0's range"
+    );
+    assert_eq!(
+        wrap.device_ptr, p0.device_ptr,
         "wrap's device_ptr ALIASES p0's device_ptr — caller-visible \
-         silent alias. Phase 2 must reset between steps to avoid this.");
+         silent alias. Phase 2 must reset between steps to avoid this."
+    );
 }
 
 /// OT parity: the exact byte-position of a sequence of forward allocs
@@ -1049,14 +1110,13 @@ fn ot_parity_forward_sequence_byte_positions() {
         // (slab_idx, intra_offset, ending_allocation_end)
         (0, 0, 200),
         (0, 208, 508),
-        (1, 0, 1624),   // jumped
+        (1, 0, 1624), // jumped
         (1, 608, 1732),
     ];
     let sizes = [200, 300, 600, 100];
 
     let mut h = ring.forward_handle(0);
-    for (i, (&n, &(exp_slab, exp_intra, exp_end))) in
-        sizes.iter().zip(expected.iter()).enumerate()
+    for (i, (&n, &(exp_slab, exp_intra, exp_end))) in sizes.iter().zip(expected.iter()).enumerate()
     {
         let p = h.alloc(n).expect("alloc");
         assert_eq!(
@@ -1066,7 +1126,8 @@ fn ot_parity_forward_sequence_byte_positions() {
             p.slab_idx, p.intra_offset
         );
         assert_eq!(
-            h.allocation_end(), exp_end,
+            h.allocation_end(),
+            exp_end,
             "step {i}: allocation_end mismatch — got {}, expected {exp_end}",
             h.allocation_end()
         );

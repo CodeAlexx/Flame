@@ -9,9 +9,7 @@
 //!   - groups/dilation unsupported paths return clean errors
 //!   - output shape matches PyTorch formula
 
-use flame_core::{
-    cuda_ops::GpuOps, global_cuda_device, DType, Result, Shape, Tensor,
-};
+use flame_core::{cuda_ops::GpuOps, global_cuda_device, DType, Result, Shape, Tensor};
 
 fn ones_bf16(dims: &[usize]) -> Result<Tensor> {
     let dev = global_cuda_device();
@@ -25,7 +23,13 @@ fn zeros_like_bf16(dims: &[usize]) -> Result<Tensor> {
 
 /// Expected output size for ConvTranspose2d (PyTorch formula, dilation=1):
 /// out = (in - 1) * stride - 2*padding + kernel + output_padding
-fn expected_hw(in_hw: usize, kernel: usize, stride: usize, padding: usize, out_pad: usize) -> usize {
+fn expected_hw(
+    in_hw: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    out_pad: usize,
+) -> usize {
     (in_hw - 1) * stride + kernel - 2 * padding + out_pad
 }
 
@@ -36,19 +40,26 @@ fn conv_transpose2d_stride1_pad0_shape_and_nonzero() -> Result<()> {
     let input = ones_bf16(&[1, 2, 3, 3])?;
     let weight = ones_bf16(&[2, 4, 2, 2])?;
 
-    let out = GpuOps::conv_transpose2d_forward(
-        &input, &weight, None, (1, 1), (0, 0), (0, 0), 1, (1, 1),
-    )?;
+    let out =
+        GpuOps::conv_transpose2d_forward(&input, &weight, None, (1, 1), (0, 0), (0, 0), 1, (1, 1))?;
 
     let dims = out.shape().dims();
-    assert_eq!(dims, &[1, 4, 4, 4], "stride1 shape mismatch: got {:?}", dims);
+    assert_eq!(
+        dims,
+        &[1, 4, 4, 4],
+        "stride1 shape mismatch: got {:?}",
+        dims
+    );
 
     // All inputs and weights are 1.0, so every output cell is a positive sum.
     // Going through bf16 we accept tiny precision slack but cell value must be
     // well above zero.
     let out_f32 = out.to_dtype(DType::F32)?.to_vec()?;
     assert!(!out_f32.iter().any(|v| v.is_nan()), "output contains NaN");
-    assert!(out_f32.iter().all(|v| *v >= 0.0), "output has negative cells");
+    assert!(
+        out_f32.iter().all(|v| *v >= 0.0),
+        "output has negative cells"
+    );
     assert!(out_f32.iter().any(|v| *v > 0.0), "output is all zeros");
     Ok(())
 }
@@ -76,7 +87,11 @@ fn conv_transpose2d_stride2_pad1_upsample_shape() -> Result<()> {
     let dims = out.shape().dims();
     let h_expected = expected_hw(4, 4, 2, 1, 0);
     let w_expected = expected_hw(4, 4, 2, 1, 0);
-    assert_eq!(dims, &[1, 2, h_expected, w_expected], "stride2 shape mismatch");
+    assert_eq!(
+        dims,
+        &[1, 2, h_expected, w_expected],
+        "stride2 shape mismatch"
+    );
 
     let out_f32 = out.to_dtype(DType::F32)?.to_vec()?;
     assert!(!out_f32.iter().any(|v| v.is_nan()), "NaN in stride2 output");
@@ -88,9 +103,8 @@ fn conv_transpose2d_stride2_pad1_upsample_shape() -> Result<()> {
 fn conv_transpose2d_rejects_groups_gt_1() -> Result<()> {
     let input = ones_bf16(&[1, 4, 2, 2])?;
     let weight = ones_bf16(&[4, 2, 2, 2])?;
-    let err = GpuOps::conv_transpose2d_forward(
-        &input, &weight, None, (1, 1), (0, 0), (0, 0), 2, (1, 1),
-    );
+    let err =
+        GpuOps::conv_transpose2d_forward(&input, &weight, None, (1, 1), (0, 0), (0, 0), 2, (1, 1));
     assert!(err.is_err(), "groups>1 should fail");
     let msg = format!("{}", err.unwrap_err());
     assert!(
@@ -104,9 +118,8 @@ fn conv_transpose2d_rejects_groups_gt_1() -> Result<()> {
 fn conv_transpose2d_rejects_dilation_ne_1() -> Result<()> {
     let input = ones_bf16(&[1, 2, 2, 2])?;
     let weight = ones_bf16(&[2, 2, 2, 2])?;
-    let err = GpuOps::conv_transpose2d_forward(
-        &input, &weight, None, (1, 1), (0, 0), (0, 0), 1, (2, 2),
-    );
+    let err =
+        GpuOps::conv_transpose2d_forward(&input, &weight, None, (1, 1), (0, 0), (0, 0), 1, (2, 2));
     assert!(err.is_err(), "dilation!=(1,1) should fail");
     let msg = format!("{}", err.unwrap_err());
     assert!(

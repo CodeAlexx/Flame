@@ -25,28 +25,50 @@ fn bench(name: &str, dims: &[usize]) -> Result<()> {
     let b = rand_bf16(&[last], 3, 0.1)?;
 
     for _ in 0..50 {
-        let _ = black_box(cuda_ops_bf16::layer_norm_bf16(&x, Some(&g), Some(&b), 1e-5)?);
+        let _ = black_box(cuda_ops_bf16::layer_norm_bf16(
+            &x,
+            Some(&g),
+            Some(&b),
+            1e-5,
+        )?);
     }
-    dev.synchronize().map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
 
     let t0 = Instant::now();
     for _ in 0..ITERS {
-        let _ = black_box(cuda_ops_bf16::layer_norm_bf16(&x, Some(&g), Some(&b), 1e-5)?);
+        let _ = black_box(cuda_ops_bf16::layer_norm_bf16(
+            &x,
+            Some(&g),
+            Some(&b),
+            1e-5,
+        )?);
     }
-    dev.synchronize().map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
     let per_us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
-    println!("  {:<20} dims={:?}  norm={:<5} → {:>7.2} us/iter", name, dims, last, per_us);
+    println!(
+        "  {:<20} dims={:?}  norm={:<5} → {:>7.2} us/iter",
+        name, dims, last, per_us
+    );
     Ok(())
 }
 
 fn main() -> Result<()> {
     let legacy = std::env::var("FLAME_LAYER_NORM_FWD_LEGACY")
-        .map(|v| v != "0").unwrap_or(false);
-    println!("=== layer_norm forward — mode: {} ===",
-        if legacy { "LEGACY smem-tree" } else { "VEC=4 warp-shuffle" });
-    bench("flux 3072",   &[1, 4608, 3072])?;
+        .map(|v| v != "0")
+        .unwrap_or(false);
+    println!(
+        "=== layer_norm forward — mode: {} ===",
+        if legacy {
+            "LEGACY smem-tree"
+        } else {
+            "VEC=4 warp-shuffle"
+        }
+    );
+    bench("flux 3072", &[1, 4608, 3072])?;
     bench("zimage 2560", &[1, 4096, 2560])?;
-    bench("klein 4096",  &[1, 4096, 4096])?;
-    bench("small 1280",  &[1, 1024, 1280])?;
+    bench("klein 4096", &[1, 4096, 4096])?;
+    bench("small 1280", &[1, 1024, 1280])?;
     Ok(())
 }

@@ -192,8 +192,8 @@ impl HalfTensor {
                 // For now, store f16 data as f32 on GPU (2x memory usage)
                 // Full implementation would use proper f16 CUDA support
                 let f32_data: Vec<f32> = half_data.iter().map(|&x| x.to_f32()).collect();
-                let cuda_data =
-                    alloc_and_copy_to_pool(&device, &f32_data).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
+                let cuda_data = alloc_and_copy_to_pool(&device, &f32_data)
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
                 Ok(Self {
                     data: cuda_data,
@@ -208,8 +208,8 @@ impl HalfTensor {
                 // For now, store bf16 data as f32 on GPU (2x memory usage)
                 // Full implementation would use proper bf16 CUDA support
                 let f32_data: Vec<f32> = half_data.iter().map(|&x| x.to_f32()).collect();
-                let cuda_data =
-                    alloc_and_copy_to_pool(&device, &f32_data).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
+                let cuda_data = alloc_and_copy_to_pool(&device, &f32_data)
+                    .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
 
                 Ok(Self {
                     data: cuda_data,

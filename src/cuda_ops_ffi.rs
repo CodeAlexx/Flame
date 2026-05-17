@@ -452,9 +452,10 @@ pub fn tensor_as_view_bf16(tensor: &Tensor, tag: &str) -> Result<FcTensorView> {
 
 pub fn tensor_as_view_f32_mut(tensor: &mut Tensor, tag: &str) -> Result<FcTensorView> {
     if tensor.dtype() != DType::F32 {
-        return Err(Error::InvalidInput(
-            format!("{tag}: expected F32 storage, got {:?}", tensor.dtype()),
-        ));
+        return Err(Error::InvalidInput(format!(
+            "{tag}: expected F32 storage, got {:?}",
+            tensor.dtype()
+        )));
     }
     let shape = tensor.shape();
     let rank = shape.rank() as i32;

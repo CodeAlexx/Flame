@@ -27,13 +27,13 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
 
+use flame_core::adam::AdamW;
 use flame_core::autograd_v2::{AdamWV2, DispatchCtx, OptimizerV2};
 use flame_core::ops::grad_norm::global_l2_norm;
 use flame_core::ops::multi_tensor::{
     multi_tensor_l2_norm_sq_bf16, multi_tensor_l2_norm_sq_f32, MultiTensorMetaCache,
 };
 use flame_core::parameter::GradDtypePolicy;
-use flame_core::adam::AdamW;
 use flame_core::{global_cuda_device, DType, Parameter, Shape, Tensor};
 
 fn dev() -> Arc<CudaDevice> {
@@ -111,12 +111,12 @@ fn parameter_v2_set_grad_preserves_f32_on_f32_param() {
 
 fn finite_bf16_param(n: usize, scale: f32) -> Parameter {
     // Deterministic BF16 param + grad.
-    let vals: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0123 - 0.5) * scale).collect();
+    let vals: Vec<f32> = (0..n)
+        .map(|i| ((i as f32) * 0.0123 - 0.5) * scale)
+        .collect();
     let t = Tensor::from_vec_dtype(vals, Shape::from_dims(&[n]), dev(), DType::BF16).unwrap();
     let p = Parameter::new_v2(t.requires_grad_(true));
-    let g_vals: Vec<f32> = (0..n)
-        .map(|i| 0.001 + 0.0001 * (i as f32))
-        .collect();
+    let g_vals: Vec<f32> = (0..n).map(|i| 0.001 + 0.0001 * (i as f32)).collect();
     let g = Tensor::from_vec_dtype(g_vals, Shape::from_dims(&[n]), dev(), DType::BF16).unwrap();
     p.set_grad(g).unwrap();
     p
@@ -127,7 +127,8 @@ fn adam_step_bf16_param_bf16_grad_no_panic() {
     // 4 small params triggers the multi-tensor (BF16, BF16) arm.
     let params: Vec<Parameter> = (0..4).map(|_| finite_bf16_param(8, 1.0)).collect();
     let mut opt = AdamW::new(1e-3, 0.9, 0.999, 1e-8, 0.0);
-    opt.step(&params).expect("Phase 4a (BF16, BF16) multi-tensor arm must run");
+    opt.step(&params)
+        .expect("Phase 4a (BF16, BF16) multi-tensor arm must run");
 
     // Param dtype must be preserved.
     for p in &params {
@@ -154,7 +155,8 @@ fn adam_step_bf16_param_bf16_grad_matches_f32_reference() {
         .unwrap()
         .requires_grad_(true);
     let ref_param = Parameter::new(ref_t);
-    let ref_g = Tensor::from_vec(grad_vals.clone(), Shape::from_dims(&[n]), device.clone()).unwrap();
+    let ref_g =
+        Tensor::from_vec(grad_vals.clone(), Shape::from_dims(&[n]), device.clone()).unwrap();
     ref_param.set_grad(ref_g).unwrap();
     let mut ref_opt = AdamW::new(1e-3, 0.9, 0.999, 1e-8, 0.0);
     ref_opt.step(std::slice::from_ref(&ref_param)).unwrap();
@@ -274,10 +276,14 @@ fn multi_tensor_l2_norm_sq_bf16_matches_f32_reference() {
 #[test]
 fn global_l2_norm_routes_bf16_through_fast_path() {
     let device = dev();
-    let t1 = Tensor::from_vec(vec![0.1f32, 0.2, 0.3, 0.4], Shape::from_dims(&[4]), device.clone())
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+    let t1 = Tensor::from_vec(
+        vec![0.1f32, 0.2, 0.3, 0.4],
+        Shape::from_dims(&[4]),
+        device.clone(),
+    )
+    .unwrap()
+    .to_dtype(DType::BF16)
+    .unwrap();
     let t2 = Tensor::from_vec(vec![-0.05f32; 8], Shape::from_dims(&[8]), device.clone())
         .unwrap()
         .to_dtype(DType::BF16)

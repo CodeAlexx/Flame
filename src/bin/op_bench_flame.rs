@@ -11,9 +11,7 @@
 //!     ./target/release/op_bench_flame --csv
 
 use flame_core::{
-    CudaDevice, DType, Shape, Tensor,
-    config::set_default_dtype,
-    layer_norm::LayerNorm,
+    config::set_default_dtype, layer_norm::LayerNorm, CudaDevice, DType, Shape, Tensor,
 };
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -58,7 +56,9 @@ impl CudaEvent {
 
 impl Drop for CudaEvent {
     fn drop(&mut self) {
-        unsafe { cudaEventDestroy(self.0); }
+        unsafe {
+            cudaEventDestroy(self.0);
+        }
     }
 }
 
@@ -226,7 +226,11 @@ fn main() -> flame_core::Result<()> {
         let bwd = bench_bwd_simple(&device, &[1, 1024, 1280], &[1, 1024, 1280], |inp| {
             inp.to_dtype(DType::F32)
         });
-        results.push(BenchResult { name: "Cast BF16→FP32", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "Cast BF16→FP32",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -241,16 +245,24 @@ fn main() -> flame_core::Result<()> {
             || {},
             || {
                 set_default_dtype(DType::F32);
-                let inp = Tensor::randn(Shape::from_dims(&[1, 1024, 1280]), 0.0, 1.0, device.clone())?
-                    .requires_grad_(true);
+                let inp =
+                    Tensor::randn(Shape::from_dims(&[1, 1024, 1280]), 0.0, 1.0, device.clone())?
+                        .requires_grad_(true);
                 set_default_dtype(DType::BF16);
                 let out = inp.to_dtype(DType::BF16)?;
-                let loss = out.to_dtype(DType::F32)?.mul(&grad_output.to_dtype(DType::F32)?)?.sum()?;
+                let loss = out
+                    .to_dtype(DType::F32)?
+                    .mul(&grad_output.to_dtype(DType::F32)?)?
+                    .sum()?;
                 let _ = loss.backward()?;
                 Ok(())
             },
         );
-        results.push(BenchResult { name: "Cast FP32→BF16", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "Cast FP32→BF16",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -259,10 +271,12 @@ fn main() -> flame_core::Result<()> {
     {
         let x = randn(&[1, 1024, 1280], &device);
         let fwd = bench_fwd(|| x.abs());
-        let bwd = bench_bwd_simple(&device, &[1, 1024, 1280], &[1, 1024, 1280], |inp| {
-            inp.abs()
+        let bwd = bench_bwd_simple(&device, &[1, 1024, 1280], &[1, 1024, 1280], |inp| inp.abs());
+        results.push(BenchResult {
+            name: "Abs",
+            fwd_us: fwd,
+            bwd_us: bwd,
         });
-        results.push(BenchResult { name: "Abs", fwd_us: fwd, bwd_us: bwd });
         eprintln!(" done");
     }
 
@@ -283,7 +297,11 @@ fn main() -> flame_core::Result<()> {
                 Ok(())
             },
         );
-        results.push(BenchResult { name: "Add (residual)", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "Add (residual)",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -294,7 +312,11 @@ fn main() -> flame_core::Result<()> {
         let bwd = bench_bwd_simple(&device, &[1, 1024, 1280], &[1, 1024, 1280], |inp| {
             inp.mul_scalar(0.7071)
         });
-        results.push(BenchResult { name: "Mul (scalar)", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "Mul (scalar)",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -315,7 +337,11 @@ fn main() -> flame_core::Result<()> {
                 Ok(())
             },
         );
-        results.push(BenchResult { name: "Mul (elementwise)", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "Mul (elementwise)",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -326,7 +352,11 @@ fn main() -> flame_core::Result<()> {
         let bwd = bench_bwd_simple(&device, &[1, 1024, 1280], &[1, 1024, 20, 64], |inp| {
             inp.reshape(&[1, 1024, 20, 64])
         });
-        results.push(BenchResult { name: "Reshape", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "Reshape",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -337,7 +367,11 @@ fn main() -> flame_core::Result<()> {
         let bwd = bench_bwd_simple(&device, &[1, 1024, 20, 64], &[1, 20, 1024, 64], |inp| {
             inp.permute(&[0, 2, 1, 3])
         });
-        results.push(BenchResult { name: "Permute (0,2,1,3)", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "Permute (0,2,1,3)",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -348,7 +382,11 @@ fn main() -> flame_core::Result<()> {
         let bwd = bench_bwd_simple(&device, &[1, 1024, 5120], &[1, 1024, 5120], |inp| {
             inp.silu()
         });
-        results.push(BenchResult { name: "SiLU", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "SiLU",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -359,7 +397,11 @@ fn main() -> flame_core::Result<()> {
         let bwd = bench_bwd_simple(&device, &[1, 1024, 5120], &[1, 1024, 5120], |inp| {
             inp.gelu()
         });
-        results.push(BenchResult { name: "GELU", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "GELU",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -370,7 +412,11 @@ fn main() -> flame_core::Result<()> {
         let bwd = bench_bwd_simple(&device, &[20, 1024, 1024], &[20, 1024, 1024], |inp| {
             inp.softmax(-1)
         });
-        results.push(BenchResult { name: "Softmax", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "Softmax",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -390,7 +436,11 @@ fn main() -> flame_core::Result<()> {
                 Ok(())
             },
         );
-        results.push(BenchResult { name: "LayerNorm", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "LayerNorm",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -411,7 +461,11 @@ fn main() -> flame_core::Result<()> {
                 Ok(())
             },
         );
-        results.push(BenchResult { name: "MatMul (proj)", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "MatMul (proj)",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -432,7 +486,11 @@ fn main() -> flame_core::Result<()> {
                 Ok(())
             },
         );
-        results.push(BenchResult { name: "MatMul (FFN)", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "MatMul (FFN)",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -454,7 +512,11 @@ fn main() -> flame_core::Result<()> {
                 Ok(())
             },
         );
-        results.push(BenchResult { name: "BMM (QK^T)", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "BMM (QK^T)",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -476,7 +538,11 @@ fn main() -> flame_core::Result<()> {
                 Ok(())
             },
         );
-        results.push(BenchResult { name: "BMM (@V)", fwd_us: fwd, bwd_us: bwd });
+        results.push(BenchResult {
+            name: "BMM (@V)",
+            fwd_us: fwd,
+            bwd_us: bwd,
+        });
         eprintln!(" done");
     }
 
@@ -492,7 +558,11 @@ fn main() -> flame_core::Result<()> {
             let scaled = ab.mul_scalar(1.0)?;
             base.add(&scaled)
         });
-        results.push(BenchResult { name: "LoRA merge", fwd_us: fwd, bwd_us: 0.0 });
+        results.push(BenchResult {
+            name: "LoRA merge",
+            fwd_us: fwd,
+            bwd_us: 0.0,
+        });
         eprintln!(" done");
     }
 
@@ -502,7 +572,13 @@ fn main() -> flame_core::Result<()> {
         println!("op,fwd_us,bwd_us,total_us");
         for r in &results {
             let bwd = if r.bwd_us < 0.0 { 0.0 } else { r.bwd_us };
-            println!("{},{:.1},{:.1},{:.1}", r.name, r.fwd_us, bwd, r.fwd_us + bwd);
+            println!(
+                "{},{:.1},{:.1},{:.1}",
+                r.name,
+                r.fwd_us,
+                bwd,
+                r.fwd_us + bwd
+            );
         }
     } else {
         println!(

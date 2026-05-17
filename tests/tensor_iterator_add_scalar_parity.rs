@@ -5,7 +5,9 @@
 //! Reference: legacy `ops::elt::add_scalar_same_dtype` (GpuOps::add_scalar
 //! BF16 branch). Same fp32 add → rne BF16.
 
-use flame_core::{tensor_iterator::ops::binary::add_scalar_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{
+    tensor_iterator::ops::binary::add_scalar_bf16_iter, DType, Result, Shape, Tensor,
+};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
@@ -52,7 +54,9 @@ fn make_bf16_tensor(dev: Arc<CudaDevice>, dims: &[usize], seed: u64) -> Result<T
     let mut data = Vec::with_capacity(n);
     let mut s = seed;
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 40) as u32 as f32 / (1u32 << 24) as f32;
         data.push((u - 0.5) * 8.0);
     }

@@ -24,8 +24,7 @@ fn ptr_bf16_mut(t: &Tensor, tag: &str) -> *mut core::ffi::c_void {
 
 fn run_parity(b: usize, h: usize, n: usize, d: usize) {
     let device = global_cuda_device();
-    let stream = flame_core::cuda::device_lt::stream_ptr(&device)
-        .expect("stream_ptr");
+    let stream = flame_core::cuda::device_lt::stream_ptr(&device).expect("stream_ptr");
 
     let bh = b * h;
     let scale_init = 1.0f32 / (d as f32).sqrt();
@@ -61,7 +60,10 @@ fn run_parity(b: usize, h: usize, n: usize, d: usize) {
     // ---- run WMMA ----
     let ret = unsafe {
         flame_core::cuda::ffi::flame_flash_attention_bf16(
-            q_ptr, k_ptr, v_ptr, o_wmma_ptr,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            o_wmma_ptr,
             std::ptr::null_mut(),
             bh as i32,
             n as i32,
@@ -81,7 +83,10 @@ fn run_parity(b: usize, h: usize, n: usize, d: usize) {
     let strides: [i64; 4] = [(n * d) as i64, (n * d) as i64, d as i64, 1];
     let ret = unsafe {
         flame_core::cuda::ffi::flame_cudnn_sdpa_bf16(
-            q_ptr, k_ptr, v_ptr, o_cudnn_ptr,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            o_cudnn_ptr,
             bh as i32,
             1,
             n as i32,
@@ -92,7 +97,10 @@ fn run_parity(b: usize, h: usize, n: usize, d: usize) {
             strides.as_ptr(),
             strides.as_ptr(),
             strides.as_ptr(),
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
             stream,
         )
     };
@@ -101,7 +109,7 @@ fn run_parity(b: usize, h: usize, n: usize, d: usize) {
     device.synchronize().unwrap();
 
     // ---- Compare ----
-    let wmma_f32  = o_wmma.to_dtype(DType::F32).unwrap().to_vec().unwrap();
+    let wmma_f32 = o_wmma.to_dtype(DType::F32).unwrap().to_vec().unwrap();
     let cudnn_f32 = o_cudnn.to_dtype(DType::F32).unwrap().to_vec().unwrap();
     assert_eq!(wmma_f32.len(), cudnn_f32.len());
 
@@ -115,20 +123,27 @@ fn run_parity(b: usize, h: usize, n: usize, d: usize) {
     let mut ref_abs_max = 0.0_f64;
     for (a, b) in wmma_f32.iter().zip(cudnn_f32.iter()) {
         let (a, b) = (*a as f64, *b as f64);
-        if a.is_nan() || b.is_nan() { nan_count += 1; continue; }
-        dot         += a * b;
-        wmma_norm2  += a * a;
+        if a.is_nan() || b.is_nan() {
+            nan_count += 1;
+            continue;
+        }
+        dot += a * b;
+        wmma_norm2 += a * a;
         cudnn_norm2 += b * b;
         let ab = a.abs();
-        if ab > ref_abs_max { ref_abs_max = ab; }
+        if ab > ref_abs_max {
+            ref_abs_max = ab;
+        }
         let diff = (a - b).abs();
         sum_abs_diff += diff;
-        sum_abs_ref  += ab;
+        sum_abs_ref += ab;
         // Relative-to-scale, floor at max_ref/128 so near-zero positions
         // don't blow up the ratio (BF16 can't hold anything below that
         // anyway for a tensor peaking at max_ref).
         let rel = diff / a.abs().max(ref_abs_max.max(1e-6) / 128.0);
-        if rel > max_rel { max_rel = rel; }
+        if rel > max_rel {
+            max_rel = rel;
+        }
     }
     let cos_sim = dot / (wmma_norm2.sqrt() * cudnn_norm2.sqrt() + 1e-20);
     let mean_rel = sum_abs_diff / sum_abs_ref.max(1e-20);
@@ -144,10 +159,14 @@ fn run_parity(b: usize, h: usize, n: usize, d: usize) {
     // individual per-element max_rel up to ~1% naturally (mantissa ~7 bits).
     // We keep a max_rel ceiling only as a NaN/garbage trap, not a precision
     // claim. mean_rel is the honest "are these the same tensor" number.
-    assert!(cos_sim >= 0.9999,
-        "cos_sim {cos_sim:.6} < 0.9999  (B={b} H={h} N={n} D={d})");
-    assert!(mean_rel <= 5e-3,
-        "mean_rel {mean_rel:.4e} > 5e-3  (B={b} H={h} N={n} D={d})");
+    assert!(
+        cos_sim >= 0.9999,
+        "cos_sim {cos_sim:.6} < 0.9999  (B={b} H={h} N={n} D={d})"
+    );
+    assert!(
+        mean_rel <= 5e-3,
+        "mean_rel {mean_rel:.4e} > 5e-3  (B={b} H={h} N={n} D={d})"
+    );
     assert!(max_rel <= 5e-2,
         "max_rel {max_rel:.4e} > 5e-2 — suspicious, likely a bug not BF16 noise  (B={b} H={h} N={n} D={d})");
 }

@@ -52,7 +52,15 @@ fn assert_narrow_bit_exact(b: usize, n: usize, d: usize, dim: usize, start: usiz
             o.to_bits(),
             m.to_bits(),
             "narrow({},{},{}) on [{},{},{}] diverges at idx {}: oracle={} view+contig={}",
-            dim, start, length, b, n, d, i, o, m
+            dim,
+            start,
+            length,
+            b,
+            n,
+            d,
+            i,
+            o,
+            m
         );
     }
 }
@@ -135,7 +143,15 @@ fn assert_narrow_owning_bit_exact(
             o.to_bits(),
             m.to_bits(),
             "narrow_owning({},{},{}) on [{},{},{}] diverges at idx {}: oracle={} owned={}",
-            dim, start, length, b, n, d, i, o, m
+            dim,
+            start,
+            length,
+            b,
+            n,
+            d,
+            i,
+            o,
+            m
         );
     }
 
@@ -209,11 +225,10 @@ fn narrow_owning_independent_of_parent() {
     // Now: parent inside an inner scope, narrow_owning out, drop parent,
     // verify child still reads correctly.
     let owned = {
-        let parent =
-            Tensor::from_vec(data_f32, Shape::from_dims(&[b, n, d]), device.clone())
-                .unwrap()
-                .to_dtype(DType::BF16)
-                .unwrap();
+        let parent = Tensor::from_vec(data_f32, Shape::from_dims(&[b, n, d]), device.clone())
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
         let owned = parent.narrow_owning(2, 128, 128).unwrap();
         // Explicit drop — parent goes here, before owned escapes.
         drop(parent);
@@ -229,7 +244,9 @@ fn narrow_owning_independent_of_parent() {
             o.to_bits(),
             m.to_bits(),
             "narrow_owning post-parent-drop diverges at idx {}: oracle={} owned={}",
-            i, o, m
+            i,
+            o,
+            m
         );
     }
     assert!(owned.is_contiguous());
@@ -265,7 +282,9 @@ fn narrow_then_narrow() {
             o.to_bits(),
             m.to_bits(),
             "narrow-of-narrow diverges at idx {}: oracle={} view+contig={}",
-            i, o, m
+            i,
+            o,
+            m
         );
     }
 }

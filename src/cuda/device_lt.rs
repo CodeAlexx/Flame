@@ -40,8 +40,7 @@ unsafe impl Sync for LtContext {}
 
 // Global, mutex-protected source of truth. Construction happens here
 // (cublasLtCreate is a heavy call we want to make exactly once).
-static CONTEXTS: Lazy<Mutex<HashMap<usize, LtContext>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static CONTEXTS: Lazy<Mutex<HashMap<usize, LtContext>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 // Cheap TLS cache. `(ordinal, stream, handle)` — when the requested
 // device ordinal matches the cached ordinal, we return the cached
@@ -52,9 +51,7 @@ thread_local! {
 
 fn tls_disabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("FLAME_HANDLE_TLS_DISABLE").ok().as_deref() == Some("1")
-    })
+    *FLAG.get_or_init(|| std::env::var("FLAME_HANDLE_TLS_DISABLE").ok().as_deref() == Some("1"))
 }
 
 fn init_context(_device: &Arc<CudaDevice>) -> Result<LtContext> {

@@ -173,10 +173,8 @@ fn build_binary_op_broadcasts_shape_and_emits_zero_strides() {
 fn build_binary_op_rejects_incompatible_shapes() {
     let dev = flame_core::global_cuda_device();
     // [4,3] vs [4,2]: innermost dim 3 vs 2 with neither == 1 → reject.
-    let a =
-        Tensor::zeros_dtype(Shape::from_dims(&[4, 3]), DType::BF16, dev.clone()).expect("a");
-    let b =
-        Tensor::zeros_dtype(Shape::from_dims(&[4, 2]), DType::BF16, dev.clone()).expect("b");
+    let a = Tensor::zeros_dtype(Shape::from_dims(&[4, 3]), DType::BF16, dev.clone()).expect("a");
+    let b = Tensor::zeros_dtype(Shape::from_dims(&[4, 2]), DType::BF16, dev.clone()).expect("b");
 
     let res = TensorIteratorBase::build_binary_op(None, &a, &b);
     assert!(
@@ -190,8 +188,7 @@ fn build_binary_op_rejects_incompatible_shapes() {
 #[test]
 fn build_unary_op_rejects_provided_output_wrong_shape() {
     let dev = flame_core::global_cuda_device();
-    let a =
-        Tensor::zeros_dtype(Shape::from_dims(&[3, 5]), DType::BF16, dev.clone()).expect("a");
+    let a = Tensor::zeros_dtype(Shape::from_dims(&[3, 5]), DType::BF16, dev.clone()).expect("a");
     // Wrong-shape output: caller claimed [3,4] where the broadcast
     // shape is [3,5]. Phase 3 does not implicit-resize; must error.
     let y_wrong =
@@ -202,9 +199,7 @@ fn build_unary_op_rejects_provided_output_wrong_shape() {
     match err {
         Some(Error::ShapeMismatch { .. }) => {}
         Some(other) => panic!("expected ShapeMismatch, got {:?}", other),
-        None => panic!(
-            "provided output with shape != broadcast shape must error, not succeed"
-        ),
+        None => panic!("provided output with shape != broadcast shape must error, not succeed"),
     }
 }
 
@@ -237,8 +232,7 @@ fn declare_stub_register_and_lookup_round_trip() {
     // Build any iterator to pass in — a degenerate unary on a tiny BF16
     // tensor is the cheapest option.
     let dev = flame_core::global_cuda_device();
-    let x = Tensor::zeros_dtype(Shape::from_dims(&[2, 2]), DType::BF16, dev.clone())
-        .expect("x");
+    let x = Tensor::zeros_dtype(Shape::from_dims(&[2, 2]), DType::BF16, dev.clone()).expect("x");
     let mut iter = TensorIteratorBase::build_unary_op(None, &x).expect("build_unary_op");
 
     let before = TEST_KERNEL_CALLS.load(Ordering::SeqCst);

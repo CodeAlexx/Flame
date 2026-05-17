@@ -40,10 +40,14 @@ fn make_shapes() -> Vec<Shape> {
 }
 
 fn deterministic_data(n: usize, seed: u64, scale: f32) -> Vec<f32> {
-    let mut x = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut x = seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
     (0..n)
         .map(|_| {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let bits = (x >> 32) as u32;
             let normalized = (bits as f32 / u32::MAX as f32) * 2.0 - 1.0;
             normalized * scale

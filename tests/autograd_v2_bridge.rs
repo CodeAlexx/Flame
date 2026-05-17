@@ -139,19 +139,41 @@ fn backward_v2_matches_v3_at_f32() {
     let (gv3_a, gv3_b) = {
         AutogradContext::reset();
         AutogradContext::set_enabled(true);
-        let a = Tensor::from_vec_dtype(mk_bf16(11, n, 1.0), shape.clone(), device.clone(), DType::F32)
-            .unwrap()
-            .requires_grad_(true);
-        let b = Tensor::from_vec_dtype(mk_bf16(13, n, 1.0), shape.clone(), device.clone(), DType::F32)
-            .unwrap()
-            .requires_grad_(true);
+        let a = Tensor::from_vec_dtype(
+            mk_bf16(11, n, 1.0),
+            shape.clone(),
+            device.clone(),
+            DType::F32,
+        )
+        .unwrap()
+        .requires_grad_(true);
+        let b = Tensor::from_vec_dtype(
+            mk_bf16(13, n, 1.0),
+            shape.clone(),
+            device.clone(),
+            DType::F32,
+        )
+        .unwrap()
+        .requires_grad_(true);
         let aid = a.id();
         let bid = b.id();
         let prod = a.mul(&b).unwrap();
         let loss = prod.mean().unwrap();
         let g = AutogradContext::backward(&loss).unwrap();
-        let ga = g.get(aid).unwrap().to_dtype(DType::F32).unwrap().to_vec_f32().unwrap();
-        let gb = g.get(bid).unwrap().to_dtype(DType::F32).unwrap().to_vec_f32().unwrap();
+        let ga = g
+            .get(aid)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        let gb = g
+            .get(bid)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
         AutogradContext::set_enabled(false);
         (ga, gb)
     };
@@ -160,19 +182,41 @@ fn backward_v2_matches_v3_at_f32() {
     let (gv2_a, gv2_b) = {
         AutogradContext::reset();
         AutogradContext::set_enabled(true);
-        let a = Tensor::from_vec_dtype(mk_bf16(11, n, 1.0), shape.clone(), device.clone(), DType::F32)
-            .unwrap()
-            .requires_grad_(true);
-        let b = Tensor::from_vec_dtype(mk_bf16(13, n, 1.0), shape.clone(), device.clone(), DType::F32)
-            .unwrap()
-            .requires_grad_(true);
+        let a = Tensor::from_vec_dtype(
+            mk_bf16(11, n, 1.0),
+            shape.clone(),
+            device.clone(),
+            DType::F32,
+        )
+        .unwrap()
+        .requires_grad_(true);
+        let b = Tensor::from_vec_dtype(
+            mk_bf16(13, n, 1.0),
+            shape.clone(),
+            device.clone(),
+            DType::F32,
+        )
+        .unwrap()
+        .requires_grad_(true);
         let aid = a.id();
         let bid = b.id();
         let prod = a.mul(&b).unwrap();
         let loss = prod.mean().unwrap();
         let g = AutogradContext::backward_v2(&loss).unwrap();
-        let ga = g.get(aid).unwrap().to_dtype(DType::F32).unwrap().to_vec_f32().unwrap();
-        let gb = g.get(bid).unwrap().to_dtype(DType::F32).unwrap().to_vec_f32().unwrap();
+        let ga = g
+            .get(aid)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        let gb = g
+            .get(bid)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
         AutogradContext::set_enabled(false);
         (ga, gb)
     };
@@ -199,18 +243,38 @@ fn backward_v2_within_tolerance_at_bf16() {
     let run = |use_v2: bool| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         AutogradContext::reset();
         AutogradContext::set_enabled(true);
-        let x = Tensor::from_vec_dtype(mk_bf16(101, n, 1.0), shape.clone(), device.clone(), DType::BF16)
-            .unwrap()
-            .requires_grad_(true);
-        let w1 = Tensor::from_vec_dtype(mk_bf16(103, n, 0.5), shape.clone(), device.clone(), DType::BF16)
-            .unwrap()
-            .requires_grad_(true);
-        let w2 = Tensor::from_vec_dtype(mk_bf16(107, n, 0.5), shape.clone(), device.clone(), DType::BF16)
-            .unwrap()
-            .requires_grad_(true);
-        let bias = Tensor::from_vec_dtype(mk_bf16(109, n, 0.1), shape.clone(), device.clone(), DType::BF16)
-            .unwrap()
-            .requires_grad_(true);
+        let x = Tensor::from_vec_dtype(
+            mk_bf16(101, n, 1.0),
+            shape.clone(),
+            device.clone(),
+            DType::BF16,
+        )
+        .unwrap()
+        .requires_grad_(true);
+        let w1 = Tensor::from_vec_dtype(
+            mk_bf16(103, n, 0.5),
+            shape.clone(),
+            device.clone(),
+            DType::BF16,
+        )
+        .unwrap()
+        .requires_grad_(true);
+        let w2 = Tensor::from_vec_dtype(
+            mk_bf16(107, n, 0.5),
+            shape.clone(),
+            device.clone(),
+            DType::BF16,
+        )
+        .unwrap()
+        .requires_grad_(true);
+        let bias = Tensor::from_vec_dtype(
+            mk_bf16(109, n, 0.1),
+            shape.clone(),
+            device.clone(),
+            DType::BF16,
+        )
+        .unwrap()
+        .requires_grad_(true);
 
         let xid = x.id();
         let w1id = w1.id();

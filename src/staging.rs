@@ -244,7 +244,9 @@ pub fn arena_alloc(
         .map_err(|e| {
             log::debug!(
                 "arena_alloc failed: bytes={} align={} error={:?}",
-                bytes, align, e
+                bytes,
+                align,
+                e
             );
             e
         })?;
@@ -380,7 +382,7 @@ pub fn bf16_copy_async(
 /// [`bf16_copy_stats_snapshot`] for profiling. Each call-site should pass a
 /// static string literal tag; unknown tags are aggregated into "unknown".
 static COPY_STATS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<&'static str, (u64, u64)>>
+    std::sync::Mutex<std::collections::HashMap<&'static str, (u64, u64)>>,
 > = std::sync::OnceLock::new();
 
 fn copy_stats() -> &'static std::sync::Mutex<std::collections::HashMap<&'static str, (u64, u64)>> {

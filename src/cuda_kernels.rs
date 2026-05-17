@@ -84,8 +84,14 @@ pub mod permute_generic_trace {
             return;
         }
         let total: u64 = entries.iter().map(|(_, c)| *c).sum();
-        eprintln!("[permute_generic_trace] {} unique (shape,perm,dtype) tuples, {total} total calls", entries.len());
-        eprintln!("[permute_generic_trace] {:>9}  {:>5}  {:?} ← shape ← perm", "count", "dtype", "");
+        eprintln!(
+            "[permute_generic_trace] {} unique (shape,perm,dtype) tuples, {total} total calls",
+            entries.len()
+        );
+        eprintln!(
+            "[permute_generic_trace] {:>9}  {:>5}  {:?} ← shape ← perm",
+            "count", "dtype", ""
+        );
         for (k, c) in &entries {
             eprintln!(
                 "[permute_generic_trace] {c:>9}  {:?}  shape={:?}  perm={:?}",
@@ -217,7 +223,6 @@ pub fn create_output_tensor(data: CudaSlice<f32>, shape: Shape, device: Arc<Cuda
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     }
 }
 
@@ -498,9 +503,19 @@ impl CudaKernels {
         // custom_strides and view_offset — a transposed/permuted/narrowed
         // view fed in raw produces wrong values.
         let a_mat_owned;
-        let a = if a.is_contiguous() { a } else { a_mat_owned = a.contiguous()?; &a_mat_owned };
+        let a = if a.is_contiguous() {
+            a
+        } else {
+            a_mat_owned = a.contiguous()?;
+            &a_mat_owned
+        };
         let b_mat_owned;
-        let b = if b.is_contiguous() { b } else { b_mat_owned = b.contiguous()?; &b_mat_owned };
+        let b = if b.is_contiguous() {
+            b
+        } else {
+            b_mat_owned = b.contiguous()?;
+            &b_mat_owned
+        };
         // Normalize via broadcast if shapes differ (NumPy semantics)
         let (a_owned, b_owned);
         let (a_t, b_t) = if a.shape != b.shape {
@@ -557,9 +572,19 @@ impl CudaKernels {
     pub fn mul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
         // Materialize non-contiguous views — see add() for rationale.
         let a_mat_owned;
-        let a = if a.is_contiguous() { a } else { a_mat_owned = a.contiguous()?; &a_mat_owned };
+        let a = if a.is_contiguous() {
+            a
+        } else {
+            a_mat_owned = a.contiguous()?;
+            &a_mat_owned
+        };
         let b_mat_owned;
-        let b = if b.is_contiguous() { b } else { b_mat_owned = b.contiguous()?; &b_mat_owned };
+        let b = if b.is_contiguous() {
+            b
+        } else {
+            b_mat_owned = b.contiguous()?;
+            &b_mat_owned
+        };
         // Normalize via broadcast if shapes differ (NumPy semantics)
         let (a_owned, b_owned);
         let (a_t, b_t) = if a.shape != b.shape {
@@ -1118,7 +1143,6 @@ impl CudaKernels {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         })
     }
 
@@ -1625,7 +1649,13 @@ impl CudaKernels {
             Tensor::cat(&refs, 3)
         }
 
-        fn pad_hw(x: &Tensor, top: usize, bottom: usize, left: usize, right: usize) -> Result<Tensor> {
+        fn pad_hw(
+            x: &Tensor,
+            top: usize,
+            bottom: usize,
+            left: usize,
+            right: usize,
+        ) -> Result<Tensor> {
             let x = pad_h(x, top, bottom)?;
             pad_w(&x, left, right)
         }
@@ -2191,9 +2221,19 @@ extern "C" __global__ void upsample2d_nearest_backward_kernel(
         }
         // Materialize non-contiguous views — see add() for rationale.
         let a_mat_owned;
-        let a = if a.is_contiguous() { a } else { a_mat_owned = a.contiguous()?; &a_mat_owned };
+        let a = if a.is_contiguous() {
+            a
+        } else {
+            a_mat_owned = a.contiguous()?;
+            &a_mat_owned
+        };
         let b_mat_owned;
-        let b = if b.is_contiguous() { b } else { b_mat_owned = b.contiguous()?; &b_mat_owned };
+        let b = if b.is_contiguous() {
+            b
+        } else {
+            b_mat_owned = b.contiguous()?;
+            &b_mat_owned
+        };
         let mut output = Tensor::empty_dtype(a.shape.clone(), DType::F32, a.device.clone())?;
         let n = a.shape.elem_count();
         let kernel = self
@@ -2236,8 +2276,8 @@ extern "C" __global__ void upsample2d_nearest_backward_kernel(
         let out_elems: usize = out_shape_keep.iter().product();
 
         let dims_f32: Vec<f32> = dims.iter().map(|&x| x as f32).collect();
-        let mut dims_gpu =
-            unsafe { self.device.alloc::<f32>(dims_f32.len()) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
+        let mut dims_gpu = unsafe { self.device.alloc::<f32>(dims_f32.len()) }
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         self.device
             .htod_copy_into(dims_f32, &mut dims_gpu)
             .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
@@ -2432,8 +2472,8 @@ extern "C" __global__ void max_dim_keepdim_kernel(
 
         // Upload dims to GPU as i32
         let dims_i32: Vec<i32> = dims.iter().map(|&d| d as i32).collect();
-        let mut dims_gpu =
-            unsafe { self.device.alloc::<f32>(dims_i32.len()) }.map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
+        let mut dims_gpu = unsafe { self.device.alloc::<f32>(dims_i32.len()) }
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         self.device
             .htod_copy_into(
                 dims_i32.iter().map(|&x| x as f32).collect::<Vec<_>>(),
@@ -2662,10 +2702,10 @@ extern "C" __global__ void max_dim_keepdim_kernel(
             ));
         }
         let inv_std: Vec<f32> = std.iter().map(|&v| 1.0f32 / v).collect();
-        let mut mean_gpu =
-            crate::tensor::alloc_from_pool(&input.device, c).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
-        let mut inv_gpu =
-            crate::tensor::alloc_from_pool(&input.device, c).map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
+        let mut mean_gpu = crate::tensor::alloc_from_pool(&input.device, c)
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
+        let mut inv_gpu = crate::tensor::alloc_from_pool(&input.device, c)
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;
         input
             .device
             .htod_copy_into(mean.to_vec(), &mut mean_gpu)
@@ -3070,32 +3110,34 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                 _ => return Ok(None),
             };
             let stream: *mut c_void = device.cuda_stream_raw_ptr();
-            let mut output = Tensor::empty_dtype(
-                Shape::from_dims(out_dims),
-                dtype,
-                device.clone(),
-            )?;
+            let mut output =
+                Tensor::empty_dtype(Shape::from_dims(out_dims), dtype, device.clone())?;
             match dtype {
                 DType::F32 => {
                     let src = tensor.storage.try_as_slice_f32()?;
                     let dst = output.storage.try_as_slice_f32()?;
                     let src_ptr = *src.device_ptr() as *const f32;
                     let dst_ptr = *dst.device_ptr() as *mut f32;
-                    unsafe { ffi::launch_permute10_f32(src_ptr, dst_ptr, a, b, stream); }
+                    unsafe {
+                        ffi::launch_permute10_f32(src_ptr, dst_ptr, a, b, stream);
+                    }
                     return Ok(Some(output));
                 }
                 DType::BF16 => {
                     #[cfg(feature = "bf16_u16")]
                     {
-                        let src_ptr =
-                            tensor.as_device_ptr_bf16("permute10:src")? as *const c_void;
+                        let src_ptr = tensor.as_device_ptr_bf16("permute10:src")? as *const c_void;
                         let dst_ptr =
                             output.as_mut_device_ptr_bf16("permute10:dst")? as *mut c_void;
-                        unsafe { ffi::launch_permute10_bf16(src_ptr, dst_ptr, a, b, stream); }
+                        unsafe {
+                            ffi::launch_permute10_bf16(src_ptr, dst_ptr, a, b, stream);
+                        }
                         return Ok(Some(output));
                     }
                     #[cfg(not(feature = "bf16_u16"))]
-                    { return Ok(None); }
+                    {
+                        return Ok(None);
+                    }
                 }
                 _ => return Ok(None),
             }
@@ -3117,11 +3159,8 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                 return Ok(None);
             }
             let stream: *mut c_void = device.cuda_stream_raw_ptr();
-            let mut output = Tensor::empty_dtype(
-                Shape::from_dims(out_dims),
-                dtype,
-                device.clone(),
-            )?;
+            let mut output =
+                Tensor::empty_dtype(Shape::from_dims(out_dims), dtype, device.clone())?;
             match dtype {
                 DType::F32 => {
                     let src = tensor.storage.try_as_slice_f32()?;
@@ -3146,7 +3185,9 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                         return Ok(Some(output));
                     }
                     #[cfg(not(feature = "bf16_u16"))]
-                    { return Ok(None); }
+                    {
+                        return Ok(None);
+                    }
                 }
                 _ => return Ok(None),
             }
@@ -3194,8 +3235,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
 
         let mut d_in_strides = unsafe { self.device.alloc::<i64>(rank) }
             .map_err(|_| Error::Cuda("alloc in_strides".into()))?;
-        self.device
-            .htod_copy_into(in_strides, &mut d_in_strides)?;
+        self.device.htod_copy_into(in_strides, &mut d_in_strides)?;
         let mut d_out_strides = unsafe { self.device.alloc::<i64>(rank) }
             .map_err(|_| Error::Cuda("alloc out_strides".into()))?;
         self.device
@@ -3261,8 +3301,7 @@ extern "C" __global__ void max_dim_keepdim_kernel(
                         DType::BF16,
                         tensor.device.clone(),
                     )?;
-                    let input_ptr =
-                        tensor.as_device_ptr_bf16("materialize_view:input")? as u64;
+                    let input_ptr = tensor.as_device_ptr_bf16("materialize_view:input")? as u64;
                     let output_ptr =
                         output.as_mut_device_ptr_bf16("materialize_view:output")? as u64;
                     launch_kernel!(

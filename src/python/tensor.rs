@@ -67,9 +67,8 @@ impl PyTensor {
         })?;
         let shape_vec: Vec<usize> = array.shape().to_vec();
         let device = global_cuda_device();
-        let t =
-            Tensor::from_slice_dtype(slice, Shape::from_dims(&shape_vec), device, DType::F32)
-                .map_err(flame_err)?;
+        let t = Tensor::from_slice_dtype(slice, Shape::from_dims(&shape_vec), device, DType::F32)
+            .map_err(flame_err)?;
         Ok(Self { inner: t })
     }
 }
@@ -144,17 +143,23 @@ impl PyTensor {
     #[staticmethod]
     fn from_bytes_bf16(data: &[u8], shape: Vec<usize>) -> PyResult<Self> {
         if data.len() % 2 != 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err("BF16 data must have even byte count"));
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "BF16 data must have even byte count",
+            ));
         }
         let numel: usize = shape.iter().product();
         if data.len() / 2 != numel {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Expected {} elements ({} bytes) for shape {:?}, got {} bytes",
-                    numel, numel * 2, shape, data.len())
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Expected {} elements ({} bytes) for shape {:?}, got {} bytes",
+                numel,
+                numel * 2,
+                shape,
+                data.len()
+            )));
         }
         // Reinterpret bytes as u16 slice
-        let u16_data: Vec<u16> = data.chunks_exact(2)
+        let u16_data: Vec<u16> = data
+            .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let device = global_cuda_device();
@@ -168,20 +173,27 @@ impl PyTensor {
     #[staticmethod]
     fn from_bytes_f32(data: &[u8], shape: Vec<usize>) -> PyResult<Self> {
         if data.len() % 4 != 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err("F32 data must have byte count divisible by 4"));
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "F32 data must have byte count divisible by 4",
+            ));
         }
         let numel: usize = shape.iter().product();
         if data.len() / 4 != numel {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Expected {} elements ({} bytes) for shape {:?}, got {} bytes",
-                    numel, numel * 4, shape, data.len())
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Expected {} elements ({} bytes) for shape {:?}, got {} bytes",
+                numel,
+                numel * 4,
+                shape,
+                data.len()
+            )));
         }
-        let f32_data: Vec<f32> = data.chunks_exact(4)
+        let f32_data: Vec<f32> = data
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let device = global_cuda_device();
-        let t = Tensor::from_vec(f32_data, crate::Shape::from_dims(&shape), device).map_err(flame_err)?;
+        let t = Tensor::from_vec(f32_data, crate::Shape::from_dims(&shape), device)
+            .map_err(flame_err)?;
         Ok(Self { inner: t })
     }
 
@@ -389,19 +401,13 @@ impl PyTensor {
         }
 
         let parts = self.inner.split(&sizes, dim).map_err(flame_err)?;
-        Ok(parts
-            .into_iter()
-            .map(|t| Self { inner: t })
-            .collect())
+        Ok(parts.into_iter().map(|t| Self { inner: t }).collect())
     }
 
     /// Split into `n` chunks along `dim`.
     fn chunk(&self, n: usize, dim: usize) -> PyResult<Vec<Self>> {
         let parts = self.inner.chunk(n, dim).map_err(flame_err)?;
-        Ok(parts
-            .into_iter()
-            .map(|t| Self { inner: t })
-            .collect())
+        Ok(parts.into_iter().map(|t| Self { inner: t }).collect())
     }
 
     /// Concatenate a list of tensors along `dim`. (Exposed as staticmethod.)
@@ -519,7 +525,9 @@ impl PyTensor {
     }
 
     fn tanh(&self) -> PyResult<Self> {
-        Ok(Self { inner: self.inner.tanh().map_err(flame_err)? })
+        Ok(Self {
+            inner: self.inner.tanh().map_err(flame_err)?,
+        })
     }
 
     fn clamp(&self, min: f32, max: f32) -> PyResult<Self> {

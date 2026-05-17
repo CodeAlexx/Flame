@@ -152,6 +152,55 @@ fn permute_0213_matches_reference() -> Result<()> {
 }
 
 #[test]
+fn bmm_bf16_absorbs_rank3_transpose_views() -> Result<()> {
+    let dev = cuda_device();
+
+    let q_shape = Shape::from_dims(&[2, 3, 4]);
+    let k_shape = Shape::from_dims(&[2, 5, 4]);
+    let q_data: Vec<f32> = (0..q_shape.elem_count())
+        .map(|v| (v as f32 - 7.0) * 0.03125)
+        .collect();
+    let k_data: Vec<f32> = (0..k_shape.elem_count())
+        .map(|v| (v as f32 - 11.0) * -0.015625)
+        .collect();
+    let q = Tensor::from_vec_dtype(q_data, q_shape, dev.clone(), DType::BF16)?;
+    let k = Tensor::from_vec_dtype(k_data, k_shape, dev.clone(), DType::BF16)?;
+
+    let k_t = k.transpose_dims(1, 2)?;
+    let absorbed_rhs = q.bmm(&k_t)?;
+    let materialized_rhs = q.bmm(&k_t.contiguous()?)?;
+    assert_eq!(absorbed_rhs.shape().dims(), &[2, 3, 5]);
+    assert_close(
+        &absorbed_rhs.to_dtype(DType::F32)?.to_vec_f32()?,
+        &materialized_rhs.to_dtype(DType::F32)?.to_vec_f32()?,
+        1e-2,
+    );
+
+    let p_shape = Shape::from_dims(&[2, 3, 5]);
+    let dy_shape = Shape::from_dims(&[2, 3, 4]);
+    let p_data: Vec<f32> = (0..p_shape.elem_count())
+        .map(|v| (v as f32 + 3.0) * 0.0078125)
+        .collect();
+    let dy_data: Vec<f32> = (0..dy_shape.elem_count())
+        .map(|v| (v as f32 - 5.0) * 0.0234375)
+        .collect();
+    let p = Tensor::from_vec_dtype(p_data, p_shape, dev.clone(), DType::BF16)?;
+    let dy = Tensor::from_vec_dtype(dy_data, dy_shape, dev.clone(), DType::BF16)?;
+
+    let p_t = p.transpose_dims(1, 2)?;
+    let absorbed_lhs = p_t.bmm(&dy)?;
+    let materialized_lhs = p_t.contiguous()?.bmm(&dy)?;
+    assert_eq!(absorbed_lhs.shape().dims(), &[2, 5, 4]);
+    assert_close(
+        &absorbed_lhs.to_dtype(DType::F32)?.to_vec_f32()?,
+        &materialized_lhs.to_dtype(DType::F32)?.to_vec_f32()?,
+        1e-2,
+    );
+
+    Ok(())
+}
+
+#[test]
 fn sum_last_keepdim_matches_cpu() -> Result<()> {
     let dev = cuda_device();
 

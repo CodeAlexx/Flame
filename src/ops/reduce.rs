@@ -2,9 +2,9 @@
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-use crate::cuda::device_lt;
-#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 use crate::autograd::{AutogradContext, Op};
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+use crate::cuda::device_lt;
 use crate::{DType, Error, Result, Tensor};
 
 /// Sum over the last dimension, keeping the dimension (size 1) and returning

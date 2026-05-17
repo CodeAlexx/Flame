@@ -232,12 +232,13 @@ Capability checks (BF16 hardware support) — small helper module.
 
 ### ⭐ `ops/fused_inference.rs`
 The "kernel calls that bypass autograd entirely" module. Each function is a
-thin wrapper around a `flame_*_bf16` C entry in `cuda::ffi`. Eight pub fns:
+thin wrapper around a `flame_*_bf16` C entry in `cuda::ffi`. Nine pub fns:
 - `dequant_fp8_to_bf16`, `dequant_fp8_to_bf16_into`, `dequant_fp8_transpose_into` — FP8 unpack
 - `fused_rms_norm` — RMSNorm in one kernel
 - `fused_modulate` — `(1+scale)*x + shift` 
 - `fused_linear3d` — cuBLASLt 3D linear with pre-transposed weight
 - `fused_linear3d_native` — same but takes PyTorch `[Cout, Cin]` weight (added 2026-04, used by every FLUX/Chroma/QwenImage block forward)
+- `fused_linear3d_native_lora` — additive LoRA over `fused_linear3d_native`; byte-identical at LoRA=None, otherwise computes `base + scale * (x @ A^T @ B^T)` with autograd flowing into A/B only (added 2026-05 for HiDream-O1 decoder which owns weights via `HashMap<String, Tensor>`)
 - `fused_rms_norm_modulate` — RMSNorm + modulate fused
 - `fused_residual_gate` — `x + gate*attn` fused
 
@@ -1212,6 +1213,51 @@ drift-free agreement across 100 steps. The F32 path is bit-identical
 the BF16 path matches within BF16 atol across 100 steps. The
 multi-tensor variant only changes launch shape — kernel math is
 identical including the DECOUPLED-WD ordering receipt.
+
+### `adam8bit_kernel.rs` (added 2026-05-17, bnb-port)
+Fused NVRTC kernel for bitsandbytes-equivalent 8-bit AdamW (256-element
+block-wise dynamic-LUT quant). Byte-equivalent to
+`bitsandbytes 0.49.2 F.optimizer_update_8bit_blockwise(optimizer_name="adam")`
+(see `bitsandbytes/functional.py:1488-1550` for the dispatch we mirror, and
+`bitsandbytes/optim/optimizer.py:460-555` for the state layout).
+
+Two 256-entry dynamic-exponent qmaps (signed for `m`, unsigned for `v`) via
+`create_dynamic_map`, allocated once per device and uploaded with
+`upload_qmap`. State per parameter is `(m_codes: u8[n], v_codes: u8[n],
+m_absmax: f32[ceil(n/256)], v_absmax: f32[ceil(n/256)])` — held as raw
+`CudaSlice`s on the optimizer struct (no Tensor wrapper; see CONVENTIONS
+"TensorStorage has no U8 arm"). One fused kernel launch per parameter per
+step does dequant + AdamW math + block-wide max-abs reduction + requant in
+shared memory; no PCIe round-trips.
+
+Public surface:
+- `create_dynamic_map(signed: bool) -> [f32; 256]` — CPU-side LUT builder.
+- `upload_qmap(device, &[f32; 256]) -> CudaSlice<f32>` — single H2D copy.
+- `alloc_state(device, numel) -> (m_codes, v_codes, m_absmax, v_absmax)`.
+- `adam8bit_step_bnb(param, grad, m_codes, v_codes, m_absmax, v_absmax,
+  qmap_signed, qmap_unsigned, lr, β₁, β₂, ε, wd, bc1, bc2)` — F32 param
+  required; F32 or BF16 grad auto-routed to the matching NVRTC kernel.
+- `ADAM8BIT_BLOCK_SIZE` — `const usize = 256`. Matches bnb hardcoded
+  `optimizer.py:478`; do not change without matching kernel + caller edits.
+
+Consumed by `eridiffusion-core::training::training_features::optimizers::AdamW8bit`.
+Trainers that select `--optimizer adamw8bit` (`train_u1`, `train_wan22`)
+get this path automatically — Z-Image and Klein trainers remain BF16/F32
+per the no-quant rule.
+
+**Parity status**: byte-exact vs bnb across 5 envelope cases (single-step,
+10-step, wd>0, tail-block where `n % 256 ≠ 0`, BF16-grad). Validated
+2026-05-17 via `tests/parity/adam8bit_bnb_python_ref*.py` +
+`bins/parity_adam8bit_bnb*.rs`.
+
+**Deferred** (separate variants in bnb; not required for current trainers):
+- `PagedAdamW8bit` — bnb CUDA unified-memory CPU-spill variant
+  (`optimizer.py:71-103`).
+- `optimizer_name` values other than `"adam"` — `lion`, `momentum`,
+  `rmsprop`, `adagrad`. Each is a different bnb kernel.
+- `percentile_clipping` / `gnorm_scale` / `skip_zeros` — bnb defaults
+  (100, 1.0, False); trainers use external `flame_core::ops::grad_norm`
+  clipping instead.
 
 ### `sgd/mod.rs`
 Basic SGD with momentum + weight decay. F32 implementation with an inline

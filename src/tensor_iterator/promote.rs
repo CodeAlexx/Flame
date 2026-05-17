@@ -258,15 +258,9 @@ mod tests {
     #[test]
     fn promote_many_left_fold() {
         // Three-way: BF16 + F32 + BF16 → F32
-        assert_eq!(
-            promote_many([BF16, F32, BF16]),
-            Some(F32)
-        );
+        assert_eq!(promote_many([BF16, F32, BF16]), Some(F32));
         // F16 + BF16 + F32 → F32 (F16+BF16 → F32, then F32+F32 → F32)
-        assert_eq!(
-            promote_many([F16, BF16, F32]),
-            Some(F32)
-        );
+        assert_eq!(promote_many([F16, BF16, F32]), Some(F32));
         // All same: no promotion
         assert_eq!(promote_many([BF16, BF16, BF16]), Some(BF16));
         // Integer dominant + float: float wins

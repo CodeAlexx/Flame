@@ -82,11 +82,7 @@ pub fn apply_rope(
 ///   out[..., D/2:] = x[..., :D/2]*sin + x[..., D/2:]*cos
 ///
 /// Single kernel launch replaces 9 separate ops (2 narrow+clone, 4 mul, 1 sub, 1 add, 1 cat).
-pub fn apply_rope_precomputed(
-    x: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-) -> Result<Tensor> {
+pub fn apply_rope_precomputed(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     ensure_bf16(x, "apply_rope_precomputed x")?;
     ensure_bf16(cos, "apply_rope_precomputed cos")?;
     ensure_bf16(sin, "apply_rope_precomputed sin")?;
@@ -102,8 +98,7 @@ pub fn apply_rope_precomputed(
         return Err(Error::InvalidInput("RoPE head dim must be even".into()));
     }
 
-    let mut output =
-        Tensor::zeros_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
+    let mut output = Tensor::zeros_dtype(x.shape().clone(), DType::BF16, x.device().clone())?;
 
     let stream = x.device().cuda_stream_raw_ptr();
     let status = unsafe {

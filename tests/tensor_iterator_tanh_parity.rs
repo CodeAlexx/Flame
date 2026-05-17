@@ -57,7 +57,9 @@ fn make_bf16_tensor(dev: Arc<CudaDevice>, dims: &[usize], seed: u64) -> Result<T
     let mut data = Vec::with_capacity(n);
     let mut s = seed;
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 40) as u32 as f32 / (1u32 << 24) as f32;
         data.push((u - 0.5) * 8.0);
     }
@@ -139,9 +141,18 @@ fn tanh_iter_edge_values() -> Result<()> {
     let dev = cuda_device();
     // tanh saturates to ±1 at ±∞, 0 at 0.
     let values: Vec<f32> = vec![
-        0.0, -0.0, 1.0, -1.0, 2.0, -2.0, 6.0, -6.0,
-        f32::INFINITY, f32::NEG_INFINITY,
-        3.389e38, -3.389e38,
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        2.0,
+        -2.0,
+        6.0,
+        -6.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        3.389e38,
+        -3.389e38,
     ];
     let t_f32 = Tensor::from_vec(values.clone(), Shape::from_dims(&[values.len()]), dev)?;
     let x = t_f32.to_dtype(DType::BF16)?;

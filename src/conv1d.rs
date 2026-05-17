@@ -16,11 +16,11 @@
 //! Typical speedup: 200× per upsample stage (0.22 s → <1 ms) when
 //! called 6+ times in a vocoder or audio pipeline.
 
+#[cfg(feature = "bf16_u16")]
+use crate::CudaDevice;
 use crate::{DType, Error, Result, Shape, Tensor};
 #[cfg(feature = "bf16_u16")]
 use std::sync::Arc;
-#[cfg(feature = "bf16_u16")]
-use crate::CudaDevice;
 
 /// 1D convolution via cuDNN Conv2d with H=1.
 ///
@@ -41,13 +41,15 @@ pub fn conv1d(
     let in_dims = input.shape().dims();
     if in_dims.len() != 3 {
         return Err(Error::InvalidInput(format!(
-            "conv1d: input must be 3D [B,C,L], got {:?}", in_dims
+            "conv1d: input must be 3D [B,C,L], got {:?}",
+            in_dims
         )));
     }
     let w_dims = weight.shape().dims();
     if w_dims.len() != 3 {
         return Err(Error::InvalidInput(format!(
-            "conv1d: weight must be 3D [C_out,C_in/g,K], got {:?}", w_dims
+            "conv1d: weight must be 3D [C_out,C_in/g,K], got {:?}",
+            w_dims
         )));
     }
 
@@ -62,8 +64,8 @@ pub fn conv1d(
         // [B, C_in, L] → permute → [B, L, C_in] @ W^T [C_in, C_out] → [B, L, C_out] → permute
         let w_2d = weight.reshape(&[c_out, c_in_g])?;
         let x_t = input.permute(&[0, 2, 1])?; // [B, L, C_in]
-        let w_t = w_2d.permute(&[1, 0])?;     // [C_in, C_out]
-        let out = x_t.matmul(&w_t)?;           // [B, L, C_out]
+        let w_t = w_2d.permute(&[1, 0])?; // [C_in, C_out]
+        let out = x_t.matmul(&w_t)?; // [B, L, C_out]
         let mut result = out.permute(&[0, 2, 1])?; // [B, C_out, L]
         if let Some(b_tensor) = bias {
             // bias: [C_out] → [1, C_out, 1] for broadcasting
@@ -93,8 +95,13 @@ pub fn conv1d(
     // Plumb dilation through: cuDNN's 2D conv takes `(dilation_h, dilation_w)`.
     // We represent 1D as `(H=1, W=L)`, so the length-axis dilation goes in the W slot.
     let out_4d = crate::cudnn::cudnn_conv2d_bf16(
-        &input_bf16, &weight_bf16, bias_bf16.as_ref(),
-        (1, stride), (0, padding), (1, dilation), groups,
+        &input_bf16,
+        &weight_bf16,
+        bias_bf16.as_ref(),
+        (1, stride),
+        (0, padding),
+        (1, dilation),
+        groups,
     )?;
 
     let out_4d = if input.dtype() != DType::BF16 {
@@ -115,14 +122,12 @@ pub fn conv1d(
 /// `[C_out, C_in/groups, K]` (regular Conv1d layout) with flipped kernel.
 /// Call this once at load time, then use `conv_transpose1d_with_prepared_weight`
 /// to skip the flip+permute on every forward pass.
-pub fn conv_transpose1d_prepare_weight(
-    weight: &Tensor,
-    groups: usize,
-) -> Result<Tensor> {
+pub fn conv_transpose1d_prepare_weight(weight: &Tensor, groups: usize) -> Result<Tensor> {
     let w_dims = weight.shape().dims();
     if w_dims.len() != 3 {
         return Err(Error::InvalidInput(format!(
-            "conv_transpose1d_prepare_weight: weight must be 3D [C_in,C_out/g,K], got {:?}", w_dims
+            "conv_transpose1d_prepare_weight: weight must be 3D [C_in,C_out/g,K], got {:?}",
+            w_dims
         )));
     }
     let (c_in, c_out_per_group, k) = (w_dims[0], w_dims[1], w_dims[2]);
@@ -157,7 +162,8 @@ pub fn conv_transpose1d_with_prepared_weight(
     if dilation * (k - 1) < padding {
         return Err(Error::InvalidInput(format!(
             "conv_transpose1d: padding ({}) exceeds dilation*(K-1) ({})",
-            padding, dilation * (k - 1)
+            padding,
+            dilation * (k - 1)
         )));
     }
     let side_pad_left = dilation * (k - 1) - padding;
@@ -204,7 +210,16 @@ pub fn conv_transpose1d(
     output_padding: usize,
     groups: usize,
 ) -> Result<Tensor> {
-    conv_transpose1d_dilated(input, weight, bias, stride, padding, output_padding, 1, groups)
+    conv_transpose1d_dilated(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        output_padding,
+        1,
+        groups,
+    )
 }
 
 /// Full-feature 1D transposed convolution with dilation.
@@ -221,27 +236,34 @@ pub fn conv_transpose1d_dilated(
     let in_dims = input.shape().dims();
     if in_dims.len() != 3 {
         return Err(Error::InvalidInput(format!(
-            "conv_transpose1d: input must be 3D [B,C,L], got {:?}", in_dims
+            "conv_transpose1d: input must be 3D [B,C,L], got {:?}",
+            in_dims
         )));
     }
     let w_dims = weight.shape().dims();
     if w_dims.len() != 3 {
         return Err(Error::InvalidInput(format!(
-            "conv_transpose1d: weight must be 3D [C_in,C_out/g,K], got {:?}", w_dims
+            "conv_transpose1d: weight must be 3D [C_in,C_out/g,K], got {:?}",
+            w_dims
         )));
     }
     if stride == 0 {
-        return Err(Error::InvalidInput("conv_transpose1d: stride must be >= 1".into()));
+        return Err(Error::InvalidInput(
+            "conv_transpose1d: stride must be >= 1".into(),
+        ));
     }
     if dilation == 0 {
-        return Err(Error::InvalidInput("conv_transpose1d: dilation must be >= 1".into()));
+        return Err(Error::InvalidInput(
+            "conv_transpose1d: dilation must be >= 1".into(),
+        ));
     }
 
     let (c_in, c_out_per_group, k) = (w_dims[0], w_dims[1], w_dims[2]);
     let c_out = c_out_per_group * groups;
     if c_in % groups != 0 {
         return Err(Error::InvalidInput(format!(
-            "conv_transpose1d: C_in ({}) must be divisible by groups ({})", c_in, groups
+            "conv_transpose1d: C_in ({}) must be divisible by groups ({})",
+            c_in, groups
         )));
     }
     let c_in_per_group = c_in / groups;
@@ -323,7 +345,11 @@ fn zero_insert_last_axis(x: &Tensor, stride: usize) -> Result<Tensor> {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "bf16_u16")]
-fn ensure_kernel_compiled(dev: &Arc<CudaDevice>, name: &'static str, code: &'static str) -> Result<()> {
+fn ensure_kernel_compiled(
+    dev: &Arc<CudaDevice>,
+    name: &'static str,
+    code: &'static str,
+) -> Result<()> {
     if dev.get_func(name, name).is_some() {
         return Ok(());
     }
@@ -412,7 +438,8 @@ pub fn conv_transpose1d_prepare(
     let dims = x.shape().dims();
     if dims.len() != 3 {
         return Err(Error::InvalidInput(format!(
-            "conv_transpose1d_prepare: expected [B,C,L], got {:?}", dims
+            "conv_transpose1d_prepare: expected [B,C,L], got {:?}",
+            dims
         )));
     }
     let (b, c, l_in) = (dims[0], dims[1], dims[2]);
@@ -426,14 +453,13 @@ pub fn conv_transpose1d_prepare(
 
     ensure_kernel_compiled(&device, "conv_transpose1d_prepare_bf16", CUDA_FUSED_ZI_PAD)?;
     let f = device
-        .get_func("conv_transpose1d_prepare_bf16", "conv_transpose1d_prepare_bf16")
+        .get_func(
+            "conv_transpose1d_prepare_bf16",
+            "conv_transpose1d_prepare_bf16",
+        )
         .ok_or_else(|| Error::Cuda("conv_transpose1d_prepare_bf16 missing after compile".into()))?;
 
-    let mut out = Tensor::empty_dtype(
-        Shape::from_dims(&[bc, l_out]),
-        DType::BF16,
-        device.clone(),
-    )?;
+    let mut out = Tensor::empty_dtype(Shape::from_dims(&[bc, l_out]), DType::BF16, device.clone())?;
 
     let x_ptr = x_flat.as_device_ptr_bf16("ct1d_prep_x")? as u64;
     let out_ptr = out.as_mut_device_ptr_bf16("ct1d_prep_out")? as u64;
@@ -450,8 +476,16 @@ pub fn conv_transpose1d_prepare(
         use cudarc::driver::LaunchAsync;
         f.launch(
             cfg,
-            (x_ptr, out_ptr, bc as i64, l_in as i64, l_out as i64,
-             stride as i64, pad_left as i64, pad_right as i64),
+            (
+                x_ptr,
+                out_ptr,
+                bc as i64,
+                l_in as i64,
+                l_out as i64,
+                stride as i64,
+                pad_left as i64,
+                pad_right as i64,
+            ),
         )
         .map_err(|e| Error::Cuda(format!("conv_transpose1d_prepare: {:?}", e)))?;
     }

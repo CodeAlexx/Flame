@@ -45,7 +45,9 @@ fn make_bf16_tensor(dev: Arc<CudaDevice>, dims: &[usize], seed: u64) -> Result<T
     let mut data = Vec::with_capacity(n);
     let mut s = seed;
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 40) as u32 as f32 / (1u32 << 24) as f32;
         data.push((u - 0.5) * 8.0);
     }
@@ -53,17 +55,15 @@ fn make_bf16_tensor(dev: Arc<CudaDevice>, dims: &[usize], seed: u64) -> Result<T
     t_f32.to_dtype(DType::BF16)
 }
 
-fn make_bf16_tensor_positive(
-    dev: Arc<CudaDevice>,
-    dims: &[usize],
-    seed: u64,
-) -> Result<Tensor> {
+fn make_bf16_tensor_positive(dev: Arc<CudaDevice>, dims: &[usize], seed: u64) -> Result<Tensor> {
     let shape = Shape::from_dims(dims);
     let n = shape.elem_count();
     let mut data = Vec::with_capacity(n);
     let mut s = seed;
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 40) as u32 as f32 / (1u32 << 24) as f32;
         // shift to [0.5, 4.5) so no zeros in the divisor
         data.push(0.5 + u * 4.0);

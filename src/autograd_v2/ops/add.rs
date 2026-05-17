@@ -16,9 +16,7 @@ use super::super::dispatch::DispatchCtx;
 use super::super::error::AutogradV2Error;
 use super::super::hooks::Hooks;
 use super::super::node::{Edge, GradFn, NodeId};
-use super::super::recording::{
-    gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
-};
+use super::super::recording::{gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2};
 use super::fw_mode::{any_fw_grad, tangent_or_zero};
 
 #[derive(Debug)]
@@ -34,10 +32,7 @@ impl AddGradFn {
     pub fn new(a: &Tensor, b: &Tensor) -> Arc<dyn GradFn> {
         let seq = next_sequence_nr();
         Arc::new(Self {
-            next_edges: vec![
-                gradient_edge_for_tensor(a),
-                gradient_edge_for_tensor(b),
-            ],
+            next_edges: vec![gradient_edge_for_tensor(a), gradient_edge_for_tensor(b)],
             node_id: NodeId::new(),
             sequence_nr: seq,
             topological_nr: seq,

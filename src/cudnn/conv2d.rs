@@ -306,19 +306,45 @@ pub fn cudnn_conv2d_bf16(
     // where Winograd-NonFused or FFT-Tiling are better. The static
     // heuristic survives as a fallback if v7 fails.
     let fallback_hint = AlgorithmSelector::select_forward_algorithm(
-        kernel_h, kernel_w, batch_size, in_channels, in_height, in_width,
+        kernel_h,
+        kernel_w,
+        batch_size,
+        in_channels,
+        in_height,
+        in_width,
     );
     let key = AlgoKey2D {
-        x_dims: [batch_size as i32, in_channels as i32, in_height as i32, in_width as i32],
-        w_dims: [out_channels as i32, kernel_channels as i32, kernel_h as i32, kernel_w as i32],
-        y_dims: [batch_size as i32, out_channels as i32, out_height as i32, out_width as i32],
+        x_dims: [
+            batch_size as i32,
+            in_channels as i32,
+            in_height as i32,
+            in_width as i32,
+        ],
+        w_dims: [
+            out_channels as i32,
+            kernel_channels as i32,
+            kernel_h as i32,
+            kernel_w as i32,
+        ],
+        y_dims: [
+            batch_size as i32,
+            out_channels as i32,
+            out_height as i32,
+            out_width as i32,
+        ],
         pad: [padding.0 as i32, padding.1 as i32],
         stride: [stride.0 as i32, stride.1 as i32],
         dilation: [dilation.0 as i32, dilation.1 as i32],
         groups: groups as i32,
     };
     let (mut algo, mut workspace_size) = select_conv2d_algo(
-        handle_guard.as_ptr(), &x_desc, &w_desc, &conv_desc, &y_desc, &key, fallback_hint,
+        handle_guard.as_ptr(),
+        &x_desc,
+        &w_desc,
+        &conv_desc,
+        &y_desc,
+        &key,
+        fallback_hint,
     )?;
     let mut status: c_int = 0;
 
@@ -415,7 +441,10 @@ pub fn cudnn_conv2d_bf16(
             )
         };
         if bias_status != 0 {
-            log::warn!("cudnn_conv2d_bf16: bias addition failed (status {}), continuing without", bias_status);
+            log::warn!(
+                "cudnn_conv2d_bf16: bias addition failed (status {}), continuing without",
+                bias_status
+            );
         }
     }
 

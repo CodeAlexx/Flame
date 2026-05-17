@@ -312,7 +312,6 @@ fn group_norm_forward_f32(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
     Ok(GroupNormForwardArtifacts {
@@ -414,7 +413,6 @@ fn finalize_group_norm(
                 view_offset: 0,
                 #[cfg(feature = "autograd_v2")]
                 autograd_meta: None,
-
             };
             let var_tensor = Tensor {
                 storage: TensorStorage::F32 {
@@ -429,7 +427,6 @@ fn finalize_group_norm(
                 view_offset: 0,
                 #[cfg(feature = "autograd_v2")]
                 autograd_meta: None,
-
             };
 
             saved_tensors.push((mean_tensor.id, mean_tensor));

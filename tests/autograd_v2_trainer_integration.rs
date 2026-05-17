@@ -93,7 +93,13 @@ fn checkpoint_under_bridge_v2() {
     let b_qkv_c = b_qkv.clone();
     let w_out_c = w_out.clone();
     let b_out_c = b_out.clone();
-    let attn_inputs = [x.clone(), w_qkv.clone(), b_qkv.clone(), w_out.clone(), b_out.clone()];
+    let attn_inputs = [
+        x.clone(),
+        w_qkv.clone(),
+        b_qkv.clone(),
+        w_out.clone(),
+        b_out.clone(),
+    ];
     let attn_out = AutogradContext::checkpoint(&attn_inputs, move || {
         let qkv = linear(&x_c, &w_qkv_c, &b_qkv_c);
         let q_flat = qkv.narrow(2, 0, d_d)?;

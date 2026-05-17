@@ -410,7 +410,6 @@ pub fn layer_norm(
                 view_offset: 0,
                 #[cfg(feature = "autograd_v2")]
                 autograd_meta: None,
-
             };
             let rstd_tensor = Tensor {
                 storage: TensorStorage::F32 {
@@ -425,7 +424,6 @@ pub fn layer_norm(
                 view_offset: 0,
                 #[cfg(feature = "autograd_v2")]
                 autograd_meta: None,
-
             };
 
             saved_tensors.push((mean_tensor.id, mean_tensor));
@@ -694,7 +692,6 @@ fn layer_norm_forward_f32(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
     Ok(LayerNormForwardArtifacts {

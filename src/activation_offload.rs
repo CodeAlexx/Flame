@@ -464,7 +464,10 @@ impl ActivationOffloadPool {
 
     /// Number of slots currently holding a pushed activation.
     pub fn in_flight(&self) -> usize {
-        self.state.iter().filter(|s| **s == SlotState::Pushed).count()
+        self.state
+            .iter()
+            .filter(|s| **s == SlotState::Pushed)
+            .count()
     }
 
     /// Asynchronously copy `tensor` to a free pinned host slot on the
@@ -541,7 +544,8 @@ impl ActivationOffloadPool {
                 if ret != 0 {
                     self.free_stack.push(slot);
                     return Err(Error::Cuda(format!(
-                        "activation offload push: DtoH failed ({})", ret
+                        "activation offload push: DtoH failed ({})",
+                        ret
                     )));
                 }
                 (bytes, 0.0f32)
@@ -576,7 +580,8 @@ impl ActivationOffloadPool {
                 if ret != 0 {
                     self.free_stack.push(slot);
                     return Err(Error::Cuda(format!(
-                        "activation offload push: bf16_to_fp8 failed ({})", ret
+                        "activation offload push: bf16_to_fp8 failed ({})",
+                        ret
                     )));
                 }
 
@@ -593,7 +598,8 @@ impl ActivationOffloadPool {
                 if ret != 0 {
                     self.free_stack.push(slot);
                     return Err(Error::Cuda(format!(
-                        "activation offload push: FP8 DtoH failed ({})", ret
+                        "activation offload push: FP8 DtoH failed ({})",
+                        ret
                     )));
                 }
                 (fp8_bytes, scale)
@@ -665,7 +671,8 @@ impl ActivationOffloadPool {
         //   b) The returned tensor needs to outlive the caller's backward
         //      pass through autograd, long after the pool may have reused
         //      the slot.
-        let mut out = Tensor::empty_dtype(meta.shape.clone(), meta.dtype, Arc::clone(&self.device))?;
+        let mut out =
+            Tensor::empty_dtype(meta.shape.clone(), meta.dtype, Arc::clone(&self.device))?;
 
         // Get the destination device pointer.
         let dst_ptr: u64 = dst_device_ptr(out.storage_mut())?;
@@ -701,7 +708,9 @@ impl ActivationOffloadPool {
                         self.transfer.as_raw(),
                     )
                 };
-                if r1 != 0 { r1 } else {
+                if r1 != 0 {
+                    r1
+                } else {
                     unsafe {
                         flame_fp8_to_bf16(
                             staging_ptr as *const c_void,
@@ -804,11 +813,9 @@ fn src_device_ptr(storage: &TensorStorage) -> Result<u64> {
         TensorStorage::F16 { .. } => Err(Error::Unsupported(
             "ActivationOffloadPool: F16 source not supported".into(),
         )),
-        TensorStorage::I8 { .. }
-        | TensorStorage::I32 { .. }
-        | TensorStorage::Bool { .. } => Err(Error::Unsupported(
-            "ActivationOffloadPool: integer/bool dtypes not supported".into(),
-        )),
+        TensorStorage::I8 { .. } | TensorStorage::I32 { .. } | TensorStorage::Bool { .. } => Err(
+            Error::Unsupported("ActivationOffloadPool: integer/bool dtypes not supported".into()),
+        ),
     }
 }
 
@@ -1207,11 +1214,7 @@ impl GrowOnDemandActivationCache {
         // tensor's logical data, post-materialization).
         let src_ptr = src_device_ptr(contig.storage_ref())?;
         // Destination host pointer.
-        let dst_ptr = unsafe {
-            self.slabs[slab_idx]
-                .as_ptr()
-                .add(offset) as *mut c_void
-        };
+        let dst_ptr = unsafe { self.slabs[slab_idx].as_ptr().add(offset) as *mut c_void };
 
         // Gate the transfer stream on the producer kernel's progress.
         let push_event = CudaEvent::new()?;
@@ -1294,18 +1297,11 @@ impl GrowOnDemandActivationCache {
         // Allocate a fresh device tensor. `target_id` is a no-op (kept
         // for API compatibility); pulled tensors get fresh IDs.
         let _ = target_id;
-        let dst = Tensor::empty_dtype(
-            entry.shape.clone(),
-            entry.dtype,
-            self.device.clone(),
-        )?;
+        let dst = Tensor::empty_dtype(entry.shape.clone(), entry.dtype, self.device.clone())?;
         let mut dst = dst;
 
-        let src_ptr = unsafe {
-            self.slabs[entry.slab_idx]
-                .as_ptr()
-                .add(entry.offset) as *const c_void
-        };
+        let src_ptr =
+            unsafe { self.slabs[entry.slab_idx].as_ptr().add(entry.offset) as *const c_void };
         let dst_ptr = dst_device_ptr(dst.storage_mut())? as *mut c_void;
 
         // Pulled tensor allocation lives on cudarc's `CudaDevice` internal

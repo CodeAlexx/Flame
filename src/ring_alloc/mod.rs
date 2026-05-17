@@ -156,11 +156,7 @@ impl RingAllocator {
     /// first `alloc` in each slab triggers its allocation.
     ///
     /// Errors if `num_slabs == 0` or `slab_bytes == 0`.
-    pub fn new(
-        device: Arc<CudaDevice>,
-        num_slabs: usize,
-        slab_bytes: usize,
-    ) -> Result<Self> {
+    pub fn new(device: Arc<CudaDevice>, num_slabs: usize, slab_bytes: usize) -> Result<Self> {
         if num_slabs == 0 {
             return Err(Error::InvalidInput(
                 "RingAllocator: num_slabs must be > 0".into(),
@@ -177,11 +173,9 @@ impl RingAllocator {
         // on the caller picking a sensible size); we make it impossible to
         // mis-size by construction.
         let slab_bytes = ceil_16(slab_bytes);
-        let total_bytes = slab_bytes
-            .checked_mul(num_slabs)
-            .ok_or_else(|| Error::InvalidInput(
-                "RingAllocator: num_slabs * slab_bytes overflows usize".into(),
-            ))?;
+        let total_bytes = slab_bytes.checked_mul(num_slabs).ok_or_else(|| {
+            Error::InvalidInput("RingAllocator: num_slabs * slab_bytes overflows usize".into())
+        })?;
 
         let slabs = (0..num_slabs).map(|_| None).collect();
 
@@ -284,12 +278,18 @@ impl RingAllocator {
     /// borrows the allocator mutably; drop before requesting a backward
     /// handle on the same allocator.
     pub fn forward_handle(&mut self, block_idx: usize) -> RingForwardHandle<'_> {
-        RingForwardHandle { alloc: self, layer_idx: block_idx }
+        RingForwardHandle {
+            alloc: self,
+            layer_idx: block_idx,
+        }
     }
 
     /// Begin a backward-pass scope for `block_idx`.
     pub fn backward_handle(&mut self, block_idx: usize) -> RingBackwardHandle<'_> {
-        RingBackwardHandle { alloc: self, layer_idx: block_idx }
+        RingBackwardHandle {
+            alloc: self,
+            layer_idx: block_idx,
+        }
     }
 
     // -------- Internal helpers --------
@@ -304,10 +304,9 @@ impl RingAllocator {
         // SAFETY: `device.alloc` returns uninitialized memory; we make no
         // assumptions about the contents — every allocator hand-out is
         // expected to be fully written by the caller before any read.
-        let slab = unsafe { self.device.alloc::<u8>(self.slab_bytes) }
-            .map_err(|e| Error::CudaDriver(format!(
-                "RingAllocator slab[{idx}] cudaMalloc: {e:?}"
-            )))?;
+        let slab = unsafe { self.device.alloc::<u8>(self.slab_bytes) }.map_err(|e| {
+            Error::CudaDriver(format!("RingAllocator slab[{idx}] cudaMalloc: {e:?}"))
+        })?;
         self.slabs[idx] = Some(slab);
         self.cuda_malloc_count += 1;
         Ok(())
@@ -317,7 +316,8 @@ impl RingAllocator {
     /// Assumes `ensure_slab(slab_idx)` was called.
     #[inline]
     fn slab_device_ptr(&self, slab_idx: usize, intra_offset: usize) -> u64 {
-        let slab = self.slabs[slab_idx].as_ref()
+        let slab = self.slabs[slab_idx]
+            .as_ref()
             .expect("ensure_slab must be called before slab_device_ptr");
         *slab.device_ptr() + intra_offset as u64
     }
@@ -343,12 +343,11 @@ impl RingAllocator {
 
         // OT line 74-77: if it doesn't fit in the remainder of this slab,
         // jump to slab 0 of the next.
-        let (cand_slab_idx, cand_intra) =
-            if cur_intra + num_bytes > self.slab_bytes {
-                (cur_slab_idx + 1, 0_usize)
-            } else {
-                (cur_slab_idx, cur_intra)
-            };
+        let (cand_slab_idx, cand_intra) = if cur_intra + num_bytes > self.slab_bytes {
+            (cur_slab_idx + 1, 0_usize)
+        } else {
+            (cur_slab_idx, cur_intra)
+        };
 
         // OT line 78-82: cyclic wrap if we walked off the end.
         let wrapped = cand_slab_idx >= self.slabs.len();
@@ -380,8 +379,7 @@ impl RingAllocator {
         // Invariant check (no OT analog — OT trusts sizing). If the new
         // forward end would cross into the backward-allocated region, the
         // ring is exhausted; error rather than silently overlap.
-        let new_global_end =
-            slab_idx * self.slab_bytes + intra + num_bytes;
+        let new_global_end = slab_idx * self.slab_bytes + intra + num_bytes;
         self.check_no_overlap_forward(new_global_end)?;
 
         self.ensure_slab(slab_idx)?;
@@ -426,14 +424,13 @@ impl RingAllocator {
         // i.e., one past the last slab. Treat that as "we're about to
         // step into the last slab from above" — set `cur_intra` to
         // `slab_bytes` (top of last slab) and `cur_slab_idx` to last.
-        let (cur_slab_idx, cur_intra) =
-            if self.allocation_start == self.total_bytes {
-                (self.slabs.len() - 1, self.slab_bytes)
-            } else {
-                let s = self.allocation_start / self.slab_bytes;
-                let i = self.allocation_start % self.slab_bytes;
-                (s, i)
-            };
+        let (cur_slab_idx, cur_intra) = if self.allocation_start == self.total_bytes {
+            (self.slabs.len() - 1, self.slab_bytes)
+        } else {
+            let s = self.allocation_start / self.slab_bytes;
+            let i = self.allocation_start % self.slab_bytes;
+            (s, i)
+        };
 
         // OT line 94-97: if it doesn't fit at the head of the current
         // slab, jump to the END of the previous slab.
@@ -506,13 +503,13 @@ impl RingAllocator {
         // top-of-ring AND forward stays below backward.
         // If allocation_start is at `total_bytes`, no backward has fired
         // — forward can grow freely up to total_bytes.
-        if self.allocation_start < self.total_bytes
-            && new_end > self.allocation_start
-        {
+        if self.allocation_start < self.total_bytes && new_end > self.allocation_start {
             return Err(Error::OutOfMemory(format!(
                 "RingAllocator exhausted: forward end {new_end} would cross \
                  backward start {} (total {} bytes across {} slabs)",
-                self.allocation_start, self.total_bytes, self.slabs.len(),
+                self.allocation_start,
+                self.total_bytes,
+                self.slabs.len(),
             )));
         }
         Ok(())
@@ -526,7 +523,9 @@ impl RingAllocator {
             return Err(Error::OutOfMemory(format!(
                 "RingAllocator exhausted: backward start {new_start} would cross \
                  forward end {} (total {} bytes across {} slabs)",
-                self.allocation_end, self.total_bytes, self.slabs.len(),
+                self.allocation_end,
+                self.total_bytes,
+                self.slabs.len(),
             )));
         }
         Ok(())
@@ -547,12 +546,16 @@ impl<'a> RingForwardHandle<'a> {
     /// Current forward cursor (read-through to allocator). Useful for
     /// in-loop invariant checks while the handle is live.
     #[inline]
-    pub fn allocation_end(&self) -> usize { self.alloc.allocation_end }
+    pub fn allocation_end(&self) -> usize {
+        self.alloc.allocation_end
+    }
 
     /// Current backward cursor (read-through). The bidirectional
     /// invariant is `allocation_end <= allocation_start`.
     #[inline]
-    pub fn allocation_start(&self) -> usize { self.alloc.allocation_start }
+    pub fn allocation_start(&self) -> usize {
+        self.alloc.allocation_start
+    }
 }
 
 impl<'a> RingBackwardHandle<'a> {
@@ -563,11 +566,15 @@ impl<'a> RingBackwardHandle<'a> {
 
     /// Current forward cursor (read-through).
     #[inline]
-    pub fn allocation_end(&self) -> usize { self.alloc.allocation_end }
+    pub fn allocation_end(&self) -> usize {
+        self.alloc.allocation_end
+    }
 
     /// Current backward cursor (read-through).
     #[inline]
-    pub fn allocation_start(&self) -> usize { self.alloc.allocation_start }
+    pub fn allocation_start(&self) -> usize {
+        self.alloc.allocation_start
+    }
 }
 
 // ---------------------------------------------------------------------------

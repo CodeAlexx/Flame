@@ -8,7 +8,9 @@
 //! cos_sim ≥ 0.9999 holds on random BF16 ranges — matches silu/sigmoid
 //! threshold which also use `__expf`.
 
-use flame_core::{tensor_iterator::ops::transcendentals::exp_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{
+    tensor_iterator::ops::transcendentals::exp_bf16_iter, DType, Result, Shape, Tensor,
+};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
@@ -58,7 +60,9 @@ fn make_bf16_moderate_tensor(dev: Arc<CudaDevice>, dims: &[usize], seed: u64) ->
     let mut data = Vec::with_capacity(n);
     let mut s = seed;
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 40) as u32 as f32 / (1u32 << 24) as f32;
         // exp saturates beyond ~±88; keep in [-8, 8] to avoid inf/zero domination.
         data.push((u - 0.5) * 16.0);
@@ -80,7 +84,10 @@ fn exp_iter_contig_cos_sim() -> Result<()> {
     let new_f32 = new_out.to_vec_f32()?;
 
     let cs = cos_sim_f32(&ref_f32, &new_f32);
-    assert!(cs >= 0.9999, "exp contig cos_sim {cs} below threshold 0.9999");
+    assert!(
+        cs >= 0.9999,
+        "exp contig cos_sim {cs} below threshold 0.9999"
+    );
     Ok(())
 }
 
@@ -101,7 +108,10 @@ fn exp_iter_permuted_view_cos_sim() -> Result<()> {
     let new_out = exp_bf16_iter(&permuted)?;
     let new_f32 = new_out.to_vec_f32()?;
     let cs = cos_sim_f32(&ref_f32, &new_f32);
-    assert!(cs >= 0.9999, "exp permuted view cos_sim {cs} below threshold 0.9999");
+    assert!(
+        cs >= 0.9999,
+        "exp permuted view cos_sim {cs} below threshold 0.9999"
+    );
     Ok(())
 }
 
@@ -122,7 +132,10 @@ fn exp_iter_narrow_view_cos_sim() -> Result<()> {
     let new_out = exp_bf16_iter(&narrow_view)?;
     let new_f32 = new_out.to_vec_f32()?;
     let cs = cos_sim_f32(&ref_f32, &new_f32);
-    assert!(cs >= 0.9999, "exp narrow view cos_sim {cs} below threshold 0.9999");
+    assert!(
+        cs >= 0.9999,
+        "exp narrow view cos_sim {cs} below threshold 0.9999"
+    );
     Ok(())
 }
 
@@ -132,7 +145,15 @@ fn exp_iter_edge_values() -> Result<()> {
     // Landmarks: 0→1, ln(2)≈0.6931→2, -inf→0, large negative should not NaN.
     let ln2 = std::f32::consts::LN_2; // ≈ 0.6931472
     let values: Vec<f32> = vec![
-        0.0, -0.0, ln2, 1.0, -1.0, 10.0, -10.0, f32::NEG_INFINITY, -50.0,
+        0.0,
+        -0.0,
+        ln2,
+        1.0,
+        -1.0,
+        10.0,
+        -10.0,
+        f32::NEG_INFINITY,
+        -50.0,
     ];
     let t_f32 = Tensor::from_vec(values.clone(), Shape::from_dims(&[values.len()]), dev)?;
     let x = t_f32.to_dtype(DType::BF16)?;

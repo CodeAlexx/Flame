@@ -124,7 +124,10 @@ fn main() -> Result<()> {
     let stream = dev.cuda_stream_raw_ptr();
     let n = N as i64;
 
-    println!("\nActivation backward microbench  (BF16, N={}, warmup={}, iters={})", N, WARMUP, ITERS);
+    println!(
+        "\nActivation backward microbench  (BF16, N={}, warmup={}, iters={})",
+        N, WARMUP, ITERS
+    );
     println!("------------------------------------------------------------------------");
 
     // ReLU: decomposed = gt(0) + mul;  fused = 1 kernel
@@ -163,10 +166,12 @@ fn main() -> Result<()> {
             let tanh_k_sq = GpuOps::mul(&tanh_k, &tanh_k).unwrap();
             let ones = Tensor::ones_dtype(shape.clone(), DType::BF16, dev.clone()).unwrap();
             let sech2 = GpuOps::add(&ones, &GpuOps::mul_scalar(&tanh_k_sq, -1.0).unwrap()).unwrap();
-            let dk_dx_inner = GpuOps::add_scalar(&GpuOps::mul_scalar(&x2, 3.0 * 0.044715).unwrap(), 1.0).unwrap();
+            let dk_dx_inner =
+                GpuOps::add_scalar(&GpuOps::mul_scalar(&x2, 3.0 * 0.044715).unwrap(), 1.0).unwrap();
             let dk_dx = GpuOps::mul_scalar(&dk_dx_inner, c0).unwrap();
             let term2 = GpuOps::mul(&GpuOps::mul(&x, &sech2).unwrap(), &dk_dx).unwrap();
-            let derivative = GpuOps::mul_scalar(&GpuOps::add(&one_plus_tanh, &term2).unwrap(), 0.5).unwrap();
+            let derivative =
+                GpuOps::mul_scalar(&GpuOps::add(&one_plus_tanh, &term2).unwrap(), 0.5).unwrap();
             let _ = GpuOps::mul(&g, &derivative).unwrap();
         };
         let fused = || {
@@ -215,7 +220,8 @@ fn main() -> Result<()> {
         let decomposed = || {
             let sig = GpuOps::sigmoid(&x).unwrap();
             let ones = Tensor::ones_dtype(shape.clone(), DType::BF16, dev.clone()).unwrap();
-            let one_minus_sig = GpuOps::add(&ones, &GpuOps::mul_scalar(&sig, -1.0).unwrap()).unwrap();
+            let one_minus_sig =
+                GpuOps::add(&ones, &GpuOps::mul_scalar(&sig, -1.0).unwrap()).unwrap();
             let deriv = GpuOps::mul(&sig, &one_minus_sig).unwrap();
             let _ = GpuOps::mul(&g, &deriv).unwrap();
         };
@@ -241,7 +247,8 @@ fn main() -> Result<()> {
         let decomposed = || {
             let sig = GpuOps::sigmoid(&x).unwrap();
             let ones = Tensor::ones_dtype(shape.clone(), DType::BF16, dev.clone()).unwrap();
-            let one_minus_sig = GpuOps::add(&ones, &GpuOps::mul_scalar(&sig, -1.0).unwrap()).unwrap();
+            let one_minus_sig =
+                GpuOps::add(&ones, &GpuOps::mul_scalar(&sig, -1.0).unwrap()).unwrap();
             let x_times_omsig = GpuOps::mul(&x, &one_minus_sig).unwrap();
             let inner = GpuOps::add(&ones, &x_times_omsig).unwrap();
             let deriv = GpuOps::mul(&sig, &inner).unwrap();

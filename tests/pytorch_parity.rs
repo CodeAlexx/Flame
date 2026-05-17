@@ -172,27 +172,63 @@ fn run_unary_test(op_name: &str, op_fn: fn(&Tensor) -> Result<Tensor>) {
             println!(
                 "  {op_name}/{stem}: cos_sim={cos:.8} max_abs_diff={mad:.4e} ({mismatches} bf16 bits differ)"
             );
-            assert!(
-                cos >= 0.9999,
-                "{op_name}/{stem}: cos_sim {cos:.8} < 0.9999"
-            );
+            assert!(cos >= 0.9999, "{op_name}/{stem}: cos_sim {cos:.8} < 0.9999");
         }
     }
 }
 
-#[test] fn parity_unary_silu()    { run_unary_test("silu",    |x| x.silu()); }
-#[test] fn parity_unary_gelu()    { run_unary_test("gelu",    |x| x.gelu()); }
-#[test] fn parity_unary_relu()    { run_unary_test("relu",    |x| x.relu()); }
-#[test] fn parity_unary_sigmoid() { run_unary_test("sigmoid", |x| x.sigmoid()); }
-#[test] fn parity_unary_tanh()    { run_unary_test("tanh",    |x| x.tanh()); }
-#[test] fn parity_unary_abs()     { run_unary_test("abs",     |x| x.abs()); }
-#[test] fn parity_unary_neg()     { run_unary_test("neg",     |x| x.neg()); }
-#[test] fn parity_unary_square()  { run_unary_test("square",  |x| x.square()); }
-#[test] fn parity_unary_exp()     { run_unary_test("exp",     |x| x.exp()); }
-#[test] fn parity_unary_log()     { run_unary_test("log",     |x| x.log()); }
-#[test] fn parity_unary_sqrt()    { run_unary_test("sqrt",    |x| x.sqrt()); }
-#[test] fn parity_unary_rsqrt()   { run_unary_test("rsqrt",   |x| x.rsqrt()); }
-#[test] fn parity_unary_recip()   { run_unary_test("recip",   |x| x.reciprocal()); }
+#[test]
+fn parity_unary_silu() {
+    run_unary_test("silu", |x| x.silu());
+}
+#[test]
+fn parity_unary_gelu() {
+    run_unary_test("gelu", |x| x.gelu());
+}
+#[test]
+fn parity_unary_relu() {
+    run_unary_test("relu", |x| x.relu());
+}
+#[test]
+fn parity_unary_sigmoid() {
+    run_unary_test("sigmoid", |x| x.sigmoid());
+}
+#[test]
+fn parity_unary_tanh() {
+    run_unary_test("tanh", |x| x.tanh());
+}
+#[test]
+fn parity_unary_abs() {
+    run_unary_test("abs", |x| x.abs());
+}
+#[test]
+fn parity_unary_neg() {
+    run_unary_test("neg", |x| x.neg());
+}
+#[test]
+fn parity_unary_square() {
+    run_unary_test("square", |x| x.square());
+}
+#[test]
+fn parity_unary_exp() {
+    run_unary_test("exp", |x| x.exp());
+}
+#[test]
+fn parity_unary_log() {
+    run_unary_test("log", |x| x.log());
+}
+#[test]
+fn parity_unary_sqrt() {
+    run_unary_test("sqrt", |x| x.sqrt());
+}
+#[test]
+fn parity_unary_rsqrt() {
+    run_unary_test("rsqrt", |x| x.rsqrt());
+}
+#[test]
+fn parity_unary_recip() {
+    run_unary_test("recip", |x| x.reciprocal());
+}
 
 // ---------------------------------------------------------------------------
 // Section 2: Binary op parity
@@ -225,20 +261,35 @@ fn run_binary_test(op_name: &str, op_fn: fn(&Tensor, &Tensor) -> Result<Tensor>)
             println!(
                 "  {op_name}/{stem}: cos_sim={cos:.8} max_abs_diff={mad:.4e} ({mismatches} bf16 bits differ)"
             );
-            assert!(
-                cos >= 0.9999,
-                "{op_name}/{stem}: cos_sim {cos:.8} < 0.9999"
-            );
+            assert!(cos >= 0.9999, "{op_name}/{stem}: cos_sim {cos:.8} < 0.9999");
         }
     }
 }
 
-#[test] fn parity_binary_add()     { run_binary_test("add",     |a, b| a.add(b)); }
-#[test] fn parity_binary_sub()     { run_binary_test("sub",     |a, b| a.sub(b)); }
-#[test] fn parity_binary_mul()     { run_binary_test("mul",     |a, b| a.mul(b)); }
-#[test] fn parity_binary_div()     { run_binary_test("div",     |a, b| a.div(b)); }
-#[test] fn parity_binary_maximum() { run_binary_test("maximum", |a, b| a.maximum(b)); }
-#[test] fn parity_binary_minimum() { run_binary_test("minimum", |a, b| a.minimum(b)); }
+#[test]
+fn parity_binary_add() {
+    run_binary_test("add", |a, b| a.add(b));
+}
+#[test]
+fn parity_binary_sub() {
+    run_binary_test("sub", |a, b| a.sub(b));
+}
+#[test]
+fn parity_binary_mul() {
+    run_binary_test("mul", |a, b| a.mul(b));
+}
+#[test]
+fn parity_binary_div() {
+    run_binary_test("div", |a, b| a.div(b));
+}
+#[test]
+fn parity_binary_maximum() {
+    run_binary_test("maximum", |a, b| a.maximum(b));
+}
+#[test]
+fn parity_binary_minimum() {
+    run_binary_test("minimum", |a, b| a.minimum(b));
+}
 
 // ---------------------------------------------------------------------------
 // Section 3: Scalar op parity
@@ -246,7 +297,9 @@ fn run_binary_test(op_name: &str, op_fn: fn(&Tensor, &Tensor) -> Result<Tensor>)
 
 #[test]
 fn parity_scalar_add() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
     let dir = fixtures_dir().join("scalar").join("add_scalar");
     for fixture_path in discover_fixtures(&dir) {
         let stem = fixture_path.file_stem().unwrap().to_str().unwrap();
@@ -261,7 +314,9 @@ fn parity_scalar_add() {
 
 #[test]
 fn parity_scalar_mul() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
     let dir = fixtures_dir().join("scalar").join("mul_scalar");
     for fixture_path in discover_fixtures(&dir) {
         let stem = fixture_path.file_stem().unwrap().to_str().unwrap();
@@ -286,7 +341,9 @@ fn parity_scalar_mul() {
 // required — they're either 0 or 1 with no precision in between.
 
 fn run_comparison_test(op_name: &str, op_fn: fn(&Tensor, &Tensor) -> Result<Tensor>) {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
 
     let dir = fixtures_dir().join("comparison").join(op_name);
     for fixture_path in discover_fixtures(&dir) {
@@ -301,7 +358,8 @@ fn run_comparison_test(op_name: &str, op_fn: fn(&Tensor, &Tensor) -> Result<Tens
         let got_f = got.to_vec_f32().unwrap();
         let exp_f = expected.to_vec_f32().unwrap();
         assert_eq!(
-            got_f.len(), exp_f.len(),
+            got_f.len(),
+            exp_f.len(),
             "{op_name}/{stem}: length mismatch"
         );
         let mismatches: Vec<usize> = got_f
@@ -322,12 +380,30 @@ fn run_comparison_test(op_name: &str, op_fn: fn(&Tensor, &Tensor) -> Result<Tens
     }
 }
 
-#[test] fn parity_cmp_gt() { run_comparison_test("gt", |a, b| a.gt(b)); }
-#[test] fn parity_cmp_ge() { run_comparison_test("ge", |a, b| a.ge(b)); }
-#[test] fn parity_cmp_lt() { run_comparison_test("lt", |a, b| a.lt(b)); }
-#[test] fn parity_cmp_le() { run_comparison_test("le", |a, b| a.le(b)); }
-#[test] fn parity_cmp_eq() { run_comparison_test("eq", |a, b| a.eq(b)); }
-#[test] fn parity_cmp_ne() { run_comparison_test("ne", |a, b| a.ne(b)); }
+#[test]
+fn parity_cmp_gt() {
+    run_comparison_test("gt", |a, b| a.gt(b));
+}
+#[test]
+fn parity_cmp_ge() {
+    run_comparison_test("ge", |a, b| a.ge(b));
+}
+#[test]
+fn parity_cmp_lt() {
+    run_comparison_test("lt", |a, b| a.lt(b));
+}
+#[test]
+fn parity_cmp_le() {
+    run_comparison_test("le", |a, b| a.le(b));
+}
+#[test]
+fn parity_cmp_eq() {
+    run_comparison_test("eq", |a, b| a.eq(b));
+}
+#[test]
+fn parity_cmp_ne() {
+    run_comparison_test("ne", |a, b| a.ne(b));
+}
 
 // ---------------------------------------------------------------------------
 // Section 5: SDPA parity
@@ -335,11 +411,15 @@ fn run_comparison_test(op_name: &str, op_fn: fn(&Tensor, &Tensor) -> Result<Tens
 
 #[test]
 fn parity_sdpa_contiguous() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
     let dir = fixtures_dir().join("sdpa");
     for fixture_path in discover_fixtures(&dir) {
         let stem = fixture_path.file_stem().unwrap().to_str().unwrap();
-        if !stem.ends_with("_contig") { continue; }
+        if !stem.ends_with("_contig") {
+            continue;
+        }
 
         let tensors = load_fixture(&fixture_path);
         let q = tensors.get("q").unwrap();
@@ -361,11 +441,15 @@ fn parity_sdpa_contiguous() {
 // directly). This test just documents the fixture exists.
 #[test]
 fn parity_sdpa_strided_placeholder() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
     let dir = fixtures_dir().join("sdpa");
     for fixture_path in discover_fixtures(&dir) {
         let stem = fixture_path.file_stem().unwrap().to_str().unwrap();
-        if !stem.ends_with("_strided") { continue; }
+        if !stem.ends_with("_strided") {
+            continue;
+        }
         let tensors = load_fixture(&fixture_path);
         let q = tensors.get("q").unwrap();
         let k = tensors.get("k").unwrap();
@@ -391,11 +475,15 @@ fn parity_sdpa_strided_placeholder() {
 
 #[test]
 fn parity_matmul_linear() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
     let dir = fixtures_dir().join("matmul");
     for fixture_path in discover_fixtures(&dir) {
         let stem = fixture_path.file_stem().unwrap().to_str().unwrap();
-        if stem.ends_with("_nobias") { continue; }
+        if stem.ends_with("_nobias") {
+            continue;
+        }
 
         let tensors = load_fixture(&fixture_path);
         let input = tensors.get("input").unwrap();
@@ -413,11 +501,15 @@ fn parity_matmul_linear() {
 
 #[test]
 fn parity_matmul_nobias() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
     let dir = fixtures_dir().join("matmul");
     for fixture_path in discover_fixtures(&dir) {
         let stem = fixture_path.file_stem().unwrap().to_str().unwrap();
-        if !stem.ends_with("_nobias") { continue; }
+        if !stem.ends_with("_nobias") {
+            continue;
+        }
 
         let tensors = load_fixture(&fixture_path);
         let input = tensors.get("input").unwrap();
@@ -438,7 +530,9 @@ fn parity_matmul_nobias() {
 #[test]
 #[ignore] // Needs flame_core::conv::Conv2d wrapping; pending a dedicated conv parity test.
 fn parity_conv2d() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
     println!("conv2d parity pending dedicated implementation");
 }
 
@@ -448,11 +542,15 @@ fn parity_conv2d() {
 
 #[test]
 fn parity_fused_swiglu() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
     let dir = fixtures_dir().join("fused");
     for fixture_path in discover_fixtures(&dir) {
         let stem = fixture_path.file_stem().unwrap().to_str().unwrap();
-        if !stem.starts_with("swiglu_") { continue; }
+        if !stem.starts_with("swiglu_") {
+            continue;
+        }
 
         let tensors = load_fixture(&fixture_path);
         let gate_up = tensors.get("input").unwrap();
@@ -475,11 +573,15 @@ fn parity_fused_swiglu() {
 
 #[test]
 fn parity_fused_rmsnorm() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
     let dir = fixtures_dir().join("fused");
     for fixture_path in discover_fixtures(&dir) {
         let stem = fixture_path.file_stem().unwrap().to_str().unwrap();
-        if !stem.starts_with("rmsnorm_") { continue; }
+        if !stem.starts_with("rmsnorm_") {
+            continue;
+        }
 
         let tensors = load_fixture(&fixture_path);
         let input = tensors.get("input").unwrap();
@@ -514,12 +616,12 @@ fn parity_fused_rmsnorm() {
 ///   attn = permute back to [B,N,D]
 ///   out = Linear(attn, w_out, b_out)
 fn run_klein_attn(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
-    let x      = ts.get("input").unwrap();
-    let w_qkv  = ts.get("w_qkv").unwrap();
-    let b_qkv  = ts.get("b_qkv").unwrap();
-    let w_out  = ts.get("w_out").unwrap();
-    let b_out  = ts.get("b_out").unwrap();
-    let freqs  = ts.get("freqs").unwrap();
+    let x = ts.get("input").unwrap();
+    let w_qkv = ts.get("w_qkv").unwrap();
+    let b_qkv = ts.get("b_qkv").unwrap();
+    let w_out = ts.get("w_out").unwrap();
+    let b_out = ts.get("b_out").unwrap();
+    let freqs = ts.get("freqs").unwrap();
     let dims = x.shape().dims();
     let (b, n, d) = (dims[0], dims[1], dims[2]);
     // Derive H/HD from the freqs fixture (shape [1, 1, N, HD]).
@@ -533,13 +635,28 @@ fn run_klein_attn(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
     let v3 = qkv.narrow(2, 2 * d, d)?;
     // Reshape views to [B, N, H, HD] then permute to [B, H, N, HD].
     // reshape requires contig, so materialize the narrow views first.
-    let q = q3.contiguous()?.reshape(&[b, n, h, hd])?.permute(&[0, 2, 1, 3])?.contiguous()?;
-    let k = k3.contiguous()?.reshape(&[b, n, h, hd])?.permute(&[0, 2, 1, 3])?.contiguous()?;
-    let v = v3.contiguous()?.reshape(&[b, n, h, hd])?.permute(&[0, 2, 1, 3])?.contiguous()?;
+    let q = q3
+        .contiguous()?
+        .reshape(&[b, n, h, hd])?
+        .permute(&[0, 2, 1, 3])?
+        .contiguous()?;
+    let k = k3
+        .contiguous()?
+        .reshape(&[b, n, h, hd])?
+        .permute(&[0, 2, 1, 3])?
+        .contiguous()?;
+    let v = v3
+        .contiguous()?
+        .reshape(&[b, n, h, hd])?
+        .permute(&[0, 2, 1, 3])?
+        .contiguous()?;
     let q = q.mul(freqs)?;
     let k = k.mul(freqs)?;
     let attn = flame_core::sdpa::forward(&q, &k, &v, None)?;
-    let attn = attn.permute(&[0, 2, 1, 3])?.contiguous()?.reshape(&[b, n, d])?;
+    let attn = attn
+        .permute(&[0, 2, 1, 3])?
+        .contiguous()?
+        .reshape(&[b, n, d])?;
     let out = flame_core::ops::fused_inference::fused_linear3d_native(&attn, w_out, Some(b_out))?;
     Ok(out)
 }
@@ -550,9 +667,9 @@ fn run_klein_attn(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
 ///   hidden = SwiGLU(gate, up)         (fused)
 ///   out = Linear(hidden, w_down, b_down)
 fn run_klein_mlp(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
-    let x      = ts.get("input").unwrap();
-    let w_up   = ts.get("w_up").unwrap();
-    let b_up   = ts.get("b_up").unwrap();
+    let x = ts.get("input").unwrap();
+    let w_up = ts.get("w_up").unwrap();
+    let b_up = ts.get("b_up").unwrap();
     let w_down = ts.get("w_down").unwrap();
     let b_down = ts.get("b_down").unwrap();
 
@@ -563,7 +680,8 @@ fn run_klein_mlp(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
     let gate = gate_up.narrow(last_axis, 0, half)?;
     let up = gate_up.narrow(last_axis, half, half)?;
     let hidden = flame_core::bf16_ops::swiglu_fused_bf16(&gate, &up)?;
-    let out = flame_core::ops::fused_inference::fused_linear3d_native(&hidden, w_down, Some(b_down))?;
+    let out =
+        flame_core::ops::fused_inference::fused_linear3d_native(&hidden, w_down, Some(b_down))?;
     Ok(out)
 }
 
@@ -575,10 +693,10 @@ fn run_klein_mlp(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
 /// flame-core has `fused_rms_norm_modulate` which does RMSNorm + (1+scale)·x
 /// + shift in ONE kernel — that's the fused-path to use.
 fn run_dit_modulate_residual(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
-    let x        = ts.get("input").unwrap();
-    let shift    = ts.get("shift").unwrap();
-    let scale    = ts.get("scale").unwrap();
-    let gate     = ts.get("gate").unwrap();
+    let x = ts.get("input").unwrap();
+    let shift = ts.get("shift").unwrap();
+    let scale = ts.get("scale").unwrap();
+    let gate = ts.get("gate").unwrap();
     let residual = ts.get("residual").unwrap();
     // shift/scale/gate are [B, 1, D] from the fixture; fused_rms_norm_modulate
     // wants [B, D] so we need to handle that. Simpler: use the unfused path
@@ -601,7 +719,7 @@ fn run_dit_modulate_residual(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
 
 /// Klein double-block pattern: attention + residual + MLP + residual.
 fn run_klein_double_block(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
-    let x    = ts.get("input").unwrap();
+    let x = ts.get("input").unwrap();
     let gate = ts.get("gate").unwrap();
 
     let attn_out = run_klein_attn(ts)?;
@@ -612,8 +730,8 @@ fn run_klein_double_block(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
     // fixture which also has w_up/b_up/w_down/b_down. It expects "input"
     // to be the MLP input — but the block feeds `h` here, not the raw `x`.
     // So inline the MLP with the right input instead.
-    let w_up   = ts.get("w_up").unwrap();
-    let b_up   = ts.get("b_up").unwrap();
+    let w_up = ts.get("w_up").unwrap();
+    let b_up = ts.get("b_up").unwrap();
     let w_down = ts.get("w_down").unwrap();
     let b_down = ts.get("b_down").unwrap();
     let gate_up = flame_core::ops::fused_inference::fused_linear3d_native(&h, w_up, Some(b_up))?;
@@ -623,7 +741,8 @@ fn run_klein_double_block(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
     let g = gate_up.narrow(last_axis, 0, half)?;
     let u = gate_up.narrow(last_axis, half, half)?;
     let hidden = flame_core::bf16_ops::swiglu_fused_bf16(&g, &u)?;
-    let mlp_out = flame_core::ops::fused_inference::fused_linear3d_native(&hidden, w_down, Some(b_down))?;
+    let mlp_out =
+        flame_core::ops::fused_inference::fused_linear3d_native(&hidden, w_down, Some(b_down))?;
 
     let gated_mlp = gate.mul(&mlp_out)?;
     let out = h.add(&gated_mlp)?;
@@ -632,9 +751,14 @@ fn run_klein_double_block(ts: &HashMap<String, Tensor>) -> Result<Tensor> {
 
 #[test]
 fn parity_pattern_klein_attention() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
     let path = fixtures_dir().join("patterns/klein_attention_path.safetensors");
-    if !path.exists() { println!("SKIP: klein_attention_path fixture missing"); return; }
+    if !path.exists() {
+        println!("SKIP: klein_attention_path fixture missing");
+        return;
+    }
     let ts = load_fixture(&path);
     let got = run_klein_attn(&ts).unwrap_or_else(|e| panic!("klein_attention: {e:?}"));
     let expected = ts.get("output").unwrap();
@@ -644,9 +768,14 @@ fn parity_pattern_klein_attention() {
 
 #[test]
 fn parity_pattern_klein_mlp() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
     let path = fixtures_dir().join("patterns/klein_mlp_path.safetensors");
-    if !path.exists() { println!("SKIP: klein_mlp_path fixture missing"); return; }
+    if !path.exists() {
+        println!("SKIP: klein_mlp_path fixture missing");
+        return;
+    }
     let ts = load_fixture(&path);
     let got = run_klein_mlp(&ts).unwrap_or_else(|e| panic!("klein_mlp: {e:?}"));
     let expected = ts.get("output").unwrap();
@@ -656,12 +785,17 @@ fn parity_pattern_klein_mlp() {
 
 #[test]
 fn parity_pattern_dit_modulate_residual() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
     let path = fixtures_dir().join("patterns/dit_modulate_residual.safetensors");
-    if !path.exists() { println!("SKIP: dit_modulate_residual fixture missing"); return; }
+    if !path.exists() {
+        println!("SKIP: dit_modulate_residual fixture missing");
+        return;
+    }
     let ts = load_fixture(&path);
-    let got = run_dit_modulate_residual(&ts)
-        .unwrap_or_else(|e| panic!("dit_modulate_residual: {e:?}"));
+    let got =
+        run_dit_modulate_residual(&ts).unwrap_or_else(|e| panic!("dit_modulate_residual: {e:?}"));
     let expected = ts.get("output").unwrap();
     // Lower threshold because flame-core's fused_rms_norm uses learned weight=1
     // while Python's pattern is a hand-rolled RMSNorm (no affine). The
@@ -673,12 +807,16 @@ fn parity_pattern_dit_modulate_residual() {
 
 #[test]
 fn parity_pattern_klein_double_block() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
     let path = fixtures_dir().join("patterns/klein_double_block.safetensors");
-    if !path.exists() { println!("SKIP: klein_double_block fixture missing"); return; }
+    if !path.exists() {
+        println!("SKIP: klein_double_block fixture missing");
+        return;
+    }
     let ts = load_fixture(&path);
-    let got = run_klein_double_block(&ts)
-        .unwrap_or_else(|e| panic!("klein_double_block: {e:?}"));
+    let got = run_klein_double_block(&ts).unwrap_or_else(|e| panic!("klein_double_block: {e:?}"));
     let expected = ts.get("output").unwrap();
     assert_cos_sim("pattern/klein_double_block", &got, expected, 0.99);
     println!("  pattern/klein_double_block: ok");
@@ -736,65 +874,113 @@ fn bench_flame_for(op_path: &str, shape_name: &str) -> Option<f64> {
     match category {
         "unary" => {
             let op = subop?;
-            let path = root.join("unary").join(op).join(format!("{shape_name}.safetensors"));
-            if !path.exists() { return None; }
+            let path = root
+                .join("unary")
+                .join(op)
+                .join(format!("{shape_name}.safetensors"));
+            if !path.exists() {
+                return None;
+            }
             let ts = load_fixture(&path);
             let x = ts.get("input")?.clone();
             let f: fn(&Tensor) -> Result<Tensor> = match op {
-                "silu"    => |t| t.silu(),
-                "gelu"    => |t| t.gelu(),
-                "relu"    => |t| t.relu(),
+                "silu" => |t| t.silu(),
+                "gelu" => |t| t.gelu(),
+                "relu" => |t| t.relu(),
                 "sigmoid" => |t| t.sigmoid(),
-                "tanh"    => |t| t.tanh(),
-                "abs"     => |t| t.abs(),
-                "neg"     => |t| t.neg(),
-                "square"  => |t| t.square(),
-                "exp"     => |t| t.exp(),
-                "log"     => |t| t.log(),
-                "sqrt"    => |t| t.sqrt(),
-                "rsqrt"   => |t| t.rsqrt(),
-                "recip"   => |t| t.reciprocal(),
+                "tanh" => |t| t.tanh(),
+                "abs" => |t| t.abs(),
+                "neg" => |t| t.neg(),
+                "square" => |t| t.square(),
+                "exp" => |t| t.exp(),
+                "log" => |t| t.log(),
+                "sqrt" => |t| t.sqrt(),
+                "rsqrt" => |t| t.rsqrt(),
+                "recip" => |t| t.reciprocal(),
                 _ => return None,
             };
-            Some(bench_flame(|| { let _ = f(&x)?; Ok(()) }, 3, 10))
+            Some(bench_flame(
+                || {
+                    let _ = f(&x)?;
+                    Ok(())
+                },
+                3,
+                10,
+            ))
         }
 
         "binary" => {
             let op = subop?;
-            let path = root.join("binary").join(op).join(format!("{shape_name}.safetensors"));
-            if !path.exists() { return None; }
+            let path = root
+                .join("binary")
+                .join(op)
+                .join(format!("{shape_name}.safetensors"));
+            if !path.exists() {
+                return None;
+            }
             let ts = load_fixture(&path);
             let a = ts.get("input_a")?.clone();
             let b = ts.get("input_b")?.clone();
             let f: fn(&Tensor, &Tensor) -> Result<Tensor> = match op {
-                "add"     => |x, y| x.add(y),
-                "sub"     => |x, y| x.sub(y),
-                "mul"     => |x, y| x.mul(y),
-                "div"     => |x, y| x.div(y),
+                "add" => |x, y| x.add(y),
+                "sub" => |x, y| x.sub(y),
+                "mul" => |x, y| x.mul(y),
+                "div" => |x, y| x.div(y),
                 "maximum" => |x, y| x.maximum(y),
                 "minimum" => |x, y| x.minimum(y),
                 _ => return None,
             };
-            Some(bench_flame(|| { let _ = f(&a, &b)?; Ok(()) }, 3, 10))
+            Some(bench_flame(
+                || {
+                    let _ = f(&a, &b)?;
+                    Ok(())
+                },
+                3,
+                10,
+            ))
         }
 
         "scalar" => {
             let op = subop?;
-            let path = root.join("scalar").join(op).join(format!("{shape_name}.safetensors"));
-            if !path.exists() { return None; }
+            let path = root
+                .join("scalar")
+                .join(op)
+                .join(format!("{shape_name}.safetensors"));
+            if !path.exists() {
+                return None;
+            }
             let ts = load_fixture(&path);
             let x = ts.get("input")?.clone();
             Some(match op {
-                "add_scalar" => bench_flame(|| { let _ = x.add_scalar(0.5)?; Ok(()) }, 3, 10),
-                "mul_scalar" => bench_flame(|| { let _ = x.mul_scalar(2.0)?; Ok(()) }, 3, 10),
+                "add_scalar" => bench_flame(
+                    || {
+                        let _ = x.add_scalar(0.5)?;
+                        Ok(())
+                    },
+                    3,
+                    10,
+                ),
+                "mul_scalar" => bench_flame(
+                    || {
+                        let _ = x.mul_scalar(2.0)?;
+                        Ok(())
+                    },
+                    3,
+                    10,
+                ),
                 _ => return None,
             })
         }
 
         "comparison" => {
             let op = subop?;
-            let path = root.join("comparison").join(op).join(format!("{shape_name}.safetensors"));
-            if !path.exists() { return None; }
+            let path = root
+                .join("comparison")
+                .join(op)
+                .join(format!("{shape_name}.safetensors"));
+            if !path.exists() {
+                return None;
+            }
             let ts = load_fixture(&path);
             let a = ts.get("input_a")?.clone();
             let b = ts.get("input_b")?.clone();
@@ -807,21 +993,34 @@ fn bench_flame_for(op_path: &str, shape_name: &str) -> Option<f64> {
                 "ne" => |x, y| x.ne(y),
                 _ => return None,
             };
-            Some(bench_flame(|| { let _ = f(&a, &b)?; Ok(()) }, 3, 10))
+            Some(bench_flame(
+                || {
+                    let _ = f(&a, &b)?;
+                    Ok(())
+                },
+                3,
+                10,
+            ))
         }
 
         // SDPA: fixture path is `sdpa/<shape_name>.safetensors`; shape_name
         // has `_contig` or `_strided` suffix already.
         "sdpa" => {
             let path = root.join("sdpa").join(format!("{shape_name}.safetensors"));
-            if !path.exists() { return None; }
+            if !path.exists() {
+                return None;
+            }
             let ts = load_fixture(&path);
             let q = ts.get("q")?.clone();
             let k = ts.get("k")?.clone();
             let v = ts.get("v")?.clone();
             Some(bench_flame(
-                || { let _ = flame_core::sdpa::forward(&q, &k, &v, None)?; Ok(()) },
-                3, 10,
+                || {
+                    let _ = flame_core::sdpa::forward(&q, &k, &v, None)?;
+                    Ok(())
+                },
+                3,
+                10,
             ))
         }
 
@@ -829,8 +1028,12 @@ fn bench_flame_for(op_path: &str, shape_name: &str) -> Option<f64> {
         // `_nobias` variants are matmul without the bias add.
         "matmul" => {
             let op = subop?;
-            let path = root.join("matmul").join(format!("{shape_name}.safetensors"));
-            if !path.exists() { return None; }
+            let path = root
+                .join("matmul")
+                .join(format!("{shape_name}.safetensors"));
+            if !path.exists() {
+                return None;
+            }
             let ts = load_fixture(&path);
             let input = ts.get("input")?.clone();
             let weight = ts.get("weight")?.clone();
@@ -844,14 +1047,19 @@ fn bench_flame_for(op_path: &str, shape_name: &str) -> Option<f64> {
                             let _ = logits.add(&bias)?;
                             Ok(())
                         },
-                        3, 10,
+                        3,
+                        10,
                     ))
                 }
                 "mm" => {
                     let w_t = weight.transpose().ok()?;
                     Some(bench_flame(
-                        || { let _ = input.matmul(&w_t)?; Ok(()) },
-                        3, 10,
+                        || {
+                            let _ = input.matmul(&w_t)?;
+                            Ok(())
+                        },
+                        3,
+                        10,
                     ))
                 }
                 _ => None,
@@ -863,8 +1071,12 @@ fn bench_flame_for(op_path: &str, shape_name: &str) -> Option<f64> {
         // `<shape>` (`klein_hidden`), so we prepend `<sub>_` here.
         "fused" => {
             let op = subop?;
-            let path = root.join("fused").join(format!("{op}_{shape_name}.safetensors"));
-            if !path.exists() { return None; }
+            let path = root
+                .join("fused")
+                .join(format!("{op}_{shape_name}.safetensors"));
+            if !path.exists() {
+                return None;
+            }
             let ts = load_fixture(&path);
             match op {
                 "swiglu" => {
@@ -872,13 +1084,19 @@ fn bench_flame_for(op_path: &str, shape_name: &str) -> Option<f64> {
                     let dims = gate_up.shape().dims().to_vec();
                     let last_axis = dims.len() - 1;
                     let last = dims[last_axis];
-                    if last % 2 != 0 { return None; }
+                    if last % 2 != 0 {
+                        return None;
+                    }
                     let half = last / 2;
                     let gate = gate_up.narrow(last_axis, 0, half).ok()?;
                     let up = gate_up.narrow(last_axis, half, half).ok()?;
                     Some(bench_flame(
-                        || { let _ = flame_core::bf16_ops::swiglu_fused_bf16(&gate, &up)?; Ok(()) },
-                        3, 10,
+                        || {
+                            let _ = flame_core::bf16_ops::swiglu_fused_bf16(&gate, &up)?;
+                            Ok(())
+                        },
+                        3,
+                        10,
                     ))
                 }
                 "rmsnorm" => {
@@ -891,7 +1109,8 @@ fn bench_flame_for(op_path: &str, shape_name: &str) -> Option<f64> {
                             )?;
                             Ok(())
                         },
-                        3, 10,
+                        3,
+                        10,
                     ))
                 }
                 _ => None,
@@ -912,28 +1131,50 @@ fn bench_flame_for(op_path: &str, shape_name: &str) -> Option<f64> {
             //   dit_modulate_residual → dit_modulate_residual.safetensors
             //   klein_double_block    → klein_double_block.safetensors
             let file = match op {
-                "klein_attention"       => "klein_attention_path.safetensors",
-                "klein_mlp"             => "klein_mlp_path.safetensors",
+                "klein_attention" => "klein_attention_path.safetensors",
+                "klein_mlp" => "klein_mlp_path.safetensors",
                 "dit_modulate_residual" => "dit_modulate_residual.safetensors",
-                "klein_double_block"    => "klein_double_block.safetensors",
+                "klein_double_block" => "klein_double_block.safetensors",
                 // permute_narrow_linear / sdpa_backward not wired.
                 _ => return None,
             };
             let path = root.join("patterns").join(file);
-            if !path.exists() { return None; }
+            if !path.exists() {
+                return None;
+            }
             let ts = load_fixture(&path);
             Some(match op {
                 "klein_attention" => bench_flame(
-                    || { let _ = run_klein_attn(&ts)?; Ok(()) }, 3, 10,
+                    || {
+                        let _ = run_klein_attn(&ts)?;
+                        Ok(())
+                    },
+                    3,
+                    10,
                 ),
                 "klein_mlp" => bench_flame(
-                    || { let _ = run_klein_mlp(&ts)?; Ok(()) }, 3, 10,
+                    || {
+                        let _ = run_klein_mlp(&ts)?;
+                        Ok(())
+                    },
+                    3,
+                    10,
                 ),
                 "dit_modulate_residual" => bench_flame(
-                    || { let _ = run_dit_modulate_residual(&ts)?; Ok(()) }, 3, 10,
+                    || {
+                        let _ = run_dit_modulate_residual(&ts)?;
+                        Ok(())
+                    },
+                    3,
+                    10,
                 ),
                 "klein_double_block" => bench_flame(
-                    || { let _ = run_klein_double_block(&ts)?; Ok(()) }, 3, 10,
+                    || {
+                        let _ = run_klein_double_block(&ts)?;
+                        Ok(())
+                    },
+                    3,
+                    10,
                 ),
                 _ => return None,
             })
@@ -948,7 +1189,9 @@ fn bench_flame_for(op_path: &str, shape_name: &str) -> Option<f64> {
 #[test]
 #[ignore]
 fn perf_comparison() {
-    if skip_if_no_fixtures() { return; }
+    if skip_if_no_fixtures() {
+        return;
+    }
 
     let timing_path = fixtures_dir().join("timing_results.json");
     if !timing_path.exists() {
@@ -1031,8 +1274,7 @@ fn parity_klein_head_rms_norm_toy_diag() {
         .reshape(&[b_d, n_d, h_d, hd_d])
         .and_then(|t| t.permute(&[0, 2, 1, 3]))
         .expect("reshape/permute");
-    let out = flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6)
-        .expect("rms_norm");
+    let out = flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6).expect("rms_norm");
 
     let loss = out.sum().expect("sum");
     let grads = loss.backward().expect("backward");
@@ -1041,12 +1283,23 @@ fn parity_klein_head_rms_norm_toy_diag() {
     let dscale = grads.get(scale.id()).expect("missing dscale (toy)");
     eprintln!(
         "head_rms_norm_toy_diag: ||dx||={:.3e} ||dscale||={:.3e}",
-        dx.to_dtype(flame_core::DType::F32).unwrap()
-            .to_vec().unwrap()
-            .iter().map(|v: &f32| v * v).sum::<f32>().sqrt(),
-        dscale.to_dtype(flame_core::DType::F32).unwrap()
-            .to_vec().unwrap()
-            .iter().map(|v: &f32| v * v).sum::<f32>().sqrt(),
+        dx.to_dtype(flame_core::DType::F32)
+            .unwrap()
+            .to_vec()
+            .unwrap()
+            .iter()
+            .map(|v: &f32| v * v)
+            .sum::<f32>()
+            .sqrt(),
+        dscale
+            .to_dtype(flame_core::DType::F32)
+            .unwrap()
+            .to_vec()
+            .unwrap()
+            .iter()
+            .map(|v: &f32| v * v)
+            .sum::<f32>()
+            .sqrt(),
     );
 }
 
@@ -1080,29 +1333,39 @@ fn parity_klein_head_rms_norm_prod_diag() {
         .reshape(&[b_d, n_d, h_d, hd_d])
         .and_then(|t| t.permute(&[0, 2, 1, 3]))
         .expect("reshape/permute");
-    let out = flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6)
-        .expect("rms_norm");
+    let out = flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6).expect("rms_norm");
 
     let loss = out.sum().expect("sum");
     let grads = loss.backward().expect("backward");
 
     let dx = grads.get(x.id()).expect("missing dx (prod HD=128)");
     let dscale = grads.get(scale.id()).expect("missing dscale (prod)");
-    let cos_dx     = cos_sim_f32(dx,     fix.get("dx").unwrap());
+    let cos_dx = cos_sim_f32(dx, fix.get("dx").unwrap());
     let cos_dscale = cos_sim_f32(dscale, fix.get("dscale").unwrap());
     eprintln!(
         "head_rms_norm_prod_diag: cos_dx={:.4} cos_dscale={:.4}  \
          (||dx||={:.3e} ||dscale||={:.3e})",
         cos_dx,
         cos_dscale,
-        dx.to_dtype(flame_core::DType::F32).unwrap()
-            .to_vec().unwrap()
-            .iter().map(|v: &f32| v * v).sum::<f32>().sqrt(),
-        dscale.to_dtype(flame_core::DType::F32).unwrap()
-            .to_vec().unwrap()
-            .iter().map(|v: &f32| v * v).sum::<f32>().sqrt(),
+        dx.to_dtype(flame_core::DType::F32)
+            .unwrap()
+            .to_vec()
+            .unwrap()
+            .iter()
+            .map(|v: &f32| v * v)
+            .sum::<f32>()
+            .sqrt(),
+        dscale
+            .to_dtype(flame_core::DType::F32)
+            .unwrap()
+            .to_vec()
+            .unwrap()
+            .iter()
+            .map(|v: &f32| v * v)
+            .sum::<f32>()
+            .sqrt(),
     );
-    assert!(cos_dx     > 0.99, "dx cos_sim {cos_dx}");
+    assert!(cos_dx > 0.99, "dx cos_sim {cos_dx}");
     assert!(cos_dscale > 0.99, "dscale cos_sim {cos_dscale}");
 }
 
@@ -1131,8 +1394,8 @@ fn parity_klein_apply_rope_prod_diag() {
 
     let out = {
         use flame_core::autograd::{AutogradContext, Op};
-        let mut o = flame_core::bf16_ops::rope_fused_bf16(&x, &pe_cos, &pe_sin)
-            .expect("rope_fused_bf16");
+        let mut o =
+            flame_core::bf16_ops::rope_fused_bf16(&x, &pe_cos, &pe_sin).expect("rope_fused_bf16");
         if x.requires_grad() {
             o = o.requires_grad_(true);
             if AutogradContext::is_recording() {
@@ -1160,12 +1423,24 @@ fn parity_klein_apply_rope_prod_diag() {
     let dx = grads.get(x.id()).expect("missing dx (rope prod)");
     let expected_dx = fix.get("dx").unwrap();
     let cos_dx = cos_sim_f32(dx, expected_dx);
-    let dx_norm = dx.to_dtype(flame_core::DType::F32).unwrap()
-        .to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
-    let exp_norm = expected_dx.to_dtype(flame_core::DType::F32).unwrap()
-        .to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let dx_norm = dx
+        .to_dtype(flame_core::DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
+    let exp_norm = expected_dx
+        .to_dtype(flame_core::DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
     eprintln!(
         "apply_rope_prod_diag: cos_dx={:.4}  ||dx||={:.3e} (expected {:.3e})",
         cos_dx, dx_norm, exp_norm
@@ -1207,21 +1482,23 @@ fn parity_klein_rms_norm_direct_4d_diag() {
         .expect("reshape (no-grad)")
         .requires_grad_(true);
 
-    let out = flame_core::norm::rms_norm(&x_4d, &[hd_d], Some(&scale), 1.0e-6)
-        .expect("rms_norm");
+    let out = flame_core::norm::rms_norm(&x_4d, &[hd_d], Some(&scale), 1.0e-6).expect("rms_norm");
 
     let loss = out.sum().expect("sum");
     let grads = loss.backward().expect("backward");
 
     let dx = grads.get(x_4d.id()).expect("missing dx (4D direct)");
     let _dscale = grads.get(scale.id()).expect("missing dscale");
-    let dx_norm = dx.to_dtype(flame_core::DType::F32).unwrap()
-        .to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
-    eprintln!(
-        "rms_norm_direct_4d_diag: ||dx_4d||={:.3e}",
-        dx_norm
-    );
+    let dx_norm = dx
+        .to_dtype(flame_core::DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
+    eprintln!("rms_norm_direct_4d_diag: ||dx_4d||={:.3e}", dx_norm);
 }
 
 /// Sanity: rms_norm on a CONTIGUOUS input (no permute) at production
@@ -1256,17 +1533,22 @@ fn parity_klein_rms_norm_contig_prod_diag() {
 
     // Reshape ONLY (no permute) → tensor is still contiguous.
     let h = x.reshape(&[b_d, n_d, h_d, hd_d]).expect("reshape");
-    let out = flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6)
-        .expect("rms_norm");
+    let out = flame_core::norm::rms_norm(&h, &[hd_d], Some(&scale), 1.0e-6).expect("rms_norm");
 
     let loss = out.sum().expect("sum");
     let grads = loss.backward().expect("backward");
 
     let dx = grads.get(x.id()).expect("missing dx (contig)");
     let _dscale = grads.get(scale.id()).expect("missing dscale");
-    let dx_norm = dx.to_dtype(flame_core::DType::F32).unwrap()
-        .to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let dx_norm = dx
+        .to_dtype(flame_core::DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
     eprintln!(
         "rms_norm_contig_prod_diag: ||dx||={:.3e}  (sanity: should be nonzero)",
         dx_norm
@@ -1350,8 +1632,8 @@ fn parity_klein_attn_chain_prod_diag() {
 
     let rope = |x_in: &Tensor| -> Tensor {
         use flame_core::autograd::{AutogradContext, Op};
-        let mut o = flame_core::bf16_ops::rope_fused_bf16(x_in, &pe_cos, &pe_sin)
-            .expect("rope_fused_bf16");
+        let mut o =
+            flame_core::bf16_ops::rope_fused_bf16(x_in, &pe_cos, &pe_sin).expect("rope_fused_bf16");
         if x_in.requires_grad() {
             o = o.requires_grad_(true);
             if AutogradContext::is_recording() {
@@ -1376,7 +1658,8 @@ fn parity_klein_attn_chain_prod_diag() {
     let k = rope(&k);
 
     let o = flame_core::sdpa::forward(&q, &k, &v, None).expect("sdpa");
-    let o = o.permute(&[0, 2, 1, 3])
+    let o = o
+        .permute(&[0, 2, 1, 3])
         .and_then(|t| t.reshape(&[b_d, n_d, d_d]))
         .expect("permute/reshape back");
     let out = linear(&o, &w_out, &b_out);
@@ -1391,21 +1674,23 @@ fn parity_klein_attn_chain_prod_diag() {
     // (separate flame-core bug — Op::Add saves nothing). Treat bias
     // gradients as best-effort: the chaos hunt cares about the chain not
     // the biases.
-    let dx       = grads.get(x.id()).expect("missing dx");
-    let dw_qkv   = grads.get(w_qkv.id()).expect("missing dw_qkv");
+    let dx = grads.get(x.id()).expect("missing dx");
+    let dw_qkv = grads.get(w_qkv.id()).expect("missing dw_qkv");
     let dq_scale = grads.get(q_scale.id()).expect("missing dq_scale");
     let dk_scale = grads.get(k_scale.id()).expect("missing dk_scale");
-    let dw_out   = grads.get(w_out.id()).expect("missing dw_out");
+    let dw_out = grads.get(w_out.id()).expect("missing dw_out");
 
-    let cos_dx       = cos_sim_f32(dx,       fix.get("dx").unwrap());
-    let cos_dw_qkv   = cos_sim_f32(dw_qkv,   fix.get("dw_qkv").unwrap());
+    let cos_dx = cos_sim_f32(dx, fix.get("dx").unwrap());
+    let cos_dw_qkv = cos_sim_f32(dw_qkv, fix.get("dw_qkv").unwrap());
     let cos_dq_scale = cos_sim_f32(dq_scale, fix.get("dq_scale").unwrap());
     let cos_dk_scale = cos_sim_f32(dk_scale, fix.get("dk_scale").unwrap());
-    let cos_dw_out   = cos_sim_f32(dw_out,   fix.get("dw_out").unwrap());
-    let cos_db_qkv = grads.get(b_qkv.id())
+    let cos_dw_out = cos_sim_f32(dw_out, fix.get("dw_out").unwrap());
+    let cos_db_qkv = grads
+        .get(b_qkv.id())
         .map(|g| cos_sim_f32(g, fix.get("db_qkv").unwrap()))
         .unwrap_or(f64::NAN);
-    let cos_db_out = grads.get(b_out.id())
+    let cos_db_out = grads
+        .get(b_out.id())
         .map(|g| cos_sim_f32(g, fix.get("db_out").unwrap()))
         .unwrap_or(f64::NAN);
 
@@ -1415,12 +1700,12 @@ fn parity_klein_attn_chain_prod_diag() {
          dq_scale={cos_dq_scale:.4} dk_scale={cos_dk_scale:.4} \
          dw_out={cos_dw_out:.4} db_out={cos_db_out:.4}"
     );
-    assert!(cos_fwd       > 0.999, "fwd cos_sim {cos_fwd}");
-    assert!(cos_dx        > 0.99,  "dx  cos_sim {cos_dx}");
-    assert!(cos_dw_qkv    > 0.99,  "dw_qkv cos_sim {cos_dw_qkv}");
-    assert!(cos_dq_scale  > 0.99,  "dq_scale cos_sim {cos_dq_scale}");
-    assert!(cos_dk_scale  > 0.99,  "dk_scale cos_sim {cos_dk_scale}");
-    assert!(cos_dw_out    > 0.99,  "dw_out cos_sim {cos_dw_out}");
+    assert!(cos_fwd > 0.999, "fwd cos_sim {cos_fwd}");
+    assert!(cos_dx > 0.99, "dx  cos_sim {cos_dx}");
+    assert!(cos_dw_qkv > 0.99, "dw_qkv cos_sim {cos_dw_qkv}");
+    assert!(cos_dq_scale > 0.99, "dq_scale cos_sim {cos_dq_scale}");
+    assert!(cos_dk_scale > 0.99, "dk_scale cos_sim {cos_dk_scale}");
+    assert!(cos_dw_out > 0.99, "dw_out cos_sim {cos_dw_out}");
 }
 
 /// Same chain as `parity_klein_attn_chain_prod_diag` BUT with SDPA
@@ -1477,26 +1762,35 @@ fn parity_klein_attn_chain_no_sdpa_prod_diag() {
     let k_flat = qkv.narrow(2, inner, inner).expect("nk");
     let v_flat = qkv.narrow(2, 2 * inner, inner).expect("nv");
 
-    let q = q_flat.reshape(&[b_d, n_d, h_d, hd_d])
-        .and_then(|t| t.permute(&[0, 2, 1, 3])).expect("q");
-    let k = k_flat.reshape(&[b_d, n_d, h_d, hd_d])
-        .and_then(|t| t.permute(&[0, 2, 1, 3])).expect("k");
-    let v = v_flat.reshape(&[b_d, n_d, h_d, hd_d])
-        .and_then(|t| t.permute(&[0, 2, 1, 3])).expect("v");
+    let q = q_flat
+        .reshape(&[b_d, n_d, h_d, hd_d])
+        .and_then(|t| t.permute(&[0, 2, 1, 3]))
+        .expect("q");
+    let k = k_flat
+        .reshape(&[b_d, n_d, h_d, hd_d])
+        .and_then(|t| t.permute(&[0, 2, 1, 3]))
+        .expect("k");
+    let v = v_flat
+        .reshape(&[b_d, n_d, h_d, hd_d])
+        .and_then(|t| t.permute(&[0, 2, 1, 3]))
+        .expect("v");
 
     let q = flame_core::norm::rms_norm(&q, &[hd_d], Some(&q_scale), 1.0e-6).expect("q rms");
     let k = flame_core::norm::rms_norm(&k, &[hd_d], Some(&k_scale), 1.0e-6).expect("k rms");
 
     let rope = |x_in: &Tensor| -> Tensor {
         use flame_core::autograd::{AutogradContext, Op};
-        let mut o = flame_core::bf16_ops::rope_fused_bf16(x_in, &pe_cos, &pe_sin)
-            .expect("rope");
+        let mut o = flame_core::bf16_ops::rope_fused_bf16(x_in, &pe_cos, &pe_sin).expect("rope");
         if x_in.requires_grad() {
             o = o.requires_grad_(true);
             if AutogradContext::is_recording() {
                 AutogradContext::record_op(
                     o.id(),
-                    Op::RoPePrecomputed { input: x_in.id(), cos: pe_cos.id(), sin: pe_sin.id() },
+                    Op::RoPePrecomputed {
+                        input: x_in.id(),
+                        cos: pe_cos.id(),
+                        sin: pe_sin.id(),
+                    },
                     vec![
                         (x_in.id(), x_in.clone()),
                         (pe_cos.id(), pe_cos.clone()),
@@ -1527,7 +1821,8 @@ fn parity_klein_attn_chain_no_sdpa_prod_diag() {
     } else {
         o
     };
-    let o = o.permute(&[0, 2, 1, 3])
+    let o = o
+        .permute(&[0, 2, 1, 3])
         .and_then(|t| t.reshape(&[b_d, n_d, d_d]))
         .expect("permute/reshape");
     let out = linear(&o, &w_out, &b_out);
@@ -1538,17 +1833,17 @@ fn parity_klein_attn_chain_no_sdpa_prod_diag() {
     let loss = out.sum().expect("sum");
     let grads = loss.backward().expect("backward");
 
-    let dx       = grads.get(x.id()).expect("missing dx");
-    let dw_qkv   = grads.get(w_qkv.id()).expect("missing dw_qkv");
+    let dx = grads.get(x.id()).expect("missing dx");
+    let dw_qkv = grads.get(w_qkv.id()).expect("missing dw_qkv");
     let dq_scale = grads.get(q_scale.id()).expect("missing dq_scale");
     let dk_scale = grads.get(k_scale.id()).expect("missing dk_scale");
-    let dw_out   = grads.get(w_out.id()).expect("missing dw_out");
+    let dw_out = grads.get(w_out.id()).expect("missing dw_out");
 
-    let cos_dx       = cos_sim_f32(dx,       fix.get("dx").unwrap());
-    let cos_dw_qkv   = cos_sim_f32(dw_qkv,   fix.get("dw_qkv").unwrap());
+    let cos_dx = cos_sim_f32(dx, fix.get("dx").unwrap());
+    let cos_dw_qkv = cos_sim_f32(dw_qkv, fix.get("dw_qkv").unwrap());
     let cos_dq_scale = cos_sim_f32(dq_scale, fix.get("dq_scale").unwrap());
     let cos_dk_scale = cos_sim_f32(dk_scale, fix.get("dk_scale").unwrap());
-    let cos_dw_out   = cos_sim_f32(dw_out,   fix.get("dw_out").unwrap());
+    let cos_dw_out = cos_sim_f32(dw_out, fix.get("dw_out").unwrap());
 
     eprintln!(
         "attn_chain_no_sdpa_prod_diag: cos_fwd={cos_fwd:.4}  \
@@ -1556,12 +1851,12 @@ fn parity_klein_attn_chain_no_sdpa_prod_diag() {
          dq_scale={cos_dq_scale:.4} dk_scale={cos_dk_scale:.4} \
          dw_out={cos_dw_out:.4}"
     );
-    assert!(cos_fwd       > 0.999, "fwd cos_sim {cos_fwd}");
-    assert!(cos_dx        > 0.99,  "dx  cos_sim {cos_dx}");
-    assert!(cos_dw_qkv    > 0.99,  "dw_qkv cos_sim {cos_dw_qkv}");
-    assert!(cos_dq_scale  > 0.99,  "dq_scale cos_sim {cos_dq_scale}");
-    assert!(cos_dk_scale  > 0.99,  "dk_scale cos_sim {cos_dk_scale}");
-    assert!(cos_dw_out    > 0.99,  "dw_out cos_sim {cos_dw_out}");
+    assert!(cos_fwd > 0.999, "fwd cos_sim {cos_fwd}");
+    assert!(cos_dx > 0.99, "dx  cos_sim {cos_dx}");
+    assert!(cos_dw_qkv > 0.99, "dw_qkv cos_sim {cos_dw_qkv}");
+    assert!(cos_dq_scale > 0.99, "dq_scale cos_sim {cos_dq_scale}");
+    assert!(cos_dk_scale > 0.99, "dk_scale cos_sim {cos_dk_scale}");
+    assert!(cos_dw_out > 0.99, "dw_out cos_sim {cos_dw_out}");
 }
 
 /// Production-shape LoRA forward_delta backward. Mirrors
@@ -1607,8 +1902,14 @@ fn parity_klein_lora_delta_prod_diag() {
     // Cast to BF16 with autograd (Parameters are F32 for optimizer stability).
     let a_bf16 = lora_a.to_dtype(flame_core::DType::BF16).expect("a cast");
     let b_bf16 = lora_b.to_dtype(flame_core::DType::BF16).expect("b cast");
-    let a_t = a_bf16.transpose().and_then(|t| t.contiguous()).expect("a_t");
-    let b_t = b_bf16.transpose().and_then(|t| t.contiguous()).expect("b_t");
+    let a_t = a_bf16
+        .transpose()
+        .and_then(|t| t.contiguous())
+        .expect("a_t");
+    let b_t = b_bf16
+        .transpose()
+        .and_then(|t| t.contiguous())
+        .expect("b_t");
     let delta_2d = x2d
         .matmul(&a_t)
         .and_then(|t| t.matmul(&b_t))
@@ -1624,11 +1925,11 @@ fn parity_klein_lora_delta_prod_diag() {
     let loss = out.sum().expect("sum");
     let grads = loss.backward().expect("backward");
 
-    let dx       = grads.get(x.id()).expect("missing dx");
-    let dlora_a  = grads.get(lora_a.id()).expect("missing dlora_a");
-    let dlora_b  = grads.get(lora_b.id()).expect("missing dlora_b");
+    let dx = grads.get(x.id()).expect("missing dx");
+    let dlora_a = grads.get(lora_a.id()).expect("missing dlora_a");
+    let dlora_b = grads.get(lora_b.id()).expect("missing dlora_b");
 
-    let cos_dx      = cos_sim_f32(dx,      fix.get("dx").unwrap());
+    let cos_dx = cos_sim_f32(dx, fix.get("dx").unwrap());
     let cos_dlora_a = cos_sim_f32(dlora_a, fix.get("dlora_a").unwrap());
     let cos_dlora_b = cos_sim_f32(dlora_b, fix.get("dlora_b").unwrap());
 
@@ -1636,10 +1937,10 @@ fn parity_klein_lora_delta_prod_diag() {
         "lora_delta_prod_diag: cos_fwd={cos_fwd:.4}  \
          dx={cos_dx:.4} dlora_a={cos_dlora_a:.4} dlora_b={cos_dlora_b:.4}"
     );
-    assert!(cos_fwd      > 0.999, "fwd cos_sim {cos_fwd}");
-    assert!(cos_dx       > 0.99,  "dx  cos_sim {cos_dx}");
-    assert!(cos_dlora_a  > 0.99,  "dlora_a cos_sim {cos_dlora_a}");
-    assert!(cos_dlora_b  > 0.99,  "dlora_b cos_sim {cos_dlora_b}");
+    assert!(cos_fwd > 0.999, "fwd cos_sim {cos_fwd}");
+    assert!(cos_dx > 0.99, "dx  cos_sim {cos_dx}");
+    assert!(cos_dlora_a > 0.99, "dlora_a cos_sim {cos_dlora_a}");
+    assert!(cos_dlora_b > 0.99, "dlora_b cos_sim {cos_dlora_b}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1699,15 +2000,23 @@ fn parity_klein_modulate_pre_prod_diag() {
     let (b_d, n_d, d_d) = (dims[0], dims[1], dims[2]);
     let target = flame_core::Shape::from_dims(&[b_d, n_d, d_d]);
 
-    let normed = flame_core::layer_norm::layer_norm(&x, &[d_d], None, None, 1.0e-6)
-        .expect("layer_norm");
-    let scale_b = scale.unsqueeze(1).expect("scale unsqueeze")
-        .broadcast_to(&target).expect("scale broadcast");
-    let shift_b = shift.unsqueeze(1).expect("shift unsqueeze")
-        .broadcast_to(&target).expect("shift broadcast");
+    let normed =
+        flame_core::layer_norm::layer_norm(&x, &[d_d], None, None, 1.0e-6).expect("layer_norm");
+    let scale_b = scale
+        .unsqueeze(1)
+        .expect("scale unsqueeze")
+        .broadcast_to(&target)
+        .expect("scale broadcast");
+    let shift_b = shift
+        .unsqueeze(1)
+        .expect("shift unsqueeze")
+        .broadcast_to(&target)
+        .expect("shift broadcast");
     let out = normed
-        .mul(&scale_b.add_scalar(1.0).expect("scale + 1")).expect("mul")
-        .add(&shift_b).expect("add shift");
+        .mul(&scale_b.add_scalar(1.0).expect("scale + 1"))
+        .expect("mul")
+        .add(&shift_b)
+        .expect("add shift");
 
     let expected = fix.get("output").unwrap();
     let cos_fwd = cos_sim_f32(&out, expected);
@@ -1720,11 +2029,9 @@ fn parity_klein_modulate_pre_prod_diag() {
     let dx = grads.get(x.id()).expect("missing dx");
     let cos_dx = cos_sim_f32(dx, fix.get("dx").unwrap());
 
-    eprintln!(
-        "modulate_pre_prod_diag: cos_fwd={cos_fwd:.4}  dx={cos_dx:.4}"
-    );
+    eprintln!("modulate_pre_prod_diag: cos_fwd={cos_fwd:.4}  dx={cos_dx:.4}");
     assert!(cos_fwd > 0.999, "fwd cos_sim {cos_fwd}");
-    assert!(cos_dx  > 0.99,  "dx cos_sim {cos_dx}");
+    assert!(cos_dx > 0.99, "dx cos_sim {cos_dx}");
 }
 
 /// SwiGLU activation at single-block production shape: `silu(gate) * up`.
@@ -1744,8 +2051,8 @@ fn parity_klein_swiglu_act_prod_diag() {
     }
     let fix = load_fixture(&path);
     let gate = fix.get("gate").unwrap().clone().requires_grad_(true);
-    let up   = fix.get("up").unwrap().clone().requires_grad_(true);
-    let go   = fix.get("go").unwrap().clone();
+    let up = fix.get("up").unwrap().clone().requires_grad_(true);
+    let go = fix.get("go").unwrap().clone();
 
     flame_core::autograd::AutogradContext::clear();
 
@@ -1758,18 +2065,18 @@ fn parity_klein_swiglu_act_prod_diag() {
     let grads = loss.backward().expect("backward");
 
     let dgate = grads.get(gate.id()).expect("missing dgate");
-    let dup   = grads.get(up.id()).expect("missing dup");
+    let dup = grads.get(up.id()).expect("missing dup");
 
     let cos_dgate = cos_sim_f32(dgate, fix.get("dgate").unwrap());
-    let cos_dup   = cos_sim_f32(dup,   fix.get("dup").unwrap());
+    let cos_dup = cos_sim_f32(dup, fix.get("dup").unwrap());
 
     eprintln!(
         "swiglu_act_prod_diag: cos_fwd={cos_fwd:.4}  \
          dgate={cos_dgate:.4} dup={cos_dup:.4}"
     );
-    assert!(cos_fwd  > 0.999, "fwd cos_sim {cos_fwd}");
+    assert!(cos_fwd > 0.999, "fwd cos_sim {cos_fwd}");
     assert!(cos_dgate > 0.99, "dgate cos_sim {cos_dgate}");
-    assert!(cos_dup   > 0.99, "dup cos_sim {cos_dup}");
+    assert!(cos_dup > 0.99, "dup cos_sim {cos_dup}");
 }
 
 /// Gate-residual at single-block production shape:
@@ -1791,11 +2098,11 @@ fn parity_klein_gate_residual_prod_diag() {
         return;
     }
     let fix = load_fixture(&path);
-    let x      = fix.get("x").unwrap().clone().requires_grad_(true);
+    let x = fix.get("x").unwrap().clone().requires_grad_(true);
     let update = fix.get("update").unwrap().clone().requires_grad_(true);
     // `gate` is a frozen modulation output in production: no requires_grad.
-    let gate   = fix.get("gate").unwrap().clone();
-    let go     = fix.get("go").unwrap().clone();
+    let gate = fix.get("gate").unwrap().clone();
+    let go = fix.get("go").unwrap().clone();
 
     flame_core::autograd::AutogradContext::clear();
 
@@ -1809,8 +2116,11 @@ fn parity_klein_gate_residual_prod_diag() {
     let x_chained = x.reshape(&x_dims).expect("identity reshape on x");
 
     let target = update.shape().clone();
-    let gate_b = gate.unsqueeze(1).expect("gate unsqueeze")
-        .broadcast_to(&target).expect("gate broadcast");
+    let gate_b = gate
+        .unsqueeze(1)
+        .expect("gate unsqueeze")
+        .broadcast_to(&target)
+        .expect("gate broadcast");
     let scaled = update.mul(&gate_b).expect("update*gate");
     let out = x_chained.add(&scaled).expect("x+scaled");
 
@@ -1820,19 +2130,19 @@ fn parity_klein_gate_residual_prod_diag() {
     let loss = out.mul(&go).expect("out*go").sum().expect("sum");
     let grads = loss.backward().expect("backward");
 
-    let dx      = grads.get(x.id()).expect("missing dx");
+    let dx = grads.get(x.id()).expect("missing dx");
     let dupdate = grads.get(update.id()).expect("missing dupdate");
 
-    let cos_dx      = cos_sim_f32(dx,      fix.get("dx").unwrap());
+    let cos_dx = cos_sim_f32(dx, fix.get("dx").unwrap());
     let cos_dupdate = cos_sim_f32(dupdate, fix.get("dupdate").unwrap());
 
     eprintln!(
         "gate_residual_prod_diag: cos_fwd={cos_fwd:.4}  \
          dx={cos_dx:.4} dupdate={cos_dupdate:.4}"
     );
-    assert!(cos_fwd     > 0.999, "fwd cos_sim {cos_fwd}");
-    assert!(cos_dx      > 0.99,  "dx cos_sim {cos_dx}");
-    assert!(cos_dupdate > 0.99,  "dupdate cos_sim {cos_dupdate}");
+    assert!(cos_fwd > 0.999, "fwd cos_sim {cos_fwd}");
+    assert!(cos_dx > 0.99, "dx cos_sim {cos_dx}");
+    assert!(cos_dupdate > 0.99, "dupdate cos_sim {cos_dupdate}");
 }
 
 /// End-to-end Klein single-block parity at production shape. Composes
@@ -1926,7 +2236,8 @@ fn parity_klein_full_single_block_prod_diag() {
         let b_t = b_bf.transpose().and_then(|t| t.contiguous()).expect("b_t");
         let scale_factor = ALPHA / RANK as f32;
         let delta_2d = inp2d
-            .matmul(&a_t).and_then(|t| t.matmul(&b_t))
+            .matmul(&a_t)
+            .and_then(|t| t.matmul(&b_t))
             .and_then(|t| t.mul_scalar(scale_factor))
             .expect("lora matmul chain");
         let mut out_dims = dims;
@@ -1938,8 +2249,8 @@ fn parity_klein_full_single_block_prod_diag() {
     // parity_klein_apply_rope_prod_diag.
     let rope = |x_in: &Tensor| -> Tensor {
         use flame_core::autograd::{AutogradContext, Op};
-        let mut o = flame_core::bf16_ops::rope_fused_bf16(x_in, &pe_cos, &pe_sin)
-            .expect("rope_fused_bf16");
+        let mut o =
+            flame_core::bf16_ops::rope_fused_bf16(x_in, &pe_cos, &pe_sin).expect("rope_fused_bf16");
         if x_in.requires_grad() {
             o = o.requires_grad_(true);
             if AutogradContext::is_recording() {
@@ -1964,21 +2275,29 @@ fn parity_klein_full_single_block_prod_diag() {
     // ---- forward (mirrors single_block_forward step-by-step) ---------------
 
     // 1. modulate_pre
-    let normed = flame_core::layer_norm::layer_norm(&x, &[D], None, None, 1.0e-6)
-        .expect("layer_norm");
-    let scale_b = scale.unsqueeze(1).expect("scale unsqueeze")
-        .broadcast_to(&target_3d).expect("scale broadcast");
-    let shift_b = shift.unsqueeze(1).expect("shift unsqueeze")
-        .broadcast_to(&target_3d).expect("shift broadcast");
+    let normed =
+        flame_core::layer_norm::layer_norm(&x, &[D], None, None, 1.0e-6).expect("layer_norm");
+    let scale_b = scale
+        .unsqueeze(1)
+        .expect("scale unsqueeze")
+        .broadcast_to(&target_3d)
+        .expect("scale broadcast");
+    let shift_b = shift
+        .unsqueeze(1)
+        .expect("shift unsqueeze")
+        .broadcast_to(&target_3d)
+        .expect("shift broadcast");
     let x_normed = normed
-        .mul(&scale_b.add_scalar(1.0).expect("scale+1")).expect("mul")
-        .add(&shift_b).expect("add shift");
+        .mul(&scale_b.add_scalar(1.0).expect("scale+1"))
+        .expect("mul")
+        .add(&shift_b)
+        .expect("add shift");
 
     // 2. linear1 fused → narrow → LoRA(QKV)
     let qkv_mlp = linear3d(&x_normed, &linear1_w);
     let qkv_dim = 3 * INNER;
     let qkv_base = qkv_mlp.narrow(2, 0, qkv_dim).expect("narrow qkv");
-    let gate_up  = qkv_mlp.narrow(2, qkv_dim, 2 * MLP).expect("narrow gate_up");
+    let gate_up = qkv_mlp.narrow(2, qkv_dim, 2 * MLP).expect("narrow gate_up");
     let delta_qkv = lora_delta(&x_normed, &lora_qkv_a, &lora_qkv_b);
     let qkv = qkv_base.add(&delta_qkv).expect("qkv + lora");
 
@@ -1997,10 +2316,8 @@ fn parity_klein_full_single_block_prod_diag() {
     let v = split_head(&qkv.narrow(2, 2 * INNER, INNER).expect("narrow v"));
 
     // 4. head_rms_norm
-    let q = flame_core::norm::rms_norm(&q, &[HD], Some(&q_norm_scale), 1.0e-6)
-        .expect("q rms_norm");
-    let k = flame_core::norm::rms_norm(&k, &[HD], Some(&k_norm_scale), 1.0e-6)
-        .expect("k rms_norm");
+    let q = flame_core::norm::rms_norm(&q, &[HD], Some(&q_norm_scale), 1.0e-6).expect("q rms_norm");
+    let k = flame_core::norm::rms_norm(&k, &[HD], Some(&k_norm_scale), 1.0e-6).expect("k rms_norm");
 
     // 5. RoPE
     let q = rope(&q);
@@ -2016,7 +2333,7 @@ fn parity_klein_full_single_block_prod_diag() {
 
     // 7. swiglu on gate_up
     let gate_proj = gate_up.narrow(2, 0, MLP).expect("narrow gate_proj");
-    let up_proj   = gate_up.narrow(2, MLP, MLP).expect("narrow up_proj");
+    let up_proj = gate_up.narrow(2, MLP, MLP).expect("narrow up_proj");
     let silu_gate = gate_proj.silu().expect("silu");
     let mlp_out = silu_gate.mul(&up_proj).expect("silu*up");
 
@@ -2029,8 +2346,11 @@ fn parity_klein_full_single_block_prod_diag() {
     let out_block = out_block_base.add(&delta_out).expect("linear2 + lora_out");
 
     // 10. gate_residual
-    let gate_b = gate.unsqueeze(1).expect("gate unsqueeze")
-        .broadcast_to(&target_3d).expect("gate broadcast");
+    let gate_b = gate
+        .unsqueeze(1)
+        .expect("gate unsqueeze")
+        .broadcast_to(&target_3d)
+        .expect("gate broadcast");
     let scaled = out_block.mul(&gate_b).expect("out_block * gate");
     // Route x through identity reshape to break leaf-bias-of-Op::Add pattern,
     // matching the trainer's chain-of-blocks topology where x is intermediate.
@@ -2064,16 +2384,15 @@ fn parity_klein_full_single_block_prod_diag() {
 
     let loss = out.mul(&go).expect("out*go").sum().expect("sum");
     let grads = loss.backward().expect("backward");
-    let captured =
-        flame_core::autograd::AutogradContext::take_retained_intermediate_grads();
+    let captured = flame_core::autograd::AutogradContext::take_retained_intermediate_grads();
 
-    let dx          = grads.get(x.id()).expect("missing dx");
+    let dx = grads.get(x.id()).expect("missing dx");
     let dlora_qkv_a = grads.get(lora_qkv_a.id()).expect("missing dlora_qkv_a");
     let dlora_qkv_b = grads.get(lora_qkv_b.id()).expect("missing dlora_qkv_b");
     let dlora_out_a = grads.get(lora_out_a.id()).expect("missing dlora_out_a");
     let dlora_out_b = grads.get(lora_out_b.id()).expect("missing dlora_out_b");
 
-    let cos_dx          = cos_sim_f32(dx,          fix.get("dx").unwrap());
+    let cos_dx = cos_sim_f32(dx, fix.get("dx").unwrap());
     let cos_dlora_qkv_a = cos_sim_f32(dlora_qkv_a, fix.get("dlora_qkv_a").unwrap());
     let cos_dlora_qkv_b = cos_sim_f32(dlora_qkv_b, fix.get("dlora_qkv_b").unwrap());
     let cos_dlora_out_a = cos_sim_f32(dlora_out_a, fix.get("dlora_out_a").unwrap());
@@ -2089,71 +2408,100 @@ fn parity_klein_full_single_block_prod_diag() {
         let cos = cos_sim_f32(g, exp);
         let g_f32 = g.to_dtype(flame_core::DType::F32).ok()?.to_vec().ok()?;
         let exp_f32 = exp.to_dtype(flame_core::DType::F32).ok()?.to_vec().ok()?;
-        let g_norm   = g_f32.iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+        let g_norm = g_f32.iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
         let exp_norm = exp_f32.iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
         Some((cos, g_norm, exp_norm))
     };
 
-    let p_normed    = probe(normed.id(),    "dnormed");
-    let p_x_normed  = probe(x_normed.id(),  "dx_normed");
-    let p_qkv_mlp   = probe(qkv_mlp.id(),   "dqkv_mlp");
-    let p_qkv_base  = probe(qkv_base.id(),  "dqkv_base");
-    let p_gate_up   = probe(gate_up.id(),   "dgate_up");
+    let p_normed = probe(normed.id(), "dnormed");
+    let p_x_normed = probe(x_normed.id(), "dx_normed");
+    let p_qkv_mlp = probe(qkv_mlp.id(), "dqkv_mlp");
+    let p_qkv_base = probe(qkv_base.id(), "dqkv_base");
+    let p_gate_up = probe(gate_up.id(), "dgate_up");
     let p_delta_qkv = probe(delta_qkv.id(), "ddelta_qkv");
-    let p_qkv       = probe(qkv.id(),       "dqkv");
-    let p_attn_out  = probe(attn_out.id(),  "dattn_out");
+    let p_qkv = probe(qkv.id(), "dqkv");
+    let p_attn_out = probe(attn_out.id(), "dattn_out");
     let p_gate_proj = probe(gate_proj.id(), "dgate_proj");
-    let p_up_proj   = probe(up_proj.id(),   "dup_proj");
+    let p_up_proj = probe(up_proj.id(), "dup_proj");
     let p_silu_gate = probe(silu_gate.id(), "dsilu_gate");
-    let p_mlp_out   = probe(mlp_out.id(),   "dmlp_out");
-    let p_fused     = probe(fused.id(),     "dfused");
+    let p_mlp_out = probe(mlp_out.id(), "dmlp_out");
+    let p_fused = probe(fused.id(), "dfused");
     let p_out_block = probe(out_block.id(), "dout_block");
 
-    let dx_norm = dx.to_dtype(flame_core::DType::F32).unwrap()
-        .to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
-    let exp_dx_norm = fix.get("dx").unwrap()
-        .to_dtype(flame_core::DType::F32).unwrap()
-        .to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
-    let go_norm = go.to_dtype(flame_core::DType::F32).unwrap()
-        .to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let dx_norm = dx
+        .to_dtype(flame_core::DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
+    let exp_dx_norm = fix
+        .get("dx")
+        .unwrap()
+        .to_dtype(flame_core::DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
+    let go_norm = go
+        .to_dtype(flame_core::DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
     eprintln!(
         "full_single_block_prod_diag: cos_fwd={cos_fwd:.4}  \
          dx={cos_dx:.4} (||rust_dx||={dx_norm:.3e} ||py_dx||={exp_dx_norm:.3e} ||go||={go_norm:.3e}) \
          dlora_qkv_a={cos_dlora_qkv_a:.4} dlora_qkv_b={cos_dlora_qkv_b:.4} \
          dlora_out_a={cos_dlora_out_a:.4} dlora_out_b={cos_dlora_out_b:.4}"
     );
-    let dump = |label: &str, p: Option<(f64, f32, f32)>| {
-        match p {
-            Some((c, gn, en)) => eprintln!(
-                "  PROBE {label:<11} cos={c:.4}  ||rust||={gn:.3e}  ||py||={en:.3e}"
-            ),
-            None => eprintln!("  PROBE {label:<11} <missing>"),
+    let dump = |label: &str, p: Option<(f64, f32, f32)>| match p {
+        Some((c, gn, en)) => {
+            eprintln!("  PROBE {label:<11} cos={c:.4}  ||rust||={gn:.3e}  ||py||={en:.3e}")
         }
+        None => eprintln!("  PROBE {label:<11} <missing>"),
     };
     dump("dout_block", p_out_block);
-    dump("dfused",     p_fused);
-    dump("dattn_out",  p_attn_out);
-    dump("dmlp_out",   p_mlp_out);
+    dump("dfused", p_fused);
+    dump("dattn_out", p_attn_out);
+    dump("dmlp_out", p_mlp_out);
     dump("dsilu_gate", p_silu_gate);
-    dump("dup_proj",   p_up_proj);
+    dump("dup_proj", p_up_proj);
     dump("dgate_proj", p_gate_proj);
-    dump("dqkv",       p_qkv);
-    dump("dqkv_base",  p_qkv_base);
+    dump("dqkv", p_qkv);
+    dump("dqkv_base", p_qkv_base);
     dump("ddelta_qkv", p_delta_qkv);
-    dump("dgate_up",   p_gate_up);
-    dump("dqkv_mlp",   p_qkv_mlp);
-    dump("dx_normed",  p_x_normed);
-    dump("dnormed",    p_normed);
+    dump("dgate_up", p_gate_up);
+    dump("dqkv_mlp", p_qkv_mlp);
+    dump("dx_normed", p_x_normed);
+    dump("dnormed", p_normed);
 
-    assert!(cos_fwd          > 0.999, "fwd cos_sim {cos_fwd}");
-    assert!(cos_dx           > 0.99,  "dx cos_sim {cos_dx}");
-    assert!(cos_dlora_qkv_a  > 0.99,  "dlora_qkv_a cos_sim {cos_dlora_qkv_a}");
-    assert!(cos_dlora_qkv_b  > 0.99,  "dlora_qkv_b cos_sim {cos_dlora_qkv_b}");
-    assert!(cos_dlora_out_a  > 0.99,  "dlora_out_a cos_sim {cos_dlora_out_a}");
-    assert!(cos_dlora_out_b  > 0.99,  "dlora_out_b cos_sim {cos_dlora_out_b}");
+    assert!(cos_fwd > 0.999, "fwd cos_sim {cos_fwd}");
+    assert!(cos_dx > 0.99, "dx cos_sim {cos_dx}");
+    assert!(
+        cos_dlora_qkv_a > 0.99,
+        "dlora_qkv_a cos_sim {cos_dlora_qkv_a}"
+    );
+    assert!(
+        cos_dlora_qkv_b > 0.99,
+        "dlora_qkv_b cos_sim {cos_dlora_qkv_b}"
+    );
+    assert!(
+        cos_dlora_out_a > 0.99,
+        "dlora_out_a cos_sim {cos_dlora_out_a}"
+    );
+    assert!(
+        cos_dlora_out_b > 0.99,
+        "dlora_out_b cos_sim {cos_dlora_out_b}"
+    );
 }
 
 /// Diagnostic for the dx-failure mode of `parity_klein_full_single_block_prod_diag`.
@@ -2222,16 +2570,30 @@ fn parity_multi_use_accumulation_diag() {
     let dx_ref = dx_a.add(&dx_b).unwrap();
 
     let cos = cos_sim_f32(dx, &dx_ref);
-    let dx_norm = dx.to_dtype(DType::F32).unwrap().to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
-    let ref_norm = dx_ref.to_dtype(DType::F32).unwrap().to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let dx_norm = dx
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
+    let ref_norm = dx_ref
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
     let ratio = dx_norm / ref_norm;
     eprintln!(
         "multi_use_accumulation_diag: cos_dx={cos:.4} \
          ||rust_dx||={dx_norm:.3e} ||ref_dx||={ref_norm:.3e} ratio={ratio:.4}"
     );
-    assert!(cos   > 0.999, "multi-use dx cos_sim {cos}");
+    assert!(cos > 0.999, "multi-use dx cos_sim {cos}");
     assert!((ratio - 1.0).abs() < 0.05, "multi-use dx ||ratio|| {ratio}");
 }
 
@@ -2270,16 +2632,22 @@ fn parity_multi_use_after_layernorm_diag() {
 
     let x_f32 = Tensor::from_vec(x_data, Shape::from_dims(&[BN, D]), device.clone()).unwrap();
     let m1 = Tensor::from_vec(m1_data, Shape::from_dims(&[D, M]), device.clone())
-        .unwrap().to_dtype(DType::BF16).unwrap();
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
     let m2 = Tensor::from_vec(m2_data, Shape::from_dims(&[D, M]), device.clone())
-        .unwrap().to_dtype(DType::BF16).unwrap();
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
     let go = Tensor::from_vec(go_data, Shape::from_dims(&[BN, M]), device.clone())
-        .unwrap().to_dtype(DType::BF16).unwrap();
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
 
     // Path A — through autograd (Rust):
     let x = x_f32.to_dtype(DType::BF16).unwrap().requires_grad_(true);
-    let normed = flame_core::layer_norm::layer_norm(&x, &[D], None, None, 1.0e-6)
-        .expect("layer_norm");
+    let normed =
+        flame_core::layer_norm::layer_norm(&x, &[D], None, None, 1.0e-6).expect("layer_norm");
     let y1 = normed.matmul(&m1).expect("normed @ m1");
     let y2 = normed.matmul(&m2).expect("normed @ m2");
     let out = y1.add(&y2).expect("y1 + y2");
@@ -2296,25 +2664,46 @@ fn parity_multi_use_after_layernorm_diag() {
     flame_core::autograd::AutogradContext::clear();
     let m_sum = m1.add(&m2).expect("m1 + m2");
     let x2 = x_f32.to_dtype(DType::BF16).unwrap().requires_grad_(true);
-    let normed2 = flame_core::layer_norm::layer_norm(&x2, &[D], None, None, 1.0e-6)
-        .expect("layer_norm 2");
+    let normed2 =
+        flame_core::layer_norm::layer_norm(&x2, &[D], None, None, 1.0e-6).expect("layer_norm 2");
     let y_combined = normed2.matmul(&m_sum).expect("normed2 @ m_sum");
-    let loss2 = y_combined.mul(&go).expect("y_combined * go").sum().expect("sum2");
+    let loss2 = y_combined
+        .mul(&go)
+        .expect("y_combined * go")
+        .sum()
+        .expect("sum2");
     let grads2 = loss2.backward().expect("backward 2");
     let dx_ref = grads2.get(x2.id()).expect("missing dx_ref");
 
     let cos = cos_sim_f32(&dx, dx_ref);
-    let dx_norm = dx.to_dtype(DType::F32).unwrap().to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
-    let ref_norm = dx_ref.to_dtype(DType::F32).unwrap().to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let dx_norm = dx
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
+    let ref_norm = dx_ref
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
     let ratio = dx_norm / ref_norm;
     eprintln!(
         "multi_use_after_layernorm_diag: cos_dx={cos:.4} \
          ||two_branch_dx||={dx_norm:.3e} ||single_branch_dx||={ref_norm:.3e} ratio={ratio:.4}"
     );
-    assert!(cos   > 0.999, "post-LN multi-use cos_sim {cos}");
-    assert!((ratio - 1.0).abs() < 0.05, "post-LN multi-use ratio {ratio}");
+    assert!(cos > 0.999, "post-LN multi-use cos_sim {cos}");
+    assert!(
+        (ratio - 1.0).abs() < 0.05,
+        "post-LN multi-use ratio {ratio}"
+    );
 }
 
 /// Step-3 diagnostic: x feeds BOTH a LayerNorm path AND a direct residual
@@ -2343,11 +2732,16 @@ fn parity_multi_use_x_via_ln_and_direct_diag() {
         .map(|i| (i as f32 * 0.073).sin() * 0.1)
         .collect();
 
-    let x_f32 = Tensor::from_vec(x_data.clone(), Shape::from_dims(&[BN, D]), device.clone()).unwrap();
+    let x_f32 =
+        Tensor::from_vec(x_data.clone(), Shape::from_dims(&[BN, D]), device.clone()).unwrap();
     let m = Tensor::from_vec(m_data, Shape::from_dims(&[D, D]), device.clone())
-        .unwrap().to_dtype(DType::BF16).unwrap();
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
     let go = Tensor::from_vec(go_data, Shape::from_dims(&[BN, D]), device.clone())
-        .unwrap().to_dtype(DType::BF16).unwrap();
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
 
     // Path A — through autograd:
     //   y_ln = LN(x) @ m
@@ -2355,8 +2749,8 @@ fn parity_multi_use_x_via_ln_and_direct_diag() {
     //                                          x_chained = x.reshape(&dims))
     //   out = y_ln + y_res
     let x = x_f32.to_dtype(DType::BF16).unwrap().requires_grad_(true);
-    let normed = flame_core::layer_norm::layer_norm(&x, &[D], None, None, 1.0e-6)
-        .expect("layer_norm");
+    let normed =
+        flame_core::layer_norm::layer_norm(&x, &[D], None, None, 1.0e-6).expect("layer_norm");
     let y_ln = normed.matmul(&m).expect("normed @ m");
     let dims_v: Vec<usize> = x.shape().dims().to_vec();
     let x_residual = x.reshape(&dims_v).expect("identity reshape on x");
@@ -2374,8 +2768,8 @@ fn parity_multi_use_x_via_ln_and_direct_diag() {
     // own clean autograd session.
     flame_core::autograd::AutogradContext::clear();
     let x_a = x_f32.to_dtype(DType::BF16).unwrap().requires_grad_(true);
-    let normed_a = flame_core::layer_norm::layer_norm(&x_a, &[D], None, None, 1.0e-6)
-        .expect("layer_norm a");
+    let normed_a =
+        flame_core::layer_norm::layer_norm(&x_a, &[D], None, None, 1.0e-6).expect("layer_norm a");
     let y_ln_a = normed_a.matmul(&m).expect("normed_a @ m");
     let loss_a = y_ln_a.mul(&go).expect("y_ln_a * go").sum().expect("sum a");
     let grads_a = loss_a.backward().expect("backward a");
@@ -2389,27 +2783,62 @@ fn parity_multi_use_x_via_ln_and_direct_diag() {
     // leaf-bias-of-Op::Add pattern when we later .add into a sink. Since
     // we just want to extract dx via "any op that has go as upstream",
     // multiply by ones (= go path).
-    let loss_b = x_res_b.mul(&go).expect("x_res_b * go").sum().expect("sum b");
+    let loss_b = x_res_b
+        .mul(&go)
+        .expect("x_res_b * go")
+        .sum()
+        .expect("sum b");
     let grads_b = loss_b.backward().expect("backward b");
     let dx_res_only = grads_b.get(x_b.id()).expect("missing dx_res_only").clone();
 
     let dx_ref = dx_ln_only.add(&dx_res_only).expect("dx_ln + dx_res");
 
     let cos = cos_sim_f32(&dx, &dx_ref);
-    let dx_norm = dx.to_dtype(DType::F32).unwrap().to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
-    let ref_norm = dx_ref.to_dtype(DType::F32).unwrap().to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
-    let ln_norm = dx_ln_only.to_dtype(DType::F32).unwrap().to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
-    let res_norm = dx_res_only.to_dtype(DType::F32).unwrap().to_vec().unwrap()
-        .iter().map(|v: &f32| v * v).sum::<f32>().sqrt();
+    let dx_norm = dx
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
+    let ref_norm = dx_ref
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
+    let ln_norm = dx_ln_only
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
+    let res_norm = dx_res_only
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|v: &f32| v * v)
+        .sum::<f32>()
+        .sqrt();
     let ratio = dx_norm / ref_norm;
     eprintln!(
         "multi_use_x_via_ln_and_direct_diag: cos_dx={cos:.4} ratio={ratio:.4}\n\
          \t||combined_dx||={dx_norm:.3e}  ||ref_dx||={ref_norm:.3e}\n\
          \t||dx_ln_only||={ln_norm:.3e}  ||dx_res_only||={res_norm:.3e}"
     );
-    assert!(cos   > 0.999, "x-via-LN-and-direct cos_sim {cos}");
-    assert!((ratio - 1.0).abs() < 0.05, "x-via-LN-and-direct ratio {ratio}");
+    assert!(cos > 0.999, "x-via-LN-and-direct cos_sim {cos}");
+    assert!(
+        (ratio - 1.0).abs() < 0.05,
+        "x-via-LN-and-direct ratio {ratio}"
+    );
 }

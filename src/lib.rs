@@ -79,7 +79,6 @@ pub mod trace {
 
 pub mod config;
 pub mod conv;
-pub mod env_flags;
 pub mod conv1d;
 pub mod conv3d_bf16;
 pub mod conv3d_simple;
@@ -90,6 +89,7 @@ pub mod cuda_conv2d_fast;
 pub mod debug_device;
 pub mod debug_finite;
 pub mod diagnostics;
+pub mod env_flags;
 pub mod parity;
 pub mod pinned;
 pub use pinned::{
@@ -101,36 +101,36 @@ pub use pinned::{
 // streaming. Lives here (not in trainer crates) because it's used by every
 // model family that needs to fit on commodity GPUs — DiT, MMDiT, MoE, video
 // DiT, multimodal. Per tenets §1: fix the primitive, ship every model.
-#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-pub mod offload;
+pub mod activation_offload;
 pub mod cuda_alloc_pool;
-pub mod external_memory;
-pub mod static_slab_v2;
-#[cfg(feature = "cuda")]
-pub mod ring_alloc;
 pub mod cuda_graph;
 pub mod device;
 pub mod devtensor;
 pub mod dtype;
 pub mod error;
+pub mod external_memory;
 pub mod gradient;
 pub mod linear;
 pub mod memory_pool;
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub mod offload;
 pub mod ops;
 pub mod ops_ext;
+#[cfg(feature = "cuda")]
+pub mod ring_alloc;
 pub mod rng;
+pub mod saved_ref;
 pub mod sgd;
 pub mod shape;
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 pub mod staging;
+pub mod static_slab_v2;
 pub mod tensor;
-pub mod tensor_iterator;
 pub mod tensor_compute;
 pub mod tensor_ext;
+pub mod tensor_iterator;
 pub mod tensor_narrow;
 pub mod tensor_storage;
-pub mod saved_ref;
-pub mod activation_offload;
 pub use tensor::contracts::*;
 pub mod structured;
 pub mod telemetry;
@@ -172,11 +172,11 @@ pub mod cuda_tensor_gpu;
 // pub mod autograd_engine;  // Using new autograd
 pub mod activations;
 pub mod attention;
+#[cfg(feature = "autograd_v2")]
+pub mod autograd_v2;
 pub mod autograd_v3; // Primary autograd engine
 #[cfg(feature = "autograd_v4")]
 pub mod autograd_v4;
-#[cfg(feature = "autograd_v2")]
-pub mod autograd_v2;
 pub mod image_ops_nhwc;
 pub mod mixed_precision;
 pub mod perf_telemetry;
@@ -221,6 +221,7 @@ pub mod fp16;
 pub mod tensor_ops_extended;
 // Provide missing convenience ops (div_scalar, etc.) unconditionally
 pub mod adam;
+pub mod adam8bit_kernel;
 pub mod lora;
 pub mod parameter;
 pub mod tensor_ops_missing;

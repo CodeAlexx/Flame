@@ -371,7 +371,7 @@ directly at backward).
   `cuda/cuda_ops.cu` remains as the fallback inside `norm::` for shapes
   where `norm_size % 4 != 0`.
 - `cuda_ops_bf16::rms_norm_bf16_to_f32(x, eps)` — `cuda_ops_bf16.rs:296` — F32 output variant
-- ⭐ `ops::fused_inference::fused_rms_norm(x, weight, eps)` — `ops/fused_inference.rs:116`
+- ⭐ `ops::fused_inference::fused_rms_norm(x, weight, eps)` — `ops/fused_inference.rs:202`
   Direct call to `flame_fused_rms_norm_bf16` kernel (`src/cuda/fused_rms_norm.cu`).
   Used by Z-Image NextDiT, MagiHuman MM/Shared transformer layers.
 - 💡 **`(weight + 1)` precompute pattern** (Gemma3 / MagiHuman): the kernel
@@ -409,13 +409,21 @@ directly at backward).
 ## Linear / GEMM / matmul
 
 ### ⭐ The live linear path (FLUX, Chroma, QwenImage, Klein, LTX-2)
-- `ops::fused_inference::fused_linear3d(input, weight, bias)` — `ops/fused_inference.rs:190`
+- `ops::fused_inference::fused_linear3d(input, weight, bias)` — `ops/fused_inference.rs:276`
   cuBLASLt 3D linear. Weight must be **pre-transposed** to `[Cin, Cout]`.
-- `ops::fused_inference::fused_linear3d_native(input, weight, bias)` — `ops/fused_inference.rs:275`
+- `ops::fused_inference::fused_linear3d_native(input, weight, bias)` — `ops/fused_inference.rs:357`
   **Same but takes weight in standard PyTorch `[Cout, Cin]` row-major layout.**
   Uses cuBLASLt `TRANSA=T` to do the transpose inside the GEMM. **This is what
   every FLUX/Chroma/QwenImage block forward calls.** Added 2026-04 to kill the
   per-call `transpose2d_bf16` cost.
+- `ops::fused_inference::fused_linear3d_native_lora(input, weight, bias, lora_a, lora_b, scale)`
+  — `ops/fused_inference.rs:489`
+  Additive LoRA wrapper over `fused_linear3d_native`. With both LoRA tensors
+  `None`, byte-identical to the base (same kernel, same autograd). With LoRA,
+  computes `out = base + scale * (x @ A^T @ B^T)` where A=[rank,Cin], B=[Cout,rank].
+  Autograd flows into A and B (frozen base weight). Added 2026-05 for HiDream-O1
+  LoRA injection where decoder owns weights via `HashMap<String, Tensor>`
+  (decoder.rs:346-419) rather than `Linear` modules.
 - C side: `flame_linear3d_bf16` / `flame_linear3d_bf16_native` in
   `src/cuda/fused_linear3d.cu`.
 
@@ -628,15 +636,16 @@ The "kernel calls that bypass autograd entirely". Used by every FLUX-style block
 
 | Function | Line | What it does |
 |---|---|---|
-| ⭐ `dequant_fp8_to_bf16` | `:16` | FP8 → BF16 dequant (one shot) |
-| ⭐ `dequant_fp8_to_bf16_into` | `:45` | Same, output-into |
-| ⭐ `dequant_fp8_transpose_into` | `:78` | Dequant + transpose in one kernel |
-| ⭐ `fused_rms_norm` | `:116` | RMSNorm with weight, single kernel |
-| ⭐ `fused_modulate` | `:155` | `(1+scale) * x + shift` — DiT modulate |
-| ⭐ `fused_linear3d` | `:190` | cuBLASLt 3D linear (pre-transposed weight) |
-| ⭐ `fused_linear3d_native` | `:275` | cuBLASLt 3D linear (PyTorch weight layout, TRANSA=T) |
-| ⭐ `fused_rms_norm_modulate` | `:350` | RMSNorm + modulate fused |
-| ⭐ `fused_residual_gate` | `:388` | `x + gate * attn` fused |
+| ⭐ `dequant_fp8_to_bf16` | `:98` | FP8 → BF16 dequant (one shot) |
+| ⭐ `dequant_fp8_to_bf16_into` | `:131` | Same, output-into |
+| ⭐ `dequant_fp8_transpose_into` | `:164` | Dequant + transpose in one kernel |
+| ⭐ `fused_rms_norm` | `:202` | RMSNorm with weight, single kernel |
+| ⭐ `fused_modulate` | `:241` | `(1+scale) * x + shift` — DiT modulate |
+| ⭐ `fused_linear3d` | `:276` | cuBLASLt 3D linear (pre-transposed weight) |
+| ⭐ `fused_linear3d_native` | `:357` | cuBLASLt 3D linear (PyTorch weight layout, TRANSA=T) |
+| ⭐ `fused_linear3d_native_lora` | `:489` | Additive LoRA over `fused_linear3d_native`; byte-identical at LoRA=None |
+| ⭐ `fused_rms_norm_modulate` | `:552` | RMSNorm + modulate fused |
+| ⭐ `fused_residual_gate` | `:599` | `x + gate * attn` fused |
 
 **All of these go through `crate::cuda::ffi::flame_*_bf16` declarations and
 the `.cu` files in `src/cuda/`.**
@@ -761,7 +770,7 @@ convention (`fc_status_t` returns), different file generation:
 
 - ⭐ `serialization::load_file<P>(path, device)` — `:555` — load a safetensors file as `HashMap<String, Tensor>`
 - ⭐ `serialization::load_file_filtered<P, F>(path, device, filter_fn)` — `:570` — same but a closure picks which keys to load
-- ⭐ `serialization::save_file(tensors, path)` — `:690` — save a HashMap to safetensors
+- ⭐ `serialization::save_file(tensors, path)` — `:690` — save a HashMap to safetensors (atomic: writes to `{path}.tmp` then renames)
 - ⭐ `serialization::save_tensors(tensors, path, format)` — `:61`
 - `serialization::load_tensors(path, format, device)` — `:73`
 - `serialization::save_tensor(tensor, path, format)` — `:41`
@@ -1779,6 +1788,11 @@ cross-process plumbing (single-process trainers only).
 - `adam::Adam::set_stochastic_round(bool)` / `Adam::is_stochastic_round() -> bool` — toggle and read of the stochastic-round flag (added 2026-05-08).
 - `adam::AdamW::set_stochastic_round(bool)` / `AdamW::is_stochastic_round() -> bool` — same on AdamW (forwards to Adam).
 - `adam::MultiTensorMetaCache` (re-exported, `adam.rs:347`) — cache type held by `Adam` for reuse across steps. Reallocates when n changes.
+- `adam8bit_kernel::create_dynamic_map(signed) -> [f32; 256]` — `adam8bit_kernel.rs`. CPU-side port of bitsandbytes 0.49.2 `functional.create_dynamic_map` (the 8-bit dynamic-exponent LUT). Used by `eridiffusion_core::AdamW8bit`; allocate the two LUTs (signed for `m`, unsigned for `v`) once per device and upload via `upload_qmap`.
+- `adam8bit_kernel::upload_qmap(device, &[f32; 256]) -> Result<CudaSlice<f32>>` — `adam8bit_kernel.rs`. Single H2D copy of a 256-entry F32 LUT.
+- `adam8bit_kernel::alloc_state(device, numel) -> Result<(CudaSlice<u8>, CudaSlice<u8>, CudaSlice<f32>, CudaSlice<f32>)>` — `adam8bit_kernel.rs`. Allocates the per-parameter 8-bit state for one tensor: `(m_codes, v_codes, m_absmax, v_absmax)`, all zero-initialized. Absmax buffers are sized `ceil(numel / 256)`.
+- `adam8bit_kernel::adam8bit_step_bnb(param, grad, m_codes, v_codes, m_absmax, v_absmax, qmap_signed, qmap_unsigned, lr, beta1, beta2, eps, wd, bc1, bc2)` — `adam8bit_kernel.rs`. Fused NVRTC kernel: dequant + AdamW step + requant in one launch per parameter, no host round-trip. F32 param required (use a master shadow for BF16 params); F32 or BF16 grad auto-routed. Bit-exact-equivalent (modulo BF16 noise) to bitsandbytes 0.49.2 `optim.AdamW8bit(block_wise=True)`. Block size = 256.
+- `adam8bit_kernel::ADAM8BIT_BLOCK_SIZE` — `adam8bit_kernel.rs`. `const usize = 256`. Block size for both quantization and the block-wide max-abs reduction. Matches bnb `optimizer.py:478`.
 - `sgd::*` — basic SGD
 - `parameter::Parameter` — re-exported as `Var` and `Parameter`. Wraps a `Tensor` with `requires_grad=true`.
 - `nn::Optimizer` trait — `lib.rs:258` — `step()` + `zero_grad()`

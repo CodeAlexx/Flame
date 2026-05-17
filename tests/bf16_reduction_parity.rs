@@ -111,8 +111,7 @@ fn bf16_mean_matches_host_reference() -> Result<()> {
 fn bf16_sum_small_tensor() -> Result<()> {
     let device = cuda_device().cuda_device().clone();
     // 64 elements, well within a single block — exercises the simple case.
-    let x_f32 =
-        Tensor::randn(Shape::from_dims(&[8, 8]), 0.0, 1.0, device.clone())?;
+    let x_f32 = Tensor::randn(Shape::from_dims(&[8, 8]), 0.0, 1.0, device.clone())?;
     let x_bf16 = x_f32.to_dtype(DType::BF16)?;
 
     let legacy = host_sum_bf16(&x_bf16)?;

@@ -15,8 +15,8 @@ use anyhow::Result;
 use flame_core::device::Device;
 use flame_core::tensor::Tensor;
 use flame_core::{conv1d::conv1d, DType, Shape};
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -30,7 +30,8 @@ fn seeded_f32(numel: usize, seed: u64) -> Vec<f32> {
 use std::sync::OnceLock;
 fn dev() -> std::sync::Arc<cudarc::driver::CudaDevice> {
     static D: OnceLock<std::sync::Arc<cudarc::driver::CudaDevice>> = OnceLock::new();
-    D.get_or_init(|| Device::cuda(0).unwrap().cuda_device_arc()).clone()
+    D.get_or_init(|| Device::cuda(0).unwrap().cuda_device_arc())
+        .clone()
 }
 
 fn make_bf16(data: Vec<f32>, shape: &[usize]) -> Result<Tensor> {
@@ -44,7 +45,10 @@ fn make_f32(data: Vec<f32>, shape: &[usize]) -> Result<Tensor> {
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +86,10 @@ fn cat_with_permuted_input_materializes_and_is_contiguous() -> Result<()> {
 
     let extra = make_bf16(seeded_f32(2 * 4 * 3, 8), &[2, 4, 3])?;
     let out = Tensor::cat(&[&permuted, &extra], 1)?;
-    assert!(out.is_contiguous(), "cat with permuted input lost contiguity");
+    assert!(
+        out.is_contiguous(),
+        "cat with permuted input lost contiguity"
+    );
     assert_eq!(out.shape().dims(), &[2, 8, 3]);
 
     // Spot-check values.
@@ -95,7 +102,12 @@ fn cat_with_permuted_input_materializes_and_is_contiguous() -> Result<()> {
                 let oi = batch * 8 * 3 + r * 3 + c;
                 let pi = batch * 4 * 3 + r * 3 + c;
                 let d = (out_vec[oi] - perm_vec[pi]).abs();
-                assert!(d < 5e-3, "permuted half mismatch at b{batch} r{r} c{c}: {} vs {}", out_vec[oi], perm_vec[pi]);
+                assert!(
+                    d < 5e-3,
+                    "permuted half mismatch at b{batch} r{r} c{c}: {} vs {}",
+                    out_vec[oi],
+                    perm_vec[pi]
+                );
             }
         }
         for r in 0..4 {
@@ -131,8 +143,8 @@ fn conv1d_k1_fast_path_matches_unfused_path() -> Result<()> {
     let x_contig = x.contiguous()?;
     let x_t = x_contig.permute(&[0, 2, 1])?.contiguous()?; // [B, L, C_in]
     let w_2d = w.reshape(&[c_out, c_in])?;
-    let w_t = w_2d.permute(&[1, 0])?.contiguous()?;        // [C_in, C_out]
-    let out_2d = x_t.matmul(&w_t)?;                        // [B, L, C_out]
+    let w_t = w_2d.permute(&[1, 0])?.contiguous()?; // [C_in, C_out]
+    let out_2d = x_t.matmul(&w_t)?; // [B, L, C_out]
     let out_chl = out_2d.permute(&[0, 2, 1])?.contiguous()?; // [B, C_out, L]
     let bias_3d = bias.reshape(&[1, c_out, 1])?;
     let out_ref = out_chl.add(&bias_3d)?;
@@ -140,7 +152,10 @@ fn conv1d_k1_fast_path_matches_unfused_path() -> Result<()> {
     let af = out_fast.to_dtype(DType::F32)?.to_vec()?;
     let bf = out_ref.to_dtype(DType::F32)?.to_vec()?;
     let max_diff = max_abs_diff(&af, &bf);
-    assert!(max_diff < 1e-2, "conv1d k=1 fast path differs from contiguous reference: max_abs={max_diff}");
+    assert!(
+        max_diff < 1e-2,
+        "conv1d k=1 fast path differs from contiguous reference: max_abs={max_diff}"
+    );
     Ok(())
 }
 
@@ -167,7 +182,9 @@ fn conv1d_k1_with_permuted_input_view_matches_contig() -> Result<()> {
     let av = out_view.to_dtype(DType::F32)?.to_vec()?;
     let bv = out_contig.to_dtype(DType::F32)?.to_vec()?;
     let max_diff = max_abs_diff(&av, &bv);
-    assert!(max_diff < 1e-2,
-        "conv1d k=1 with permuted-view input differs from contig input: max_abs={max_diff}");
+    assert!(
+        max_diff < 1e-2,
+        "conv1d k=1 with permuted-view input differs from contig input: max_abs={max_diff}"
+    );
     Ok(())
 }

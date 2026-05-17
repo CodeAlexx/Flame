@@ -213,12 +213,8 @@ pub fn sdpa(
             }
         }
         let device = q_bf16.device().clone();
-        let mask_f32 = Tensor::from_vec(
-            mask_data,
-            Shape::from_dims(&[1, 1, q_len, k_len]),
-            device,
-        )
-        .map_err(flame_err)?;
+        let mask_f32 = Tensor::from_vec(mask_data, Shape::from_dims(&[1, 1, q_len, k_len]), device)
+            .map_err(flame_err)?;
         mask_bf16_owned = mask_f32.to_dtype(DType::BF16).map_err(flame_err)?;
         Some(&mask_bf16_owned)
     } else if let Some(m) = attn_mask {

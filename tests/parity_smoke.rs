@@ -27,8 +27,7 @@ use flame_core::{global_cuda_device, serialization::load_file};
 use std::path::PathBuf;
 
 const FIXTURE_REL: &str = "tests/pytorch_fixtures/smoke/add_4x8_bf16.safetensors";
-const FIXTURE_SHA256: &str =
-    "ddde4d62922baf2969a0eba1b8db813580b1dbc9f37fcc66ef9e8110dc1a5086";
+const FIXTURE_SHA256: &str = "ddde4d62922baf2969a0eba1b8db813580b1dbc9f37fcc66ef9e8110dc1a5086";
 
 fn fixture_path() -> PathBuf {
     // Resolve relative to the flame-core crate root regardless of cwd.
@@ -58,7 +57,11 @@ fn smoke_fixture_sha256_matches_pin() {
 fn smoke_add_matches_pytorch_oracle() {
     let dev = global_cuda_device();
     let p = fixture_path();
-    assert_eq!(parity_helpers::sha256_file(&p), FIXTURE_SHA256, "fixture sha drift");
+    assert_eq!(
+        parity_helpers::sha256_file(&p),
+        FIXTURE_SHA256,
+        "fixture sha drift"
+    );
 
     let tensors = load_file(&p, &dev).expect("load smoke fixture");
     let a = tensors.get("input_a").expect("missing input_a");
@@ -68,11 +71,7 @@ fn smoke_add_matches_pytorch_oracle() {
     let got = a.add(b).expect("add failed");
 
     let report = parity_helpers::compare_bf16(&got, expected);
-    assert!(
-        report.passed,
-        "smoke add: parity FAIL\n{}",
-        report.pretty()
-    );
+    assert!(report.passed, "smoke add: parity FAIL\n{}", report.pretty());
     eprintln!("smoke add ok: {}", report.pretty());
 }
 
@@ -119,7 +118,11 @@ fn smoke_fp32_reduction_tolerance_is_tight() {
     let a = Tensor::from_vec(vec![1.0_f32], Shape::from_dims(&[1]), dev.clone()).unwrap();
     let b = Tensor::from_vec(vec![1.0_f32 + 4e-7], Shape::from_dims(&[1]), dev.clone()).unwrap();
     let r = parity_helpers::compare_fp32_reduction(&a, &b);
-    assert!(r.passed, "FP32-reduction tol unexpectedly failed: {}", r.pretty());
+    assert!(
+        r.passed,
+        "FP32-reduction tol unexpectedly failed: {}",
+        r.pretty()
+    );
 
     // Clearly outside FP32-reduction tol.
     let c = Tensor::from_vec(vec![1.0_f32 + 1e-3], Shape::from_dims(&[1]), dev.clone()).unwrap();

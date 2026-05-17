@@ -4,16 +4,49 @@ use cudarc::driver::DevicePtr;
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 use crate::cuda::device_lt;
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-use crate::DType;
+use crate::{DType, Shape, TensorId};
 use crate::{Error, Result, Tensor};
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn rank3_transpose021_base(tensor: &Tensor) -> Option<Tensor> {
+    if tensor.view_offset != 0 {
+        return None;
+    }
+    let dims = tensor.shape().dims();
+    if dims.len() != 3 {
+        return None;
+    }
+    let strides = tensor.custom_strides.as_ref()?;
+    if strides.len() != 3 {
+        return None;
+    }
+
+    // A pure transpose_dims(1, 2) view of base [B, K, D] has logical shape
+    // [B, D, K] and row-major view strides [K*D, 1, D].
+    if strides[0] != dims[1] * dims[2] || strides[1] != 1 || strides[2] != dims[1] {
+        return None;
+    }
+
+    Some(Tensor {
+        storage: tensor.storage.clone(),
+        shape: Shape::from_dims(&[dims[0], dims[2], dims[1]]),
+        device: tensor.device.clone(),
+        id: TensorId::new(),
+        requires_grad: tensor.requires_grad,
+        custom_strides: None,
+        view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
+    })
+}
 
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 pub fn bmm_bf16_fp32acc_out(
     a: &Tensor,
     b: &Tensor,
     out: &mut Tensor,
-    trans_a: bool,
-    trans_b: bool,
+    mut trans_a: bool,
+    mut trans_b: bool,
 ) -> Result<()> {
     if a.dtype() != DType::BF16 || b.dtype() != DType::BF16 || out.dtype() != DType::BF16 {
         return Err(Error::InvalidInput(
@@ -21,20 +54,29 @@ pub fn bmm_bf16_fp32acc_out(
         ));
     }
 
-    // Stride refactor Phase 2a safety net: this cuBLASLt path derives lda/ldb
-    // from contiguous shape. A strided view would silently read the wrong
-    // memory. Phase 2b will teach trans_a/trans_b to absorb per-input
-    // transposes directly so callers can pass permute-views.
+    // Absorb pure rank-3 transpose views into cuBLASLt's trans flags. This
+    // keeps attention's K^T / P^T BMMs from materializing a full permute_021
+    // copy before every GEMM.
+    let a_base;
     let a_owned;
     let a = if a.is_contiguous() {
         a
+    } else if let Some(base) = rank3_transpose021_base(a) {
+        trans_a = !trans_a;
+        a_base = base;
+        &a_base
     } else {
         a_owned = a.contiguous()?;
         &a_owned
     };
+    let b_base;
     let b_owned;
     let b = if b.is_contiguous() {
         b
+    } else if let Some(base) = rank3_transpose021_base(b) {
+        trans_b = !trans_b;
+        b_base = base;
+        &b_base
     } else {
         b_owned = b.contiguous()?;
         &b_owned
@@ -48,11 +90,23 @@ pub fn bmm_bf16_fp32acc_out(
             "bmm_bf16_fp32acc_out: expect 3D tensors".into(),
         ));
     }
+
+    let (m_eff, k_a) = if trans_a {
+        (ashp[2], ashp[1])
+    } else {
+        (ashp[1], ashp[2])
+    };
+    let (k_b, n_eff) = if trans_b {
+        (bshp[2], bshp[1])
+    } else {
+        (bshp[1], bshp[2])
+    };
+
     if bshp[0] != ashp[0]
         || oshp[0] != ashp[0]
-        || oshp[1] != ashp[1]
-        || bshp[1] != ashp[2]
-        || oshp[2] != bshp[2]
+        || oshp[1] != m_eff
+        || oshp[2] != n_eff
+        || k_a != k_b
     {
         return Err(Error::InvalidInput(
             "bmm_bf16_fp32acc_out: shape mismatch".into(),
@@ -60,20 +114,20 @@ pub fn bmm_bf16_fp32acc_out(
     }
 
     let batch = ashp[0] as i32;
-    let m = ashp[1] as i32;
-    let k = ashp[2] as i32;
-    let n = bshp[2] as i32;
+    let m = m_eff as i32;
+    let k = k_a as i32;
+    let n = n_eff as i32;
 
     let device = a.device();
     let stream = device_lt::stream_ptr(device)?;
     let lt = device_lt::cublaslt_handle_ptr(device)?;
 
-    let lda: i64 = if trans_a { m } else { k } as i64;
-    let ldb: i64 = if trans_b { k } else { n } as i64;
+    let lda: i64 = ashp[2] as i64;
+    let ldb: i64 = bshp[2] as i64;
     let ldc: i64 = n as i64;
-    let stride_a = (m * k) as i64;
-    let stride_b = (k * n) as i64;
-    let stride_c = (m * n) as i64;
+    let stride_a = (ashp[1] * ashp[2]) as i64;
+    let stride_b = (bshp[1] * bshp[2]) as i64;
+    let stride_c = (m_eff * n_eff) as i64;
 
     let op_a = if trans_a { 1 } else { 0 };
     let op_b = if trans_b { 1 } else { 0 };

@@ -133,6 +133,9 @@ fn lora_backward_matches_finite_diff_f32() -> Result<()> {
     }
 
     println!("\nworst relative error = {worst:.4}");
-    assert!(worst < 0.05, "autograd produces wrong LoRA gradients (worst rel_err={worst:.4})");
+    assert!(
+        worst < 0.05,
+        "autograd produces wrong LoRA gradients (worst rel_err={worst:.4})"
+    );
     Ok(())
 }

@@ -121,21 +121,30 @@ impl Tensor {
     /// tape — `.requires_grad` doesn't propagate through a boolean mask.
     pub fn gt(&self, other: &Tensor) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_comparison_bf16(
-            self, other, crate::tensor_iterator::ops::comparison::gt_bf16_iter, GpuOps::cmp_gt,
+            self,
+            other,
+            crate::tensor_iterator::ops::comparison::gt_bf16_iter,
+            GpuOps::cmp_gt,
         )
     }
 
     /// Greater than or equal comparison. See `gt` for dispatch notes.
     pub fn ge(&self, other: &Tensor) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_comparison_bf16(
-            self, other, crate::tensor_iterator::ops::comparison::ge_bf16_iter, GpuOps::cmp_ge,
+            self,
+            other,
+            crate::tensor_iterator::ops::comparison::ge_bf16_iter,
+            GpuOps::cmp_ge,
         )
     }
 
     /// Less than comparison. See `gt` for dispatch notes.
     pub fn lt(&self, other: &Tensor) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_comparison_bf16(
-            self, other, crate::tensor_iterator::ops::comparison::lt_bf16_iter, GpuOps::cmp_lt,
+            self,
+            other,
+            crate::tensor_iterator::ops::comparison::lt_bf16_iter,
+            GpuOps::cmp_lt,
         )
     }
 
@@ -143,7 +152,10 @@ impl Tensor {
     /// ne(NaN, NaN) = true.
     pub fn ne(&self, other: &Tensor) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_comparison_bf16(
-            self, other, crate::tensor_iterator::ops::comparison::ne_bf16_iter, GpuOps::cmp_ne,
+            self,
+            other,
+            crate::tensor_iterator::ops::comparison::ne_bf16_iter,
+            GpuOps::cmp_ne,
         )
     }
 
@@ -312,7 +324,13 @@ impl Tensor {
         // strided views first.
         let materialized: Vec<Tensor> = tensors
             .iter()
-            .map(|t| if t.is_contiguous() { Ok((*t).clone()) } else { t.contiguous() })
+            .map(|t| {
+                if t.is_contiguous() {
+                    Ok((*t).clone())
+                } else {
+                    t.contiguous()
+                }
+            })
             .collect::<Result<Vec<_>>>()?;
         let tensors_vec: Vec<&Tensor> = materialized.iter().collect();
         let tensors: &[&Tensor] = &tensors_vec;
@@ -505,17 +523,19 @@ impl Tensor {
                                 "Tensor::cat/cuMemcpy2D dst",
                             );
                             let rc = unsafe {
-                                cudarc::driver::sys::lib()
-                                    .cuMemcpy2DAsync_v2(&params, stream_ptr)
+                                cudarc::driver::sys::lib().cuMemcpy2DAsync_v2(&params, stream_ptr)
                             };
                             if rc != CUresult::CUDA_SUCCESS {
                                 return Err(Error::Cuda(format!(
                                     "cuMemcpy2DAsync_v2 (cat) failed: {rc:?} \
                                      src={:#x} dst={:#x} srcPitch={} dstPitch={} \
                                      width={} height={}",
-                                    params.srcDevice, params.dstDevice,
-                                    params.srcPitch, params.dstPitch,
-                                    params.WidthInBytes, params.Height,
+                                    params.srcDevice,
+                                    params.dstDevice,
+                                    params.srcPitch,
+                                    params.dstPitch,
+                                    params.WidthInBytes,
+                                    params.Height,
                                 )));
                             }
                         }
@@ -634,10 +654,7 @@ impl Tensor {
                             indices: indices.id(),
                             dim,
                         },
-                        vec![
-                            (self.id, self.alias()),
-                            (indices.id(), indices.alias()),
-                        ],
+                        vec![(self.id, self.alias()), (indices.id(), indices.alias())],
                     );
                 }
             }
@@ -656,10 +673,7 @@ impl Tensor {
                         indices: indices.id(),
                         dim,
                     },
-                    vec![
-                        (self.id, self.alias()),
-                        (indices.id(), indices.alias()),
-                    ],
+                    vec![(self.id, self.alias()), (indices.id(), indices.alias())],
                 );
             }
         }
@@ -682,12 +696,7 @@ impl Tensor {
     /// `index_select(upstream, dim, indices)`.
     ///
     /// Used by TREAD's scatter-back step (`features::tread::TreadStep`).
-    pub fn index_assign(
-        &self,
-        dim: usize,
-        indices: &Tensor,
-        values: &Tensor,
-    ) -> Result<Tensor> {
+    pub fn index_assign(&self, dim: usize, indices: &Tensor, values: &Tensor) -> Result<Tensor> {
         let mut output = self.index_assign_no_grad(dim, indices, values)?;
 
         if self.requires_grad || values.requires_grad {
@@ -875,7 +884,9 @@ impl Tensor {
     /// else → GpuOps::log.
     pub fn log(&self) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_unary_bf16(
-            self, crate::tensor_iterator::ops::transcendentals::log_bf16_iter, GpuOps::log,
+            self,
+            crate::tensor_iterator::ops::transcendentals::log_bf16_iter,
+            GpuOps::log,
         )
     }
 
@@ -939,18 +950,10 @@ impl Tensor {
         }
 
         let dtype = self.dtype();
-        let lower = Tensor::from_vec(
-            vec![min],
-            Shape::from_dims(&[1]),
-            self.device.clone(),
-        )?
-        .to_dtype(dtype)?;
-        let upper = Tensor::from_vec(
-            vec![max],
-            Shape::from_dims(&[1]),
-            self.device.clone(),
-        )?
-        .to_dtype(dtype)?;
+        let lower = Tensor::from_vec(vec![min], Shape::from_dims(&[1]), self.device.clone())?
+            .to_dtype(dtype)?;
+        let upper = Tensor::from_vec(vec![max], Shape::from_dims(&[1]), self.device.clone())?
+            .to_dtype(dtype)?;
         // `maximum` / `minimum` broadcast scalar-shaped tensors internally.
         let clipped = self.maximum(&lower)?;
         clipped.minimum(&upper)
@@ -984,7 +987,10 @@ impl Tensor {
             if AutogradContext::is_recording() {
                 AutogradContext::record_op(
                     out.id,
-                    Op::Maximum { a: self.id, b: other.id },
+                    Op::Maximum {
+                        a: self.id,
+                        b: other.id,
+                    },
                     vec![(self.id, self.alias()), (other.id, other.alias())],
                 );
             }
@@ -1023,7 +1029,10 @@ impl Tensor {
             if AutogradContext::is_recording() {
                 AutogradContext::record_op(
                     out.id,
-                    Op::Minimum { a: self.id, b: other.id },
+                    Op::Minimum {
+                        a: self.id,
+                        b: other.id,
+                    },
                     vec![(self.id, self.alias()), (other.id, other.alias())],
                 );
             }
@@ -1053,7 +1062,10 @@ impl Tensor {
             if AutogradContext::is_recording() {
                 AutogradContext::record_op(
                     output.id,
-                    Op::SumDimKeepdim { input: self.id, dim },
+                    Op::SumDimKeepdim {
+                        input: self.id,
+                        dim,
+                    },
                     vec![(self.id, self.alias())],
                 );
             }
@@ -1120,7 +1132,10 @@ impl Tensor {
             ));
         }
         crate::tensor_iterator::dispatch_comparison_bf16(
-            self, other, crate::tensor_iterator::ops::comparison::eq_bf16_iter, GpuOps::cmp_eq,
+            self,
+            other,
+            crate::tensor_iterator::ops::comparison::eq_bf16_iter,
+            GpuOps::cmp_eq,
         )
     }
 
@@ -1199,7 +1214,10 @@ impl Tensor {
     /// → iter, else → `GpuOps::cmp_le`.
     pub fn le(&self, other: &Tensor) -> Result<Tensor> {
         crate::tensor_iterator::dispatch_comparison_bf16(
-            self, other, crate::tensor_iterator::ops::comparison::le_bf16_iter, GpuOps::cmp_le,
+            self,
+            other,
+            crate::tensor_iterator::ops::comparison::le_bf16_iter,
+            GpuOps::cmp_le,
         )
     }
 
@@ -1823,8 +1841,7 @@ mod index_assign_tests {
             Tensor::from_vec(data.clone(), Shape::from_dims(&[2, 4, 3]), device.clone()).unwrap();
         // Indices = all positions; values = self → output should equal self.
         let idx_data: Vec<f32> = vec![0.0, 1.0, 2.0, 3.0];
-        let idx_f32 =
-            Tensor::from_vec(idx_data, Shape::from_dims(&[4]), device.clone()).unwrap();
+        let idx_f32 = Tensor::from_vec(idx_data, Shape::from_dims(&[4]), device.clone()).unwrap();
         let idx = idx_f32.to_dtype(DType::I32).unwrap();
         let out = self_t.index_assign(1, &idx, &self_t).unwrap();
         let out_v = out.to_vec().unwrap();
@@ -1840,8 +1857,7 @@ mod index_assign_tests {
             Tensor::from_vec(data.clone(), Shape::from_dims(&[2, 4, 3]), device.clone()).unwrap();
         // Pick indices = [0, 2]
         let idx_data: Vec<f32> = vec![0.0, 2.0];
-        let idx_f32 =
-            Tensor::from_vec(idx_data, Shape::from_dims(&[2]), device.clone()).unwrap();
+        let idx_f32 = Tensor::from_vec(idx_data, Shape::from_dims(&[2]), device.clone()).unwrap();
         let idx = idx_f32.to_dtype(DType::I32).unwrap();
 
         let gathered = self_t.index_select(1, &idx).unwrap();
@@ -1860,8 +1876,7 @@ mod index_assign_tests {
             Tensor::from_vec(self_data, Shape::from_dims(&[4, 2]), device.clone()).unwrap();
         // values shape [2, 2] → put rows at indices 1, 3
         let val_data: Vec<f32> = vec![99.0, 98.0, 97.0, 96.0];
-        let val_t =
-            Tensor::from_vec(val_data, Shape::from_dims(&[2, 2]), device.clone()).unwrap();
+        let val_t = Tensor::from_vec(val_data, Shape::from_dims(&[2, 2]), device.clone()).unwrap();
         let idx_f32 =
             Tensor::from_vec(vec![1.0, 3.0], Shape::from_dims(&[2]), device.clone()).unwrap();
         let idx = idx_f32.to_dtype(DType::I32).unwrap();

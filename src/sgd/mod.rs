@@ -40,8 +40,8 @@ fn ensure_module(dev: &Arc<CudaDevice>) -> Result<()> {
             .unwrap_or_else(|_| "/usr/local/cuda/include".into());
         let mut opts = CompileOptions::default();
         opts.include_paths.push(include_dir.into());
-        let ptx =
-            compile_ptx_with_opts(CUDA_SRC, opts).map_err(|e| Error::KernelError(format!("{e:?}")))?;
+        let ptx = compile_ptx_with_opts(CUDA_SRC, opts)
+            .map_err(|e| Error::KernelError(format!("{e:?}")))?;
         #[cfg(feature = "bf16_u16")]
         let symbols: &[&str] = &["sgd_f32", "sgd_bf16"];
         #[cfg(not(feature = "bf16_u16"))]

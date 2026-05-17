@@ -18,9 +18,7 @@ use crate::Result;
 use super::super::dispatch::DispatchCtx;
 use super::super::error::AutogradV2Error;
 use super::super::node::{Edge, GradFn, NodeId};
-use super::super::recording::{
-    gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
-};
+use super::super::recording::{gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2};
 use super::super::saved_tensor::SavedTensor;
 use super::fw_mode::{any_fw_grad, tangent_or_zero};
 
@@ -41,10 +39,7 @@ impl MatMulGradFn {
         Arc::new(Self {
             saved_a: SavedTensor::save_named(a, "MatMulGradFn:a"),
             saved_b: SavedTensor::save_named(b, "MatMulGradFn:b"),
-            next_edges: vec![
-                gradient_edge_for_tensor(a),
-                gradient_edge_for_tensor(b),
-            ],
+            next_edges: vec![gradient_edge_for_tensor(a), gradient_edge_for_tensor(b)],
             node_id: NodeId::new(),
             sequence_nr: seq,
             topological_nr: seq,

@@ -87,11 +87,7 @@ fn launch_fa2(q_3d: &Tensor, k_3d: &Tensor, v_3d: &Tensor) -> Result<Tensor> {
 /// NOTE: this materializes a full `[bh, N, N]` FP32 scores tensor. At
 /// `bh=8, N=16384` that's 8 GiB. This is intentional — no tiling is the
 /// whole point: it shares nothing with FA2's online softmax.
-fn naive_attn_fp32(
-    q_bf16: &Tensor,
-    k_bf16: &Tensor,
-    v_bf16: &Tensor,
-) -> Result<Tensor> {
+fn naive_attn_fp32(q_bf16: &Tensor, k_bf16: &Tensor, v_bf16: &Tensor) -> Result<Tensor> {
     let dims = q_bf16.shape().dims();
     let hd = dims[2];
     let scale = 1.0f32 / (hd as f32).sqrt();
@@ -196,12 +192,27 @@ fn run_case(
         .map_err(|e| anyhow::anyhow!("set_seed: {e:?}"))?;
 
     // Build BF16 inputs. Both paths see the SAME bytes.
-    let q = Tensor::randn(Shape::from_dims(&[bh, seq_len, head_dim]), 0.0, 1.0, device.clone())?
-        .to_dtype(DType::BF16)?;
-    let k = Tensor::randn(Shape::from_dims(&[bh, seq_len, head_dim]), 0.0, 1.0, device.clone())?
-        .to_dtype(DType::BF16)?;
-    let v = Tensor::randn(Shape::from_dims(&[bh, seq_len, head_dim]), 0.0, 1.0, device.clone())?
-        .to_dtype(DType::BF16)?;
+    let q = Tensor::randn(
+        Shape::from_dims(&[bh, seq_len, head_dim]),
+        0.0,
+        1.0,
+        device.clone(),
+    )?
+    .to_dtype(DType::BF16)?;
+    let k = Tensor::randn(
+        Shape::from_dims(&[bh, seq_len, head_dim]),
+        0.0,
+        1.0,
+        device.clone(),
+    )?
+    .to_dtype(DType::BF16)?;
+    let v = Tensor::randn(
+        Shape::from_dims(&[bh, seq_len, head_dim]),
+        0.0,
+        1.0,
+        device.clone(),
+    )?
+    .to_dtype(DType::BF16)?;
 
     // FA2 forward.
     let out_fa2 = launch_fa2(&q, &k, &v)?;
@@ -342,9 +353,7 @@ fn print_and_assert(reports: &[DiffReport], abs_tol: f32, cos_tol: f32) -> Resul
         }
     }
 
-    let any_fail = reports
-        .iter()
-        .any(|r| r.skipped.is_none() && !r.passed);
+    let any_fail = reports.iter().any(|r| r.skipped.is_none() && !r.passed);
     if any_fail {
         anyhow::bail!(
             "FA2 vs FP32-naive parity failed (tol: abs ≤ {abs_tol:.1e}, cos_sim ≥ {cos_tol:.4}). \

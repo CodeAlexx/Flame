@@ -78,7 +78,9 @@ impl Tensor {
     /// Square root. Phase 10: BF16 → TensorIterator, else → GpuOps::sqrt.
     pub fn sqrt(&self) -> Result<Tensor> {
         let mut output = crate::tensor_iterator::dispatch_unary_bf16(
-            self, crate::tensor_iterator::ops::transcendentals::sqrt_bf16_iter, GpuOps::sqrt,
+            self,
+            crate::tensor_iterator::ops::transcendentals::sqrt_bf16_iter,
+            GpuOps::sqrt,
         )?;
         if self.requires_grad {
             output.requires_grad = true;
@@ -202,7 +204,8 @@ impl Tensor {
         let dims = self.shape().dims();
         if dims.len() != 3 {
             return Err(Error::InvalidOperation(format!(
-                "pad1d: expected 3D [B,C,L], got {}D", dims.len()
+                "pad1d: expected 3D [B,C,L], got {}D",
+                dims.len()
             )));
         }
         if pad_left == 0 && pad_right == 0 {
@@ -262,7 +265,9 @@ impl Tensor {
     /// Element-wise maximum with a scalar
     pub fn maximum_scalar(&self, scalar: f32) -> Result<Tensor> {
         if self.dtype() == DType::BF16 {
-            let scalar_tensor = self.zeros_like_with_dtype(DType::BF16)?.add_scalar(scalar)?;
+            let scalar_tensor = self
+                .zeros_like_with_dtype(DType::BF16)?
+                .add_scalar(scalar)?;
             return self.maximum(&scalar_tensor);
         }
         let scalar_tensor = self.full_like(scalar)?;
@@ -272,7 +277,9 @@ impl Tensor {
     /// Element-wise minimum with a scalar
     pub fn minimum_scalar(&self, scalar: f32) -> Result<Tensor> {
         if self.dtype() == DType::BF16 {
-            let scalar_tensor = self.zeros_like_with_dtype(DType::BF16)?.add_scalar(scalar)?;
+            let scalar_tensor = self
+                .zeros_like_with_dtype(DType::BF16)?
+                .add_scalar(scalar)?;
             return self.minimum(&scalar_tensor);
         }
         let scalar_tensor = self.full_like(scalar)?;

@@ -193,9 +193,9 @@ impl GradFn for CheckpointGradFn {
         // -----------------------------------------------------------------
         let mut inner_grads: Vec<Option<Tensor>> = Vec::with_capacity(reattached.len());
         for leaf in &reattached {
-            let g = leaf.autograd_meta().and_then(|m| {
-                m.lock().ok().and_then(|guard| guard.grad.clone())
-            });
+            let g = leaf
+                .autograd_meta()
+                .and_then(|m| m.lock().ok().and_then(|guard| guard.grad.clone()));
             inner_grads.push(g);
         }
 

@@ -43,8 +43,7 @@ fn ensure_kernel(dev: &Arc<CudaDevice>) -> Result<cudarc::driver::CudaFunction> 
     if let Some(f) = dev.get_func(name, name) {
         return Ok(f);
     }
-    let cuda_home =
-        std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
+    let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
     let mut opts = CompileOptions::default();
     opts.include_paths.push(format!("{cuda_home}/include"));
     let ptx = compile_ptx_with_opts(DEINTERLEAVE_PAIR_F32_KERNEL, opts)

@@ -12,7 +12,6 @@
 //! future change to the `tensor_iterator::ops::unary::{silu,gelu,square}`
 //! functors.
 
-use std::sync::Arc;
 use crate::dtype::DType;
 use crate::tensor_storage::{ensure_unique_slice, slice_ref, TensorStorage};
 use crate::{Error, Result, Shape, Tensor, TensorId};
@@ -20,6 +19,7 @@ use cudarc::{
     driver::{CudaDevice, LaunchAsync, LaunchConfig},
     nvrtc::{compile_ptx_with_opts, CompileOptions},
 };
+use std::sync::Arc;
 
 // Vectorized BF16 unary kernels: 2 elements per thread via __nv_bfloat162.
 // The previous scalar versions were running ~3.6 ms on [1,4096,15360] = 13×
@@ -147,7 +147,6 @@ pub fn gelu_bf16(x: &Tensor) -> Result<Tensor> {
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
     ensure(&x.device, "gelu_bf16_kernel", CUDA_GELU)?;
     let f = x
@@ -186,7 +185,6 @@ pub fn square_bf16(x: &Tensor) -> Result<Tensor> {
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
     ensure(&x.device, "square_bf16_kernel", CUDA_SQUARE)?;
     let f = x
@@ -268,7 +266,9 @@ void softmax_last_dim_bf16_kernel(const __nv_bfloat16* __restrict__ X,
 pub fn softmax_last_dim_bf16(x: &Tensor) -> Result<Tensor> {
     debug_assert_eq!(x.dtype(), DType::BF16);
     let dims = x.shape().dims();
-    let cols = *dims.last().ok_or_else(|| Error::InvalidOperation("empty shape".into()))?;
+    let cols = *dims
+        .last()
+        .ok_or_else(|| Error::InvalidOperation("empty shape".into()))?;
     let rows: usize = dims[..dims.len() - 1].iter().product();
     let n = rows * cols;
 
@@ -286,7 +286,6 @@ pub fn softmax_last_dim_bf16(x: &Tensor) -> Result<Tensor> {
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
     ensure(
         &x.device,
@@ -302,7 +301,11 @@ pub fn softmax_last_dim_bf16(x: &Tensor) -> Result<Tensor> {
         .ok_or_else(|| Error::Cuda("softmax_last_dim_bf16_kernel missing".into()))?;
     let xs = match &x.storage {
         TensorStorage::BF16 { data, .. } => data,
-        _ => return Err(Error::InvalidOperation("softmax_last_dim_bf16 expects BF16".into())),
+        _ => {
+            return Err(Error::InvalidOperation(
+                "softmax_last_dim_bf16 expects BF16".into(),
+            ))
+        }
     };
     let ys = match &mut out.storage {
         TensorStorage::BF16 { data, .. } => data,
@@ -342,7 +345,6 @@ pub fn silu_bf16(x: &Tensor) -> Result<Tensor> {
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
     ensure(&x.device, "silu_bf16_kernel", CUDA_SILU)?;
     let f = x
@@ -501,8 +503,8 @@ pub fn silu_bf16_contig_direct(x: &Tensor) -> Result<Tensor> {
 
         let mut out = alloc_contig_bf16_like(x)?;
         let numel = x.shape().elem_count();
-        let x_ptr = x.as_device_ptr_bf16("silu_bf16_contig_direct: x")?
-            as *mut std::os::raw::c_void;
+        let x_ptr =
+            x.as_device_ptr_bf16("silu_bf16_contig_direct: x")? as *mut std::os::raw::c_void;
         let out_ptr = match &mut out.storage {
             TensorStorage::BF16 { data, .. } => {
                 let s = ensure_unique_slice(data)?;
@@ -542,8 +544,8 @@ pub fn gelu_bf16_contig_direct(x: &Tensor) -> Result<Tensor> {
 
         let mut out = alloc_contig_bf16_like(x)?;
         let numel = x.shape().elem_count();
-        let x_ptr = x.as_device_ptr_bf16("gelu_bf16_contig_direct: x")?
-            as *mut std::os::raw::c_void;
+        let x_ptr =
+            x.as_device_ptr_bf16("gelu_bf16_contig_direct: x")? as *mut std::os::raw::c_void;
         let out_ptr = match &mut out.storage {
             TensorStorage::BF16 { data, .. } => {
                 let s = ensure_unique_slice(data)?;
@@ -674,8 +676,8 @@ pub fn mul_scalar_bf16_contig_direct(x: &Tensor, scalar: f32) -> Result<Tensor> 
 
         let mut out = alloc_contig_bf16_like(x)?;
         let numel = x.shape().elem_count();
-        let x_ptr = x.as_device_ptr_bf16("mul_scalar_bf16_contig_direct: x")?
-            as *mut std::os::raw::c_void;
+        let x_ptr =
+            x.as_device_ptr_bf16("mul_scalar_bf16_contig_direct: x")? as *mut std::os::raw::c_void;
         let out_ptr = match &mut out.storage {
             TensorStorage::BF16 { data, .. } => {
                 let s = ensure_unique_slice(data)?;
@@ -859,7 +861,6 @@ pub fn rope_fused_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor>
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
     ensure(&x.device, "rope_fused_bf16_kernel", CUDA_ROPE_FUSED)?;
@@ -984,13 +985,15 @@ pub fn rope_fused_bf16_f32pe(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<T
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
     ensure(&x.device, "rope_fused_bf16_f32pe_kernel", CUDA_ROPE_FUSED)?;
     let f = x
         .device
-        .get_func("rope_fused_bf16_f32pe_kernel", "rope_fused_bf16_f32pe_kernel")
+        .get_func(
+            "rope_fused_bf16_f32pe_kernel",
+            "rope_fused_bf16_f32pe_kernel",
+        )
         .ok_or_else(|| Error::Cuda("rope_fused_bf16_f32pe_kernel missing".into()))?;
 
     let xs = match &x_flat.storage {
@@ -999,11 +1002,19 @@ pub fn rope_fused_bf16_f32pe(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<T
     };
     let cs = match &cos_flat.storage {
         TensorStorage::F32 { data, .. } => data,
-        _ => return Err(Error::InvalidOperation("rope_fused_bf16_f32pe cos expects F32".into())),
+        _ => {
+            return Err(Error::InvalidOperation(
+                "rope_fused_bf16_f32pe cos expects F32".into(),
+            ))
+        }
     };
     let ss = match &sin_flat.storage {
         TensorStorage::F32 { data, .. } => data,
-        _ => return Err(Error::InvalidOperation("rope_fused_bf16_f32pe sin expects F32".into())),
+        _ => {
+            return Err(Error::InvalidOperation(
+                "rope_fused_bf16_f32pe sin expects F32".into(),
+            ))
+        }
     };
     let ys = match &mut out.storage {
         TensorStorage::BF16 { data, .. } => data,
@@ -1109,7 +1120,6 @@ pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Ten
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
     ensure(&x.device, "rope_halfsplit_bf16_kernel", CUDA_ROPE_FUSED)?;
@@ -1500,7 +1510,8 @@ pub fn modulate_pre_fused_bf16(
     let x_dims = x.shape().dims();
     if x_dims.len() != 3 {
         return Err(Error::InvalidOperation(format!(
-            "modulate_pre_fused: expected 3D [B,N,dim], got {:?}", x_dims
+            "modulate_pre_fused: expected 3D [B,N,dim], got {:?}",
+            x_dims
         )));
     }
     // If any input requires grad, route through autograd-recording primitives
@@ -1508,9 +1519,14 @@ pub fn modulate_pre_fused_bf16(
     // and silently severs gradient at every block's modulation step.
     let needs_grad = x.requires_grad || shift.requires_grad || scale.requires_grad;
     if std::env::var("DEBUG_MODULATE_PRE").ok().as_deref() == Some("1") {
-        eprintln!("[modulate_pre] x.rg={} shift.rg={} scale.rg={} needs_grad={} recording={}",
-            x.requires_grad, shift.requires_grad, scale.requires_grad, needs_grad,
-            crate::autograd::AutogradContext::is_recording());
+        eprintln!(
+            "[modulate_pre] x.rg={} shift.rg={} scale.rg={} needs_grad={} recording={}",
+            x.requires_grad,
+            shift.requires_grad,
+            scale.requires_grad,
+            needs_grad,
+            crate::autograd::AutogradContext::is_recording()
+        );
     }
     if needs_grad {
         let dim = x_dims[2];
@@ -1542,7 +1558,10 @@ fn modulate_pre_fused_bf16_contig(
 
     let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, total)?;
     let mut out = Tensor {
-        storage: TensorStorage::BF16 { data: data.into(), numel: total },
+        storage: TensorStorage::BF16 {
+            data: data.into(),
+            numel: total,
+        },
         shape: x.shape().clone(),
         device: x.device.clone(),
         id: TensorId::new(),
@@ -1551,18 +1570,30 @@ fn modulate_pre_fused_bf16_contig(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
     ensure(&x.device, "modulate_pre_bf16_kernel", CUDA_MODULATE_PRE)?;
-    let f = x.device
+    let f = x
+        .device
         .get_func("modulate_pre_bf16_kernel", "modulate_pre_bf16_kernel")
         .ok_or_else(|| Error::Cuda("modulate_pre_bf16_kernel missing".into()))?;
 
-    let xs = match &x.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let scs = match &scale.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let shs = match &shift.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let ys = match &mut out.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let xs = match &x.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let scs = match &scale.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let shs = match &shift.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let ys = match &mut out.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
     let ys = ensure_unique_slice(ys)?;
 
     let threads = dim.min(256) as u32;
@@ -1573,7 +1604,19 @@ fn modulate_pre_fused_bf16_contig(
         shared_mem_bytes: smem,
     };
     unsafe {
-        f.launch(cfg, (slice_ref(xs), slice_ref(scs), slice_ref(shs), ys, rows as i32, dim as i32, n as i32, eps))?;
+        f.launch(
+            cfg,
+            (
+                slice_ref(xs),
+                slice_ref(scs),
+                slice_ref(shs),
+                ys,
+                rows as i32,
+                dim as i32,
+                n as i32,
+                eps,
+            ),
+        )?;
     }
     Ok(out)
 }
@@ -1599,8 +1642,7 @@ fn modulate_pre_fused_bf16_strided(
             shift_dims, scale_dims
         )));
     }
-    if shift_dims[0] != b || shift_dims[1] != dim
-        || scale_dims[0] != b || scale_dims[1] != dim {
+    if shift_dims[0] != b || shift_dims[1] != dim || scale_dims[0] != b || scale_dims[1] != dim {
         return Err(Error::InvalidOperation(format!(
             "modulate_pre_fused: shift/scale shape must be [B={},dim={}], got {:?}/{:?}",
             b, dim, shift_dims, scale_dims
@@ -1611,9 +1653,13 @@ fn modulate_pre_fused_bf16_strided(
     let shift_s = shift.strides();
     let scale_s = scale.strides();
     let strides_packed: Vec<i64> = vec![
-        x_s[0] as i64, x_s[1] as i64, x_s[2] as i64,
-        shift_s[0] as i64, shift_s[1] as i64,
-        scale_s[0] as i64, scale_s[1] as i64,
+        x_s[0] as i64,
+        x_s[1] as i64,
+        x_s[2] as i64,
+        shift_s[0] as i64,
+        shift_s[1] as i64,
+        scale_s[0] as i64,
+        scale_s[1] as i64,
     ];
 
     let mut d_strides: CudaSlice<i64> = unsafe { device.alloc::<i64>(7) }
@@ -1624,7 +1670,10 @@ fn modulate_pre_fused_bf16_strided(
 
     let data = crate::cuda_alloc_pool::pool_alloc_u16(&device, total)?;
     let mut out = Tensor {
-        storage: TensorStorage::BF16 { data: data.into(), numel: total },
+        storage: TensorStorage::BF16 {
+            data: data.into(),
+            numel: total,
+        },
         shape: x.shape().clone(),
         device: device.clone(),
         id: TensorId::new(),
@@ -1635,7 +1684,11 @@ fn modulate_pre_fused_bf16_strided(
         autograd_meta: None,
     };
 
-    ensure(&device, "modulate_pre_strided_bf16_kernel", CUDA_MODULATE_PRE_STRIDED)?;
+    ensure(
+        &device,
+        "modulate_pre_strided_bf16_kernel",
+        CUDA_MODULATE_PRE_STRIDED,
+    )?;
     let f = device
         .get_func(
             "modulate_pre_strided_bf16_kernel",
@@ -1643,10 +1696,22 @@ fn modulate_pre_fused_bf16_strided(
         )
         .ok_or_else(|| Error::Cuda("modulate_pre_strided_bf16_kernel missing".into()))?;
 
-    let xs = match &x.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let scs = match &scale.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let shs = match &shift.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let ys = match &mut out.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let xs = match &x.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let scs = match &scale.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let shs = match &shift.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let ys = match &mut out.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
     let ys = ensure_unique_slice(ys)?;
 
     let x_offset = x.offset() as i64;
@@ -1664,11 +1729,17 @@ fn modulate_pre_fused_bf16_strided(
         f.launch(
             cfg,
             (
-                slice_ref(xs), x_offset,
-                slice_ref(scs), scale_offset,
-                slice_ref(shs), shift_offset,
+                slice_ref(xs),
+                x_offset,
+                slice_ref(scs),
+                scale_offset,
+                slice_ref(shs),
+                shift_offset,
                 ys,
-                rows as i32, dim as i32, n as i32, eps,
+                rows as i32,
+                dim as i32,
+                n as i32,
+                eps,
                 &d_strides,
             ),
         )
@@ -1701,13 +1772,15 @@ pub fn modulate_pre_split_apply_bf16(
     let x_dims = x.shape().dims();
     if x_dims.len() != 3 {
         return Err(Error::InvalidOperation(format!(
-            "modulate_pre_split_apply: expected 3D x [B,N,dim], got {:?}", x_dims
+            "modulate_pre_split_apply: expected 3D x [B,N,dim], got {:?}",
+            x_dims
         )));
     }
     let m_dims = modulation.shape().dims();
     if m_dims.len() != 3 {
         return Err(Error::InvalidOperation(format!(
-            "modulate_pre_split_apply: expected 3D modulation [B,mod_dim,dim], got {:?}", m_dims
+            "modulate_pre_split_apply: expected 3D modulation [B,mod_dim,dim], got {:?}",
+            m_dims
         )));
     }
     let (b, _n, dim) = (x_dims[0], x_dims[1], x_dims[2]);
@@ -1745,7 +1818,10 @@ fn modulate_pre_split_apply_bf16_contig(
 
     let data = crate::cuda_alloc_pool::pool_alloc_u16(&x.device, total)?;
     let mut out = Tensor {
-        storage: TensorStorage::BF16 { data: data.into(), numel: total },
+        storage: TensorStorage::BF16 {
+            data: data.into(),
+            numel: total,
+        },
         shape: x.shape().clone(),
         device: x.device.clone(),
         id: TensorId::new(),
@@ -1761,7 +1837,8 @@ fn modulate_pre_split_apply_bf16_contig(
         "modulate_pre_split_apply_bf16_kernel",
         CUDA_MODULATE_PRE_SPLIT_APPLY,
     )?;
-    let f = x.device
+    let f = x
+        .device
         .get_func(
             "modulate_pre_split_apply_bf16_kernel",
             "modulate_pre_split_apply_bf16_kernel",
@@ -1790,17 +1867,20 @@ fn modulate_pre_split_apply_bf16_contig(
         shared_mem_bytes: smem,
     };
     unsafe {
-        f.launch(cfg, (
-            slice_ref(xs),
-            slice_ref(ms),
-            ys,
-            rows as i32,
-            dim as i32,
-            n as i32,
-            mod_dim as i32,
-            shift_idx as i32,
-            eps,
-        ))?;
+        f.launch(
+            cfg,
+            (
+                slice_ref(xs),
+                slice_ref(ms),
+                ys,
+                rows as i32,
+                dim as i32,
+                n as i32,
+                mod_dim as i32,
+                shift_idx as i32,
+                eps,
+            ),
+        )?;
     }
     Ok(out)
 }
@@ -1821,8 +1901,12 @@ fn modulate_pre_split_apply_bf16_strided(
     let x_s = x.strides();
     let mod_s = modulation.strides();
     let strides_packed: Vec<i64> = vec![
-        x_s[0] as i64, x_s[1] as i64, x_s[2] as i64,
-        mod_s[0] as i64, mod_s[1] as i64, mod_s[2] as i64,
+        x_s[0] as i64,
+        x_s[1] as i64,
+        x_s[2] as i64,
+        mod_s[0] as i64,
+        mod_s[1] as i64,
+        mod_s[2] as i64,
     ];
 
     let mut d_strides: CudaSlice<i64> = unsafe { device.alloc::<i64>(6) }
@@ -1833,7 +1917,10 @@ fn modulate_pre_split_apply_bf16_strided(
 
     let data = crate::cuda_alloc_pool::pool_alloc_u16(&device, total)?;
     let mut out = Tensor {
-        storage: TensorStorage::BF16 { data: data.into(), numel: total },
+        storage: TensorStorage::BF16 {
+            data: data.into(),
+            numel: total,
+        },
         shape: x.shape().clone(),
         device: device.clone(),
         id: TensorId::new(),
@@ -1886,11 +1973,16 @@ fn modulate_pre_split_apply_bf16_strided(
         f.launch(
             cfg,
             (
-                slice_ref(xs), x_offset,
-                slice_ref(ms), mod_offset,
+                slice_ref(xs),
+                x_offset,
+                slice_ref(ms),
+                mod_offset,
                 ys,
-                rows as i32, dim as i32, n as i32,
-                shift_idx as i32, eps,
+                rows as i32,
+                dim as i32,
+                n as i32,
+                shift_idx as i32,
+                eps,
                 &d_strides,
             ),
         )
@@ -1990,16 +2082,13 @@ void gate_residual_bf16_kernel(
 /// Stride-aware as of Phase 2b-4 (2026-04-23). Contig fast path when
 /// all three inputs are contiguous; strided path indexes narrow/permute
 /// views directly, eliminating the Phase-2a `.contiguous()` guards.
-pub fn gate_residual_fused_bf16(
-    residual: &Tensor,
-    gate: &Tensor,
-    x: &Tensor,
-) -> Result<Tensor> {
+pub fn gate_residual_fused_bf16(residual: &Tensor, gate: &Tensor, x: &Tensor) -> Result<Tensor> {
     debug_assert_eq!(residual.dtype(), DType::BF16);
     let dims = residual.shape().dims();
     if dims.len() != 3 {
         return Err(Error::InvalidOperation(format!(
-            "gate_residual_fused: expected 3D [B,N,dim], got {:?}", dims
+            "gate_residual_fused: expected 3D [B,N,dim], got {:?}",
+            dims
         )));
     }
     let mut result = if residual.is_contiguous() && gate.is_contiguous() && x.is_contiguous() {
@@ -2014,8 +2103,10 @@ pub fn gate_residual_fused_bf16(
     let needs_grad = residual.requires_grad || gate.requires_grad || x.requires_grad;
     if std::env::var("DEBUG_GATE_RESIDUAL").ok().as_deref() == Some("1") {
         let recording = crate::autograd::AutogradContext::is_recording();
-        eprintln!("[gate_residual] r.rg={} g.rg={} x.rg={} needs_grad={} recording={}",
-            residual.requires_grad, gate.requires_grad, x.requires_grad, needs_grad, recording);
+        eprintln!(
+            "[gate_residual] r.rg={} g.rg={} x.rg={} needs_grad={} recording={}",
+            residual.requires_grad, gate.requires_grad, x.requires_grad, needs_grad, recording
+        );
     }
     if needs_grad {
         result.requires_grad = true;
@@ -2038,18 +2129,17 @@ pub fn gate_residual_fused_bf16(
     Ok(result)
 }
 
-fn gate_residual_fused_bf16_contig(
-    residual: &Tensor,
-    gate: &Tensor,
-    x: &Tensor,
-) -> Result<Tensor> {
+fn gate_residual_fused_bf16_contig(residual: &Tensor, gate: &Tensor, x: &Tensor) -> Result<Tensor> {
     let dims = residual.shape().dims();
     let (b, n, dim) = (dims[0], dims[1], dims[2]);
     let total = b * n * dim;
 
     let data = crate::cuda_alloc_pool::pool_alloc_u16(&residual.device, total)?;
     let mut out = Tensor {
-        storage: TensorStorage::BF16 { data: data.into(), numel: total },
+        storage: TensorStorage::BF16 {
+            data: data.into(),
+            numel: total,
+        },
         shape: residual.shape().clone(),
         device: residual.device.clone(),
         id: TensorId::new(),
@@ -2058,22 +2148,49 @@ fn gate_residual_fused_bf16_contig(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
-    ensure(&residual.device, "gate_residual_bf16_kernel", CUDA_GATE_RESIDUAL)?;
-    let f = residual.device
+    ensure(
+        &residual.device,
+        "gate_residual_bf16_kernel",
+        CUDA_GATE_RESIDUAL,
+    )?;
+    let f = residual
+        .device
         .get_func("gate_residual_bf16_kernel", "gate_residual_bf16_kernel")
         .ok_or_else(|| Error::Cuda("gate_residual_bf16_kernel missing".into()))?;
 
-    let rs = match &residual.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let gs = match &gate.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let xs_data = match &x.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let ys = match &mut out.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let rs = match &residual.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let gs = match &gate.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let xs_data = match &x.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let ys = match &mut out.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
     let ys = ensure_unique_slice(ys)?;
 
     unsafe {
-        f.launch(lc(total), (slice_ref(rs), slice_ref(gs), slice_ref(xs_data), ys, total as i64, dim as i32, n as i32))?;
+        f.launch(
+            lc(total),
+            (
+                slice_ref(rs),
+                slice_ref(gs),
+                slice_ref(xs_data),
+                ys,
+                total as i64,
+                dim as i32,
+                n as i32,
+            ),
+        )?;
     }
     Ok(out)
 }
@@ -2093,12 +2210,14 @@ fn gate_residual_fused_bf16_strided(
     let x_dims = x.shape().dims();
     if gate_dims.len() != 2 {
         return Err(Error::InvalidOperation(format!(
-            "gate_residual_fused: gate must be 2D [B,dim], got {:?}", gate_dims
+            "gate_residual_fused: gate must be 2D [B,dim], got {:?}",
+            gate_dims
         )));
     }
     if x_dims.len() != 3 {
         return Err(Error::InvalidOperation(format!(
-            "gate_residual_fused: x must be 3D [B,N,dim], got {:?}", x_dims
+            "gate_residual_fused: x must be 3D [B,N,dim], got {:?}",
+            x_dims
         )));
     }
     if gate_dims[0] != b || gate_dims[1] != dim {
@@ -2112,9 +2231,14 @@ fn gate_residual_fused_bf16_strided(
     let g_s = gate.strides();
     let x_s = x.strides();
     let strides_packed: Vec<i64> = vec![
-        r_s[0] as i64, r_s[1] as i64, r_s[2] as i64,
-        g_s[0] as i64, g_s[1] as i64,
-        x_s[0] as i64, x_s[1] as i64, x_s[2] as i64,
+        r_s[0] as i64,
+        r_s[1] as i64,
+        r_s[2] as i64,
+        g_s[0] as i64,
+        g_s[1] as i64,
+        x_s[0] as i64,
+        x_s[1] as i64,
+        x_s[2] as i64,
     ];
 
     let mut d_strides: CudaSlice<i64> = unsafe { device.alloc::<i64>(8) }
@@ -2125,7 +2249,10 @@ fn gate_residual_fused_bf16_strided(
 
     let data = crate::cuda_alloc_pool::pool_alloc_u16(&device, total)?;
     let mut out = Tensor {
-        storage: TensorStorage::BF16 { data: data.into(), numel: total },
+        storage: TensorStorage::BF16 {
+            data: data.into(),
+            numel: total,
+        },
         shape: residual.shape().clone(),
         device: device.clone(),
         id: TensorId::new(),
@@ -2136,7 +2263,11 @@ fn gate_residual_fused_bf16_strided(
         autograd_meta: None,
     };
 
-    ensure(&device, "gate_residual_strided_bf16_kernel", CUDA_GATE_RESIDUAL_STRIDED)?;
+    ensure(
+        &device,
+        "gate_residual_strided_bf16_kernel",
+        CUDA_GATE_RESIDUAL_STRIDED,
+    )?;
     let f = device
         .get_func(
             "gate_residual_strided_bf16_kernel",
@@ -2144,10 +2275,22 @@ fn gate_residual_fused_bf16_strided(
         )
         .ok_or_else(|| Error::Cuda("gate_residual_strided_bf16_kernel missing".into()))?;
 
-    let rs = match &residual.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let gs = match &gate.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let xs_data = match &x.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let ys = match &mut out.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let rs = match &residual.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let gs = match &gate.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let xs_data = match &x.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let ys = match &mut out.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
     let ys = ensure_unique_slice(ys)?;
 
     let r_offset = residual.offset() as i64;
@@ -2158,11 +2301,16 @@ fn gate_residual_fused_bf16_strided(
         f.launch(
             lc(total),
             (
-                slice_ref(rs), r_offset,
-                slice_ref(gs), g_offset,
-                slice_ref(xs_data), x_offset,
+                slice_ref(rs),
+                r_offset,
+                slice_ref(gs),
+                g_offset,
+                slice_ref(xs_data),
+                x_offset,
                 ys,
-                total as i64, dim as i32, n as i32,
+                total as i64,
+                dim as i32,
+                n as i32,
                 &d_strides,
             ),
         )
@@ -2283,6 +2431,43 @@ void swiglu_fused_strided_bf16_kernel(
 }
 "#;
 
+const CUDA_SWIGLU_SPLIT_LASTDIM: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void swiglu_split_lastdim_bf16_kernel(
+    const __nv_bfloat16* __restrict__ X,
+    __nv_bfloat16* __restrict__ Y,
+    const long long* __restrict__ input_meta,
+    long long input_offset,
+    int ndim,
+    long long total,
+    long long half)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long step = (long long)blockDim.x * gridDim.x;
+    while (idx < total) {
+        long long row = idx / half;
+        long long d = idx - row * half;
+        long long rem = row;
+        long long in_addr = input_offset;
+
+        for (int axis = ndim - 2; axis >= 0; --axis) {
+            long long dim = input_meta[ndim + axis];
+            long long coord = rem % dim;
+            rem /= dim;
+            in_addr += coord * input_meta[axis];
+        }
+
+        long long last_stride = input_meta[ndim - 1];
+        float g = __bfloat162float(X[in_addr + d * last_stride]);
+        float u = __bfloat162float(X[in_addr + (half + d) * last_stride]);
+        float silu_g = g / (1.0f + expf(-g));
+        Y[idx] = __float2bfloat16(silu_g * u);
+        idx += step;
+    }
+}
+"#;
+
 /// Fused SwiGLU: silu(gate) * up in one kernel (no intermediate silu tensor).
 ///
 /// Stride-aware as of Phase 2b (2026-04-23). Contig fast path when both
@@ -2309,7 +2494,10 @@ pub fn swiglu_fused_bf16(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         if crate::autograd::AutogradContext::is_recording() {
             crate::autograd::AutogradContext::record_op(
                 out.id,
-                crate::autograd::Op::FusedSwiGLU { gate: gate.id, up: up.id },
+                crate::autograd::Op::FusedSwiGLU {
+                    gate: gate.id,
+                    up: up.id,
+                },
                 vec![(gate.id, gate.clone()), (up.id, up.clone())],
             );
         }
@@ -2322,7 +2510,10 @@ fn swiglu_fused_bf16_contig(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 
     let data = crate::cuda_alloc_pool::pool_alloc_u16(&gate.device, total)?;
     let mut out = Tensor {
-        storage: TensorStorage::BF16 { data: data.into(), numel: total },
+        storage: TensorStorage::BF16 {
+            data: data.into(),
+            numel: total,
+        },
         shape: gate.shape().clone(),
         device: gate.device.clone(),
         id: TensorId::new(),
@@ -2331,7 +2522,6 @@ fn swiglu_fused_bf16_contig(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
     // 2026-05-12 perf: prefer the vec2 kernel (one __nv_bfloat162 load per
@@ -2340,23 +2530,42 @@ fn swiglu_fused_bf16_contig(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     // Env override FLAME_SWIGLU_LEGACY=1 forces the scalar kernel.
     let use_vec2 = total >= 2
         && total % 2 == 0
-        && std::env::var("FLAME_SWIGLU_LEGACY").map(|v| v == "0").unwrap_or(true);
+        && std::env::var("FLAME_SWIGLU_LEGACY")
+            .map(|v| v == "0")
+            .unwrap_or(true);
 
-    let kernel_name = if use_vec2 { "swiglu_fused_bf16_vec2_kernel" } else { "swiglu_fused_bf16_kernel" };
+    let kernel_name = if use_vec2 {
+        "swiglu_fused_bf16_vec2_kernel"
+    } else {
+        "swiglu_fused_bf16_kernel"
+    };
     ensure(&gate.device, kernel_name, CUDA_SWIGLU_FUSED)?;
-    let f = gate.device
+    let f = gate
+        .device
         .get_func(kernel_name, kernel_name)
         .ok_or_else(|| Error::Cuda(format!("{kernel_name} missing")))?;
 
-    let gs = match &gate.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let us = match &up.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("expects BF16".into())) };
-    let ys = match &mut out.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let gs = match &gate.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let us = match &up.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let ys = match &mut out.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
     let ys = ensure_unique_slice(ys)?;
 
     unsafe {
         // Launch config: vec2 path divides work by 2 (one pair per thread).
         let work_count = if use_vec2 { (total + 1) / 2 } else { total };
-        f.launch(lc(work_count), (slice_ref(gs), slice_ref(us), ys, total as i64))?;
+        f.launch(
+            lc(work_count),
+            (slice_ref(gs), slice_ref(us), ys, total as i64),
+        )?;
     }
     Ok(out)
 }
@@ -2397,7 +2606,10 @@ fn swiglu_fused_bf16_strided(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 
     let data = crate::cuda_alloc_pool::pool_alloc_u16(&device, total)?;
     let mut out = Tensor {
-        storage: TensorStorage::BF16 { data: data.into(), numel: total },
+        storage: TensorStorage::BF16 {
+            data: data.into(),
+            numel: total,
+        },
         shape: shape.clone(),
         device: device.clone(),
         id: TensorId::new(),
@@ -2408,7 +2620,11 @@ fn swiglu_fused_bf16_strided(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         autograd_meta: None,
     };
 
-    ensure(&device, "swiglu_fused_strided_bf16_kernel", CUDA_SWIGLU_FUSED_STRIDED)?;
+    ensure(
+        &device,
+        "swiglu_fused_strided_bf16_kernel",
+        CUDA_SWIGLU_FUSED_STRIDED,
+    )?;
     let f = device
         .get_func(
             "swiglu_fused_strided_bf16_kernel",
@@ -2448,6 +2664,109 @@ fn swiglu_fused_bf16_strided(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         )
         .map_err(|e| Error::Cuda(format!("launch swiglu_fused_strided: {:?}", e)))?;
     }
+    Ok(out)
+}
+
+/// Fused SwiGLU over a packed input whose last dimension is `[gate | up]`.
+///
+/// This is the training fast path for Klein MLPs: it avoids creating two
+/// narrow-view tape entries and backward emits one packed gradient instead of
+/// two full zero+scatter narrow gradients.
+pub fn swiglu_split_lastdim_bf16(input: &Tensor) -> Result<Tensor> {
+    debug_assert_eq!(input.dtype(), DType::BF16);
+    let dims = input.shape().dims();
+    let ndim = dims.len();
+    if ndim == 0 {
+        return Err(Error::InvalidOperation(
+            "swiglu_split_lastdim_bf16: expected rank >= 1".into(),
+        ));
+    }
+    let last = dims[ndim - 1];
+    if last % 2 != 0 {
+        return Err(Error::InvalidOperation(format!(
+            "swiglu_split_lastdim_bf16: last dim {last} is not even"
+        )));
+    }
+    let half = last / 2;
+    let mut out_dims = dims.to_vec();
+    out_dims[ndim - 1] = half;
+    let out_shape = Shape::from_dims(&out_dims);
+    let total = out_shape.elem_count();
+
+    let device = input.device.clone();
+    let data = crate::cuda_alloc_pool::pool_alloc_u16(&device, total)?;
+    let mut out = Tensor {
+        storage: TensorStorage::BF16 {
+            data: data.into(),
+            numel: total,
+        },
+        shape: out_shape,
+        device: device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
+    };
+
+    let mut meta: Vec<i64> = input.strides().iter().map(|&s| s as i64).collect();
+    meta.extend(dims.iter().map(|&d| d as i64));
+    let mut d_meta: cudarc::driver::CudaSlice<i64> = unsafe { device.alloc::<i64>(meta.len()) }
+        .map_err(|e| Error::Cuda(format!("alloc swiglu split meta: {:?}", e)))?;
+    device
+        .htod_copy_into(meta, &mut d_meta)
+        .map_err(|e| Error::Cuda(format!("htod swiglu split meta: {:?}", e)))?;
+
+    ensure(
+        &device,
+        "swiglu_split_lastdim_bf16_kernel",
+        CUDA_SWIGLU_SPLIT_LASTDIM,
+    )?;
+    let f = device
+        .get_func(
+            "swiglu_split_lastdim_bf16_kernel",
+            "swiglu_split_lastdim_bf16_kernel",
+        )
+        .ok_or_else(|| Error::Cuda("swiglu_split_lastdim_bf16_kernel missing".into()))?;
+
+    let xs = match &input.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("expects BF16".into())),
+    };
+    let ys = match &mut out.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
+    let ys = ensure_unique_slice(ys)?;
+
+    unsafe {
+        f.launch(
+            lc(total),
+            (
+                slice_ref(xs),
+                ys,
+                &d_meta,
+                input.offset() as i64,
+                ndim as i32,
+                total as i64,
+                half as i64,
+            ),
+        )
+        .map_err(|e| Error::Cuda(format!("launch swiglu_split_lastdim: {:?}", e)))?;
+    }
+
+    if input.requires_grad {
+        out.requires_grad = true;
+        if crate::autograd::AutogradContext::is_recording() {
+            crate::autograd::AutogradContext::record_op(
+                out.id,
+                crate::autograd::Op::FusedSwiGLUSplit { input: input.id },
+                vec![(input.id, input.clone())],
+            );
+        }
+    }
+
     Ok(out)
 }
 
@@ -2518,7 +2837,8 @@ pub fn attn_split_txt_img_bf16(
     let dims = attn_out.shape().dims();
     if dims.len() != 4 {
         return Err(Error::InvalidOperation(format!(
-            "attn_split_txt_img_bf16: expected 4D [B,H,N_total,D], got {:?}", dims
+            "attn_split_txt_img_bf16: expected 4D [B,H,N_total,D], got {:?}",
+            dims
         )));
     }
     let (b, h, n_total, d) = (dims[0], dims[1], dims[2], dims[3]);
@@ -2549,7 +2869,10 @@ pub fn attn_split_txt_img_bf16(
     let txt_data = crate::cuda_alloc_pool::pool_alloc_u16(&attn_out.device, txt_numel)?;
     let img_data = crate::cuda_alloc_pool::pool_alloc_u16(&attn_out.device, img_numel)?;
     let mut txt = Tensor {
-        storage: TensorStorage::BF16 { data: txt_data.into(), numel: txt_numel },
+        storage: TensorStorage::BF16 {
+            data: txt_data.into(),
+            numel: txt_numel,
+        },
         shape: Shape::from_dims(&[b, n_txt, h * d]),
         device: attn_out.device.clone(),
         id: TensorId::new(),
@@ -2558,10 +2881,12 @@ pub fn attn_split_txt_img_bf16(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
     let mut img = Tensor {
-        storage: TensorStorage::BF16 { data: img_data.into(), numel: img_numel },
+        storage: TensorStorage::BF16 {
+            data: img_data.into(),
+            numel: img_numel,
+        },
         shape: Shape::from_dims(&[b, n_img, h * d]),
         device: attn_out.device.clone(),
         id: TensorId::new(),
@@ -2570,25 +2895,50 @@ pub fn attn_split_txt_img_bf16(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
-    ensure(&attn_out.device, "attn_split_txt_img_bf16_kernel", CUDA_ATTN_SPLIT_TXT_IMG)?;
-    let f = attn_out.device
-        .get_func("attn_split_txt_img_bf16_kernel", "attn_split_txt_img_bf16_kernel")
+    ensure(
+        &attn_out.device,
+        "attn_split_txt_img_bf16_kernel",
+        CUDA_ATTN_SPLIT_TXT_IMG,
+    )?;
+    let f = attn_out
+        .device
+        .get_func(
+            "attn_split_txt_img_bf16_kernel",
+            "attn_split_txt_img_bf16_kernel",
+        )
         .ok_or_else(|| Error::Cuda("attn_split_txt_img_bf16_kernel missing".into()))?;
 
-    let xs = match &attn_out.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("attn_out BF16".into())) };
-    let ts = match &mut txt.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let xs = match &attn_out.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => return Err(Error::InvalidOperation("attn_out BF16".into())),
+    };
+    let ts = match &mut txt.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
     let ts = ensure_unique_slice(ts)?;
-    let is_ = match &mut img.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let is_ = match &mut img.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
     let is_ = ensure_unique_slice(is_)?;
 
     let total = b * h * n_total * d;
     unsafe {
         f.launch(
             lc(total),
-            (slice_ref(xs), ts, is_, b as i32, h as i32, n_txt as i32, n_img as i32, d as i32),
+            (
+                slice_ref(xs),
+                ts,
+                is_,
+                b as i32,
+                h as i32,
+                n_txt as i32,
+                n_img as i32,
+                d as i32,
+            ),
         )?;
     }
     Ok((txt, img))
@@ -2977,7 +3327,8 @@ pub fn qkv_split_permute_bf16(
     let dims = qkv.shape().dims();
     if dims.len() != 3 {
         return Err(Error::InvalidOperation(format!(
-            "qkv_split_permute_bf16: expected 3D [B,N,3*H*D], got {:?}", dims
+            "qkv_split_permute_bf16: expected 3D [B,N,3*H*D], got {:?}",
+            dims
         )));
     }
     let (b, n, c) = (dims[0], dims[1], dims[2]);
@@ -2988,29 +3339,70 @@ pub fn qkv_split_permute_bf16(
             3 * hd
         )));
     }
-    // Training-time path: the fused kernels output `requires_grad=false` and
-    // record no autograd op, which severs the gradient chain to Q/K/V LoRA
-    // adapters in Klein/Z-Image/Flux/etc. When autograd is recording and the
-    // input requires grad, fall back to a composition of primitives — each
-    // of `narrow`, `reshape`, `permute` records its own autograd op so
-    // backward flows through to the QKV input.
-    if qkv.requires_grad && crate::autograd::AutogradContext::is_recording() {
-        let q = qkv.narrow(2, 0, hd)?
+    let training = qkv.requires_grad && crate::autograd::AutogradContext::is_recording();
+
+    // Escape hatch for parity/profiling. The primitive training path is correct
+    // but expensive: each Q/K/V output records narrow+reshape+permute and
+    // backward pays repeated narrow scatter kernels.
+    if training && std::env::var("FLAME_QKV_SPLIT_TRAIN_PRIMS").ok().as_deref() == Some("1") {
+        let q = qkv
+            .narrow(2, 0, hd)?
             .reshape(&[b, n, heads, head_dim])?
             .permute(&[0, 2, 1, 3])?;
-        let k = qkv.narrow(2, hd, hd)?
+        let k = qkv
+            .narrow(2, hd, hd)?
             .reshape(&[b, n, heads, head_dim])?
             .permute(&[0, 2, 1, 3])?;
-        let v = qkv.narrow(2, 2 * hd, hd)?
+        let v = qkv
+            .narrow(2, 2 * hd, hd)?
             .reshape(&[b, n, heads, head_dim])?
             .permute(&[0, 2, 1, 3])?;
         return Ok((q, k, v));
     }
-    if qkv.is_contiguous() {
+
+    let (mut q, mut k, mut v) = if qkv.is_contiguous() {
         qkv_split_permute_bf16_contig(qkv, heads, head_dim)
     } else {
         qkv_split_permute_bf16_strided(qkv, heads, head_dim)
+    }?;
+
+    if training {
+        q.requires_grad = true;
+        k.requires_grad = true;
+        v.requires_grad = true;
+        crate::autograd::AutogradContext::record_op(
+            q.id,
+            crate::autograd::Op::QkvSplitPermute {
+                input: qkv.id,
+                part: 0,
+                heads,
+                head_dim,
+            },
+            vec![(qkv.id, qkv.clone())],
+        );
+        crate::autograd::AutogradContext::record_op(
+            k.id,
+            crate::autograd::Op::QkvSplitPermute {
+                input: qkv.id,
+                part: 1,
+                heads,
+                head_dim,
+            },
+            vec![(qkv.id, qkv.clone())],
+        );
+        crate::autograd::AutogradContext::record_op(
+            v.id,
+            crate::autograd::Op::QkvSplitPermute {
+                input: qkv.id,
+                part: 2,
+                heads,
+                head_dim,
+            },
+            vec![(qkv.id, qkv.clone())],
+        );
     }
+
+    Ok((q, k, v))
 }
 
 fn qkv_split_permute_bf16_contig(
@@ -3027,7 +3419,10 @@ fn qkv_split_permute_bf16_contig(
     let k_data = crate::cuda_alloc_pool::pool_alloc_u16(&qkv.device, out_numel)?;
     let v_data = crate::cuda_alloc_pool::pool_alloc_u16(&qkv.device, out_numel)?;
     let mut q = Tensor {
-        storage: TensorStorage::BF16 { data: q_data.into(), numel: out_numel },
+        storage: TensorStorage::BF16 {
+            data: q_data.into(),
+            numel: out_numel,
+        },
         shape: out_shape.clone(),
         device: qkv.device.clone(),
         id: TensorId::new(),
@@ -3036,10 +3431,12 @@ fn qkv_split_permute_bf16_contig(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
     let mut k = Tensor {
-        storage: TensorStorage::BF16 { data: k_data.into(), numel: out_numel },
+        storage: TensorStorage::BF16 {
+            data: k_data.into(),
+            numel: out_numel,
+        },
         shape: out_shape.clone(),
         device: qkv.device.clone(),
         id: TensorId::new(),
@@ -3048,10 +3445,12 @@ fn qkv_split_permute_bf16_contig(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
     let mut v = Tensor {
-        storage: TensorStorage::BF16 { data: v_data.into(), numel: out_numel },
+        storage: TensorStorage::BF16 {
+            data: v_data.into(),
+            numel: out_numel,
+        },
         shape: out_shape,
         device: qkv.device.clone(),
         id: TensorId::new(),
@@ -3060,26 +3459,58 @@ fn qkv_split_permute_bf16_contig(
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
-    ensure(&qkv.device, "qkv_split_permute_bf16_kernel", CUDA_QKV_SPLIT_PERMUTE)?;
-    let f = qkv.device
-        .get_func("qkv_split_permute_bf16_kernel", "qkv_split_permute_bf16_kernel")
+    ensure(
+        &qkv.device,
+        "qkv_split_permute_bf16_kernel",
+        CUDA_QKV_SPLIT_PERMUTE,
+    )?;
+    let f = qkv
+        .device
+        .get_func(
+            "qkv_split_permute_bf16_kernel",
+            "qkv_split_permute_bf16_kernel",
+        )
         .ok_or_else(|| Error::Cuda("qkv_split_permute_bf16_kernel missing".into()))?;
 
-    let xs = match &qkv.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("qkv_split_permute_bf16: input must be BF16".into())) };
-    let qs = match &mut q.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let xs = match &qkv.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => {
+            return Err(Error::InvalidOperation(
+                "qkv_split_permute_bf16: input must be BF16".into(),
+            ))
+        }
+    };
+    let qs = match &mut q.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
     let qs = ensure_unique_slice(qs)?;
-    let ks = match &mut k.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let ks = match &mut k.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
     let ks = ensure_unique_slice(ks)?;
-    let vs = match &mut v.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let vs = match &mut v.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
     let vs = ensure_unique_slice(vs)?;
 
     unsafe {
         f.launch(
             lc(out_numel),
-            (slice_ref(xs), qs, ks, vs, b as i32, heads as i32, n as i32, head_dim as i32),
+            (
+                slice_ref(xs),
+                qs,
+                ks,
+                vs,
+                b as i32,
+                heads as i32,
+                n as i32,
+                head_dim as i32,
+            ),
         )?;
     }
     Ok((q, k, v))
@@ -3101,7 +3532,10 @@ fn qkv_split_permute_bf16_strided(
     let k_data = crate::cuda_alloc_pool::pool_alloc_u16(&device, out_numel)?;
     let v_data = crate::cuda_alloc_pool::pool_alloc_u16(&device, out_numel)?;
     let mut q = Tensor {
-        storage: TensorStorage::BF16 { data: q_data.into(), numel: out_numel },
+        storage: TensorStorage::BF16 {
+            data: q_data.into(),
+            numel: out_numel,
+        },
         shape: out_shape.clone(),
         device: device.clone(),
         id: TensorId::new(),
@@ -3112,7 +3546,10 @@ fn qkv_split_permute_bf16_strided(
         autograd_meta: None,
     };
     let mut k = Tensor {
-        storage: TensorStorage::BF16 { data: k_data.into(), numel: out_numel },
+        storage: TensorStorage::BF16 {
+            data: k_data.into(),
+            numel: out_numel,
+        },
         shape: out_shape.clone(),
         device: device.clone(),
         id: TensorId::new(),
@@ -3123,7 +3560,10 @@ fn qkv_split_permute_bf16_strided(
         autograd_meta: None,
     };
     let mut v = Tensor {
-        storage: TensorStorage::BF16 { data: v_data.into(), numel: out_numel },
+        storage: TensorStorage::BF16 {
+            data: v_data.into(),
+            numel: out_numel,
+        },
         shape: out_shape,
         device: device.clone(),
         id: TensorId::new(),
@@ -3146,12 +3586,28 @@ fn qkv_split_permute_bf16_strided(
         )
         .ok_or_else(|| Error::Cuda("qkv_split_permute_strided_bf16_kernel missing".into()))?;
 
-    let xs = match &qkv.storage { TensorStorage::BF16 { data, .. } => data, _ => return Err(Error::InvalidOperation("qkv_split_permute_bf16: input must be BF16".into())) };
-    let qs = match &mut q.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let xs = match &qkv.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => {
+            return Err(Error::InvalidOperation(
+                "qkv_split_permute_bf16: input must be BF16".into(),
+            ))
+        }
+    };
+    let qs = match &mut q.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
     let qs = ensure_unique_slice(qs)?;
-    let ks = match &mut k.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let ks = match &mut k.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
     let ks = ensure_unique_slice(ks)?;
-    let vs = match &mut v.storage { TensorStorage::BF16 { data, .. } => data, _ => unreachable!() };
+    let vs = match &mut v.storage {
+        TensorStorage::BF16 { data, .. } => data,
+        _ => unreachable!(),
+    };
     let vs = ensure_unique_slice(vs)?;
 
     let qkv_s = qkv.strides();
@@ -3164,10 +3620,18 @@ fn qkv_split_permute_bf16_strided(
         f.launch(
             lc(out_numel),
             (
-                slice_ref(xs), qkv_offset,
-                qs, ks, vs,
-                b as i32, heads as i32, n as i32, head_dim as i32,
-                qkv_s_b, qkv_s_n, qkv_s_c,
+                slice_ref(xs),
+                qkv_offset,
+                qs,
+                ks,
+                vs,
+                b as i32,
+                heads as i32,
+                n as i32,
+                head_dim as i32,
+                qkv_s_b,
+                qkv_s_n,
+                qkv_s_c,
             ),
         )
         .map_err(|e| Error::Cuda(format!("launch qkv_split_permute_strided: {:?}", e)))?;
@@ -3252,7 +3716,11 @@ pub fn stochastic_round_f32_to_bf16(
         autograd_meta: None,
     };
 
-    ensure(&src.device, "bf16_stoch_round_kernel", CUDA_BF16_STOCH_ROUND)?;
+    ensure(
+        &src.device,
+        "bf16_stoch_round_kernel",
+        CUDA_BF16_STOCH_ROUND,
+    )?;
     let f = src
         .device
         .get_func("bf16_stoch_round_kernel", "bf16_stoch_round_kernel")
@@ -3363,6 +3831,12 @@ mod stoch_round_tests {
 
         let mean: f64 = gpu_vals.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
         let err = (mean as f32 - val).abs();
-        assert!(err < 1e-2, "biased: input={} mean={} err={}", val, mean, err);
+        assert!(
+            err < 1e-2,
+            "biased: input={} mean={} err={}",
+            val,
+            mean,
+            err
+        );
     }
 }

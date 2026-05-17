@@ -46,15 +46,10 @@ fn pseudo_stream(seed: u64, n: usize) -> Vec<f32> {
 }
 
 fn bf16_tensor_from_vec(dev: &Arc<CudaDevice>, shape: &[usize], data: Vec<f32>) -> Tensor {
-    Tensor::from_vec_dtype(
-        data,
-        Shape::from_dims(shape),
-        dev.clone(),
-        DType::F32,
-    )
-    .expect("from_vec_dtype f32")
-    .to_dtype(DType::BF16)
-    .expect("cast to bf16")
+    Tensor::from_vec_dtype(data, Shape::from_dims(shape), dev.clone(), DType::F32)
+        .expect("from_vec_dtype f32")
+        .to_dtype(DType::BF16)
+        .expect("cast to bf16")
 }
 
 fn max_abs_and_cos(a: &[f32], b: &[f32]) -> (f32, f32) {
@@ -95,11 +90,7 @@ fn report(tag: &str, a: &Tensor, b: &Tensor) {
 /// Reference forward: `output = input @ weight^T + bias` using the old
 /// `transpose2d_bf16` + `matmul` sequence. This is what `Linear::forward`
 /// used to do before Phase 3.
-fn reference_forward(
-    input: &Tensor,
-    weight_2d: &Tensor,
-    bias: Option<&Tensor>,
-) -> Tensor {
+fn reference_forward(input: &Tensor, weight_2d: &Tensor, bias: Option<&Tensor>) -> Tensor {
     let input_shape = input.shape().dims().to_vec();
     let in_features = input_shape[input_shape.len() - 1];
     let out_features = weight_2d.shape().dims()[0];

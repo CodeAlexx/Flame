@@ -377,6 +377,44 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    pub fn flame_swiglu_split_backward_bf16(
+        grad_out: *const core::ffi::c_void,
+        input: *const core::ffi::c_void,
+        grad_input: *mut core::ffi::c_void,
+        input_meta: *const i64,
+        input_offset: i64,
+        ndim: i32,
+        out_n: i64,
+        half: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn flame_qkv_split_permute_backward_bf16(
+        grad_out: *const core::ffi::c_void,
+        grad_input: *mut core::ffi::c_void,
+        grad_strides: *const i64,
+        grad_offset: i64,
+        part: i32,
+        b: i64,
+        h: i64,
+        n: i64,
+        d: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn flame_qkv_split_permute_backward_f32(
+        grad_out: *const core::ffi::c_void,
+        grad_input: *mut core::ffi::c_void,
+        grad_strides: *const i64,
+        grad_offset: i64,
+        part: i32,
+        b: i64,
+        h: i64,
+        n: i64,
+        d: i64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     pub fn flame_rope_precomputed_bf16(
         x: *const core::ffi::c_void,
         cos_buf: *const core::ffi::c_void,
@@ -927,8 +965,10 @@ extern "C" {
     ) -> i32;
 
     /// Launch a previously instantiated graph on `stream`.
-    pub fn cudaGraphLaunch(graph_exec: *mut core::ffi::c_void, stream: *mut core::ffi::c_void)
-        -> i32;
+    pub fn cudaGraphLaunch(
+        graph_exec: *mut core::ffi::c_void,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
 
     /// Destroy a captured graph (not the executable).
     pub fn cudaGraphDestroy(graph: *mut core::ffi::c_void) -> i32;

@@ -254,7 +254,9 @@ pub fn forward_with_bias(
         if !(bq == bk && bq == bv && hq == hk && hq == hv) {
             return Err(Error::InvalidInput(format!(
                 "batch/head mismatch: q={:?}, k={:?}, v={:?}",
-                q.shape(), k.shape(), v.shape()
+                q.shape(),
+                k.shape(),
+                v.shape()
             )));
         }
         if !(d_q == d_k && d_q == d_v) {
@@ -265,7 +267,8 @@ pub fn forward_with_bias(
         }
         if k_len != v_len {
             return Err(Error::InvalidInput(format!(
-                "sequence mismatch: k_len={} v_len={}", k_len, v_len
+                "sequence mismatch: k_len={} v_len={}",
+                k_len, v_len
             )));
         }
 
@@ -273,7 +276,8 @@ pub fn forward_with_bias(
             let bd = b.shape().dims();
             if bd.len() != 4 {
                 return Err(Error::InvalidInput(format!(
-                    "bias must be 4D [B|1, H|1, Q, K], got shape {:?}", bd
+                    "bias must be 4D [B|1, H|1, Q, K], got shape {:?}",
+                    bd
                 )));
             }
             if !(bd[0] == bq || bd[0] == 1)
@@ -527,11 +531,10 @@ fn forward_bf16(
     // (see `flame-core/tests/cudnn_sdpa_parity.rs`).
     #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
     if (d_q == 64 || d_q == 96 || d_q == 128) && mask.is_none() {
-        return forward_cudnn_sdpa_bf16(q, k, v, b, h, q_len, k_len, d_q)
-            .map_err(|e| {
-                log::error!("cudnn SDPA failed (no WMMA fallback): {:?}", e);
-                e
-            });
+        return forward_cudnn_sdpa_bf16(q, k, v, b, h, q_len, k_len, d_q).map_err(|e| {
+            log::error!("cudnn SDPA failed (no WMMA fallback): {:?}", e);
+            e
+        });
     }
 
     // Auto-stream policy: the materialized fallback allocates an FP32 scores
@@ -549,7 +552,10 @@ fn forward_bf16(
     let force_stream = force_stream_sdpa();
     let auto_stream = {
         let threshold = stream_threshold_from_env().unwrap_or(2_000_000_000usize);
-        b.saturating_mul(h).saturating_mul(q_len).saturating_mul(k_len) > threshold
+        b.saturating_mul(h)
+            .saturating_mul(q_len)
+            .saturating_mul(k_len)
+            > threshold
     };
     if !force_stream && !auto_stream {
         return forward_bf16_fallback(q, k, v, mask, b, h, q_len, k_len, d_q, scale);
@@ -557,7 +563,11 @@ fn forward_bf16(
     if auto_stream && !force_stream {
         log::debug!(
             "sdpa: auto-routing to stream path (B={} H={} Q={} K={} elems={})",
-            b, h, q_len, k_len, b * h * q_len * k_len,
+            b,
+            h,
+            q_len,
+            k_len,
+            b * h * q_len * k_len,
         );
     }
 
@@ -682,7 +692,10 @@ fn forward_cudnn_sdpa_bf16(
 
     let ret = unsafe {
         crate::cuda::ffi::flame_cudnn_sdpa_bf16(
-            q_ptr, k_ptr, v_ptr, o_ptr,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            o_ptr,
             b as i32,
             h as i32,
             q_len as i32,
@@ -693,7 +706,10 @@ fn forward_cudnn_sdpa_bf16(
             k_strides.as_ptr(),
             v_strides.as_ptr(),
             o_strides.as_ptr(),
-            q_off, k_off, v_off, o_off,
+            q_off,
+            k_off,
+            v_off,
+            o_off,
             stream,
         )
     };
@@ -747,11 +763,14 @@ fn forward_cudnn_sdpa_train_bf16(
     let v_ptr = v.as_device_ptr_bf16("cudnn_sdpa_train:v")? as *const core::ffi::c_void;
     let o_ptr = output.as_device_ptr_bf16("cudnn_sdpa_train:o")? as *mut core::ffi::c_void;
     let stats_ptr = match &stats.storage {
-        crate::tensor_storage::TensorStorage::F32 { data, .. } =>
-            *crate::tensor_storage::slice_ref(data).device_ptr() as *mut core::ffi::c_void,
-        _ => return Err(Error::InvalidOperation(
-            "cudnn_sdpa_train: expected F32 storage for stats".into()
-        )),
+        crate::tensor_storage::TensorStorage::F32 { data, .. } => {
+            *crate::tensor_storage::slice_ref(data).device_ptr() as *mut core::ffi::c_void
+        }
+        _ => {
+            return Err(Error::InvalidOperation(
+                "cudnn_sdpa_train: expected F32 storage for stats".into(),
+            ))
+        }
     };
 
     let q_off = q.offset() as i64;
@@ -767,7 +786,11 @@ fn forward_cudnn_sdpa_train_bf16(
 
     let ret = unsafe {
         crate::cuda::ffi::flame_cudnn_sdpa_bf16_train_fwd(
-            q_ptr, k_ptr, v_ptr, o_ptr, stats_ptr,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            o_ptr,
+            stats_ptr,
             b as i32,
             h as i32,
             q_len as i32,
@@ -778,7 +801,10 @@ fn forward_cudnn_sdpa_train_bf16(
             k_strides.as_ptr(),
             v_strides.as_ptr(),
             o_strides.as_ptr(),
-            q_off, k_off, v_off, o_off,
+            q_off,
+            k_off,
+            v_off,
+            o_off,
             stats_off,
             stream,
         )
@@ -887,47 +913,50 @@ fn forward_bf16_fallback(
     if do_tile {
         log::debug!(
             "sdpa_tiled: bh={} q_len={} k_len={} d_q={} q_tile={} num_tiles={}",
-            bh, q_len, k_len, d_q, q_tile, num_tiles
+            bh,
+            q_len,
+            k_len,
+            d_q,
+            q_tile,
+            num_tiles
         );
     }
 
     // Run one Q chunk through the materialized pipeline. Returns `[bh, len, d_q]` BF16.
-    let run_one_tile = |q_chunk: &Tensor, mask_slice: Option<&Tensor>, len: usize|
-        -> SdpaResult<Tensor>
-    {
-        // QK^T tile → [bh, len, K] via cuBLASLt (tensor cores)
-        let logits_shape = Shape::from_dims(&[bh, len, k_len]);
-        let mut logits_bf16 =
-            Tensor::empty_dtype(logits_shape, DType::BF16, device.clone())?;
-        bmm_bf16_fp32acc_out(q_chunk, &k_t, &mut logits_bf16, false, false)?;
+    let run_one_tile =
+        |q_chunk: &Tensor, mask_slice: Option<&Tensor>, len: usize| -> SdpaResult<Tensor> {
+            // QK^T tile → [bh, len, K] via cuBLASLt (tensor cores)
+            let logits_shape = Shape::from_dims(&[bh, len, k_len]);
+            let mut logits_bf16 = Tensor::empty_dtype(logits_shape, DType::BF16, device.clone())?;
+            bmm_bf16_fp32acc_out(q_chunk, &k_t, &mut logits_bf16, false, false)?;
 
-        // Upcast to FP32 for scale / mask / softmax (Flash Attention precision).
-        let logits_f32 = logits_bf16.to_dtype(DType::F32)?;
-        drop(logits_bf16);
-        let mut scores = logits_f32.mul_scalar(scale)?;
+            // Upcast to FP32 for scale / mask / softmax (Flash Attention precision).
+            let logits_f32 = logits_bf16.to_dtype(DType::F32)?;
+            drop(logits_bf16);
+            let mut scores = logits_f32.mul_scalar(scale)?;
 
-        if let Some(mask_tile) = mask_slice {
-            // mask_tile comes in as `[bh, len, K]` F32 already prepared.
-            let ones = full_like(mask_tile, 1.0)?;
-            let complement = ones.sub(mask_tile)?;
-            let penalty = complement.mul_scalar(NEG_INF)?;
-            scores = scores.add(&penalty)?;
-        }
+            if let Some(mask_tile) = mask_slice {
+                // mask_tile comes in as `[bh, len, K]` F32 already prepared.
+                let ones = full_like(mask_tile, 1.0)?;
+                let complement = ones.sub(mask_tile)?;
+                let penalty = complement.mul_scalar(NEG_INF)?;
+                scores = scores.add(&penalty)?;
+            }
 
-        let attn = scores.softmax(-1)?;
-        drop(scores);
-        let attn_bf16 = if attn.dtype() != DType::BF16 {
-            attn.to_dtype(DType::BF16)?
-        } else {
-            attn
+            let attn = scores.softmax(-1)?;
+            drop(scores);
+            let attn_bf16 = if attn.dtype() != DType::BF16 {
+                attn.to_dtype(DType::BF16)?
+            } else {
+                attn
+            };
+
+            // attn × V → [bh, len, d_q] via cuBLASLt
+            let out_shape = Shape::from_dims(&[bh, len, d_q]);
+            let mut projected = Tensor::empty_dtype(out_shape, DType::BF16, device.clone())?;
+            bmm_bf16_fp32acc_out(&attn_bf16, &v_flat, &mut projected, false, false)?;
+            Ok(projected)
         };
-
-        // attn × V → [bh, len, d_q] via cuBLASLt
-        let out_shape = Shape::from_dims(&[bh, len, d_q]);
-        let mut projected = Tensor::empty_dtype(out_shape, DType::BF16, device.clone())?;
-        bmm_bf16_fp32acc_out(&attn_bf16, &v_flat, &mut projected, false, false)?;
-        Ok(projected)
-    };
 
     let projected = if !do_tile {
         // Single-shot path: prepare the optional mask once, run one tile.
@@ -969,12 +998,23 @@ fn forward_bf16_fallback(
     if do_tile {
         log::debug!(
             "[SDPA] tiled total={}ms (BH={} Q={} K={} d={} q_tile={} num_tiles={})",
-            total, bh, q_len, k_len, d_q, q_tile, num_tiles
+            total,
+            bh,
+            q_len,
+            k_len,
+            d_q,
+            q_tile,
+            num_tiles
         );
     } else {
         log::debug!(
             "[SDPA] reshape={}ms total={}ms (BH={} Q={} K={} d={})",
-            t_reshape, total, bh, q_len, k_len, d_q
+            t_reshape,
+            total,
+            bh,
+            q_len,
+            k_len,
+            d_q
         );
     }
 

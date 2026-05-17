@@ -5,7 +5,9 @@
 //! Rsqrt uses f32 opmath inside the functor (__frsqrt_rn). The reference
 //! is computed on the host in f32 (`1.0 / v.sqrt()`) then rounded to BF16.
 
-use flame_core::{tensor_iterator::ops::transcendentals::rsqrt_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{
+    tensor_iterator::ops::transcendentals::rsqrt_bf16_iter, DType, Result, Shape, Tensor,
+};
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
@@ -55,7 +57,9 @@ fn make_bf16_positive_tensor(dev: Arc<CudaDevice>, dims: &[usize], seed: u64) ->
     let mut data = Vec::with_capacity(n);
     let mut s = seed;
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 40) as u32 as f32 / (1u32 << 24) as f32;
         // Rsqrt domain: [0.1, 100.1) — keep bounded away from 0 for cos_sim.
         data.push(u * 100.0 + 0.1);
@@ -77,7 +81,10 @@ fn rsqrt_iter_contig_cos_sim() -> Result<()> {
     let new_f32 = new_out.to_vec_f32()?;
 
     let cs = cos_sim_f32(&ref_f32, &new_f32);
-    assert!(cs >= 0.9999, "rsqrt contig cos_sim {cs} below threshold 0.9999");
+    assert!(
+        cs >= 0.9999,
+        "rsqrt contig cos_sim {cs} below threshold 0.9999"
+    );
     Ok(())
 }
 
@@ -98,7 +105,10 @@ fn rsqrt_iter_permuted_view_cos_sim() -> Result<()> {
     let new_out = rsqrt_bf16_iter(&permuted)?;
     let new_f32 = new_out.to_vec_f32()?;
     let cs = cos_sim_f32(&ref_f32, &new_f32);
-    assert!(cs >= 0.9999, "rsqrt permuted view cos_sim {cs} below threshold 0.9999");
+    assert!(
+        cs >= 0.9999,
+        "rsqrt permuted view cos_sim {cs} below threshold 0.9999"
+    );
     Ok(())
 }
 
@@ -119,7 +129,10 @@ fn rsqrt_iter_narrow_view_cos_sim() -> Result<()> {
     let new_out = rsqrt_bf16_iter(&narrow_view)?;
     let new_f32 = new_out.to_vec_f32()?;
     let cs = cos_sim_f32(&ref_f32, &new_f32);
-    assert!(cs >= 0.9999, "rsqrt narrow view cos_sim {cs} below threshold 0.9999");
+    assert!(
+        cs >= 0.9999,
+        "rsqrt narrow view cos_sim {cs} below threshold 0.9999"
+    );
     Ok(())
 }
 
@@ -137,7 +150,15 @@ fn rsqrt_iter_edge_values() -> Result<()> {
     assert_eq!(y_f32[0], 1.0, "rsqrt(1) expected 1, got {}", y_f32[0]);
     assert_eq!(y_f32[1], 0.5, "rsqrt(4) expected 0.5, got {}", y_f32[1]);
     assert_eq!(y_f32[2], 2.0, "rsqrt(0.25) expected 2, got {}", y_f32[2]);
-    assert!(y_f32[3].is_infinite() && y_f32[3] > 0.0, "rsqrt(0) expected +inf, got {}", y_f32[3]);
-    assert!(y_f32[4].is_nan(), "rsqrt(-1) expected NaN, got {}", y_f32[4]);
+    assert!(
+        y_f32[3].is_infinite() && y_f32[3] > 0.0,
+        "rsqrt(0) expected +inf, got {}",
+        y_f32[3]
+    );
+    assert!(
+        y_f32[4].is_nan(),
+        "rsqrt(-1) expected NaN, got {}",
+        y_f32[4]
+    );
     Ok(())
 }

@@ -14,7 +14,11 @@ fn rand(dims: &[usize], dt: DType, seed: u64) -> Result<Tensor> {
     let dev = global_cuda_device();
     let _ = flame_core::rng::set_seed(seed);
     let x = Tensor::randn(Shape::from_dims(dims), 0.0, 0.5, dev.clone())?;
-    if x.dtype() != dt { x.to_dtype(dt) } else { Ok(x) }
+    if x.dtype() != dt {
+        x.to_dtype(dt)
+    } else {
+        Ok(x)
+    }
 }
 
 fn bench_cast(name: &str, dims: &[usize], src: DType, dst: DType) -> Result<()> {
@@ -27,25 +31,44 @@ fn bench_cast(name: &str, dims: &[usize], src: DType, dst: DType) -> Result<()> 
     for _ in 0..50 {
         let _ = black_box(x.to_dtype(dst)?);
     }
-    dev.synchronize().map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
     let t0 = Instant::now();
     for _ in 0..ITERS {
         let _ = black_box(x.to_dtype(dst)?);
     }
-    dev.synchronize().map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
     let per_us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
     let bytes = elems * (src_bytes + dst_bytes);
     let gb_s = (bytes as f64 / 1e9) / (per_us / 1e6);
-    println!("  {:<20} {:?}->{:?}  dims={:?} → {:>7.2} us  ({:>5.0} GB/s rd+wr)",
-        name, src, dst, dims, per_us, gb_s * 1000.0);
+    println!(
+        "  {:<20} {:?}->{:?}  dims={:?} → {:>7.2} us  ({:>5.0} GB/s rd+wr)",
+        name,
+        src,
+        dst,
+        dims,
+        per_us,
+        gb_s * 1000.0
+    );
     Ok(())
 }
 
 fn main() -> Result<()> {
     println!("=== Tensor::to_dtype fast-path bench (vs 15-30x PyTorch gap from morning bench) ===");
-    bench_cast("medium bf16->f32", &[1, 4096, 3840], DType::BF16, DType::F32)?;
-    bench_cast("medium f32->bf16", &[1, 4096, 3840], DType::F32, DType::BF16)?;
-    bench_cast("klein bf16->f32",  &[1, 4096, 4096], DType::BF16, DType::F32)?;
-    bench_cast("klein f32->bf16",  &[1, 4096, 4096], DType::F32, DType::BF16)?;
+    bench_cast(
+        "medium bf16->f32",
+        &[1, 4096, 3840],
+        DType::BF16,
+        DType::F32,
+    )?;
+    bench_cast(
+        "medium f32->bf16",
+        &[1, 4096, 3840],
+        DType::F32,
+        DType::BF16,
+    )?;
+    bench_cast("klein bf16->f32", &[1, 4096, 4096], DType::BF16, DType::F32)?;
+    bench_cast("klein f32->bf16", &[1, 4096, 4096], DType::F32, DType::BF16)?;
     Ok(())
 }

@@ -29,15 +29,22 @@ fn qkv_split_permute_contig_matches_strided_on_narrow_view() {
     // produces a view with stride[1] = wide_width (not qkv_width).
     let wide_width = qkv_width + 64;
     let wide_data = hash_fill(&[b, n, wide_width]);
-    let wide = Tensor::from_vec(wide_data, Shape::from_dims(&[b, n, wide_width]), global_cuda_device().clone())
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+    let wide = Tensor::from_vec(
+        wide_data,
+        Shape::from_dims(&[b, n, wide_width]),
+        global_cuda_device().clone(),
+    )
+    .unwrap()
+    .to_dtype(DType::BF16)
+    .unwrap();
     let _ = global_cuda_device();
 
     let qkv_strided = wide.narrow(2, 0, qkv_width).unwrap();
     assert_eq!(qkv_strided.shape().dims(), &[b, n, qkv_width]);
-    assert!(!qkv_strided.is_contiguous(), "narrow view should be strided");
+    assert!(
+        !qkv_strided.is_contiguous(),
+        "narrow view should be strided"
+    );
 
     let (q_s, k_s, v_s) =
         flame_core::bf16_ops::qkv_split_permute_bf16(&qkv_strided, heads, head_dim).unwrap();
@@ -71,10 +78,14 @@ fn qkv_split_permute_strided_math_check() {
     let wide_width = qkv_width + 32;
 
     let wide_data = hash_fill(&[b, n, wide_width]);
-    let wide = Tensor::from_vec(wide_data.clone(), Shape::from_dims(&[b, n, wide_width]), global_cuda_device().clone())
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+    let wide = Tensor::from_vec(
+        wide_data.clone(),
+        Shape::from_dims(&[b, n, wide_width]),
+        global_cuda_device().clone(),
+    )
+    .unwrap()
+    .to_dtype(DType::BF16)
+    .unwrap();
     let qkv = wide.narrow(2, 0, qkv_width).unwrap();
 
     let (q, k, v) = flame_core::bf16_ops::qkv_split_permute_bf16(&qkv, heads, head_dim).unwrap();
@@ -102,13 +113,81 @@ fn qkv_split_permute_strided_math_check() {
                         q_vec[flat_out].to_bits(),
                         exp_q.to_bits(),
                         "Q mismatch at (b={bi},h={hi},n={ni},d={di}): got={} exp={}",
-                        q_vec[flat_out], exp_q
+                        q_vec[flat_out],
+                        exp_q
                     );
                     assert_eq!(k_vec[flat_out].to_bits(), exp_k.to_bits());
                     assert_eq!(v_vec[flat_out].to_bits(), exp_v.to_bits());
                 }
             }
         }
+    }
+}
+
+#[test]
+fn qkv_split_permute_backward_matches_primitive_path() {
+    fn run(use_prims: bool) -> flame_core::Result<Vec<f32>> {
+        flame_core::autograd::AutogradContext::clear();
+        if use_prims {
+            std::env::set_var("FLAME_QKV_SPLIT_TRAIN_PRIMS", "1");
+        } else {
+            std::env::remove_var("FLAME_QKV_SPLIT_TRAIN_PRIMS");
+        }
+
+        let (b, n, heads, head_dim) = (1, 7, 3, 8);
+        let qkv_width = 3 * heads * head_dim;
+        let out_shape = Shape::from_dims(&[b, heads, n, head_dim]);
+        let device = global_cuda_device();
+
+        let leaf = Tensor::from_vec(
+            hash_fill(&[b, n, qkv_width]),
+            Shape::from_dims(&[b, n, qkv_width]),
+            device.clone(),
+        )?
+        .to_dtype(DType::BF16)?
+        .requires_grad_(true);
+        let qkv = leaf.reshape(&[b, n, qkv_width])?;
+        let (q, k, v) = flame_core::bf16_ops::qkv_split_permute_bf16(&qkv, heads, head_dim)?;
+
+        let q_go = Tensor::from_vec(hash_fill(&[b, heads, n, head_dim]), out_shape.clone(), device.clone())?;
+        let k_go = Tensor::from_vec(
+            hash_fill(&[b, heads, n, head_dim])
+                .into_iter()
+                .map(|x| x * 0.5 + 0.25)
+                .collect(),
+            out_shape.clone(),
+            device.clone(),
+        )?;
+        let v_go = Tensor::from_vec(
+            hash_fill(&[b, heads, n, head_dim])
+                .into_iter()
+                .map(|x| x * -0.75)
+                .collect(),
+            out_shape,
+            device,
+        )?;
+
+        let q_loss = q.to_dtype(DType::F32)?.mul(&q_go)?.sum()?;
+        let k_loss = k.to_dtype(DType::F32)?.mul(&k_go)?.sum()?;
+        let v_loss = v.to_dtype(DType::F32)?.mul(&v_go)?.sum()?;
+        let loss = q_loss.add(&k_loss)?.add(&v_loss)?;
+        let grads = flame_core::autograd::backward(&loss, false)?;
+        let grad = grads.get(leaf.id()).expect("leaf grad");
+        grad.to_vec()
+    }
+
+    let primitive_grad = run(true).unwrap();
+    let fused_grad = run(false).unwrap();
+    std::env::remove_var("FLAME_QKV_SPLIT_TRAIN_PRIMS");
+    flame_core::autograd::AutogradContext::clear();
+
+    assert_eq!(primitive_grad.len(), fused_grad.len());
+    for (i, (a, b)) in primitive_grad.iter().zip(fused_grad.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "qkv fused backward diverges at idx {i}: primitive={a} fused={b}"
+        );
     }
 }
 

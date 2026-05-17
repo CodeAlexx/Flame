@@ -262,7 +262,9 @@ impl Engine {
             if !seen.insert(node.node_id()) {
                 continue;
             }
-            nodes_by_id.entry(node.node_id()).or_insert_with(|| node.clone());
+            nodes_by_id
+                .entry(node.node_id())
+                .or_insert_with(|| node.clone());
             for edge in node.next_edges() {
                 if let Some(child) = &edge.function {
                     *dep_count.entry(child.node_id()).or_insert(0) += 1;
@@ -351,8 +353,7 @@ impl Engine {
         // (0+1)→0 and enqueue immediately; outputs that ARE referenced
         // wait for their full contribution count.
         let mut ready: BinaryHeap<(ReadyKey, NodeId)> = BinaryHeap::new();
-        let mut in_queue: std::collections::HashSet<NodeId> =
-            std::collections::HashSet::new();
+        let mut in_queue: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
         {
             // First pass: bump dep_count by 1 for each output occurrence,
             // accounting for the user's grad_outputs as one contribution.
@@ -473,8 +474,10 @@ impl Engine {
             // Run hooks. Fast path: pointer-compare against the empty
             // sentinel to skip the for-loops entirely in the common case.
             let hooks_ref: &Hooks = node.hooks();
-            let no_hooks =
-                std::ptr::eq(hooks_ref as *const Hooks, Hooks::empty_ref() as *const Hooks);
+            let no_hooks = std::ptr::eq(
+                hooks_ref as *const Hooks,
+                Hooks::empty_ref() as *const Hooks,
+            );
 
             let processed_grads: Vec<Option<Tensor>> = if no_hooks {
                 input_grads

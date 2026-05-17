@@ -109,5 +109,6 @@ impl std::fmt::Debug for SavedRef {
 #[inline]
 pub fn legacy_saved_mode() -> bool {
     static CACHED: once_cell::sync::OnceCell<bool> = once_cell::sync::OnceCell::new();
-    *CACHED.get_or_init(|| std::env::var("FLAME_AUTOGRAD_SAVED_LEGACY").ok().as_deref() == Some("1"))
+    *CACHED
+        .get_or_init(|| std::env::var("FLAME_AUTOGRAD_SAVED_LEGACY").ok().as_deref() == Some("1"))
 }

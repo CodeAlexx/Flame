@@ -20,12 +20,10 @@ use crate::DType;
 
 use super::base::{OperandInfo, OperandSrc, TensorIteratorBase};
 use super::broadcast::{
-    can_use_32bit_indexing, coalesce_dimensions, compute_shape, compute_strides, reorder_dimensions,
-    OperandView,
+    can_use_32bit_indexing, coalesce_dimensions, compute_shape, compute_strides,
+    reorder_dimensions, OperandView,
 };
-use super::cache::{
-    flag_bits, CachedIterGeometry, IterCacheKey, KeyShape, KeyStrides,
-};
+use super::cache::{flag_bits, CachedIterGeometry, IterCacheKey, KeyShape, KeyStrides};
 use super::dim_vec::{DimVec, I64StrideVec};
 use smallvec::SmallVec;
 
@@ -76,7 +74,6 @@ pub struct TensorIteratorConfig<'a> {
     // iteration (no affine-strided custom kernels that bypass reorder).
     // If a future phase adds one, thread the flag through config → base
     // → broadcast::reorder_dimensions.
-
     /// Port of `promote_inputs_to_common_dtype` (h:897). Phase 1 stores
     /// the flag but does not act on it (no promotion until Phase 8).
     pub(crate) promote_inputs_to_common_dtype: bool,
@@ -511,8 +508,7 @@ impl<'a> TensorIteratorConfig<'a> {
                                     .into(),
                             )
                         })?;
-                        let shape_obj =
-                            crate::shape::Shape::from_dims(logical.as_slice());
+                        let shape_obj = crate::shape::Shape::from_dims(logical.as_slice());
                         let allocated = Tensor::empty_dtype(shape_obj, dtype, dev)?;
                         op.src = Some(OperandSrc::Owned(allocated));
                     }
@@ -617,8 +613,11 @@ impl<'a> TensorIteratorConfig<'a> {
         // Drives the innermost-stride-first ordering. Invalid for rank<=1
         // (the helper returns identity in that case).
         {
-            let mut all_strides: Vec<I64StrideVec> =
-                base.operands.iter().map(|op| op.stride_bytes.clone()).collect();
+            let mut all_strides: Vec<I64StrideVec> = base
+                .operands
+                .iter()
+                .map(|op| op.stride_bytes.clone())
+                .collect();
             let perm = reorder_dimensions(&mut base.shape_, &mut all_strides);
             base.perm_ = perm;
             for (op, s) in base.operands.iter_mut().zip(all_strides.into_iter()) {
@@ -652,8 +651,11 @@ impl<'a> TensorIteratorConfig<'a> {
 
         // --- Step 6: coalesce_dimensions ------------------------------
         {
-            let mut all_strides: Vec<I64StrideVec> =
-                base.operands.iter().map(|op| op.stride_bytes.clone()).collect();
+            let mut all_strides: Vec<I64StrideVec> = base
+                .operands
+                .iter()
+                .map(|op| op.stride_bytes.clone())
+                .collect();
             let changed = coalesce_dimensions(&mut base.shape_, &mut all_strides);
             base.has_coalesced_dimensions_ = changed;
             for (op, s) in base.operands.iter_mut().zip(all_strides.into_iter()) {
@@ -663,8 +665,11 @@ impl<'a> TensorIteratorConfig<'a> {
 
         // --- Step 7: finalize flags -----------------------------------
         {
-            let all_strides: Vec<I64StrideVec> =
-                base.operands.iter().map(|op| op.stride_bytes.clone()).collect();
+            let all_strides: Vec<I64StrideVec> = base
+                .operands
+                .iter()
+                .map(|op| op.stride_bytes.clone())
+                .collect();
             base.requires_32bit_indexing_ =
                 can_use_32bit_indexing(base.shape_.as_slice(), &all_strides);
         }
@@ -674,8 +679,11 @@ impl<'a> TensorIteratorConfig<'a> {
         // if we never built a key (e.g. cache_disabled() was true at the
         // top of the function — kept in sync via the cache_key Option).
         if let Some(key) = cache_key {
-            let stride_bytes: smallvec::SmallVec<[I64StrideVec; 4]> =
-                base.operands.iter().map(|op| op.stride_bytes.clone()).collect();
+            let stride_bytes: smallvec::SmallVec<[I64StrideVec; 4]> = base
+                .operands
+                .iter()
+                .map(|op| op.stride_bytes.clone())
+                .collect();
             let target_dtypes: smallvec::SmallVec<[DType; 4]> =
                 base.operands.iter().map(|op| op.target_dtype).collect();
             let geom = CachedIterGeometry {

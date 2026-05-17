@@ -66,9 +66,7 @@ fn main() {
             println!("cargo:rustc-link-arg=-Wl,-rpath,{}", candidate);
             cudnn_lib = Some((*candidate).to_string());
             // Prefer sibling `include/` next to the discovered `lib/`.
-            let sibling = Path::new(candidate)
-                .parent()
-                .map(|p| p.join("include"));
+            let sibling = Path::new(candidate).parent().map(|p| p.join("include"));
             if let Some(s) = sibling {
                 if s.exists() {
                     cudnn_include = Some(s.to_string_lossy().into_owned());
@@ -92,8 +90,7 @@ fn main() {
     {
         let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
         let stub_dir = PathBuf::from(&out_dir).join("cudnn_stubs");
-        std::fs::create_dir_all(&stub_dir)
-            .expect("create cudnn stub dir");
+        std::fs::create_dir_all(&stub_dir).expect("create cudnn stub dir");
         for (unversioned, versioned) in [
             ("libcudnn.so", "libcudnn.so.9"),
             ("libcudnn_graph.so", "libcudnn_graph.so.9"),
@@ -159,6 +156,7 @@ fn main() {
     cuda_sources.push("kernels/silu_backward.cu");
     cuda_sources.push("src/cuda/f32_to_bf16.cu");
     cuda_sources.push("kernels/swiglu_backward.cu");
+    cuda_sources.push("kernels/qkv_split_backward.cu");
     cuda_sources.push("kernels/relu_backward.cu");
     cuda_sources.push("kernels/gelu_backward.cu");
     cuda_sources.push("kernels/tanh_backward.cu");

@@ -561,15 +561,12 @@ impl<'a> TensorIteratorBase<'a> {
                     // Broadcast those back into the iterator frame by
                     // applying `perm_` to produce stride_bytes of length
                     // `ndim` in post-reorder order.
-                    let logical_es =
-                        contiguous_element_strides(inverted_shape.as_slice());
+                    let logical_es = contiguous_element_strides(inverted_shape.as_slice());
                     let elem_size = dtype.size_in_bytes();
-                    let mut reordered: I64StrideVec =
-                        smallvec::smallvec![0i64; ndim];
+                    let mut reordered: I64StrideVec = smallvec::smallvec![0i64; ndim];
                     for new_dim in 0..ndim {
                         let old_dim = perm_slice[new_dim];
-                        reordered[new_dim] =
-                            (logical_es[old_dim] as i64) * (elem_size as i64);
+                        reordered[new_dim] = (logical_es[old_dim] as i64) * (elem_size as i64);
                     }
                     // Also patch the just-allocated output's
                     // element-stride field in the operand info.
@@ -726,9 +723,9 @@ impl<'a> TensorIteratorBase<'a> {
             let (ptr, offset_elems) = match op.src.as_ref() {
                 Some(OperandSrc::Owned(t)) => {
                     let raw = match t.dtype() {
-                        DType::BF16 => t.as_device_ptr_bf16(
-                            "build_iter_metadata: owned output ptr",
-                        )?,
+                        DType::BF16 => {
+                            t.as_device_ptr_bf16("build_iter_metadata: owned output ptr")?
+                        }
                         other => {
                             return Err(Error::InvalidOperation(format!(
                                 "build_iter_metadata: operand {arg} dtype {other:?} \
@@ -740,9 +737,9 @@ impl<'a> TensorIteratorBase<'a> {
                 }
                 Some(OperandSrc::Borrowed(t)) => {
                     let raw = match t.dtype() {
-                        DType::BF16 => t.as_device_ptr_bf16(
-                            "build_iter_metadata: borrowed operand ptr",
-                        )?,
+                        DType::BF16 => {
+                            t.as_device_ptr_bf16("build_iter_metadata: borrowed operand ptr")?
+                        }
                         other => {
                             return Err(Error::InvalidOperation(format!(
                                 "build_iter_metadata: operand {arg} dtype {other:?} \

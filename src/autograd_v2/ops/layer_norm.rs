@@ -37,9 +37,7 @@ use crate::{Result, Shape};
 use super::super::dispatch::DispatchCtx;
 use super::super::error::AutogradV2Error;
 use super::super::node::{Edge, GradFn, NodeId};
-use super::super::recording::{
-    gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2,
-};
+use super::super::recording::{gradient_edge_for_tensor, needs_grad, next_sequence_nr, record_v2};
 use super::super::saved_tensor::SavedTensor;
 use super::fw_mode::any_fw_grad;
 
@@ -156,9 +154,7 @@ impl GradFn for LayerNormGradFn {
         let dy_ref = if dy_ref.is_contiguous() {
             dy_ref
         } else {
-            dy_contig_owned = dy_ref
-                .contiguous()
-                .map_err(AutogradV2Error::FlameCore)?;
+            dy_contig_owned = dy_ref.contiguous().map_err(AutogradV2Error::FlameCore)?;
             &dy_contig_owned
         };
 

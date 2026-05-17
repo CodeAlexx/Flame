@@ -34,18 +34,30 @@ fn bench_bwd(name: &str, dims: &[usize], norm_size: usize) -> Result<()> {
     // Warmup
     for _ in 0..20 {
         let _ = black_box(flame_core::cuda_ops_bf16::layer_norm_backward_bf16(
-            &x, &dy, gamma.as_ref(), beta.as_ref(), &[norm_size], EPS,
+            &x,
+            &dy,
+            gamma.as_ref(),
+            beta.as_ref(),
+            &[norm_size],
+            EPS,
         )?);
     }
-    dev.synchronize().map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
 
     let t0 = Instant::now();
     for _ in 0..ITERS {
         let _ = black_box(flame_core::cuda_ops_bf16::layer_norm_backward_bf16(
-            &x, &dy, gamma.as_ref(), beta.as_ref(), &[norm_size], EPS,
+            &x,
+            &dy,
+            gamma.as_ref(),
+            beta.as_ref(),
+            &[norm_size],
+            EPS,
         )?);
     }
-    dev.synchronize().map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| FlameError::Cuda(format!("sync {e:?}")))?;
     let dur = t0.elapsed();
     let per_us = dur.as_secs_f64() * 1e6 / ITERS as f64;
     println!(
@@ -59,13 +71,17 @@ fn main() -> Result<()> {
     let legacy = std::env::var("FLAME_LAYER_NORM_LEGACY")
         .map(|v| v != "0")
         .unwrap_or(false);
-    let mode = if legacy { "LEGACY scalar (1 thread/row)" } else { "VEC (256 threads/row + cross-row dgamma/dbeta)" };
+    let mode = if legacy {
+        "LEGACY scalar (1 thread/row)"
+    } else {
+        "VEC (256 threads/row + cross-row dgamma/dbeta)"
+    };
     println!("=== layer_norm_vec bench — mode: {} ===", mode);
     println!("    inputs: randn(0, std=0.5) for x, randn(0, 0.1) for dy, randn for gamma/beta");
 
-    bench_bwd("zimage block",  &[1, 4096, 2560], 2560)?;
-    bench_bwd("klein block",   &[1, 4096, 4096], 4096)?;
-    bench_bwd("chroma block",  &[1, 4096, 3072], 3072)?;
-    bench_bwd("sdxl mid",      &[1, 1024, 1280], 1280)?;
+    bench_bwd("zimage block", &[1, 4096, 2560], 2560)?;
+    bench_bwd("klein block", &[1, 4096, 4096], 4096)?;
+    bench_bwd("chroma block", &[1, 4096, 3072], 3072)?;
+    bench_bwd("sdxl mid", &[1, 1024, 1280], 1280)?;
     Ok(())
 }

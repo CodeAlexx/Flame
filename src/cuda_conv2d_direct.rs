@@ -162,7 +162,6 @@ impl CudaConv2dDirect {
             view_offset: 0,
             #[cfg(feature = "autograd_v2")]
             autograd_meta: None,
-
         };
 
         // Reshape weight: [out_channels, in_channels, 3, 3] -> [out_channels, in_channels * 9]

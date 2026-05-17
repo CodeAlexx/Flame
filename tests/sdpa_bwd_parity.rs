@@ -273,10 +273,8 @@ fn assert_decomposed_determinism(
 
     let seed: u64 = 42;
 
-    let (dq_a, dk_a, dv_a) =
-        run_sdpa_backward_once(b, h, nq, nkv, d, seed, &device)?;
-    let (dq_b, dk_b, dv_b) =
-        run_sdpa_backward_once(b, h, nq, nkv, d, seed, &device)?;
+    let (dq_a, dk_a, dv_a) = run_sdpa_backward_once(b, h, nq, nkv, d, seed, &device)?;
+    let (dq_b, dk_b, dv_b) = run_sdpa_backward_once(b, h, nq, nkv, d, seed, &device)?;
 
     // Stage 0c: same-path determinism. Tight tolerance.
     // (The harness signature already supports the looser Stage 2 cross-path
@@ -321,14 +319,12 @@ fn assert_cudnn_vs_decomposed(
 
     // Mode A: decomposed.
     std::env::set_var("FLAME_NO_CUDNN_SDPA_BWD", "1");
-    let (dq_d, dk_d, dv_d) =
-        run_sdpa_backward_once(b, h, nq, nkv, d, seed, &device)?;
+    let (dq_d, dk_d, dv_d) = run_sdpa_backward_once(b, h, nq, nkv, d, seed, &device)?;
 
     // Mode B: cuDNN. The default code path; remove the rollback env so
     // try_cudnn_sdpa_backward can fire.
     std::env::remove_var("FLAME_NO_CUDNN_SDPA_BWD");
-    let (dq_c, dk_c, dv_c) =
-        run_sdpa_backward_once(b, h, nq, nkv, d, seed, &device)?;
+    let (dq_c, dk_c, dv_c) = run_sdpa_backward_once(b, h, nq, nkv, d, seed, &device)?;
 
     // Stage 2 BF16 cross-path tolerance. Cosine similarity is the
     // discriminating metric — `cos ≥ 0.9995` means the gradient direction
@@ -345,12 +341,27 @@ fn assert_cudnn_vs_decomposed(
     let cos_min = 0.9995_f64;
     let max_abs_rel = 1e-1_f64;
 
-    compare_grads(&dq_c, &dq_d, &format!("{label}/dQ cudnn-vs-decomposed"),
-        cos_min, max_abs_rel)?;
-    compare_grads(&dk_c, &dk_d, &format!("{label}/dK cudnn-vs-decomposed"),
-        cos_min, max_abs_rel)?;
-    compare_grads(&dv_c, &dv_d, &format!("{label}/dV cudnn-vs-decomposed"),
-        cos_min, max_abs_rel)?;
+    compare_grads(
+        &dq_c,
+        &dq_d,
+        &format!("{label}/dQ cudnn-vs-decomposed"),
+        cos_min,
+        max_abs_rel,
+    )?;
+    compare_grads(
+        &dk_c,
+        &dk_d,
+        &format!("{label}/dK cudnn-vs-decomposed"),
+        cos_min,
+        max_abs_rel,
+    )?;
+    compare_grads(
+        &dv_c,
+        &dv_d,
+        &format!("{label}/dV cudnn-vs-decomposed"),
+        cos_min,
+        max_abs_rel,
+    )?;
 
     Ok(())
 }

@@ -52,12 +52,7 @@ const MAX_EXPERTS: i32 = 1024;
 ///
 /// # Returns
 /// `(T, N)` BF16 tensor of stacked per-expert outputs.
-pub fn grouped_mm_bf16(
-    x: &Tensor,
-    w: &Tensor,
-    offsets: &[i32],
-    t_max: usize,
-) -> Result<Tensor> {
+pub fn grouped_mm_bf16(x: &Tensor, w: &Tensor, offsets: &[i32], t_max: usize) -> Result<Tensor> {
     // ---- shape + dtype validation ------------------------------------
     if x.dtype() != DType::BF16 {
         return Err(Error::InvalidOperation(format!(
@@ -200,10 +195,13 @@ mod tests {
     /// Naive scalar Rust reference for grouped_mm.
     /// Returns y as a flat Vec<f32> of length T*N.
     fn naive_grouped_mm_f32(
-        x: &[f32], // T*K row-major
-        w: &[f32], // E*K*N
+        x: &[f32],       // T*K row-major
+        w: &[f32],       // E*K*N
         offsets: &[i32], // E
-        t: usize, k: usize, n: usize, e: usize,
+        t: usize,
+        k: usize,
+        n: usize,
+        e: usize,
     ) -> Vec<f32> {
         let mut y = vec![0.0f32; t * n];
         let mut prev = 0i32;

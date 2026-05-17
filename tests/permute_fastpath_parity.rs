@@ -28,8 +28,13 @@ fn host_data(total: usize) -> Vec<f32> {
 
 fn make_bf16(device: &Arc<cudarc::driver::CudaDevice>, dims: &[usize]) -> Tensor {
     let total: usize = dims.iter().product();
-    Tensor::from_vec_dtype(host_data(total), Shape::from_dims(dims), device.clone(), DType::BF16)
-        .expect("from_vec_dtype bf16")
+    Tensor::from_vec_dtype(
+        host_data(total),
+        Shape::from_dims(dims),
+        device.clone(),
+        DType::BF16,
+    )
+    .expect("from_vec_dtype bf16")
 }
 
 fn make_f32(device: &Arc<cudarc::driver::CudaDevice>, dims: &[usize]) -> Tensor {
@@ -50,10 +55,7 @@ fn read_f32(t: &Tensor) -> Vec<f32> {
 /// return the raw bytes for comparison.
 fn run_permute_bf16(shape: &[usize], perm: &[usize], fastpath: bool) -> Vec<u16> {
     let device = make_device();
-    std::env::set_var(
-        "FLAME_PERMUTE_FASTPATH",
-        if fastpath { "1" } else { "0" },
-    );
+    std::env::set_var("FLAME_PERMUTE_FASTPATH", if fastpath { "1" } else { "0" });
     let t = make_bf16(&device, shape);
     let p = t.permute(perm).expect("permute view");
     let c = p.contiguous().expect("contiguous");
@@ -62,10 +64,7 @@ fn run_permute_bf16(shape: &[usize], perm: &[usize], fastpath: bool) -> Vec<u16>
 
 fn run_permute_f32(shape: &[usize], perm: &[usize], fastpath: bool) -> Vec<f32> {
     let device = make_device();
-    std::env::set_var(
-        "FLAME_PERMUTE_FASTPATH",
-        if fastpath { "1" } else { "0" },
-    );
+    std::env::set_var("FLAME_PERMUTE_FASTPATH", if fastpath { "1" } else { "0" });
     let t = make_f32(&device, shape);
     let p = t.permute(perm).expect("permute view");
     let c = p.contiguous().expect("contiguous");

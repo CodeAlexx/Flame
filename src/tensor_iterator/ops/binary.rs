@@ -224,8 +224,16 @@ pub(crate) fn maximum_bf16_kernel(_iter: &mut TensorIteratorBase<'_>) -> Result<
 }
 
 pub fn maximum_bf16_iter(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    debug_assert_eq!(a.dtype(), crate::DType::BF16, "maximum_bf16_iter expects BF16");
-    debug_assert_eq!(b.dtype(), crate::DType::BF16, "maximum_bf16_iter expects BF16");
+    debug_assert_eq!(
+        a.dtype(),
+        crate::DType::BF16,
+        "maximum_bf16_iter expects BF16"
+    );
+    debug_assert_eq!(
+        b.dtype(),
+        crate::DType::BF16,
+        "maximum_bf16_iter expects BF16"
+    );
     let mut iter = TensorIteratorBase::build_binary_op(None, a, b)?;
     maximum_bf16_kernel(&mut iter)?;
     iter.take_output(0)
@@ -267,8 +275,16 @@ pub(crate) fn minimum_bf16_kernel(_iter: &mut TensorIteratorBase<'_>) -> Result<
 }
 
 pub fn minimum_bf16_iter(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    debug_assert_eq!(a.dtype(), crate::DType::BF16, "minimum_bf16_iter expects BF16");
-    debug_assert_eq!(b.dtype(), crate::DType::BF16, "minimum_bf16_iter expects BF16");
+    debug_assert_eq!(
+        a.dtype(),
+        crate::DType::BF16,
+        "minimum_bf16_iter expects BF16"
+    );
+    debug_assert_eq!(
+        b.dtype(),
+        crate::DType::BF16,
+        "minimum_bf16_iter expects BF16"
+    );
     let mut iter = TensorIteratorBase::build_binary_op(None, a, b)?;
     minimum_bf16_kernel(&mut iter)?;
     iter.take_output(0)

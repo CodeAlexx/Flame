@@ -88,14 +88,25 @@ fn run_case(
 
     flame_core::rng::set_seed(0xB11EA_u64 ^ (h_out as u64) ^ ((w_out as u64) << 16))
         .map_err(|e| anyhow::anyhow!("set_seed: {e:?}"))?;
-    let x = Tensor::randn(Shape::from_dims(&[B, C, h_in, w_in]), 0.0, 1.0, device.clone())?;
+    let x = Tensor::randn(
+        Shape::from_dims(&[B, C, h_in, w_in]),
+        0.0,
+        1.0,
+        device.clone(),
+    )?;
     let x_in = x.to_dtype(dtype)?;
 
     let cfg = Upsample2dConfig::new(UpsampleMode::Bilinear).with_size((h_out, w_out));
     let cfg = if align_corners {
-        Upsample2dConfig { align_corners: Some(true), ..cfg }
+        Upsample2dConfig {
+            align_corners: Some(true),
+            ..cfg
+        }
     } else {
-        Upsample2dConfig { align_corners: Some(false), ..cfg }
+        Upsample2dConfig {
+            align_corners: Some(false),
+            ..cfg
+        }
     };
     let up = Upsample2d::new(cfg).forward(&x_in)?;
     let up_f32 = up.to_dtype(DType::F32)?.to_vec_f32()?;
@@ -135,8 +146,14 @@ fn upsample_bilinear_f32_parity() -> Result<()> {
         println!(
             "[bilinear_f32] {hi}x{wi}->{ho}x{wo} align_corners={ac}  cos_sim={cs:.6}  max_abs={max_abs:.3e}"
         );
-        assert!(cs >= 0.9999, "F32 {hi}x{wi}->{ho}x{wo} ac={ac} cos_sim {cs}");
-        assert!(max_abs <= 1e-4, "F32 {hi}x{wi}->{ho}x{wo} ac={ac} max_abs {max_abs}");
+        assert!(
+            cs >= 0.9999,
+            "F32 {hi}x{wi}->{ho}x{wo} ac={ac} cos_sim {cs}"
+        );
+        assert!(
+            max_abs <= 1e-4,
+            "F32 {hi}x{wi}->{ho}x{wo} ac={ac} max_abs {max_abs}"
+        );
     }
     Ok(())
 }
@@ -158,8 +175,14 @@ fn upsample_bilinear_bf16_parity() -> Result<()> {
             "[bilinear_bf16] {hi}x{wi}->{ho}x{wo} align_corners={ac}  cos_sim={cs:.6}  max_abs={max_abs:.3e}"
         );
         // BF16 has ~7 bits of mantissa; tolerate small round-trip error.
-        assert!(cs >= 0.999, "BF16 {hi}x{wi}->{ho}x{wo} ac={ac} cos_sim {cs}");
-        assert!(max_abs <= 2e-2, "BF16 {hi}x{wi}->{ho}x{wo} ac={ac} max_abs {max_abs}");
+        assert!(
+            cs >= 0.999,
+            "BF16 {hi}x{wi}->{ho}x{wo} ac={ac} cos_sim {cs}"
+        );
+        assert!(
+            max_abs <= 2e-2,
+            "BF16 {hi}x{wi}->{ho}x{wo} ac={ac} max_abs {max_abs}"
+        );
     }
     Ok(())
 }

@@ -3,7 +3,10 @@
 
 #![cfg(feature = "cuda")]
 
-use flame_core::{bf16_ops, global_cuda_device, tensor_iterator::ops::unary::square_bf16_iter, DType, Result, Shape, Tensor};
+use flame_core::{
+    bf16_ops, global_cuda_device, tensor_iterator::ops::unary::square_bf16_iter, DType, Result,
+    Shape, Tensor,
+};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -16,13 +19,15 @@ fn bench_contig_reference(rows: usize, cols: usize) -> Result<()> {
     for _ in 0..10 {
         let _ = black_box(bf16_ops::square_bf16(&x)?);
     }
-    dev.synchronize().map_err(|e| flame_core::Error::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| flame_core::Error::Cuda(format!("sync {e:?}")))?;
 
     let t0 = Instant::now();
     for _ in 0..ITERS {
         let _ = black_box(bf16_ops::square_bf16(&x)?);
     }
-    dev.synchronize().map_err(|e| flame_core::Error::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| flame_core::Error::Cuda(format!("sync {e:?}")))?;
     let dt = t0.elapsed();
     let us = dt.as_nanos() as f64 / ITERS as f64 / 1_000.0;
     println!(
@@ -40,13 +45,15 @@ fn bench_contig_through_iter(rows: usize, cols: usize) -> Result<()> {
     for _ in 0..10 {
         let _ = black_box(square_bf16_iter(&x)?);
     }
-    dev.synchronize().map_err(|e| flame_core::Error::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| flame_core::Error::Cuda(format!("sync {e:?}")))?;
 
     let t0 = Instant::now();
     for _ in 0..ITERS {
         let _ = black_box(square_bf16_iter(&x)?);
     }
-    dev.synchronize().map_err(|e| flame_core::Error::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| flame_core::Error::Cuda(format!("sync {e:?}")))?;
     let dt = t0.elapsed();
     let us = dt.as_nanos() as f64 / ITERS as f64 / 1_000.0;
     println!(
@@ -65,13 +72,15 @@ fn bench_strided_via_iter(rows: usize, cols: usize) -> Result<()> {
     for _ in 0..10 {
         let _ = black_box(square_bf16_iter(&view)?);
     }
-    dev.synchronize().map_err(|e| flame_core::Error::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| flame_core::Error::Cuda(format!("sync {e:?}")))?;
 
     let t0 = Instant::now();
     for _ in 0..ITERS {
         let _ = black_box(square_bf16_iter(&view)?);
     }
-    dev.synchronize().map_err(|e| flame_core::Error::Cuda(format!("sync {e:?}")))?;
+    dev.synchronize()
+        .map_err(|e| flame_core::Error::Cuda(format!("sync {e:?}")))?;
     let dt = t0.elapsed();
     let us = dt.as_nanos() as f64 / ITERS as f64 / 1_000.0;
     println!(

@@ -102,8 +102,9 @@ pub fn broadcast_to_impl(tensor: &Tensor, target_shape: &[i64]) -> Result<Tensor
                 return Ok(output);
             }
 
-            let mut d_out_shape = unsafe { device.alloc::<i64>(ndim) }
-                .map_err(|e| Error::Cuda(format!("broadcast_to: alloc out_shape failed: {:?}", e)))?;
+            let mut d_out_shape = unsafe { device.alloc::<i64>(ndim) }.map_err(|e| {
+                Error::Cuda(format!("broadcast_to: alloc out_shape failed: {:?}", e))
+            })?;
             device
                 .htod_copy_into(out_dims_i64.clone(), &mut d_out_shape)
                 .map_err(|e| Error::CudaDriver(format!("{e:?}")))?;

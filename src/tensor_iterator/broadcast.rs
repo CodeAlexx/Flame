@@ -114,10 +114,7 @@ pub fn compute_shape(operands: &[OperandView<'_>]) -> Result<(DimVec, bool)> {
 /// This lives at `TensorIterator.cpp:1277`. The stride-0 convention on
 /// broadcast dims is what makes `gpu_kernel` treat a broadcast operand
 /// "as if" the dim were expanded in-memory without actually expanding it.
-pub fn compute_strides(
-    bcast_shape: &[usize],
-    operands: &[OperandView<'_>],
-) -> Vec<I64StrideVec> {
+pub fn compute_strides(bcast_shape: &[usize], operands: &[OperandView<'_>]) -> Vec<I64StrideVec> {
     let ndim = bcast_shape.len();
     let mut out = Vec::with_capacity(operands.len());
 
@@ -143,11 +140,7 @@ pub fn compute_strides(
 /// Apply a permutation `perm` to `shape` and every per-operand stride
 /// array. `new[i] = old[perm[i]]`. Port of
 /// `TensorIteratorBase::permute_dimensions` (TensorIterator.cpp:723).
-fn permute_in_place(
-    perm: &[usize],
-    shape: &mut DimVec,
-    byte_strides: &mut [I64StrideVec],
-) {
+fn permute_in_place(perm: &[usize], shape: &mut DimVec, byte_strides: &mut [I64StrideVec]) {
     debug_assert_eq!(perm.len(), shape.len());
     let ndim = perm.len();
 
@@ -193,10 +186,7 @@ fn permute_in_place(
 ///      breaks out of the inner loop.
 ///
 /// For a rank-1 input this is a no-op returning `[0]`.
-pub fn reorder_dimensions(
-    shape: &mut DimVec,
-    byte_strides: &mut [I64StrideVec],
-) -> DimVec {
+pub fn reorder_dimensions(shape: &mut DimVec, byte_strides: &mut [I64StrideVec]) -> DimVec {
     let ndim = shape.len();
 
     if ndim <= 1 {
@@ -214,39 +204,36 @@ pub fn reorder_dimensions(
         perm[i] = ndim - 1 - i;
     }
 
-    let should_swap = |shape_ref: &DimVec,
-                       strides_ref: &[I64StrideVec],
-                       dim0: usize,
-                       dim1: usize|
-     -> i32 {
-        for op_strides in strides_ref.iter() {
-            // NOTE (will_resize unsupported): PyTorch TensorIterator.cpp:258
-            // also skips operands where will_resize == true. flame-core has
-            // no implicit-resize path (allocate_or_resize_outputs errors on
-            // shape mismatch instead), so this skip is a no-op in the
-            // current port and carries no runtime cost.
-            if op_strides.is_empty() {
-                continue;
-            }
-            let stride0 = op_strides[dim0];
-            let stride1 = op_strides[dim1];
-            if stride0 == 0 || stride1 == 0 {
-                continue;
-            } else if stride0 < stride1 {
-                return -1;
-            } else if stride0 > stride1 {
-                return 1;
-            } else {
-                // Equal non-zero strides: tie-break on shape.
-                let t0 = shape_ref[dim0];
-                let t1 = shape_ref[dim1];
-                if t0 > t1 {
+    let should_swap =
+        |shape_ref: &DimVec, strides_ref: &[I64StrideVec], dim0: usize, dim1: usize| -> i32 {
+            for op_strides in strides_ref.iter() {
+                // NOTE (will_resize unsupported): PyTorch TensorIterator.cpp:258
+                // also skips operands where will_resize == true. flame-core has
+                // no implicit-resize path (allocate_or_resize_outputs errors on
+                // shape mismatch instead), so this skip is a no-op in the
+                // current port and carries no runtime cost.
+                if op_strides.is_empty() {
+                    continue;
+                }
+                let stride0 = op_strides[dim0];
+                let stride1 = op_strides[dim1];
+                if stride0 == 0 || stride1 == 0 {
+                    continue;
+                } else if stride0 < stride1 {
+                    return -1;
+                } else if stride0 > stride1 {
                     return 1;
+                } else {
+                    // Equal non-zero strides: tie-break on shape.
+                    let t0 = shape_ref[dim0];
+                    let t1 = shape_ref[dim1];
+                    if t0 > t1 {
+                        return 1;
+                    }
                 }
             }
-        }
-        0
-    };
+            0
+        };
 
     // Insertion sort over perm, keyed via should_swap on perm[i] indices.
     // Mirrors PyTorch `TensorIterator.cpp:293-304`:
@@ -288,35 +275,29 @@ pub fn reorder_dimensions(
 /// any coalescing happened.
 ///
 /// Mutates in place. No-op for rank ≤ 1.
-pub fn coalesce_dimensions(
-    shape: &mut DimVec,
-    byte_strides: &mut [I64StrideVec],
-) -> bool {
+pub fn coalesce_dimensions(shape: &mut DimVec, byte_strides: &mut [I64StrideVec]) -> bool {
     let ndim = shape.len();
     if ndim <= 1 {
         return false;
     }
 
-    let can_coalesce = |shape_ref: &DimVec,
-                        strides_ref: &[I64StrideVec],
-                        dim0: usize,
-                        dim1: usize|
-     -> bool {
-        let s0 = shape_ref[dim0];
-        let s1 = shape_ref[dim1];
-        if s0 == 1 || s1 == 1 {
-            return true;
-        }
-        for op_strides in strides_ref.iter() {
-            if op_strides.is_empty() {
-                continue;
+    let can_coalesce =
+        |shape_ref: &DimVec, strides_ref: &[I64StrideVec], dim0: usize, dim1: usize| -> bool {
+            let s0 = shape_ref[dim0];
+            let s1 = shape_ref[dim1];
+            if s0 == 1 || s1 == 1 {
+                return true;
             }
-            if (s0 as i64) * op_strides[dim0] != op_strides[dim1] {
-                return false;
+            for op_strides in strides_ref.iter() {
+                if op_strides.is_empty() {
+                    continue;
+                }
+                if (s0 as i64) * op_strides[dim0] != op_strides[dim1] {
+                    return false;
+                }
             }
-        }
-        true
-    };
+            true
+        };
 
     let replace_stride = |strides: &mut [I64StrideVec], dim0: usize, dim1: usize| {
         for op_strides in strides.iter_mut() {
@@ -367,10 +348,7 @@ pub fn coalesce_dimensions(
 /// 2³¹ even for moderate-element tensors if element size is large (e.g.
 /// F64). BF16's worst case is ~2³⁰ elements × 2B = 2³¹B, close to the
 /// edge; most flame-core tensors stay well under.
-pub fn can_use_32bit_indexing(
-    shape: &[usize],
-    byte_strides: &[I64StrideVec],
-) -> bool {
+pub fn can_use_32bit_indexing(shape: &[usize], byte_strides: &[I64StrideVec]) -> bool {
     let max_value = i32::MAX as i64;
     let mut numel: i64 = 1;
     for &s in shape {
@@ -397,9 +375,8 @@ pub fn can_use_32bit_indexing(
             // Match PyTorch TensorIterator.cpp:1307-1309 — iterate every
             // dim including size-0 (produces a negative contribution that
             // still passes the < i32::MAX check).
-            max_offset = max_offset.saturating_add(
-                ((shape[dim] as i64) - 1).saturating_mul(op_strides[dim]),
-            );
+            max_offset = max_offset
+                .saturating_add(((shape[dim] as i64) - 1).saturating_mul(op_strides[dim]));
             if max_offset > max_value {
                 return false;
             }
@@ -434,8 +411,16 @@ mod tests {
         let a = mk(&[4, 1, 3], &[3, 3, 1], 2);
         let b = mk(&[2, 3], &[3, 1], 2);
         let operands = vec![
-            OperandView { shape: &a.0, element_strides: &a.1, elem_size: a.2 },
-            OperandView { shape: &b.0, element_strides: &b.1, elem_size: b.2 },
+            OperandView {
+                shape: &a.0,
+                element_strides: &a.1,
+                elem_size: a.2,
+            },
+            OperandView {
+                shape: &b.0,
+                element_strides: &b.1,
+                elem_size: b.2,
+            },
         ];
         let (shape, same) = compute_shape(&operands).unwrap();
         assert_eq!(shape.as_slice(), &[4, 2, 3]);
@@ -450,8 +435,16 @@ mod tests {
         let a = mk(&[4, 1, 3], &[3, 3, 1], 2);
         let b = mk(&[2, 3], &[3, 1], 2);
         let operands = vec![
-            OperandView { shape: &a.0, element_strides: &a.1, elem_size: a.2 },
-            OperandView { shape: &b.0, element_strides: &b.1, elem_size: b.2 },
+            OperandView {
+                shape: &a.0,
+                element_strides: &a.1,
+                elem_size: a.2,
+            },
+            OperandView {
+                shape: &b.0,
+                element_strides: &b.1,
+                elem_size: b.2,
+            },
         ];
         let bcast = [4, 2, 3];
         let strides = compute_strides(&bcast, &operands);

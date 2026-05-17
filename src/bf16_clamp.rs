@@ -48,7 +48,6 @@ pub fn clamp_bf16(x: &Tensor, lo: f32, hi: f32) -> Result<Tensor> {
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
     if x.device
         .get_func("clamp_bf16_kernel", "clamp_bf16_kernel")

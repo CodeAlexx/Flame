@@ -15,9 +15,9 @@
 //!
 //! Per `PyTorch TensorIterator port plan` §7 do-not-touch list.
 
-use std::sync::Arc;
 use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+use std::sync::Arc;
 
 use crate::dtype::DType;
 use crate::tensor_storage::TensorStorage;
@@ -156,9 +156,9 @@ pub fn softmax_lastdim_bf16(x: &Tensor) -> Result<Tensor> {
         ));
     }
     let dims = x.shape().dims();
-    let cols = *dims.last().ok_or_else(|| {
-        Error::InvalidInput("softmax_lastdim_bf16: empty shape".into())
-    })?;
+    let cols = *dims
+        .last()
+        .ok_or_else(|| Error::InvalidInput("softmax_lastdim_bf16: empty shape".into()))?;
     let rows = x.shape().elem_count() / cols;
 
     let n = x.shape().elem_count();
@@ -176,21 +176,30 @@ pub fn softmax_lastdim_bf16(x: &Tensor) -> Result<Tensor> {
         view_offset: 0,
         #[cfg(feature = "autograd_v2")]
         autograd_meta: None,
-
     };
 
-    let f = ensure_and_get(&x.device, "softmax_lastdim_bf16_kernel", CUDA_SOFTMAX_LASTDIM_BF16)?;
+    let f = ensure_and_get(
+        &x.device,
+        "softmax_lastdim_bf16_kernel",
+        CUDA_SOFTMAX_LASTDIM_BF16,
+    )?;
 
     // 2026-05-12 perf: match block_size to cols (round up to multiple of 32).
     // The legacy formula used min=128 threads — for cols<128 (e.g. head_dim
     // 64) it leaves half the threads idle and burns launch overhead. Tail
     // threads in the kernel still no-op via `if (tid < cols)` so correctness
     // holds; saves launch overhead per row.
-    let block_size = if cols <= 32 { 32usize }
-                     else if cols <= 64 { 64 }
-                     else if cols <= 128 { 128 }
-                     else if cols <= 256 { 256 }
-                     else { 256 };
+    let block_size = if cols <= 32 {
+        32usize
+    } else if cols <= 64 {
+        64
+    } else if cols <= 128 {
+        128
+    } else if cols <= 256 {
+        256
+    } else {
+        256
+    };
 
     let cfg = LaunchConfig {
         grid_dim: (rows as u32, 1, 1),
@@ -262,7 +271,11 @@ pub fn transpose2d_bf16(tensor: &Tensor) -> Result<Tensor> {
     let rows = dims[0];
     let cols = dims[1];
 
-    let f = ensure_and_get(&tensor.device, "transpose2d_bf16_kernel", CUDA_TRANSPOSE2D_BF16)?;
+    let f = ensure_and_get(
+        &tensor.device,
+        "transpose2d_bf16_kernel",
+        CUDA_TRANSPOSE2D_BF16,
+    )?;
 
     let mut out = Tensor::zeros_dtype(
         Shape::from_dims(&[cols, rows]),
@@ -380,10 +393,7 @@ void unpatchify_bf16_kernel(
 /// Fused patchify: [B, C, H, W] → [B, ph*pw, p*p*C] in BF16, no 6D permute.
 ///
 /// Returns (patches, ph, pw).
-pub fn patchify_bf16(
-    x: &Tensor,
-    patch_size: usize,
-) -> Result<(Tensor, usize, usize)> {
+pub fn patchify_bf16(x: &Tensor, patch_size: usize) -> Result<(Tensor, usize, usize)> {
     assert_eq!(x.dtype(), DType::BF16, "patchify_bf16: expected BF16");
     let dims = x.shape().dims();
     assert_eq!(dims.len(), 4, "patchify_bf16: expected 4D [B,C,H,W]");

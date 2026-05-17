@@ -225,7 +225,10 @@ const MT_L2_NORM_BF16_MODULE: &str = "multi_tensor_l2_norm_bf16";
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 fn ensure_l2_norm_kernels(device: &Arc<CudaDevice>) -> Result<()> {
     if device
-        .get_func(MT_L2_NORM_MODULE, "multi_tensor_l2_norm_sq_stage1_f32_kernel")
+        .get_func(
+            MT_L2_NORM_MODULE,
+            "multi_tensor_l2_norm_sq_stage1_f32_kernel",
+        )
         .is_some()
     {
         return Ok(());

@@ -41,7 +41,9 @@ fn skip_if_no_gpu() -> Option<Arc<CudaDevice>> {
 
 #[test]
 fn microbench_thousand_bf16_allocs_no_free_after_slab_init() {
-    let Some(device) = skip_if_no_gpu() else { return };
+    let Some(device) = skip_if_no_gpu() else {
+        return;
+    };
 
     // 64 MiB slab — generous for 1000 small allocs.
     let capacity_bytes = 64 * 1024 * 1024;
@@ -84,8 +86,7 @@ fn microbench_thousand_bf16_allocs_no_free_after_slab_init() {
     // freed mid-benchmark and reallocated, range_count would dip and rise.
     let mid_range_count = ExternalMemoryRegistry::global().range_count();
     assert_eq!(
-        mid_range_count,
-        after_first_range_count,
+        mid_range_count, after_first_range_count,
         "range count must remain stable throughout the benchmark"
     );
 
@@ -101,8 +102,7 @@ fn microbench_thousand_bf16_allocs_no_free_after_slab_init() {
     // path that registers the slab for TensorStorage::Drop to find. Here
     // we shortcut by leaking.
     use std::sync::Mutex;
-    let slab_static: &'static Mutex<StaticSlabAllocator> =
-        Box::leak(Box::new(Mutex::new(slab)));
+    let slab_static: &'static Mutex<StaticSlabAllocator> = Box::leak(Box::new(Mutex::new(slab)));
     // Insert into device_map.
     {
         use flame_core::static_slab_v2;

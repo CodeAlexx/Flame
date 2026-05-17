@@ -26,16 +26,18 @@ fn host_data(total: usize) -> Vec<f32> {
 
 fn make_bf16(device: &Arc<cudarc::driver::CudaDevice>, dims: &[usize]) -> Tensor {
     let total: usize = dims.iter().product();
-    Tensor::from_vec_dtype(host_data(total), Shape::from_dims(dims), device.clone(), DType::BF16)
-        .expect("from_vec_dtype bf16")
+    Tensor::from_vec_dtype(
+        host_data(total),
+        Shape::from_dims(dims),
+        device.clone(),
+        DType::BF16,
+    )
+    .expect("from_vec_dtype bf16")
 }
 
 fn bench_one(shape: &[usize], perm: &[usize], fastpath: bool, iters: usize, warmup: usize) -> f64 {
     let device = make_device();
-    std::env::set_var(
-        "FLAME_PERMUTE_FASTPATH",
-        if fastpath { "1" } else { "0" },
-    );
+    std::env::set_var("FLAME_PERMUTE_FASTPATH", if fastpath { "1" } else { "0" });
     let t = make_bf16(&device, shape);
 
     // Warmup
@@ -82,15 +84,15 @@ fn bench_permute_fastpaths() {
     );
 
     // Top-frequency tuples from zimage trace.
-    report("rank2_8x3840",     &[8, 3840], &[1, 0]);
-    report("rank2_3840x8",     &[3840, 8], &[1, 0]);
-    report("rank2_8x10240",    &[8, 10240], &[1, 0]);
-    report("rank2_10240x8",    &[10240, 8], &[1, 0]);
-    report("rank2_64x64",      &[64, 64], &[1, 0]);
-    report("rank2_3840x3840",  &[3840, 3840], &[1, 0]);
+    report("rank2_8x3840", &[8, 3840], &[1, 0]);
+    report("rank2_3840x8", &[3840, 8], &[1, 0]);
+    report("rank2_8x10240", &[8, 10240], &[1, 0]);
+    report("rank2_10240x8", &[10240, 8], &[1, 0]);
+    report("rank2_64x64", &[64, 64], &[1, 0]);
+    report("rank2_3840x3840", &[3840, 3840], &[1, 0]);
 
     // Rank-4 inner-2 swap (QK^T).
-    report("rank4_zimage_qk",  &[1, 30, 1536, 128], &[0, 1, 3, 2]);
+    report("rank4_zimage_qk", &[1, 30, 1536, 128], &[0, 1, 3, 2]);
     // Heavy case — 1.4 GB at BF16. Skip in CI.
     if std::env::var("FLAME_PERMUTE_TEST_BIG").is_ok() {
         report("rank4_zimage_attn", &[1, 30, 1536, 1536], &[0, 1, 3, 2]);

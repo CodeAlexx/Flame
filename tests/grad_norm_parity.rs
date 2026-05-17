@@ -60,12 +60,13 @@
 
 mod parity_helpers;
 
-use flame_core::{global_cuda_device, ops::grad_norm::global_l2_norm, serialization::load_file, Tensor};
+use flame_core::{
+    global_cuda_device, ops::grad_norm::global_l2_norm, serialization::load_file, Tensor,
+};
 use std::path::PathBuf;
 
 const FIXTURE_REL: &str = "tests/pytorch_fixtures/grad_norm/lora_200tensors_4x4096.safetensors";
-const FIXTURE_SHA256: &str =
-    "d2f2544984ff26cd66102c8fb0f11099be2d2ee334c59fe6326e7f14a1359178";
+const FIXTURE_SHA256: &str = "d2f2544984ff26cd66102c8fb0f11099be2d2ee334c59fe6326e7f14a1359178";
 const N_TENSORS: usize = 200;
 
 fn fixture_path() -> PathBuf {
@@ -153,8 +154,8 @@ fn matches_pytorch_with_global_l2_norm_with_scale() {
     let expected_norm = tensors.get("total_norm").expect("total_norm");
     let expected_scale = tensors.get("scale").expect("scale");
 
-    let (norm_t, scale_t) = global_l2_norm_with_scale(&grads, 1.0_f32, 1e-6_f32)
-        .expect("global_l2_norm_with_scale");
+    let (norm_t, scale_t) =
+        global_l2_norm_with_scale(&grads, 1.0_f32, 1e-6_f32).expect("global_l2_norm_with_scale");
 
     let r1 = parity_helpers::compare_tensor(&norm_t, expected_norm, 1e-4, 1e-4);
     assert!(r1.passed, "norm parity FAIL\n{}", r1.pretty());

@@ -70,20 +70,8 @@ fn clamp_works_on_bf16() -> Result<()> {
 #[test]
 fn randn_seeded_is_deterministic() -> Result<()> {
     let device = global_cuda_device();
-    let a = Tensor::randn_seeded(
-        Shape::from_dims(&[1024]),
-        0.0,
-        1.0,
-        42,
-        device.clone(),
-    )?;
-    let b = Tensor::randn_seeded(
-        Shape::from_dims(&[1024]),
-        0.0,
-        1.0,
-        42,
-        device.clone(),
-    )?;
+    let a = Tensor::randn_seeded(Shape::from_dims(&[1024]), 0.0, 1.0, 42, device.clone())?;
+    let b = Tensor::randn_seeded(Shape::from_dims(&[1024]), 0.0, 1.0, 42, device.clone())?;
 
     // Compare in F32 to avoid BF16 rounding if the workspace default is BF16.
     let va = a.to_dtype(DType::F32)?.to_vec_f32()?;
@@ -95,13 +83,7 @@ fn randn_seeded_is_deterministic() -> Result<()> {
 #[test]
 fn randn_seeded_stats() -> Result<()> {
     let device = global_cuda_device();
-    let a = Tensor::randn_seeded(
-        Shape::from_dims(&[16384]),
-        0.0,
-        1.0,
-        42,
-        device.clone(),
-    )?;
+    let a = Tensor::randn_seeded(Shape::from_dims(&[16384]), 0.0, 1.0, 42, device.clone())?;
     // Stats in F32 so BF16 quantization (if any) doesn't skew variance.
     let v = a.to_dtype(DType::F32)?.to_vec_f32()?;
     let n = v.len() as f32;
