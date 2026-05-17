@@ -495,6 +495,25 @@ cargo's incremental build sometimes misses `.cu` mtime changes.
 
 ## Common gotchas
 
+### Rust `f32::round` ≠ PyTorch `tensor.round()` (rounding-mode parity)
+
+When porting quantization code from PyTorch:
+- `f32::round()` (Rust default) is **round-half-away-from-zero**.
+- `tensor.round()` (PyTorch) is **IEEE 754 round-half-to-even** (banker's
+  rounding, default for IEEE float-to-int).
+
+They diverge on exactly the .5 boundary, so on dense quantization
+codes (e.g. int8 absmax-scaled rounds) you'll see ~0.02% of values
+off by ±1 with the wrong choice — silent numerical drift that erodes
+parity tests one row at a time. Use `f32::round_ties_even()`
+(stabilized 1.77) for any PyTorch-parity quant path.
+
+Caught while porting `int8_weight_only_qt_kernel.rs` from torchao
+0.14.1; full receipt at that module's parity binary
+(`bin/parity_int8_torchao_qt.rs`). Same gotcha applies to any future
+GPU quant kernel that needs PyTorch-parity codes — use `rintf` (CUDA
+banker's-round-to-nearest-int) NOT `roundf` (round-half-away-from-zero).
+
 ### View-autograd backwards under `shared_storage` (HAZARD-2026-05-13-1)
 
 **TL;DR**: For view ops (`narrow`, `transpose`, `permute`, `view`,

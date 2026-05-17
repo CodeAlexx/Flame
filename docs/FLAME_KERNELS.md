@@ -264,6 +264,30 @@ small vs. the param/grad global-mem traffic.
 raw `CudaSlice<u8>` rather than `Tensor`), "`Tensor::from_vec` is
 F32-only" (how `upload_qmap` lands the 256-entry LUT on the device).
 
+### `int8_weight_only_qt_kernel.rs` — torchao int8-QT cast (2026-05-17)
+
+One NVRTC kernel, compiled once on first call, loaded into the
+`int8_qt_cast` module:
+
+| Kernel | Purpose |
+|---|---|
+| `i8_to_bf16_kernel` | Trivial sign-extending int8 → BF16 cast. No scale baked in (scale is multiplied in a separate BF16 elementwise op so autograd records the `Op::Mul` correctly). |
+
+**Launch geometry** (per `codes_to_bf16` call):
+
+- `grid_dim = (ceil(n / 256), 1, 1)` — one block per 256 elements.
+- `block_dim = (256, 1, 1)` — one thread per element.
+- `shared_mem = 0`.
+
+**Per-thread**: sign-extend `i8 → int → float → __nv_bfloat16` via
+`__float2bfloat16` (round-to-nearest-even). Tail-block bounds-checked.
+
+**Usage**: invoked by `Int8QtWeight::codes_to_bf16` at every forward
+pass (cheap; the resulting BF16 matrix feeds `Tensor::matmul`). Storing
+the cast result instead of recomputing it would defeat the memory-saving
+purpose of int8 weights — we trade ~1 NVRTC kernel + 2× BF16 memory per
+layer for the int8 storage win.
+
 ### `ops/multi_tensor.rs` — foreach-style primitives (Phase 3, 2026-05-12)
 
 | Kernel | Purpose |

@@ -222,6 +222,8 @@ pub mod tensor_ops_extended;
 // Provide missing convenience ops (div_scalar, etc.) unconditionally
 pub mod adam;
 pub mod adam8bit_kernel;
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub mod int8_weight_only_qt_kernel;
 pub mod lora;
 pub mod parameter;
 pub mod tensor_ops_missing;

@@ -1259,6 +1259,63 @@ per the no-quant rule.
   (100, 1.0, False); trainers use external `flame_core::ops::grad_norm`
   clipping instead.
 
+### `int8_weight_only_qt_kernel.rs` (added 2026-05-17, torchao-port)
+Port of torchao 0.14.1 `int8_weight_only_quantized_training` — the
+**training** prototype API (NOT the inference `int8_weight_only`). Used
+by SimpleTuner under `--base-quant int8-torchao` when `model_type=lora`.
+
+Numerical contract mirrors
+`torchao/prototype/quantized_training/int8.py:23-52` (`quantize_int8_rowwise`,
+stochastic_rounding=False path) and `int8.py:146-173`
+(`_Int8WeightOnlyLinear.forward` + backward).
+
+The torchao differentiator vs the inference path: `F.linear` against an
+`Int8QuantizedTrainingLinearWeight` is **differentiable** through the
+input — the wrapper's dispatch routes to a custom `torch.autograd.Function`
+that defines both forward and backward. Under LoRA-only training (the
+only path SimpleTuner exercises with `int8-torchao`) the int8 base is
+frozen and only adapter deltas learn; we therefore implement forward +
+`grad_input` only. `grad_weight` and the `aten.copy_` stochastic-round
+writeback are NOT ported (deferred — see below).
+
+Public surface:
+- `quantize_int8_qt(weight: &[f32], shape: [usize; 2], source_is_bf16: bool) -> (Vec<i8>, Vec<f32>)`
+  — symmetric per-row absmax INT8 quant, divisor 127, eps on inv_scale
+  only. `source_is_bf16=true` mirrors torchao's BF16-input path (the
+  realistic one — SimpleTuner always passes BF16 base weights).
+- `Int8QtWeight { codes: CudaSlice<i8>, scales: Tensor, shape, device }`
+  + `upload(...)` + `codes_to_bf16() -> Tensor` — device-side storage.
+- `linear_int8_qt(x, w, bias?) -> Tensor` — autograd-tracked forward;
+  composes `Tensor::matmul + Tensor::mul + Tensor::add` so the standard
+  autograd graph back-propagates `grad_x` (and `grad_bias` if needed)
+  while the frozen int8 weight stays out of the gradient flow.
+
+One NVRTC kernel (`int8_qt_cast::i8_to_bf16_kernel`): sign-extending
+int8 → BF16 cast, 256 threads/block, no shared mem. Compiled once per
+device on first `codes_to_bf16()` call.
+
+**Parity status**: bit-exact (codes mismatch=0, scales max|Δ|=0,
+forward+grad_x max|Δ|=0 and cos=1.0) vs torchao 0.14.1 on a [256, 384]
+synthetic weight at seed=42. Validated 2026-05-17 via
+`tests/parity/int8_torchao_python_ref.py` + `bin/parity_int8_torchao_qt`.
+Two gotchas worth recording (both fixed in the port):
+1. PyTorch `tensor.round()` uses IEEE round-ties-to-even (banker's
+   rounding); Rust's default `f32::round()` uses round-half-away-from-zero.
+   Use `f32::round_ties_even` instead.
+2. torchao quantizes a BF16 nn.Linear weight in BF16 (absmax + scale
+   computed in BF16, then `.float()` for the multiply). An F32-only
+   port would diverge on ~5% of codes by ±1.
+
+**Deferred** (not required for SimpleTuner LoRA parity):
+- `_Int8WeightOnlyLinear.backward` `grad_weight` (int8.py:169-171) —
+  needed only if someone enables full base-grad training on the int8
+  weight directly.
+- `aten.copy_` stochastic-rounding writeback (int8.py:236-252) — used
+  when optimizer steps run **on the quantized weight**. Under LoRA-only,
+  the int8 base never sees an optimizer step.
+- FP8-torchao variant — `convert_to_float8_training` is a separate
+  helper at `int8.py`'s sibling path; would be a new module here.
+
 ### `sgd/mod.rs`
 Basic SGD with momentum + weight decay. F32 implementation with an inline
 NVRTC kernel.
