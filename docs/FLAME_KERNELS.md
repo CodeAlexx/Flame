@@ -851,11 +851,16 @@ no longer allocates per call. Reference impl for SPEED_CONTRACT clause 1's
 **"variable/large workspace, cached per-device buffer"** pattern (mirrors
 `gemm_bf16_cublaslt.cu`'s cuBLASLt workspace cache).
 
+Mask API: callers pass a binary keep mask, not an additive attention bias.
+Mask values `>= 0.5` mean "attend"; values `< 0.5` mean "block". The
+accepted mask shape is `[B|1, H|1, Q, K]` BF16/F32/Bool and is expanded by
+zero stride over broadcast batch/head dimensions.
+
 | Symbol | Line | Notes |
 |---|---|---|
 | `ker_cast_bf16_to_f32` | `:42` | Per-tile BF16 → FP32 cast. |
 | `ker_cast_f32_to_bf16` | `:47` | Inverse. |
-| `ker_apply_scale_mask_rowmax` | `:54` | Apply scale, mask, compute row max. |
+| `ker_apply_scale_mask_rowmax` | `:54` | Apply scale and binary keep mask (`1=attend`, `0=block`), then compute row max. |
 | `ker_row_exp_and_sum` | `:93` | Compute exp + row sum. |
 | `ker_update_l_and_factors` | `:109` | Update l_new and the per-row scale factors. |
 | `ker_row_normalize` | `:137` | Normalize scores by 1/l. |

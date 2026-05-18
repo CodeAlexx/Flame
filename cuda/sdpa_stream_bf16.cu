@@ -51,7 +51,7 @@ __global__ void ker_cast_f32_to_bf16(const float* __restrict__ x, __nv_bfloat16*
     if (i < n) y[i] = __float2bfloat16(x[i]);
 }
 
-// Row-wise: apply scale, optional mask (1=mask), compute new row max m_ij over K_block.
+// Row-wise: apply scale, optional keep mask (1=attend, 0=block), compute new row max m_ij over K_block.
 // scores: [Q_t, K_b] FP32 in row-major contiguous (ld=K_b)
 __global__ void ker_apply_scale_mask_rowmax(
     float* __restrict__ scores, int Q_t, int K_b, float scale,
@@ -79,13 +79,13 @@ __global__ void ker_apply_scale_mask_rowmax(
         #pragma unroll 4
         for (int k=0;k<K_b;++k) {
             float mask_val = __bfloat162float(mrow[k*mask_col_stride]);
-            float v = (mask_val > 0.5f) ? -INFINITY : (row[k] * scale);
+            float v = (mask_val < 0.5f) ? -INFINITY : (row[k] * scale);
             m = fmaxf(m, v);
         }
         m_row[q] = m;
         for (int k=0;k<K_b;++k) {
             float mask_val = __bfloat162float(mrow[k*mask_col_stride]);
-            float v = (mask_val > 0.5f) ? -INFINITY : (row[k] * scale);
+            float v = (mask_val < 0.5f) ? -INFINITY : (row[k] * scale);
             row[k] = v - m;
         }
     }

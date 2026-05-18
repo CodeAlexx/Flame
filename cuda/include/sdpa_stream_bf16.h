@@ -30,7 +30,7 @@ extern "C" {
 // Mask:
 //  - attn_mask may be NULL for "no mask".
 //  - If provided, it must be a row-major [B,H,Q_len,K_len] BF16 array where values
-//    >= 0.5f mark masked positions. Stride in elements given by mask_stride_ek between
+//    >= 0.5f mark positions to attend and < 0.5f mark blocked positions. Stride in elements given by mask_stride_ek between
 //    successive K positions for a fixed (B,H,Q). Stride in rows (Q) is mask_stride_eq.
 //    Stride between heads (H) is mask_stride_eh. Stride between batches (B) is
 //    mask_stride_eb. You can pass zeros for *_stride_* to indicate contiguous [Q,K]

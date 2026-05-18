@@ -1655,6 +1655,14 @@ pub fn conv2d_bf16(
     Ok(out)
 }
 
+/// Streaming BF16 scaled dot-product attention.
+///
+/// Inputs must be `[B, H, Q, Dh]`, `[B, H, K, Dh]`, and `[B, H, K, Dv]`
+/// BF16 tensors on the same CUDA device. `mask`, when present, must be a
+/// 4D binary keep mask broadcastable over batch/head via dimensions of 1:
+/// `[B|1, H|1, Q, K]`, with values `>= 0.5` meaning "attend" and values
+/// `< 0.5` meaning "block". This is intentionally the same convention used
+/// by the non-streaming SDPA wrappers and is not an additive `0/-inf` mask.
 pub fn sdpa_stream_bf16(
     q: &Tensor,
     k: &Tensor,
@@ -1667,6 +1675,12 @@ pub fn sdpa_stream_bf16(
     sdpa_stream_bf16_with_workspace(q, k, v, mask, chunk, causal, scale, None)
 }
 
+/// Streaming BF16 SDPA with an optional caller-managed workspace.
+///
+/// See [`sdpa_stream_bf16`] for tensor layout and mask semantics. The
+/// workspace, when supplied, must be large enough for the selected chunked
+/// path; otherwise the wrapper falls back to the internal per-stream cached
+/// workspace registry.
 pub fn sdpa_stream_bf16_with_workspace(
     q: &Tensor,
     k: &Tensor,
@@ -1797,7 +1811,7 @@ pub fn sdpa_stream_bf16_with_workspace(
         let v_ptr = v.as_device_ptr_bf16("sdpa_stream_bf16:V")? as *const c_void;
         let out_ptr = out.as_mut_device_ptr_bf16("sdpa_stream_bf16:O")? as *mut c_void;
 
-        let mut _mask_buffer: Option<Tensor> = None;
+        let mut _mask_keep_buffer: Option<Tensor> = None;
         let mut mask_heads = 0usize;
         let mut mask_dims: Option<[usize; 4]> = None;
         let mask_ptr = if let Some(m) = mask {
@@ -1811,8 +1825,8 @@ pub fn sdpa_stream_bf16_with_workspace(
                     m.dtype()
                 )));
             };
-            _mask_buffer = Some(converted);
-            let dims = _mask_buffer.as_ref().unwrap().shape().dims();
+            _mask_keep_buffer = Some(converted);
+            let dims = _mask_keep_buffer.as_ref().unwrap().shape().dims();
             if dims[1] != 1 && dims[1] != h {
                 return Err(Error::InvalidInput(format!(
                     "sdpa_stream_bf16: mask head dimension {} incompatible with H {}",
@@ -1821,7 +1835,7 @@ pub fn sdpa_stream_bf16_with_workspace(
             }
             mask_heads = dims[1];
             mask_dims = Some([dims[0], dims[1], dims[2], dims[3]]);
-            _mask_buffer
+            _mask_keep_buffer
                 .as_ref()
                 .unwrap()
                 .as_device_ptr_bf16("sdpa_stream_bf16:mask")? as *const c_void
@@ -1854,7 +1868,6 @@ pub fn sdpa_stream_bf16_with_workspace(
                     stride_eb,
                 )
             };
-
         let parse_env_i32 = |name: &str| -> Option<i32> {
             std::env::var(name).ok().and_then(|v| v.parse::<i32>().ok())
         };
