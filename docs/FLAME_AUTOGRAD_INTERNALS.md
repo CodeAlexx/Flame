@@ -9,19 +9,22 @@ All file references are relative to `/home/alex/EriDiffusion/flame-core/src/`.
 
 ### 1.1 The Node Struct: `TapeEntry`
 
-The computation graph is a linear tape of `TapeEntry` nodes (`autograd.rs:282-309`):
+The computation graph is a linear tape of `TapeEntry` nodes (`autograd.rs`):
 
 ```rust
 struct TapeEntry {
-    output_id: TensorId,                      // ID of the tensor this op produced
-    op: Op,                                   // Which operation (enum variant)
-    saved_tensors: Vec<(TensorId, Tensor)>,   // Inputs needed for backward (Vec, not HashMap)
+    output_id: TensorId,        // ID of the tensor this op produced
+    op: Op,                     // Which operation (enum variant)
+    saved_tensors: SavedTensors, // Legacy saved Tensor values
+    saved_refs: SavedRefs,       // SavedRef path with storage version checks
 }
 ```
 
 - `output_id`: The `TensorId` of the output tensor. Used during backward to look up the gradient flowing into this node.
 - `op`: An `Op` enum variant (47 variants, `autograd.rs:36-279`) describing the forward operation.
-- `saved_tensors`: A `Vec<(TensorId, Tensor)>` of input tensors saved for backward. Looked up by linear scan (`get_saved`, line 297) which is fast because most ops save 1-3 tensors.
+- `saved_tensors`: The legacy inline `SmallVec<(TensorId, Tensor)>` path for input tensors saved for backward.
+- `saved_refs`: The newer `SavedRef` path. By default `record_op` converts saved tensors into `SavedRef` entries unless `FLAME_AUTOGRAD_SAVED_LEGACY=1` is set before process start.
+- Backward code must use `get_saved(id)`, `saved_count()`, or `saved_at(i)` instead of directly indexing `saved_tensors`. Those helpers expose a combined legacy + `SavedRef` view, which keeps older backward handlers compatible with the default saved-ref path.
 
 ### 1.2 Where the Graph Lives: Global Mutex
 
@@ -58,13 +61,13 @@ When `a.add(&b)` is called (`tensor.rs:1678-1703`):
 
 3. **Set output grad tracking** -- `output.requires_grad = true`
 
-4. **Record the op** -- calls `AutogradContext::record_op()` (`autograd.rs:485-512`):
+4. **Record the op** -- calls `AutogradContext::record_op()` (`autograd.rs`):
    - Acquires the global mutex lock on `AUTOGRAD_CONTEXT`
    - Checks `ctx.enabled` (returns immediately if false)
    - Optionally registers saved tensors with `CHECKPOINT_MANAGER` for CPU offload
-   - Pushes a `TapeEntry { output_id, op, saved_tensors }` onto `ctx.tape`
+   - Pushes a `TapeEntry { output_id, op, saved_tensors, saved_refs }` onto `ctx.tape`
 
-For `Add`, saved_tensors is **empty** (`Vec::new()`) because add backward only needs the output gradient, not the inputs. For `Mul`, saved_tensors contains clones of both operands (`tensor.rs:1747`).
+For `Add`, saved state is empty because add backward only needs the output gradient, not the inputs. For `Mul`, both operands are passed to `record_op`; default mode stores them in `saved_refs`, and legacy mode stores them in `saved_tensors`.
 
 ### 1.5 TensorId
 
@@ -104,7 +107,7 @@ This works because the tape records operations in forward execution order, so re
 
 ### 2.4 Compact Index Construction
 
-Before the backward loop, a `CompactIndex` is built (`autograd.rs:683-759`). This maps every `TensorId` that appears in the tape (outputs, inputs, saved tensors) to a sequential `usize` index. The `GradientMap` then uses a flat `Vec<Option<Tensor>>` for O(1) gradient lookup instead of HashMap.
+Before the backward loop, a `CompactIndex` is built. This maps every `TensorId` that appears in the tape (outputs, inputs, saved tensors, and saved refs) to a sequential `usize` index. The `GradientMap` then uses a flat `Vec<Option<Tensor>>` for O(1) gradient lookup instead of HashMap.
 
 ### 2.5 Gradient Initialization
 
@@ -119,7 +122,7 @@ The loss gradient is initialized to a tensor of ones (FP32, `gradient.rs:97-101`
 
 Before the backward loop, a `needed_grad_ids: HashSet<TensorId>` is built containing:
 - All `output_id` values from the tape (intermediate chain nodes)
-- All saved tensor IDs where `requires_grad() == true` (trainable parameters)
+- All saved tensor IDs from the combined legacy + `SavedRef` view where `requires_grad() == true` (trainable parameters)
 
 Frozen base-model weight IDs are excluded. This saves ~5 GB GPU memory for Klein 4B by not accumulating gradients for frozen weights that the optimizer never reads.
 
@@ -323,7 +326,7 @@ Every gradient produced by compute_gradients is cast to BF16 before being return
 | `HuberLoss` | `autograd.rs:2262-2303` | GPU (sign + mask + where_tensor) | Saves predictions + targets |
 | `BCELoss` | `autograd.rs:2306-2333` | GPU (clamp + sub + div + mul) | Saves predictions + targets |
 | `NLLLoss` | `autograd.rs:2336-2375` | GPU (CudaKernels::scatter_add) | Saves log_probs + targets |
-| `GroupNorm` | `autograd.rs:2378-2429` | GPU (autograd_ops_complete::group_norm_backward) | Saves input + mean + var |
+| `GroupNorm` | `autograd.rs:2378-2429` | GPU (autograd_ops_complete::group_norm_backward) | Saves input + mean + var; mean/var are recovered through `saved_at(i)` so both legacy and `SavedRef` storage work |
 | `FlashAttention` | `autograd.rs:2432-2534` | GPU (flash_attention_backward or recompute) | Saves Q, K, V |
 | `SageAttention` | `autograd.rs:2537-2588` | GPU (sage_attention_backward) | Saves Q, K, V + attn weights |
 | `Cast` | `autograd.rs:1321-1325` | GPU (to_dtype) | Pass-through gradient |
@@ -555,8 +558,9 @@ The closure `fetch_saved` defined inside `compute_gradients`
 (`src/autograd.rs:1855-1894`) is the canonical access path for saved
 tensors during backward. It:
 
-1. Pulls the saved tensor (from `entry.saved_tensors` or
-   `CHECKPOINT_MANAGER` if checkpointed).
+1. Pulls the saved tensor (from `entry.get_saved(id)`, which checks
+   `saved_refs` and `saved_tensors`, or from `CHECKPOINT_MANAGER` if
+   checkpointed).
 2. **Materializes via `.contiguous()` if not already contiguous.**
 
 Every backward op that reads a saved tensor's data via a kernel

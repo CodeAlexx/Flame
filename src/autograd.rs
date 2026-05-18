@@ -5375,19 +5375,20 @@ fn compute_gradients(
             let shape = input_tensor.shape().dims();
             let num_channels = shape[1];
 
-            // Saved mean and variance should be in saved_tensors
-            let mean = entry
-                .saved_tensors
-                .iter()
-                .map(|(_, t)| t)
-                .find(|t| t.shape().dims() == [shape[0], *num_groups])
+            // Saved mean and variance may live in either the legacy
+            // saved_tensors vector or the saved-ref path. Use the combined
+            // positional accessor so GroupNorm backward works under both
+            // storage modes.
+            let stat_shape = [shape[0], *num_groups];
+            let mut stats = (0..entry.saved_count()).filter_map(|i| {
+                let (_, t) = entry.saved_at(i)?;
+                (t.shape().dims() == stat_shape).then_some(t)
+            });
+            let mean = stats
+                .next()
                 .ok_or_else(|| Error::InvalidOperation("Missing saved mean".into()))?;
-            let var = entry
-                .saved_tensors
-                .iter()
-                .map(|(_, t)| t)
-                .skip(1)
-                .find(|t| t.shape().dims() == [shape[0], *num_groups])
+            let var = stats
+                .next()
                 .ok_or_else(|| Error::InvalidOperation("Missing saved variance".into()))?;
 
             // Compute gradients
