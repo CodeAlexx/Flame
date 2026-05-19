@@ -1858,7 +1858,13 @@ cross-process plumbing (single-process trainers only).
 - `kernel_launcher.rs` — `LaunchConfig` helpers
 - `bf16_support.rs` — capability check helpers
 - `rng/mod.rs` — `global_rng() / set_seed(seed)` — RNG state
-- `rng/torch_compat.rs` — `randn_torch(seed, shape, device) -> Tensor` — bit-exact `torch.randn(generator=manual_seed(seed))` for CUDA F32. See module doc for the SM-count caveat. ⭐ Used by `port-parity` flow.
+- `rng/torch_compat.rs` — PyTorch-parity CUDA RNG primitives. Same `port-parity` SM-count caveat applies to all. ⭐ Used by `port-parity` flow.
+  - `randn_torch(seed, shape, device) -> Tensor` — bit-exact `torch.randn(generator=manual_seed(seed))` for CUDA F32.
+  - `rand_torch(seed, shape, device) -> Tensor` — bit-exact `torch.rand` (uniform [0, 1)) for CUDA F32.
+  - `bernoulli_torch(seed, shape, p, device) -> Tensor` — bit-exact `torch.empty(shape).bernoulli_(p, generator=g)` for CUDA F32 (0.0/1.0 mask).
+  - `randint_torch(seed, low, high, shape, device) -> Tensor` — bit-exact `torch.randint(low, high, shape)` for CUDA I32. Range constraint: `high - low < 2^32`.
+  - `kaiming_uniform_torch(shape, a: f64, fan, nonlinearity, seed, device) -> Tensor` — bit-exact `torch.nn.init.kaiming_uniform_` (CUDA F32). `a` is f64 to match PyTorch's Python-float gain math: a narrowed-to-f32 `a` or `gain` perturbs the final `bound` by 1 ulp on non-power-of-2 fans (e.g. 137, 1280). Internal compute runs in f64; only the final `bound: f32` is handed to the uniform kernel.
+  - `xavier_uniform_torch(shape, gain: f64, fan_in, fan_out, seed, device) -> Tensor` — bit-exact `torch.nn.init.xavier_uniform_` (CUDA F32). `gain` is f64 for the same reason: callers passing `math.sqrt(2.0)` (the standard relu gain) must not narrow to f32 before the call, or `bound` will be 1 ulp off PyTorch's.
 - `devtensor.rs` — old per-device tensor wrapper
 - `cuda_tensor.rs / cuda_tensor_gpu.rs / cuda_tensor_with_cublas.rs` — old standalone CUDA tensor types
   ⚠️ These predate the unified `Tensor`, do not use.

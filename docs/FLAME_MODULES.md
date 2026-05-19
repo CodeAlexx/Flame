@@ -1515,11 +1515,31 @@ C API surface for non-Rust callers.
 
 ### `rng/mod.rs`
 Global RNG — `global_rng()`, `set_seed(seed)`. Used by `Tensor::randn`. Also
-hosts `torch_compat::randn_torch(seed, shape, device)`, an NVRTC kernel that
-reproduces `torch.randn` on CUDA bit-for-bit (Philox4x32-10 + curand-style
-Box-Muller, sized via PyTorch's grid policy). Output bytes depend on GPU SM
-count — see module docstring. Parity-tested against torch fixtures stored
-under `tests/torch_randn_fixtures/`. F32 only (no BF16/F16 paths yet).
+re-exports the PyTorch-parity primitives from `rng::torch_compat`: NVRTC
+kernels that reproduce PyTorch's CUDA RNG output bit-for-bit. All share the
+same Philox4x32-10 setup that mirrors `curand_init(seed, idx, 0)` and
+PyTorch's `distribution_nullary_kernel` grid policy. Output bytes depend on
+GPU SM count — see module docstring. Parity-tested against torch fixtures
+stored under `tests/torch_randn_fixtures/` and `tests/torch_compat_fixtures/`.
+F32 + I32 only (no BF16/F16/I64 paths yet).
+
+Functions exposed:
+- `randn_torch(seed, shape, device)` — `torch.randn` (normal via Box-Muller).
+- `rand_torch(seed, shape, device)` — `torch.rand` (uniform [0, 1)).
+- `bernoulli_torch(seed, shape, p, device)` — `torch.empty(...).bernoulli_(p)`,
+  emits 0.0/1.0 F32 (typical dropout-mask shape).
+- `randint_torch(seed, low, high, shape, device)` — `torch.randint(low, high,
+  shape)` for ranges `< 2^32`, output I32 (`flame-core` has no I64 storage).
+- `kaiming_uniform_torch(shape, a: f64, fan, nonlinearity, seed, device)` and
+  `xavier_uniform_torch(shape, gain: f64, fan_in, fan_out, seed, device)` —
+  PyTorch `nn.init.{kaiming,xavier}_uniform_` initialisers; both wrap an
+  internal `uniform_torch(seed, shape, -bound, +bound, ...)` so the
+  Philox stream is identical to `tensor.uniform_(a, b, generator=g)`.
+  `a` / `gain` are f64 (matching PyTorch's Python-float semantics). The
+  `bound = sqrt(3) * gain / sqrt(fan)` math runs entirely in f64; only the
+  final `bound` is cast to f32 at the kernel-launch boundary. Narrowing
+  `a` or `gain` to f32 at the API boundary would lose 29 bits of mantissa
+  and break bit-exact parity on non-power-of-2 fan values (e.g. 137, 1280).
 
 **Layout gotcha.** PyTorch's CUDA RNG is shape-dependent (per-thread
 subsequence). Calling `randn_torch(seed=42, shape=(N,))` and then
@@ -1530,12 +1550,6 @@ the same but the (position) → flat-index mapping differs. To match Python's
 shape=(L, C), device)` first, THEN reshape. See `inference-flame/src/bin/
 lance_t2v.rs` for a canonical example: torch.randn(L, C) → reshape (T, H,
 W, C) → permute (C, T, H, W) → unsqueeze batch.
-
-**Future torch-compat additions to consider** (same NVRTC skeleton, each
-~1 day): `rand_torch` (uniform[0,1) via curand_uniform4), `bernoulli_torch`
-(dropout masks), `randint_torch` (uniform integers), Kaiming/Xavier
-init helpers. The pattern in `torch_compat.rs` generalizes — Philox4_32
-→ u32 quad → distribution-specific transform.
 
 ### `devtensor.rs`
 ⚠️ Old per-device tensor wrapper. Predates the unified `Tensor`.

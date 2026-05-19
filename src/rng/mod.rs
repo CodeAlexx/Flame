@@ -4,7 +4,10 @@
 //! for bit-exact parity tests when porting models from PyTorch.
 
 pub mod torch_compat;
-pub use torch_compat::randn_torch;
+pub use torch_compat::{
+    bernoulli_torch, kaiming_uniform_torch, rand_torch, randint_torch, randn_torch,
+    xavier_uniform_torch,
+};
 
 use crate::{DType, Error, Shape, Tensor};
 use cudarc::{

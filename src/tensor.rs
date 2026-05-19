@@ -3304,6 +3304,16 @@ extern "C" __global__ void f32_to_bool_kernel(
         Ok(cpu_data)
     }
 
+    /// Copy the underlying I32 storage to host. Fails if the tensor's
+    /// storage is not I32 (no implicit cast — this is the bit-exact
+    /// readback path used by `rng::randint_torch`'s parity tests).
+    pub fn to_vec_i32(&self) -> Result<Vec<i32>> {
+        let slice = self.storage.try_as_slice_i32()?;
+        self.device
+            .dtoh_sync_copy(slice)
+            .map_err(|e| Error::CudaDriver(format!("{e:?}")))
+    }
+
     #[cfg(feature = "bf16_u16")]
     pub fn to_vec_bf16(&self) -> Result<Vec<u16>> {
         if self.dtype() != DType::BF16 {

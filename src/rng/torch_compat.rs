@@ -1,8 +1,16 @@
-//! PyTorch-compatible `torch.randn` on CUDA.
+//! PyTorch-compatible CUDA RNG primitives.
 //!
-//! Goal: produce bit-identical F32 normal samples to
-//! `torch.randn(shape, generator=torch.Generator(device='cuda').manual_seed(seed))`
-//! for any given `seed`.
+//! Goal: produce bit-identical CUDA samples to PyTorch's
+//! `torch.randn` / `torch.rand` / `torch.bernoulli` / `torch.randint` and the
+//! `torch.nn.init.{kaiming_uniform_, xavier_uniform_}` initialisers, for any
+//! given `seed`.
+//!
+//! All functions in this module share the same Philox4x32-10 state setup
+//! that mirrors curand's `curand_init(seed, idx, 0)` and PyTorch's
+//! `distribution_nullary_kernel` (DistributionTemplates.h). The "u32 →
+//! float", "u32 → integer", and "u32 → normal via Box-Muller" transforms
+//! are all derived from the same Philox quad stream — only the per-element
+//! transform differs.
 //!
 //! PyTorch's CUDA normal kernel lives in
 //! `aten/src/ATen/native/cuda/DistributionTemplates.h`. The key facts we have
@@ -200,10 +208,228 @@ __global__ void flame_randn_torch_f32(float* __restrict__ out,
     }
 }
 
+// ---------------------------------------------------------------------------
+// `torch.rand` — uniform [0, 1).
+//
+// PyTorch's uniform_kernel (DistributionTemplates.h:458) uses curand_uniform4
+// (which returns floats in (0, 1]), then computes:
+//     value = rand * (to - from) + from
+//     reverse_bound_value = (value == to) ? from : value
+// For (from=0, to=1) this reduces to `value = rand; if (value == 1.0) value = 0.0;`
+// i.e. flip the (0,1] -> [0,1) bound by mapping the 1.0 entry to 0.0.
+// _curand_uniform formula (curand_uniform.h:69-72):
+//     y = x * CURAND_2POW32_INV + (CURAND_2POW32_INV / 2.0f)
+__device__ __forceinline__ float flame_curand_uniform_u32(unsigned int x) {
+    return ((float)x) * CURAND_2POW32_INV + (CURAND_2POW32_INV * 0.5f);
+}
+
+__global__ void flame_rand_torch_f32(float* __restrict__ out,
+                                      int numel,
+                                      unsigned long long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    int unroll = 4;
+    int rounded_size = ((numel - 1) / (stride * unroll) + 1) * stride * unroll;
+    unsigned int k0 = (unsigned int)(seed & 0xFFFFFFFFu);
+    unsigned int k1 = (unsigned int)((seed >> 32) & 0xFFFFFFFFu);
+    unsigned int idx_u = (unsigned int)idx;
+    unsigned long long curand4_calls = 0;
+
+    for (int linear_index = idx; linear_index < rounded_size; linear_index += stride * unroll) {
+        unsigned int c0 = (unsigned int)curand4_calls;
+        unsigned int c1 = 0;
+        unsigned int c2 = idx_u;
+        unsigned int c3 = 0;
+        flame_philox_10(&c0, &c1, &c2, &c3, k0, k1);
+
+        float u0 = flame_curand_uniform_u32(c0);
+        float u1 = flame_curand_uniform_u32(c1);
+        float u2 = flame_curand_uniform_u32(c2);
+        float u3 = flame_curand_uniform_u32(c3);
+        // (0,1] -> [0,1) reverse-bound: if u==1.0 emit 0.0. range=1, from=0.
+        if (u0 == 1.0f) u0 = 0.0f;
+        if (u1 == 1.0f) u1 = 0.0f;
+        if (u2 == 1.0f) u2 = 0.0f;
+        if (u3 == 1.0f) u3 = 0.0f;
+
+        int li0 = linear_index;
+        int li1 = linear_index + stride;
+        int li2 = linear_index + 2 * stride;
+        int li3 = linear_index + 3 * stride;
+        if (li0 < numel) out[li0] = u0;
+        if (li1 < numel) out[li1] = u1;
+        if (li2 < numel) out[li2] = u2;
+        if (li3 < numel) out[li3] = u3;
+
+        curand4_calls += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `torch.empty(shape).bernoulli_(p, generator=g)` — scalar Bernoulli.
+//
+// PyTorch's bernoulli_kernel (DistributionTemplates.h:649) for scalar p uses
+// uniform_and_transform with `bernoulli(rand, p) = (rand < p) ? 1.0 : 0.0`,
+// where rand is in (0, 1] from curand_uniform4. Output dtype here is F32
+// (matches `torch.empty(shape, dtype=torch.float32).bernoulli_(p)`).
+__global__ void flame_bernoulli_torch_f32(float* __restrict__ out,
+                                           int numel,
+                                           unsigned long long seed,
+                                           float p) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    int unroll = 4;
+    int rounded_size = ((numel - 1) / (stride * unroll) + 1) * stride * unroll;
+    unsigned int k0 = (unsigned int)(seed & 0xFFFFFFFFu);
+    unsigned int k1 = (unsigned int)((seed >> 32) & 0xFFFFFFFFu);
+    unsigned int idx_u = (unsigned int)idx;
+    unsigned long long curand4_calls = 0;
+
+    for (int linear_index = idx; linear_index < rounded_size; linear_index += stride * unroll) {
+        unsigned int c0 = (unsigned int)curand4_calls;
+        unsigned int c1 = 0;
+        unsigned int c2 = idx_u;
+        unsigned int c3 = 0;
+        flame_philox_10(&c0, &c1, &c2, &c3, k0, k1);
+
+        float u0 = flame_curand_uniform_u32(c0);
+        float u1 = flame_curand_uniform_u32(c1);
+        float u2 = flame_curand_uniform_u32(c2);
+        float u3 = flame_curand_uniform_u32(c3);
+        float b0 = (u0 < p) ? 1.0f : 0.0f;
+        float b1 = (u1 < p) ? 1.0f : 0.0f;
+        float b2 = (u2 < p) ? 1.0f : 0.0f;
+        float b3 = (u3 < p) ? 1.0f : 0.0f;
+
+        int li0 = linear_index;
+        int li1 = linear_index + stride;
+        int li2 = linear_index + 2 * stride;
+        int li3 = linear_index + 3 * stride;
+        if (li0 < numel) out[li0] = b0;
+        if (li1 < numel) out[li1] = b1;
+        if (li2 < numel) out[li2] = b2;
+        if (li3 < numel) out[li3] = b3;
+
+        curand4_calls += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `torch.randint(low, high, shape, dtype=torch.int32)` — uniform integers.
+//
+// PyTorch's random_from_to_kernel (DistributionTemplates.h:287) for range
+// < 2^32 uses curand4 (uint4 directly) and the transform
+// `uniform_int_from_to<scalar_t>(val, range, base) = (val % range) + base`
+// (TransformationHelper.h:41). Output dtype here is I32 (flame-core does not
+// have an I64 storage path; matches the int32-cast of torch.randint).
+__global__ void flame_randint_torch_i32(int* __restrict__ out,
+                                         int numel,
+                                         unsigned long long seed,
+                                         unsigned int range,
+                                         long long base) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    int unroll = 4;
+    int rounded_size = ((numel - 1) / (stride * unroll) + 1) * stride * unroll;
+    unsigned int k0 = (unsigned int)(seed & 0xFFFFFFFFu);
+    unsigned int k1 = (unsigned int)((seed >> 32) & 0xFFFFFFFFu);
+    unsigned int idx_u = (unsigned int)idx;
+    unsigned long long curand4_calls = 0;
+
+    for (int linear_index = idx; linear_index < rounded_size; linear_index += stride * unroll) {
+        unsigned int c0 = (unsigned int)curand4_calls;
+        unsigned int c1 = 0;
+        unsigned int c2 = idx_u;
+        unsigned int c3 = 0;
+        flame_philox_10(&c0, &c1, &c2, &c3, k0, k1);
+
+        // uniform_int_from_to: (val % range) + base, then static_cast<int64_t>,
+        // then static_cast<scalar_t>. We narrow to i32 here.
+        long long v0 = (long long)(c0 % range) + base;
+        long long v1 = (long long)(c1 % range) + base;
+        long long v2 = (long long)(c2 % range) + base;
+        long long v3 = (long long)(c3 % range) + base;
+
+        int li0 = linear_index;
+        int li1 = linear_index + stride;
+        int li2 = linear_index + 2 * stride;
+        int li3 = linear_index + 3 * stride;
+        if (li0 < numel) out[li0] = (int)v0;
+        if (li1 < numel) out[li1] = (int)v1;
+        if (li2 < numel) out[li2] = (int)v2;
+        if (li3 < numel) out[li3] = (int)v3;
+
+        curand4_calls += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `tensor.uniform_(a, b, generator=g)` — uniform [a, b) with reverse-bound.
+//
+// Same as flame_rand_torch_f32 but with arbitrary [from, to) range. Kaiming
+// and Xavier uniform initialisers both call this with `a = -bound, b = +bound`.
+// Matches PyTorch's uniform_kernel (DistributionTemplates.h:458) bit-for-bit.
+__global__ void flame_uniform_torch_f32(float* __restrict__ out,
+                                         int numel,
+                                         unsigned long long seed,
+                                         float from,
+                                         float to) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    int unroll = 4;
+    int rounded_size = ((numel - 1) / (stride * unroll) + 1) * stride * unroll;
+    unsigned int k0 = (unsigned int)(seed & 0xFFFFFFFFu);
+    unsigned int k1 = (unsigned int)((seed >> 32) & 0xFFFFFFFFu);
+    unsigned int idx_u = (unsigned int)idx;
+    unsigned long long curand4_calls = 0;
+    float range = to - from;
+
+    for (int linear_index = idx; linear_index < rounded_size; linear_index += stride * unroll) {
+        unsigned int c0 = (unsigned int)curand4_calls;
+        unsigned int c1 = 0;
+        unsigned int c2 = idx_u;
+        unsigned int c3 = 0;
+        flame_philox_10(&c0, &c1, &c2, &c3, k0, k1);
+
+        float u0 = flame_curand_uniform_u32(c0);
+        float u1 = flame_curand_uniform_u32(c1);
+        float u2 = flame_curand_uniform_u32(c2);
+        float u3 = flame_curand_uniform_u32(c3);
+        float v0 = u0 * range + from;
+        float v1 = u1 * range + from;
+        float v2 = u2 * range + from;
+        float v3 = u3 * range + from;
+        // reverse-bound: value == to -> from. See DistributionTemplates.h:474.
+        if (v0 == to) v0 = from;
+        if (v1 == to) v1 = from;
+        if (v2 == to) v2 = from;
+        if (v3 == to) v3 = from;
+
+        int li0 = linear_index;
+        int li1 = linear_index + stride;
+        int li2 = linear_index + 2 * stride;
+        int li3 = linear_index + 3 * stride;
+        if (li0 < numel) out[li0] = v0;
+        if (li1 < numel) out[li1] = v1;
+        if (li2 < numel) out[li2] = v2;
+        if (li3 < numel) out[li3] = v3;
+
+        curand4_calls += 1;
+    }
+}
+
 } // extern "C"
 "#;
 
 static MOD_ONCE: OnceLock<()> = OnceLock::new();
+
+const KERNEL_NAMES: &[&str] = &[
+    "flame_randn_torch_f32",
+    "flame_rand_torch_f32",
+    "flame_bernoulli_torch_f32",
+    "flame_randint_torch_i32",
+    "flame_uniform_torch_f32",
+];
 
 fn ensure_module(dev: &Arc<CudaDevice>) -> Result<(), Error> {
     if dev
@@ -219,9 +445,9 @@ fn ensure_module(dev: &Arc<CudaDevice>) -> Result<(), Error> {
         let mut opts = CompileOptions::default();
         opts.include_paths.push(include_path);
         let ptx = compile_ptx_with_opts(CUDA_SRC, opts)
-            .map_err(|e| Error::KernelError(format!("torch_randn NVRTC: {e:?}")))?;
-        dev.load_ptx(ptx, "flame_rng_torch", &["flame_randn_torch_f32"])
-            .map_err(|e| Error::KernelError(format!("torch_randn load_ptx: {e:?}")))?;
+            .map_err(|e| Error::KernelError(format!("torch_compat NVRTC: {e:?}")))?;
+        dev.load_ptx(ptx, "flame_rng_torch", KERNEL_NAMES)
+            .map_err(|e| Error::KernelError(format!("torch_compat load_ptx: {e:?}")))?;
         let _ = MOD_ONCE.set(());
     }
     Ok(())
@@ -293,4 +519,309 @@ pub fn randn_torch(
     }
     tensor.storage_mut().bump_version();
     Ok(tensor)
+}
+
+/// Allocate an F32 tensor and fill it with samples bit-identical to
+/// `torch.rand(shape, generator=torch.Generator(device='cuda').manual_seed(seed))`.
+///
+/// Output is in `[0, 1)`. Mirrors PyTorch's `uniform_kernel`
+/// (DistributionTemplates.h:458) with `from=0, to=1`: each Philox u32 is
+/// mapped through `_curand_uniform` to (0, 1], then any 1.0 value is
+/// flipped to 0.0 by the reverse-bound rule.
+///
+/// Same SM-count caveat as [`randn_torch`].
+pub fn rand_torch(
+    seed: u64,
+    shape: Shape,
+    device: Arc<CudaDevice>,
+) -> Result<Tensor, Error> {
+    let n = shape.elem_count();
+    let mut tensor = Tensor::zeros_dtype(shape, crate::DType::F32, Arc::clone(&device))?;
+    if n == 0 {
+        return Ok(tensor);
+    }
+    ensure_module(&device)?;
+    let (grid, block) = calc_grid(&device, n)?;
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let slice = tensor.storage_mut().try_as_mut_slice_f32()?;
+        let func = device
+            .get_func("flame_rng_torch", "flame_rand_torch_f32")
+            .ok_or_else(|| Error::KernelError("flame_rand_torch_f32 missing".into()))?;
+        let seed_arg: u64 = seed;
+        let numel_arg: i32 = n as i32;
+        func.launch(cfg, (slice, numel_arg, seed_arg))
+            .map_err(|e| Error::KernelError(format!("flame_rand_torch_f32 launch: {e:?}")))?;
+    }
+    tensor.storage_mut().bump_version();
+    Ok(tensor)
+}
+
+/// Allocate an F32 tensor and fill it with samples bit-identical to
+/// `torch.empty(shape, dtype=torch.float32, device='cuda').bernoulli_(p,
+/// generator=torch.Generator(device='cuda').manual_seed(seed))`.
+///
+/// Output values are 0.0 or 1.0. Mirrors PyTorch's scalar-`p`
+/// `bernoulli_kernel` (DistributionTemplates.h:649) which is
+/// `uniform_and_transform` composed with
+/// `transformation::bernoulli(rand, p) = (rand < p)` where `rand` is the
+/// uniform (0, 1] value from `curand_uniform4`.
+///
+/// `p` must be in `[0, 1]`. Same SM-count caveat as [`randn_torch`].
+pub fn bernoulli_torch(
+    seed: u64,
+    shape: Shape,
+    p: f32,
+    device: Arc<CudaDevice>,
+) -> Result<Tensor, Error> {
+    if !(p.is_finite() && (0.0..=1.0).contains(&p)) {
+        return Err(Error::InvalidInput(format!(
+            "bernoulli_torch: p must be in [0, 1], got {p}"
+        )));
+    }
+    let n = shape.elem_count();
+    let mut tensor = Tensor::zeros_dtype(shape, crate::DType::F32, Arc::clone(&device))?;
+    if n == 0 {
+        return Ok(tensor);
+    }
+    ensure_module(&device)?;
+    let (grid, block) = calc_grid(&device, n)?;
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let slice = tensor.storage_mut().try_as_mut_slice_f32()?;
+        let func = device
+            .get_func("flame_rng_torch", "flame_bernoulli_torch_f32")
+            .ok_or_else(|| Error::KernelError("flame_bernoulli_torch_f32 missing".into()))?;
+        let seed_arg: u64 = seed;
+        let numel_arg: i32 = n as i32;
+        let p_arg: f32 = p;
+        func.launch(cfg, (slice, numel_arg, seed_arg, p_arg))
+            .map_err(|e| Error::KernelError(format!("flame_bernoulli_torch_f32 launch: {e:?}")))?;
+    }
+    tensor.storage_mut().bump_version();
+    Ok(tensor)
+}
+
+/// Allocate an I32 tensor and fill it with samples that match
+/// `torch.randint(low, high, shape, dtype=torch.int32, device='cuda',
+/// generator=torch.Generator(device='cuda').manual_seed(seed))`.
+///
+/// **Constraint**: `high - low` must fit in a `u32` (i.e. range < 2^32).
+/// This is the only regime PyTorch's `random_from_to_kernel` uses the
+/// uint32 dispatch — and it's the only one flame-core's I32 storage can
+/// represent. For ranges ≥ 2^32 you would need an I64 storage path
+/// (which flame-core does not currently expose).
+///
+/// Mirrors `uniform_int_from_to<scalar_t>(val, range, base) = (val %
+/// range) + base` (TransformationHelper.h:41).
+///
+/// Compatibility against `torch.randint` (whose default dtype is `int64`)
+/// works because for ranges < 2^32 every sampled value fits in an `i32`
+/// and the bit pattern of the i32 cast matches the low 32 bits of the
+/// i64. The Python fixture generator casts to int32 before saving for
+/// direct bit comparison.
+///
+/// Same SM-count caveat as [`randn_torch`].
+pub fn randint_torch(
+    seed: u64,
+    low: i64,
+    high: i64,
+    shape: Shape,
+    device: Arc<CudaDevice>,
+) -> Result<Tensor, Error> {
+    if high <= low {
+        return Err(Error::InvalidInput(format!(
+            "randint_torch: high ({high}) must be > low ({low})"
+        )));
+    }
+    let range_i64 = high - low;
+    if range_i64 > u32::MAX as i64 {
+        return Err(Error::InvalidInput(format!(
+            "randint_torch: range {range_i64} exceeds 2^32; I64 storage not supported"
+        )));
+    }
+    let range_u32 = range_i64 as u32;
+    let n = shape.elem_count();
+    let mut tensor = Tensor::zeros_dtype(shape, crate::DType::I32, Arc::clone(&device))?;
+    if n == 0 {
+        return Ok(tensor);
+    }
+    ensure_module(&device)?;
+    let (grid, block) = calc_grid(&device, n)?;
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let slice = tensor.storage_mut().try_as_mut_slice_i32()?;
+        let func = device
+            .get_func("flame_rng_torch", "flame_randint_torch_i32")
+            .ok_or_else(|| Error::KernelError("flame_randint_torch_i32 missing".into()))?;
+        let seed_arg: u64 = seed;
+        let numel_arg: i32 = n as i32;
+        let range_arg: u32 = range_u32;
+        let base_arg: i64 = low;
+        func.launch(cfg, (slice, numel_arg, seed_arg, range_arg, base_arg))
+            .map_err(|e| Error::KernelError(format!("flame_randint_torch_i32 launch: {e:?}")))?;
+    }
+    tensor.storage_mut().bump_version();
+    Ok(tensor)
+}
+
+/// Internal helper: allocate F32 tensor and fill it with uniform[a, b)
+/// samples matching `tensor.uniform_(a, b, generator=g)`. Used by the
+/// Kaiming and Xavier init functions; not exported because the
+/// dedicated init helpers are the intended entry points.
+fn uniform_torch(
+    seed: u64,
+    shape: Shape,
+    from: f32,
+    to: f32,
+    device: Arc<CudaDevice>,
+) -> Result<Tensor, Error> {
+    if !(from.is_finite() && to.is_finite() && to > from) {
+        return Err(Error::InvalidInput(format!(
+            "uniform_torch: requires finite from < to, got from={from}, to={to}"
+        )));
+    }
+    let n = shape.elem_count();
+    let mut tensor = Tensor::zeros_dtype(shape, crate::DType::F32, Arc::clone(&device))?;
+    if n == 0 {
+        return Ok(tensor);
+    }
+    ensure_module(&device)?;
+    let (grid, block) = calc_grid(&device, n)?;
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let slice = tensor.storage_mut().try_as_mut_slice_f32()?;
+        let func = device
+            .get_func("flame_rng_torch", "flame_uniform_torch_f32")
+            .ok_or_else(|| Error::KernelError("flame_uniform_torch_f32 missing".into()))?;
+        let seed_arg: u64 = seed;
+        let numel_arg: i32 = n as i32;
+        let from_arg: f32 = from;
+        let to_arg: f32 = to;
+        func.launch(cfg, (slice, numel_arg, seed_arg, from_arg, to_arg))
+            .map_err(|e| Error::KernelError(format!("flame_uniform_torch_f32 launch: {e:?}")))?;
+    }
+    tensor.storage_mut().bump_version();
+    Ok(tensor)
+}
+
+/// `gain` for `torch.nn.init.calculate_gain(nonlinearity, a)`.
+///
+/// Returns `f64` (matching PyTorch's Python-float semantics) — the value is
+/// kept at full f64 precision until the final `bound: f32` is computed at
+/// the kernel-launch boundary. Casting to `f32` here drops 29 bits of
+/// mantissa and breaks bit-exact parity for non-power-of-2 `fan` (e.g.
+/// `fan=137, 768, 1280, 3072`), since `gain / sqrt(fan)` would inherit the
+/// 1-ulp loss from the gain narrowing.
+///
+/// Reference: `torch/nn/init.py:calculate_gain` keeps `gain` as Python
+/// float (= f64) throughout.
+fn kaiming_gain(nonlinearity: &str, a: f64) -> Result<f64, Error> {
+    match nonlinearity {
+        "leaky_relu" => Ok((2.0_f64 / (1.0 + a * a)).sqrt()),
+        "relu" => Ok((2.0_f64).sqrt()),
+        "linear" | "sigmoid" | "conv1d" | "conv2d" | "conv3d" | "conv_transpose1d"
+        | "conv_transpose2d" | "conv_transpose3d" => Ok(1.0_f64),
+        "tanh" => Ok(5.0_f64 / 3.0_f64),
+        "selu" => Ok(0.75_f64),
+        other => Err(Error::InvalidInput(format!(
+            "kaiming_gain: unsupported nonlinearity '{other}'"
+        ))),
+    }
+}
+
+/// Allocate an F32 tensor of the given `shape` and fill it with samples
+/// bit-identical to PyTorch's
+/// `torch.nn.init.kaiming_uniform_(tensor, a, mode='fan_in',
+/// nonlinearity, generator=torch.Generator(device='cuda').manual_seed(seed))`.
+///
+/// Reference: `torch/nn/init.py:456-518`. The bound is computed as
+///   `gain = calculate_gain(nonlinearity, a)`
+///   `bound = sqrt(3.0) * gain / sqrt(fan)`
+/// where `fan = fan_in` (the canonical default mode) — pass `fan_in` for
+/// the typical case, or pass `fan_out` if you need `mode='fan_out'`.
+///
+/// Returns a fresh tensor (flame-core has no `Tensor::uniform_` in-place
+/// at present). Match PyTorch by initialising your weight buffer from
+/// this tensor's data.
+///
+/// Same SM-count caveat as [`randn_torch`].
+pub fn kaiming_uniform_torch(
+    shape: Shape,
+    a: f64,
+    fan: usize,
+    nonlinearity: &str,
+    seed: u64,
+    device: Arc<CudaDevice>,
+) -> Result<Tensor, Error> {
+    if fan == 0 {
+        return Err(Error::InvalidInput("kaiming_uniform_torch: fan == 0".into()));
+    }
+    // Match PyTorch's computation order (`torch/nn/init.py:kaiming_uniform_`):
+    //   gain  = calculate_gain(nonlinearity, a)
+    //   std   = gain / math.sqrt(fan)
+    //   bound = math.sqrt(3.0) * std
+    // Every intermediate is Python-float (f64). Only the final `bound` is
+    // cast to f32 at the kernel-launch boundary, matching PyTorch's CUDA
+    // path which hands f32 (from, to) to its uniform_ kernel.
+    let gain = kaiming_gain(nonlinearity, a)?;
+    let std = gain / (fan as f64).sqrt();
+    let bound = (3.0_f64).sqrt() * std;
+    let b = bound as f32;
+    uniform_torch(seed, shape, -b, b, device)
+}
+
+/// Allocate an F32 tensor of the given `shape` and fill it with samples
+/// bit-identical to PyTorch's
+/// `torch.nn.init.xavier_uniform_(tensor, gain,
+/// generator=torch.Generator(device='cuda').manual_seed(seed))`.
+///
+/// Reference: `torch/nn/init.py:366-404`. The bound is
+///   `std = gain * sqrt(2.0 / (fan_in + fan_out))`
+///   `bound = sqrt(3.0) * std`.
+///
+/// Returns a fresh tensor (flame-core has no `Tensor::uniform_` in-place
+/// at present).
+///
+/// Same SM-count caveat as [`randn_torch`].
+pub fn xavier_uniform_torch(
+    shape: Shape,
+    gain: f64,
+    fan_in: usize,
+    fan_out: usize,
+    seed: u64,
+    device: Arc<CudaDevice>,
+) -> Result<Tensor, Error> {
+    if fan_in == 0 && fan_out == 0 {
+        return Err(Error::InvalidInput(
+            "xavier_uniform_torch: fan_in + fan_out == 0".into(),
+        ));
+    }
+    // Match PyTorch's computation order (`torch/nn/init.py:xavier_uniform_`):
+    //   std   = gain * sqrt(2.0 / (fan_in + fan_out))
+    //   bound = sqrt(3.0) * std
+    // `gain` is Python-float (f64) — callers passing `math.sqrt(2.0)` etc.
+    // must NOT narrow to f32 before this call, or the final `bound` will be
+    // off by 1 ulp from PyTorch's. Only the f32 cast at the kernel boundary
+    // is allowed to lose precision.
+    let std = gain * (2.0_f64 / ((fan_in + fan_out) as f64)).sqrt();
+    let bound = (3.0_f64).sqrt() * std;
+    let b = bound as f32;
+    uniform_torch(seed, shape, -b, b, device)
 }

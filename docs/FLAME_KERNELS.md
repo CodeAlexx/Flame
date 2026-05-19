@@ -149,6 +149,10 @@ pub fn cudnn_conv2d_bf16(
 |---|---|---|
 | `fill_rand_f32` | `:18` | Per-thread xorshift32 F32 random fill. Used by `Tensor::randn` for the F32 path. |
 | `flame_randn_torch_f32` | `rng/torch_compat.rs` | **Bit-exact** `torch.randn` parity. Mirrors PyTorch's `distribution_elementwise_grid_stride_kernel` + `curand_normal4`: per-thread Philox4x32-10 seeded with `curand_init(seed, idx, 0)`, two Box-Muller pairs per quad, grid-stride loop with `unroll=4`. Grid sized to PyTorch's `calc_execution_policy`. Tested against torch fixtures at `tests/torch_randn_fixtures/`. |
+| `flame_rand_torch_f32` | `rng/torch_compat.rs` | **Bit-exact** `torch.rand` parity (uniform [0, 1)). Mirrors `uniform_kernel` (DistributionTemplates.h:458) with from=0, to=1: same Philox4_32_10 state setup, `_curand_uniform(x) = x * 2^-32 + 2^-33` per element, then reverse-bound `if (u == 1.0) u = 0.0`. Tested at `tests/torch_compat_fixtures/`. |
+| `flame_bernoulli_torch_f32` | `rng/torch_compat.rs` | **Bit-exact** `torch.empty(shape).bernoulli_(p, generator=g)` parity. Same uniform stream as `flame_rand_torch_f32`; emits `(u < p) ? 1.0 : 0.0` per element. Tested at `tests/torch_compat_fixtures/`. |
+| `flame_randint_torch_i32` | `rng/torch_compat.rs` | **Bit-exact** `torch.randint(low, high, shape)` parity for ranges < 2^32. Mirrors `random_from_to_kernel`'s uint32 dispatch (DistributionTemplates.h:309) + `uniform_int_from_to(val, range, base) = (val % range) + base`. Output I32. Tested at `tests/torch_compat_fixtures/`. |
+| `flame_uniform_torch_f32` | `rng/torch_compat.rs` | **Bit-exact** `tensor.uniform_(a, b, generator=g)` parity. Underlies `kaiming_uniform_torch` and `xavier_uniform_torch`. Same uniform stream as `flame_rand_torch_f32`; applies `value = rand * (to - from) + from` with reverse-bound `if (value == to) value = from`. Tested at `tests/torch_compat_fixtures/`. |
 
 ### `sgd/mod.rs` — F32 SGD step
 
