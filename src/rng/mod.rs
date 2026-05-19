@@ -1,4 +1,10 @@
 //! Minimal GPU RNG using xorshift32 kernels (NVRTC). Fills tensors on-device.
+//!
+//! See also [`torch_compat`] for a `torch.randn`-compatible variant used
+//! for bit-exact parity tests when porting models from PyTorch.
+
+pub mod torch_compat;
+pub use torch_compat::randn_torch;
 
 use crate::{DType, Error, Shape, Tensor};
 use cudarc::{

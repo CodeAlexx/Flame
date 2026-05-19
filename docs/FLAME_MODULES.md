@@ -1514,7 +1514,28 @@ C API surface for non-Rust callers.
 `LaunchConfig` helpers — block/grid sizing, occupancy hints.
 
 ### `rng/mod.rs`
-Global RNG — `global_rng()`, `set_seed(seed)`. Used by `Tensor::randn`.
+Global RNG — `global_rng()`, `set_seed(seed)`. Used by `Tensor::randn`. Also
+hosts `torch_compat::randn_torch(seed, shape, device)`, an NVRTC kernel that
+reproduces `torch.randn` on CUDA bit-for-bit (Philox4x32-10 + curand-style
+Box-Muller, sized via PyTorch's grid policy). Output bytes depend on GPU SM
+count — see module docstring. Parity-tested against torch fixtures stored
+under `tests/torch_randn_fixtures/`. F32 only (no BF16/F16 paths yet).
+
+**Layout gotcha.** PyTorch's CUDA RNG is shape-dependent (per-thread
+subsequence). Calling `randn_torch(seed=42, shape=(N,))` and then
+reshape-permuting to a 4D layout does NOT produce the same per-position
+values as `randn_torch(seed=42, shape=(B, C, H, W))` — the flat stream is
+the same but the (position) → flat-index mapping differs. To match Python's
+`torch.randn(L, C)` followed by reshape/permute, call `randn_torch(seed,
+shape=(L, C), device)` first, THEN reshape. See `inference-flame/src/bin/
+lance_t2v.rs` for a canonical example: torch.randn(L, C) → reshape (T, H,
+W, C) → permute (C, T, H, W) → unsqueeze batch.
+
+**Future torch-compat additions to consider** (same NVRTC skeleton, each
+~1 day): `rand_torch` (uniform[0,1) via curand_uniform4), `bernoulli_torch`
+(dropout masks), `randint_torch` (uniform integers), Kaiming/Xavier
+init helpers. The pattern in `torch_compat.rs` generalizes — Philox4_32
+→ u32 quad → distribution-specific transform.
 
 ### `devtensor.rs`
 ⚠️ Old per-device tensor wrapper. Predates the unified `Tensor`.

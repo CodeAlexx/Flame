@@ -147,7 +147,8 @@ pub fn cudnn_conv2d_bf16(
 
 | Kernel | Line | Purpose |
 |---|---|---|
-| `fill_rand_f32` | `:18` | Per-thread Philox-style F32 random fill. Used by `Tensor::randn` for the F32 path. |
+| `fill_rand_f32` | `:18` | Per-thread xorshift32 F32 random fill. Used by `Tensor::randn` for the F32 path. |
+| `flame_randn_torch_f32` | `rng/torch_compat.rs` | **Bit-exact** `torch.randn` parity. Mirrors PyTorch's `distribution_elementwise_grid_stride_kernel` + `curand_normal4`: per-thread Philox4x32-10 seeded with `curand_init(seed, idx, 0)`, two Box-Muller pairs per quad, grid-stride loop with `unroll=4`. Grid sized to PyTorch's `calc_execution_policy`. Tested against torch fixtures at `tests/torch_randn_fixtures/`. |
 
 ### `sgd/mod.rs` — F32 SGD step
 

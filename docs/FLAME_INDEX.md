@@ -1858,6 +1858,7 @@ cross-process plumbing (single-process trainers only).
 - `kernel_launcher.rs` — `LaunchConfig` helpers
 - `bf16_support.rs` — capability check helpers
 - `rng/mod.rs` — `global_rng() / set_seed(seed)` — RNG state
+- `rng/torch_compat.rs` — `randn_torch(seed, shape, device) -> Tensor` — bit-exact `torch.randn(generator=manual_seed(seed))` for CUDA F32. See module doc for the SM-count caveat. ⭐ Used by `port-parity` flow.
 - `devtensor.rs` — old per-device tensor wrapper
 - `cuda_tensor.rs / cuda_tensor_gpu.rs / cuda_tensor_with_cublas.rs` — old standalone CUDA tensor types
   ⚠️ These predate the unified `Tensor`, do not use.
