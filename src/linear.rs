@@ -199,6 +199,7 @@ impl Linear {
                     {
                         use crate::autograd::{AutogradContext, Op};
 
+                        output.requires_grad = true;
                         let mut saved = vec![
                             (input.id(), input.clone()),
                             (self.weight.id(), self.weight.clone()),
@@ -304,6 +305,7 @@ impl Linear {
             {
                 use crate::autograd::{AutogradContext, Op};
 
+                output.requires_grad = true;
                 let mut saved = vec![
                     (input.id(), input.clone()),
                     (self.weight.id(), self.weight.clone()),

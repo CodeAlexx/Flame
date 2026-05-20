@@ -480,12 +480,12 @@ pub fn fused_linear3d_native(
 /// `weight`/`bias` should be `requires_grad=false` (base frozen).
 /// `lora_a`/`lora_b` should be `requires_grad=true` (trainable).
 ///
-/// Note: the per-call `a.transpose()` / `b.transpose()` are harmless zero-copy
-/// views; the downstream `Tensor::matmul` lowers them into `gemm_bf16` which
-/// detects transposed-view operands (`transpose_view_underlying_2d`) and uses
-/// cuBLASLt `TRANSA=T` directly without materializing. The Op::MatMul backward
-/// path likewise calls `matmul_bf16_trans` (zero-transpose), so neither
-/// forward nor backward pays a copy for the view. Don't "optimize" this away.
+/// BF16 LoRA uses zero-copy transpose views; the downstream BF16 GEMM detects
+/// them and uses cuBLASLt transpose flags. F32 LoRA intentionally casts the
+/// input to F32, materializes transposed A/B views for the F32 GEMM path, then
+/// casts the residual back to the base output dtype. That matches Python LoRA
+/// training code that keeps adapter weights in F32 while the frozen base runs
+/// mixed precision.
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 pub fn fused_linear3d_native_lora(
     input: &Tensor,
@@ -528,21 +528,43 @@ pub fn fused_linear3d_native_lora(
             a_dims[0], b_dims
         )));
     }
-    if a.dtype() != DType::BF16 || b.dtype() != DType::BF16 {
-        return Err(Error::InvalidInput(
-            "fused_linear3d_native_lora: lora_a and lora_b must be BF16".into(),
-        ));
+    if a.dtype() != b.dtype() {
+        return Err(Error::InvalidInput(format!(
+            "fused_linear3d_native_lora: lora_a and lora_b must have the same dtype, got {:?} and {:?}",
+            a.dtype(),
+            b.dtype()
+        )));
+    }
+    if a.dtype() != DType::BF16 && a.dtype() != DType::F32 {
+        return Err(Error::InvalidInput(format!(
+            "fused_linear3d_native_lora: unsupported LoRA dtype {:?}; expected BF16 or F32",
+            a.dtype()
+        )));
     }
 
     // LoRA residual: (x @ A^T) @ B^T * scale.
     // `matmul` handles 3D@2D natively (see tensor.rs:1694 — flattens to 2D
     // GEMM, reshapes back). Autograd is recorded by Op::MatMul + Op::Transpose
     // + Op::MulScalar.
-    let lora_a_t = a.transpose()?; // [Cin, rank]
-    let lora_b_t = b.transpose()?; // [rank, Cout]
-    let xa = input.matmul(&lora_a_t)?; // [B, S, rank]
-    let xab = xa.matmul(&lora_b_t)?; // [B, S, Cout]
-    let residual = xab.mul_scalar(lora_scale)?;
+    let residual = if a.dtype() == DType::F32 {
+        let input_f32 = input.to_dtype(DType::F32)?;
+        let lora_a_t = a.transpose()?.contiguous()?; // [Cin, rank]
+        let lora_b_t = b.transpose()?.contiguous()?; // [rank, Cout]
+        let xa = input_f32.matmul(&lora_a_t)?; // [B, S, rank]
+        let xab = xa.matmul(&lora_b_t)?; // [B, S, Cout]
+        xab.mul_scalar(lora_scale)?
+    } else {
+        let lora_a_t = a.transpose()?; // [Cin, rank]
+        let lora_b_t = b.transpose()?; // [rank, Cout]
+        let xa = input.matmul(&lora_a_t)?; // [B, S, rank]
+        let xab = xa.matmul(&lora_b_t)?; // [B, S, Cout]
+        xab.mul_scalar(lora_scale)?
+    };
+    let residual = if residual.dtype() != base.dtype() {
+        residual.to_dtype(base.dtype())?
+    } else {
+        residual
+    };
     base.add(&residual)
 }
 

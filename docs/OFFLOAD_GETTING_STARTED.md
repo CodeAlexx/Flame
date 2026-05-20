@@ -78,7 +78,51 @@ Other strategies if you want manual control:
 - `strategy::Adaptive::new().with_watermarks(0.55, 0.80)` — same Adaptive
   but tuned for a different VRAM-pressure profile.
 
-## 4. Auto-strategy via `OffloadManager` (Phase 3)
+## 4. Training checkpoint rule
+
+For block-checkpointed trainers that use `checkpoint_offload_boundary`,
+the offloader policy and weight layout are part of the performance
+contract:
+
+- Use the flame-core `BlockOffloader` directly. The old two-slot-only
+  offloader works functionally, but backward recompute will refetch the
+  entire layer stack and can be several times slower.
+- Set a resident-set policy before loading, usually
+  `FLAME_LAYER_OFFLOAD_FRACTION=0.77` on 24 GB cards. This widens the GPU
+  slot window so backward replay can reuse a layer window instead of doing
+  a full second H2D pass.
+- If the model's matmul kernels use native `[Cout, Cin]` weights
+  (`fused_linear3d_native` / cuBLASLt transpose path), call
+  `.with_native_layout(true)` on the offloader. Otherwise the default
+  pre-transpose path may be immediately undone by model code, doubling
+  transfer/recompute work for no numerical change.
+- In the model loop, call `plan_layer_access(i, true, false)` before the
+  forward block and `plan_layer_access(i, false, false)` inside checkpoint
+  recompute before `await_block_handle(i)`.
+
+Klein 9B and HiDream-O1 both rely on this shape. If a future trainer
+uses boundary checkpointing but regresses to 2-slot ping-pong or
+pre-transpose/untranspose, expect an avoidable step-time cliff.
+
+Important distinction: `checkpoint_offload_boundary` is a boundary-input
+checkpoint, not a no-recompute activation-offload path. The grow cache
+stores the block input boundary tensors; the checkpoint op carries the
+output ID, and backward replays the block closure to build a local
+sub-tape. This is the right shape when the full model cannot keep every
+block's tape resident, but it still pays recompute.
+
+Measured HiDream-O1 note from 2026-05-20: after moving to flame-core
+`BlockOffloader`, `.with_native_layout(true)`, and the
+`FLAME_LAYER_OFFLOAD_FRACTION` resident policy, 512 LoRA training stayed
+around 3.5 s/step. Widening the resident target from `0.77` to `0.50`
+(about 3.0 GiB to 6.6 GiB of block weights) did not materially improve
+speed. That points at decoder recompute/model kernels, not the old
+offloader or the resident-window size. For that class of model, further
+speed work should look at partial checkpoint coverage or a true
+no-recompute sub-tape activation offload path rather than retuning the
+block loader.
+
+## 5. Auto-strategy via `OffloadManager` (Phase 3)
 
 Even better: don't pick a strategy by hand. `OffloadManager` runs a
 state machine (`NotInitialized → Discovery → Profiling → Active`) that
@@ -107,7 +151,7 @@ else                                                    → Adaptive
 Force a specific strategy via `ManagerConfig::force_strategy` (see
 [`offload::ForcedStrategy`](../src/offload/manager.rs:157)).
 
-## 5. Telemetry: turning it on
+## 6. Telemetry: turning it on
 
 The offload module already emits counters at every `prefetch_block` /
 `await_block` call. By default counters are inert (one relaxed atomic
@@ -132,7 +176,7 @@ What's counted: H2D bytes, prefetch wall ns, await wall ns, await hit
 ratio, prefetch issued vs already-resident, plus Phase 2 strategy
 decisions (plans / evictions / target resident bytes).
 
-## 6. Telemetry: reading the data
+## 7. Telemetry: reading the data
 
 **Two ways.**
 
@@ -185,7 +229,7 @@ never a partial write.
 is still recognized for back-compat but is deprecated — its `STEPS`
 suffix was a misnomer.)
 
-## 7. Transfer benchmark cache
+## 8. Transfer benchmark cache
 
 Phase 3's profile sweep takes ~1 second. Cache it across runs:
 
@@ -198,7 +242,7 @@ version checked) and skip the sweep. If the file is missing or has the
 wrong schema, the sweep runs and the result is written back. Default
 location: `$XDG_CACHE_HOME/flame-core/offload_profile.json`.
 
-## 8. When to use which strategy
+## 9. When to use which strategy
 
 | Strategy | When to use | Cost |
 |---|---|---|
@@ -209,7 +253,7 @@ location: `$XDG_CACHE_HOME/flame-core/offload_profile.json`.
 When in doubt: let `OffloadManager` decide. The decision is one
 non-blocking driver query (`cudaMemGetInfo`) at activate time.
 
-## 9. References
+## 10. References
 
 - [`SPEED_CONTRACT.md`](./SPEED_CONTRACT.md) clause 1 — no implicit
   `cudaStreamSynchronize` on the hot path. The offload module satisfies

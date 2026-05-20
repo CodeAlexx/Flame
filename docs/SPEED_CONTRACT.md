@@ -135,7 +135,7 @@ debt entry to pay back at v2 migration.
 shape, dtype, contiguity. Anything beyond that is a kernel rewrite
 candidate, not a "framework limitation."
 
-**Reason.** OneTrainer / SimpleTuner / AI-Toolkit all use PyTorch eager
+**Reason.** OneTrainer / SimpleTuner / EDv2-reference all use PyTorch eager
 (no fusion, no compile). They still win on wall-clock for many ops.
 The gap is per-kernel quality, not fusion strategy. flame's existing
 GEMM is faster per-call than PT's; flame's `sum_dim_keepdim_bf16` is

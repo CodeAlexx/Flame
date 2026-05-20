@@ -15,5 +15,9 @@ tests/pytorch_fixtures/
 # Local planning / audit / staging — kept on disk, not tracked
 PLAN_*.md
 SPEED_AUDIT_*.md
+HANDOFF_*.md
+SKEPTIC_*.md
+AUDIT_*.md
+NOTES_*.md
 kernels/_staging/
 .archive/
