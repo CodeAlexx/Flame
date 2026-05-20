@@ -142,6 +142,12 @@ by decoder checkpoint/recompute and block offload boundaries, not by the
 full image-token SDPA alignment fallback. Retuning the block offloader slot
 window alone is still unlikely to reach the resident PyTorch/HF speed.
 
+North-star reminder: structured SDPA only proves the old masked hot road is
+gone. O1 is not fixed until a real trained LoRA renders clean trigger-bound
+samples and step speed is beating, matching, or close to the ai-toolkit O1
+trainer reference. Always record same-seed no-LoRA vs LoRA samples after the
+run; image quality is the validity gate, not short-run loss alone.
+
 ---
 
 ## Next Steps: CUDA Graph for Checkpoint Sub-Backward
