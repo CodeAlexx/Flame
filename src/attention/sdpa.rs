@@ -433,26 +433,16 @@ pub fn attention_impl(
             Err(err) => return Err(err),
         }
 
-        let mut generated_mask: Option<Tensor> = None;
-        let mask_ref: Option<&Tensor> = match (mask, causal) {
+        let output = match (mask, causal) {
             (Some(_), true) => {
                 return Err(Error::Unsupported(
                     "Combined mask + causal attention is not yet supported".into(),
                 ));
             }
-            (Some(m), false) => Some(m),
-            (None, true) => {
-                generated_mask = Some(build_causal_mask(
-                    q.shape().dims()[2],
-                    k.shape().dims()[2],
-                    q,
-                )?);
-                generated_mask.as_ref()
-            }
-            (None, false) => None,
+            (Some(m), false) => crate::sdpa::forward(q_ref, k, v, Some(m))?,
+            (None, true) => crate::sdpa::forward_causal(q_ref, k, v)?,
+            (None, false) => crate::sdpa::forward(q_ref, k, v, None)?,
         };
-
-        let output = crate::sdpa::forward(q_ref, k, v, mask_ref)?;
         Ok(output)
     })
 }
@@ -524,6 +514,37 @@ pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result
     trap_is_bf16("sdpa::v", v)?;
 
     let mut output = crate::sdpa::forward(q, k, v, mask)?;
+    if output.dtype() != DType::BF16 {
+        output = output.to_dtype(DType::BF16)?;
+    }
+    Ok(output)
+}
+
+/// Scaled dot-product attention with a top-left causal mask.
+pub fn sdpa_causal(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+    trap_is_bf16("sdpa_causal::q", q)?;
+    trap_is_bf16("sdpa_causal::k", k)?;
+    trap_is_bf16("sdpa_causal::v", v)?;
+
+    let mut output = crate::sdpa::forward_causal(q, k, v)?;
+    if output.dtype() != DType::BF16 {
+        output = output.to_dtype(DType::BF16)?;
+    }
+    Ok(output)
+}
+
+/// Self-attention with causal prefix rows and full-attention suffix rows.
+pub fn sdpa_prefix_causal_full(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    prefix_len: usize,
+) -> Result<Tensor> {
+    trap_is_bf16("sdpa_prefix_causal_full::q", q)?;
+    trap_is_bf16("sdpa_prefix_causal_full::k", k)?;
+    trap_is_bf16("sdpa_prefix_causal_full::v", v)?;
+
+    let mut output = crate::sdpa::forward_prefix_causal_full(q, k, v, prefix_len)?;
     if output.dtype() != DType::BF16 {
         output = output.to_dtype(DType::BF16)?;
     }

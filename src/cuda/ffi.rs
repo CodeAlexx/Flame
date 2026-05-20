@@ -706,6 +706,7 @@ extern "C" {
         k_offset_elems: i64,
         v_offset_elems: i64,
         o_offset_elems: i64,
+        causal: i32,
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
@@ -743,6 +744,9 @@ extern "C" {
         v_offset_elems: i64,
         o_offset_elems: i64,
         stats_offset_elems: i64,
+        causal: i32,
+        real_n_q: i32,
+        real_n_kv: i32,
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
@@ -793,6 +797,9 @@ extern "C" {
         dq_offset_elems: i64,
         dk_offset_elems: i64,
         dv_offset_elems: i64,
+        causal: i32,
+        real_n_q: i32,
+        real_n_kv: i32,
         stream: *mut core::ffi::c_void,
     ) -> i32;
 

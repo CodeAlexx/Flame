@@ -329,22 +329,28 @@ scalar Rust references. 7 tests total. First time the underlying
 
 ### ⭐ `attention/sdpa.rs`
 The public attention surface. `sdpa(q, k, v, mask)`, `sdpa_with_bias(q, k, v, bias, scale)`,
-`attend(...)`, `attention_impl(...)`. Routes BF16+head_dim∈{64,96,128} to the
-wmma flash kernel; everything else falls back to the F32 path. Also defines
+`sdpa_causal(q, k, v)`, `sdpa_prefix_causal_full(q, k, v, prefix_len)`,
+`attend(...)`, `attention_impl(...)`. Routes unmasked BF16+head_dim∈{64,96,128}
+to cuDNN SDPA; structured causal and prefix-causal/full masks should use the
+structured helpers instead of materializing binary masks. True arbitrary masks
+remain on the compatibility path. Also defines
 `MultiHeadAttention`, `RotaryEmbedding`, `TransformerBlock`, `GeGLU`,
 `FeedForward`, and (legacy duplicate) `LayerNorm` structs used by training
 code.
 
 ### ⭐ `sdpa.rs` (top-level)
 Lower-level dispatcher used by `attention::sdpa::sdpa` and called directly
-by some inference code. `forward(q, k, v, mask)`, `forward_with_bias(...)`,
-`forward_v4(...)` (feature-gated). Dispatch order:
-1. **In-tree wmma flash** (`forward_flash_bf16`) — the single fast path.
-2. **cuBLASLt materialized fallback** (`forward_bf16_fallback`) — tensor
-   cores but full S×S matrix allocation.
-3. **Streaming SDPA** (`sdpa_stream_bf16`) — chunked.
+by some inference code. `forward(q, k, v, mask)`, `forward_causal(...)`,
+`forward_prefix_causal_full(...)`, `forward_with_bias(...)`, `forward_v4(...)`
+(feature-gated). Dispatch order:
+1. **cuDNN SDPA** — primary unmasked BF16 path, with training O/Stats and
+   padded Q/KV sequence lengths for backward.
+2. **Streaming SDPA** (`sdpa_stream_bf16`) — chunked path for large masked or
+   oversized shapes.
+3. **cuBLASLt materialized fallback** (`forward_bf16_fallback`) — tensor cores
+   but full S×S matrix allocation.
 
-The in-tree wmma flash path calls FFI `flame_flash_attention_bf16` whose
+The retained in-tree wmma reference path calls FFI `flame_flash_attention_bf16` whose
 implementation (`src/cuda/flash_attention_fwd.cu`) uses **FA2-style tiling**
 (BQ=64, with `s_KV` shared between K and V across stages to fit SM_86's
 100 KB shared-mem budget) plus `cp.async.cg` loads with V-prefetch

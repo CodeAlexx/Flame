@@ -42,6 +42,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace fe = cudnn_frontend;
 
@@ -60,6 +61,8 @@ static constexpr int32_t STATS_UID = 6;
 static constexpr int32_t DQ_UID    = 7;
 static constexpr int32_t DK_UID    = 8;
 static constexpr int32_t DV_UID    = 9;
+static constexpr int32_t SEQ_LEN_Q_UID  = 10;
+static constexpr int32_t SEQ_LEN_KV_UID = 11;
 
 // Cache key: shape + scale + all 8 BF16 stride vectors. Stats stride is
 // fixed by convention ([H*N_q, N_q, 1, 1]) so it's not in the key. Offsets
@@ -70,6 +73,9 @@ struct SdpaBwdKey {
     int N_q;
     int N_kv;
     int D;
+    int causal;
+    int real_N_q;
+    int real_N_kv;
     float scale;
     int64_t q_s[4];
     int64_t k_s[4];
@@ -82,7 +88,9 @@ struct SdpaBwdKey {
 
     bool operator==(const SdpaBwdKey& o) const noexcept {
         if (!(B == o.B && H == o.H && N_q == o.N_q &&
-              N_kv == o.N_kv && D == o.D && scale == o.scale))
+              N_kv == o.N_kv && D == o.D && causal == o.causal &&
+              real_N_q == o.real_N_q && real_N_kv == o.real_N_kv &&
+              scale == o.scale))
             return false;
         for (int i = 0; i < 4; ++i) {
             if (q_s[i]  != o.q_s[i])  return false;
@@ -110,6 +118,9 @@ struct SdpaBwdKeyHash {
         mix((uint64_t)k.N_q);
         mix((uint64_t)k.N_kv);
         mix((uint64_t)k.D);
+        mix((uint64_t)k.causal);
+        mix((uint64_t)k.real_N_q);
+        mix((uint64_t)k.real_N_kv);
         uint32_t s_bits = 0;
         std::memcpy(&s_bits, &k.scale, sizeof(s_bits));
         mix((uint64_t)s_bits);
@@ -131,6 +142,8 @@ struct SdpaBwdEntry {
     std::shared_ptr<fe::graph::Graph> graph;
     int64_t                            workspace_size = 0;
     void*                              workspace_buf  = nullptr;
+    void*                              seq_len_q_buf  = nullptr;
+    void*                              seq_len_kv_buf = nullptr;
 };
 
 std::once_flag            g_handle_once;
@@ -210,7 +223,26 @@ int build_graph(const SdpaBwdKey& k, SdpaBwdEntry& entry) {
     auto opts = fe::graph::SDPA_backward_attributes()
                     .set_name("flame_klein_sdpa_bwd")
                     .set_attn_scale(k.scale);
-    // No causal, no bias, no dropout, no sliding window.
+    if (k.causal) {
+        opts.set_causal_mask(true);
+    }
+    if (k.real_N_q != k.N_q || k.real_N_kv != k.N_kv) {
+        auto SeqLenQ = g->tensor(fe::graph::Tensor_attributes()
+                                     .set_name("SeqLenQ")
+                                     .set_uid(SEQ_LEN_Q_UID)
+                                     .set_dim({B, 1, 1, 1})
+                                     .set_stride({1, 1, 1, 1})
+                                     .set_data_type(fe::DataType_t::INT32));
+        auto SeqLenKV = g->tensor(fe::graph::Tensor_attributes()
+                                      .set_name("SeqLenKV")
+                                      .set_uid(SEQ_LEN_KV_UID)
+                                      .set_dim({B, 1, 1, 1})
+                                      .set_stride({1, 1, 1, 1})
+                                      .set_data_type(fe::DataType_t::INT32));
+        opts.set_padding_mask(true)
+            .set_seq_len_q(SeqLenQ)
+            .set_seq_len_kv(SeqLenKV);
+    }
 
     auto [dQ, dK, dV] = g->sdpa_backward(Q, K, V, O, dO, Stats, opts);
 
@@ -257,6 +289,34 @@ int build_graph(const SdpaBwdKey& k, SdpaBwdEntry& entry) {
     entry.graph          = g;
     entry.workspace_size = ws;
     entry.workspace_buf  = ws_buf;
+    if (k.real_N_q != k.N_q || k.real_N_kv != k.N_kv) {
+        std::vector<int32_t> seq_q((size_t)B, k.real_N_q);
+        std::vector<int32_t> seq_kv((size_t)B, k.real_N_kv);
+        cudaError_t e = cudaMalloc(&entry.seq_len_q_buf, seq_q.size() * sizeof(int32_t));
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[flame_cudnn_sdpa_bwd] seq_len_q cudaMalloc failed: %s\n",
+                    cudaGetErrorString(e));
+            return -1;
+        }
+        e = cudaMalloc(&entry.seq_len_kv_buf, seq_kv.size() * sizeof(int32_t));
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[flame_cudnn_sdpa_bwd] seq_len_kv cudaMalloc failed: %s\n",
+                    cudaGetErrorString(e));
+            return -1;
+        }
+        e = cudaMemcpy(entry.seq_len_q_buf, seq_q.data(), seq_q.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[flame_cudnn_sdpa_bwd] seq_len_q cudaMemcpy failed: %s\n",
+                    cudaGetErrorString(e));
+            return -1;
+        }
+        e = cudaMemcpy(entry.seq_len_kv_buf, seq_kv.data(), seq_kv.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[flame_cudnn_sdpa_bwd] seq_len_kv cudaMemcpy failed: %s\n",
+                    cudaGetErrorString(e));
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -281,6 +341,8 @@ extern "C" int flame_cudnn_sdpa_bwd_bf16(
     int64_t do_offset_elems, int64_t stats_offset_elems,
     int64_t dq_offset_elems, int64_t dk_offset_elems,
     int64_t dv_offset_elems,
+    int causal,
+    int real_N_q, int real_N_kv,
     void* stream
 ) {
     if (!Q || !K || !V || !O || !dO || !Stats) return -1;
@@ -294,6 +356,9 @@ extern "C" int flame_cudnn_sdpa_bwd_bf16(
 
     SdpaBwdKey key{};
     key.B = B; key.H = H; key.N_q = N_q; key.N_kv = N_kv; key.D = D;
+    key.causal = causal ? 1 : 0;
+    key.real_N_q = real_N_q > 0 ? real_N_q : N_q;
+    key.real_N_kv = real_N_kv > 0 ? real_N_kv : N_kv;
     key.scale = scale;
     for (int i = 0; i < 4; ++i) {
         key.q_s[i]  = q_strides[i];
@@ -308,6 +373,8 @@ extern "C" int flame_cudnn_sdpa_bwd_bf16(
 
     std::shared_ptr<fe::graph::Graph> graph;
     void*   ws_buf = nullptr;
+    void*   seq_q_buf = nullptr;
+    void*   seq_kv_buf = nullptr;
     int64_t ws_sz  = 0;
     {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
@@ -320,6 +387,8 @@ extern "C" int flame_cudnn_sdpa_bwd_bf16(
         }
         graph  = it->second.graph;
         ws_buf = it->second.workspace_buf;
+        seq_q_buf = it->second.seq_len_q_buf;
+        seq_kv_buf = it->second.seq_len_kv_buf;
         ws_sz  = it->second.workspace_size;
         (void)ws_sz;
     }
@@ -350,6 +419,10 @@ extern "C" int flame_cudnn_sdpa_bwd_bf16(
         {DK_UID,    advance_bf16(dK, dk_offset_elems)},
         {DV_UID,    advance_bf16(dV, dv_offset_elems)},
     };
+    if (seq_q_buf && seq_kv_buf) {
+        vp.emplace(SEQ_LEN_Q_UID, seq_q_buf);
+        vp.emplace(SEQ_LEN_KV_UID, seq_kv_buf);
+    }
 
     auto status = graph->execute(g_handle, vp, ws_buf);
     if (!status.is_good()) {

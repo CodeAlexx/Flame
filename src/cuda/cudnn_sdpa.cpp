@@ -35,6 +35,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace fe = cudnn_frontend;
 
@@ -45,6 +46,8 @@ static constexpr int32_t K_UID     = 2;
 static constexpr int32_t V_UID     = 3;
 static constexpr int32_t O_UID     = 4;
 static constexpr int32_t STATS_UID = 5;
+static constexpr int32_t SEQ_LEN_Q_UID  = 6;
+static constexpr int32_t SEQ_LEN_KV_UID = 7;
 
 // Cache key. Stride refactor Phase 2b: strides are part of the graph
 // definition (cuDNN bakes them into the operation signature), so they must
@@ -56,6 +59,9 @@ struct SdpaKey {
     int N_q;
     int N_kv;
     int D;
+    int causal;
+    int real_N_q;
+    int real_N_kv;
     float scale;
     int64_t q_s[4];
     int64_t k_s[4];
@@ -64,7 +70,9 @@ struct SdpaKey {
 
     bool operator==(const SdpaKey& o) const noexcept {
         if (!(B == o.B && H == o.H && N_q == o.N_q &&
-              N_kv == o.N_kv && D == o.D && scale == o.scale))
+              N_kv == o.N_kv && D == o.D && causal == o.causal &&
+              real_N_q == o.real_N_q && real_N_kv == o.real_N_kv &&
+              scale == o.scale))
             return false;
         for (int i = 0; i < 4; ++i) {
             if (q_s[i] != o.q_s[i]) return false;
@@ -89,6 +97,9 @@ struct SdpaKeyHash {
         mix((uint64_t)k.N_q);
         mix((uint64_t)k.N_kv);
         mix((uint64_t)k.D);
+        mix((uint64_t)k.causal);
+        mix((uint64_t)k.real_N_q);
+        mix((uint64_t)k.real_N_kv);
         uint32_t s_bits = 0;
         std::memcpy(&s_bits, &k.scale, sizeof(s_bits));
         mix((uint64_t)s_bits);
@@ -108,6 +119,8 @@ struct SdpaEntry {
     // Per-workspace buffer (allocated lazily on first execute with this key).
     // Reused across executions at this shape.
     void* workspace_buf = nullptr;
+    void* seq_len_q_buf = nullptr;
+    void* seq_len_kv_buf = nullptr;
 };
 
 namespace {
@@ -175,8 +188,9 @@ int build_graph(const SdpaKey& k, SdpaEntry& entry) {
                     .set_name("flame_klein_sdpa")
                     .set_generate_stats(false)
                     .set_attn_scale(k.scale);
-    // No causal / padding mask — Klein, FLUX, Chroma, Qwen-Edit joint attn
-    // is full self-attention. Callers that need masking use the WMMA path.
+    if (k.causal) {
+        opts.set_causal_mask(true);
+    }
 
     auto [O, Stats] = g->sdpa(Q, K, V, opts);
     (void)Stats; // generate_stats=false, Stats is nullptr
@@ -259,7 +273,26 @@ int build_graph_train(const SdpaKey& k, SdpaEntry& entry) {
                     .set_name("flame_klein_sdpa_train")
                     .set_generate_stats(true)
                     .set_attn_scale(k.scale);
-    // No causal / padding mask. See inference build_graph for rationale.
+    if (k.causal) {
+        opts.set_causal_mask(true);
+    }
+    if (k.real_N_q != k.N_q || k.real_N_kv != k.N_kv) {
+        auto SeqLenQ = g->tensor(fe::graph::Tensor_attributes()
+                                     .set_name("SeqLenQ")
+                                     .set_uid(SEQ_LEN_Q_UID)
+                                     .set_dim({B, 1, 1, 1})
+                                     .set_stride({1, 1, 1, 1})
+                                     .set_data_type(fe::DataType_t::INT32));
+        auto SeqLenKV = g->tensor(fe::graph::Tensor_attributes()
+                                      .set_name("SeqLenKV")
+                                      .set_uid(SEQ_LEN_KV_UID)
+                                      .set_dim({B, 1, 1, 1})
+                                      .set_stride({1, 1, 1, 1})
+                                      .set_data_type(fe::DataType_t::INT32));
+        opts.set_padding_mask(true)
+            .set_seq_len_q(SeqLenQ)
+            .set_seq_len_kv(SeqLenKV);
+    }
 
     auto [O, Stats] = g->sdpa(Q, K, V, opts);
 
@@ -306,6 +339,34 @@ int build_graph_train(const SdpaKey& k, SdpaEntry& entry) {
     entry.graph          = g;
     entry.workspace_size = ws;
     entry.workspace_buf  = ws_buf;
+    if (k.real_N_q != k.N_q || k.real_N_kv != k.N_kv) {
+        std::vector<int32_t> seq_q((size_t)B, k.real_N_q);
+        std::vector<int32_t> seq_kv((size_t)B, k.real_N_kv);
+        cudaError_t e = cudaMalloc(&entry.seq_len_q_buf, seq_q.size() * sizeof(int32_t));
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[flame_cudnn_sdpa_train] seq_len_q cudaMalloc failed: %s\n",
+                    cudaGetErrorString(e));
+            return -1;
+        }
+        e = cudaMalloc(&entry.seq_len_kv_buf, seq_kv.size() * sizeof(int32_t));
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[flame_cudnn_sdpa_train] seq_len_kv cudaMalloc failed: %s\n",
+                    cudaGetErrorString(e));
+            return -1;
+        }
+        e = cudaMemcpy(entry.seq_len_q_buf, seq_q.data(), seq_q.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[flame_cudnn_sdpa_train] seq_len_q cudaMemcpy failed: %s\n",
+                    cudaGetErrorString(e));
+            return -1;
+        }
+        e = cudaMemcpy(entry.seq_len_kv_buf, seq_kv.data(), seq_kv.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[flame_cudnn_sdpa_train] seq_len_kv cudaMemcpy failed: %s\n",
+                    cudaGetErrorString(e));
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -321,6 +382,7 @@ extern "C" int flame_cudnn_sdpa_bf16(
     const int64_t* o_strides,
     int64_t q_offset_elems, int64_t k_offset_elems,
     int64_t v_offset_elems, int64_t o_offset_elems,
+    int causal,
     void* stream
 ) {
     if (!Q || !K || !V || !O) return -1;
@@ -332,6 +394,9 @@ extern "C" int flame_cudnn_sdpa_bf16(
 
     SdpaKey key{};
     key.B = B; key.H = H; key.N_q = N_q; key.N_kv = N_kv; key.D = D;
+    key.causal = causal ? 1 : 0;
+    key.real_N_q = N_q;
+    key.real_N_kv = N_kv;
     key.scale = scale;
     for (int i = 0; i < 4; ++i) {
         key.q_s[i] = q_strides[i];
@@ -413,6 +478,8 @@ extern "C" int flame_cudnn_sdpa_bf16_train_fwd(
     int64_t q_offset_elems, int64_t k_offset_elems,
     int64_t v_offset_elems, int64_t o_offset_elems,
     int64_t stats_offset_elems,
+    int causal,
+    int real_N_q, int real_N_kv,
     void* stream
 ) {
     if (!Q || !K || !V || !O || !Stats) return -1;
@@ -424,6 +491,9 @@ extern "C" int flame_cudnn_sdpa_bf16_train_fwd(
 
     SdpaKey key{};
     key.B = B; key.H = H; key.N_q = N_q; key.N_kv = N_kv; key.D = D;
+    key.causal = causal ? 1 : 0;
+    key.real_N_q = real_N_q > 0 ? real_N_q : N_q;
+    key.real_N_kv = real_N_kv > 0 ? real_N_kv : N_kv;
     key.scale = scale;
     for (int i = 0; i < 4; ++i) {
         key.q_s[i] = q_strides[i];
@@ -434,6 +504,8 @@ extern "C" int flame_cudnn_sdpa_bf16_train_fwd(
 
     std::shared_ptr<fe::graph::Graph> graph;
     void*   ws_buf = nullptr;
+    void*   seq_q_buf = nullptr;
+    void*   seq_kv_buf = nullptr;
     int64_t ws_sz  = 0;
     {
         std::lock_guard<std::mutex> lock(g_cache_train_mutex);
@@ -446,6 +518,8 @@ extern "C" int flame_cudnn_sdpa_bf16_train_fwd(
         }
         graph  = it->second.graph;
         ws_buf = it->second.workspace_buf;
+        seq_q_buf = it->second.seq_len_q_buf;
+        seq_kv_buf = it->second.seq_len_kv_buf;
         ws_sz  = it->second.workspace_size;
         (void)ws_sz;
     }
@@ -473,6 +547,10 @@ extern "C" int flame_cudnn_sdpa_bf16_train_fwd(
         {O_UID,     advance_bf16(O, o_offset_elems)},
         {STATS_UID, advance_f32(Stats, stats_offset_elems)},
     };
+    if (seq_q_buf && seq_kv_buf) {
+        vp.emplace(SEQ_LEN_Q_UID, seq_q_buf);
+        vp.emplace(SEQ_LEN_KV_UID, seq_kv_buf);
+    }
 
     auto status = graph->execute(g_handle, vp, ws_buf);
     if (!status.is_good()) {

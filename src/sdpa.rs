@@ -15,6 +15,129 @@ use crate::{
 type SdpaResult<T> = crate::Result<T>;
 
 const NEG_INF: f32 = -1.0e9;
+const CUDNN_SDPA_BWD_SEQ_ALIGN: usize = 64;
+
+fn allow_cudnn_sdpa_bwd_causal() -> bool {
+    std::env::var("FLAME_CUDNN_SDPA_BWD_CAUSAL")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+#[inline]
+fn align_up(value: usize, align: usize) -> usize {
+    if align == 0 {
+        value
+    } else {
+        value.div_ceil(align) * align
+    }
+}
+
+fn causal_keep_mask(
+    q_len: usize,
+    k_len: usize,
+    q_start: usize,
+    device: std::sync::Arc<cudarc::driver::CudaDevice>,
+    dtype: DType,
+) -> SdpaResult<Tensor> {
+    let mut data = vec![0.0f32; q_len * k_len];
+    for q_idx in 0..q_len {
+        let cutoff = (q_start + q_idx).min(k_len.saturating_sub(1));
+        let row = q_idx * k_len;
+        for k_idx in 0..=cutoff {
+            data[row + k_idx] = 1.0;
+        }
+    }
+    Tensor::from_vec_dtype(data, Shape::from_dims(&[1, 1, q_len, k_len]), device, dtype)
+}
+
+fn maybe_pad_for_cudnn(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    causal: bool,
+) -> SdpaResult<(
+    Tensor,
+    Tensor,
+    Tensor,
+    Option<usize>,
+    Option<(usize, usize)>,
+)> {
+    if causal && !allow_cudnn_sdpa_bwd_causal() {
+        return Ok((q.clone(), k.clone(), v.clone(), None, None));
+    }
+
+    let q_dims = q.shape().dims();
+    let k_dims = k.shape().dims();
+    let v_dims = v.shape().dims();
+    if q_dims.len() != 4 || k_dims.len() != 4 || v_dims.len() != 4 {
+        return Ok((q.clone(), k.clone(), v.clone(), None, None));
+    }
+
+    let q_len = q_dims[2];
+    let k_len = k_dims[2];
+    let v_len = v_dims[2];
+    let head_dim = q_dims[3];
+    if k_len != v_len
+        || q.dtype() != DType::BF16
+        || k.dtype() != DType::BF16
+        || v.dtype() != DType::BF16
+        || !(head_dim == 64 || head_dim == 96 || head_dim == 128)
+    {
+        return Ok((q.clone(), k.clone(), v.clone(), None, None));
+    }
+    if causal && q_len != k_len {
+        return Ok((q.clone(), k.clone(), v.clone(), None, None));
+    }
+    if mask.is_some() {
+        return Ok((q.clone(), k.clone(), v.clone(), None, None));
+    }
+
+    let target_q_len = align_up(q_len, CUDNN_SDPA_BWD_SEQ_ALIGN);
+    let target_kv_len = align_up(k_len, CUDNN_SDPA_BWD_SEQ_ALIGN);
+    if target_q_len == q_len && target_kv_len == k_len {
+        return Ok((q.clone(), k.clone(), v.clone(), None, None));
+    }
+
+    let q_work = if target_q_len > q_len {
+        let q_pad = Tensor::zeros_dtype(
+            Shape::from_dims(&[q_dims[0], q_dims[1], target_q_len - q_len, q_dims[3]]),
+            q.dtype(),
+            q.device().clone(),
+        )?;
+        Tensor::cat(&[q, &q_pad], 2)?
+    } else {
+        q.clone()
+    };
+    let k_work = if target_kv_len > k_len {
+        let k_pad = Tensor::zeros_dtype(
+            Shape::from_dims(&[k_dims[0], k_dims[1], target_kv_len - k_len, k_dims[3]]),
+            k.dtype(),
+            k.device().clone(),
+        )?;
+        Tensor::cat(&[k, &k_pad], 2)?
+    } else {
+        k.clone()
+    };
+    let v_work = if target_kv_len > v_len {
+        let v_pad = Tensor::zeros_dtype(
+            Shape::from_dims(&[v_dims[0], v_dims[1], target_kv_len - v_len, v_dims[3]]),
+            v.dtype(),
+            v.device().clone(),
+        )?;
+        Tensor::cat(&[v, &v_pad], 2)?
+    } else {
+        v.clone()
+    };
+    Ok((
+        q_work,
+        k_work,
+        v_work,
+        if target_q_len > q_len { Some(q_len) } else { None },
+        Some((q_len, k_len)),
+    ))
+}
 
 // Raw reader kept for the (rare) paths that need to check a flag that the
 // cached helpers below don't cover. Prefer the cached accessors below.
@@ -92,13 +215,90 @@ pub fn forward(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Sdp
     if crate::autograd::AutogradContext::is_recording()
         && (q.requires_grad || k.requires_grad || v.requires_grad)
     {
-        return forward_train(q, k, v, mask);
+        return forward_train_inner(q, k, v, mask, false);
     }
     scope("sdpa.forward", GuardMode::env_default(), || {
-        let output = forward_inner(q, k, v, mask)?;
+        let output = forward_inner(q, k, v, mask, false)?;
         debug_assert_eq!(output.dtype(), DType::BF16);
         Ok(output)
     })
+}
+
+/// Scaled dot-product attention with a top-left causal mask.
+///
+/// Use this for causal self-attention instead of materializing a binary
+/// lower-triangular mask and passing it to [`forward`]. The causal flag can
+/// route through cuDNN train forward/backward; a materialized mask cannot.
+pub fn forward_causal(q: &Tensor, k: &Tensor, v: &Tensor) -> SdpaResult<Tensor> {
+    if crate::autograd::AutogradContext::is_recording()
+        && (q.requires_grad || k.requires_grad || v.requires_grad)
+    {
+        return forward_train_inner(q, k, v, None, true);
+    }
+    scope("sdpa.forward_causal", GuardMode::env_default(), || {
+        let output = forward_inner(q, k, v, None, true)?;
+        debug_assert_eq!(output.dtype(), DType::BF16);
+        Ok(output)
+    })
+}
+
+/// Scaled dot-product self-attention where the prefix rows are causal and the
+/// remaining rows attend to the full sequence.
+///
+/// This is the structured equivalent of a common mixed binary mask:
+/// rows `[0, prefix_len)` use a top-left causal mask over the prefix, while
+/// rows `[prefix_len, S)` use unmasked full attention over all keys. Keeping
+/// it structured avoids a materialized `[B,1,S,S]` binary mask and lets the
+/// large full pass stay on the cuDNN SDPA path.
+pub fn forward_prefix_causal_full(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    prefix_len: usize,
+) -> SdpaResult<Tensor> {
+    scope(
+        "sdpa.forward_prefix_causal_full",
+        GuardMode::env_default(),
+        || {
+            let q_dims = q.shape().dims();
+            let k_dims = k.shape().dims();
+            let v_dims = v.shape().dims();
+            if q_dims.len() != 4 || k_dims.len() != 4 || v_dims.len() != 4 {
+                return Err(Error::InvalidOperation(format!(
+                    "sdpa.forward_prefix_causal_full expects [B,H,S,D] tensors, got q={:?} k={:?} v={:?}",
+                    q_dims, k_dims, v_dims
+                )));
+            }
+            let seq_len = q_dims[2];
+            if k_dims[2] != seq_len || v_dims[2] != seq_len {
+                return Err(Error::InvalidInput(format!(
+                    "sdpa.forward_prefix_causal_full requires self-attention lengths, got q={} k={} v={}",
+                    seq_len, k_dims[2], v_dims[2]
+                )));
+            }
+            if prefix_len > seq_len {
+                return Err(Error::InvalidInput(format!(
+                    "sdpa.forward_prefix_causal_full prefix_len {} exceeds seq_len {}",
+                    prefix_len, seq_len
+                )));
+            }
+            if prefix_len == 0 {
+                return forward(q, k, v, None);
+            }
+            if prefix_len == seq_len {
+                return forward_causal(q, k, v);
+            }
+
+            let q_prefix = q.narrow(2, 0, prefix_len)?.contiguous()?;
+            let k_prefix = k.narrow(2, 0, prefix_len)?.contiguous()?;
+            let v_prefix = v.narrow(2, 0, prefix_len)?.contiguous()?;
+            let out_prefix = forward_causal(&q_prefix, &k_prefix, &v_prefix)?;
+
+            let out_full = forward(q, k, v, None)?;
+            let out_suffix = out_full.narrow(2, prefix_len, seq_len - prefix_len)?;
+            Tensor::cat(&[&out_prefix, &out_suffix], 2)
+        },
+    )
 }
 
 /// Fused SDPA entry point for training.
@@ -112,7 +312,22 @@ pub fn forward_train(
     v: &Tensor,
     mask: Option<&Tensor>,
 ) -> SdpaResult<Tensor> {
+    forward_train_inner(q, k, v, mask, false)
+}
+
+fn forward_train_inner(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    causal: bool,
+) -> SdpaResult<Tensor> {
     scope("sdpa.forward_train", GuardMode::env_default(), || {
+        if mask.is_some() && causal {
+            return Err(Error::Unsupported(
+                "sdpa.forward_train: combined mask + causal attention is not supported".into(),
+            ));
+        }
         let dims = q.shape().dims();
         if dims.len() != 4 {
             return Err(Error::InvalidInput(format!(
@@ -134,6 +349,14 @@ pub fn forward_train(
             1.0
         };
 
+        let (q_work, k_work, v_work, slice_q_len, padding_lens) =
+            maybe_pad_for_cudnn(q, k, v, mask, causal)?;
+        let q_ref = &q_work;
+        let k_ref = &k_work;
+        let v_ref = &v_work;
+        let work_dims = q_ref.shape().dims();
+        let work_k_dims = k_ref.shape().dims();
+
         // Run forward under no_grad. Primary path: cuDNN SDPA forward-train,
         // which produces both O and Stats (per-row LSE) in one call. Backward
         // (autograd.rs::Op::FlashAttention) picks up the Stats tensor and
@@ -141,36 +364,57 @@ pub fn forward_train(
         // decomposed-recompute path this was doing pre-Phase-2c. Unsupported
         // shapes (head_dim ∉ {64,96,128}, masked, non-BF16) fall through to
         // `forward_inner`; backward recomputes from scratch in that case.
+        let mut used_cudnn = false;
         let (output, stats_tensor) = {
             let _guard = crate::autograd::AutogradContext::no_grad();
-            let (b, h, sq, hd) = (dims[0], dims[1], dims[2], head_dim);
+            let (b, h, sq, hd) = (work_dims[0], work_dims[1], work_dims[2], head_dim);
 
             if mask.is_none()
                 && (hd == 64 || hd == 96 || hd == 128)
-                && q.dtype() == DType::BF16
-                && k.dtype() == DType::BF16
-                && v.dtype() == DType::BF16
+                && q_ref.dtype() == DType::BF16
+                && k_ref.dtype() == DType::BF16
+                && v_ref.dtype() == DType::BF16
             {
-                match forward_cudnn_sdpa_train_bf16(q, k, v, b, h, sq, k_dims[2], hd) {
-                    Ok((o, stats)) => (o, Some(stats)),
+                match forward_cudnn_sdpa_train_bf16(
+                    q_ref,
+                    k_ref,
+                    v_ref,
+                    b,
+                    h,
+                    sq,
+                    work_k_dims[2],
+                    hd,
+                    causal,
+                    padding_lens,
+                ) {
+                    Ok((o, stats)) => {
+                        used_cudnn = true;
+                        (o, Some(stats))
+                    }
                     Err(e) => {
                         log::error!("cudnn SDPA train-fwd failed: {:?}", e);
                         return Err(e);
                     }
                 }
             } else {
-                (forward_inner(q, k, v, mask)?, None)
+                (forward_inner(q_ref, k_ref, v_ref, mask, causal)?, None)
             }
         };
 
-        if q.requires_grad() || k.requires_grad() || v.requires_grad() {
+        let saved_q = if used_cudnn { q_ref } else { q };
+        let saved_k = if used_cudnn { k_ref } else { k };
+        let saved_v = if used_cudnn { v_ref } else { v };
+        let saved_slice_q_len = if used_cudnn { slice_q_len } else { None };
+        let saved_padding_lens = if used_cudnn { padding_lens } else { None };
+
+        if saved_q.requires_grad() || saved_k.requires_grad() || saved_v.requires_grad() {
             let mut out = output;
             out = out.requires_grad_(true);
 
             let mut saved = vec![
-                (q.id(), q.clone()),
-                (k.id(), k.clone()),
-                (v.id(), v.clone()),
+                (saved_q.id(), saved_q.clone()),
+                (saved_k.id(), saved_k.clone()),
+                (saved_v.id(), saved_v.clone()),
                 // Save output for fused backward
                 (out.id(), out.clone()),
             ];
@@ -181,8 +425,12 @@ pub fn forward_train(
                 saved.push((stats.id(), stats.clone()));
             }
             let mask_id = if let Some(mask_tensor) = mask {
-                saved.push((mask_tensor.id(), mask_tensor.clone()));
-                Some(mask_tensor.id())
+                if used_cudnn {
+                    None
+                } else {
+                    saved.push((mask_tensor.id(), mask_tensor.clone()));
+                    Some(mask_tensor.id())
+                }
             } else {
                 None
             };
@@ -190,12 +438,13 @@ pub fn forward_train(
             crate::autograd::AutogradContext::record_op(
                 out.id(),
                 crate::autograd::Op::FlashAttention {
-                    query: q.id(),
-                    key: k.id(),
-                    value: v.id(),
+                    query: saved_q.id(),
+                    key: saved_k.id(),
+                    value: saved_v.id(),
                     mask: mask_id,
                     scale,
-                    causal: false,
+                    causal,
+                    padding_lens: saved_padding_lens,
                     // Stage 2 fix (2026-05-12): record saved-O and saved-Stats
                     // ids directly so the backward dispatch can use
                     // `fetch_saved(id)` instead of a shape-find heuristic.
@@ -209,9 +458,17 @@ pub fn forward_train(
                 },
                 saved,
             );
-            Ok(out)
+            if let Some(orig_q_len) = saved_slice_q_len {
+                out.narrow(2, 0, orig_q_len)
+            } else {
+                Ok(out)
+            }
         } else {
-            Ok(output)
+            if let Some(orig_q_len) = saved_slice_q_len {
+                output.narrow(2, 0, orig_q_len)
+            } else {
+                Ok(output)
+            }
         }
     })
 }
@@ -341,7 +598,13 @@ pub fn forward_with_bias(
     })
 }
 
-fn forward_inner(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> SdpaResult<Tensor> {
+fn forward_inner(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    causal: bool,
+) -> SdpaResult<Tensor> {
     let (bq, hq, q_len, d_q) = shape4(q)?;
     let (bk, hk, k_len, d_k) = shape4(k)?;
     let (bv, hv, v_len, d_v) = shape4(v)?;
@@ -365,6 +628,12 @@ fn forward_inner(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> S
             "sequence mismatch: k_len={} v_len={}",
             k_len, v_len
         )));
+    }
+
+    if mask.is_some() && causal {
+        return Err(Error::Unsupported(
+            "sdpa.forward: combined mask + causal attention is not supported".into(),
+        ));
     }
 
     if let Some(m) = mask {
@@ -405,7 +674,7 @@ fn forward_inner(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> S
     #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
     {
         if q.dtype() == DType::BF16 && k.dtype() == DType::BF16 && v.dtype() == DType::BF16 {
-            return forward_bf16(q, k, v, mask, bq, hq, q_len, k_len, d_q);
+            return forward_bf16(q, k, v, mask, bq, hq, q_len, k_len, d_q, causal);
         }
     }
 
@@ -416,7 +685,7 @@ fn forward_inner(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> S
         ));
     }
 
-    forward_f32(q, k, v, mask, d_q)
+    forward_f32(q, k, v, mask, d_q, causal)
 }
 
 #[cfg(feature = "autograd_v4")]
@@ -470,6 +739,7 @@ fn forward_f32(
     v: &Tensor,
     mask: Option<&Tensor>,
     d_q: usize,
+    causal: bool,
 ) -> SdpaResult<Tensor> {
     let q32 = q.to_dtype(DType::F32)?;
     let k32 = k.to_dtype(DType::F32)?;
@@ -490,6 +760,21 @@ fn forward_f32(
         let mask_f32 = expanded.to_dtype(DType::F32)?;
         let ones = full_like(&mask_f32, 1.0)?;
         let complement = ones.sub(&mask_f32)?;
+        let penalty = complement.mul_scalar(NEG_INF)?;
+        scores = scores.add(&penalty)?;
+    }
+    if causal {
+        let target_dims = scores.shape().dims().to_vec();
+        let q_len = q.shape().dims()[2];
+        let k_len = k.shape().dims()[2];
+        let causal_mask = causal_keep_mask(q_len, k_len, 0, q.device().clone(), DType::F32)?;
+        let causal_bcast = if causal_mask.shape().dims() != target_dims.as_slice() {
+            causal_mask.broadcast_to(&Shape::from_dims(&target_dims))?
+        } else {
+            causal_mask.reshape(&target_dims)?
+        };
+        let ones = full_like(&causal_bcast, 1.0)?;
+        let complement = ones.sub(&causal_bcast)?;
         let penalty = complement.mul_scalar(NEG_INF)?;
         scores = scores.add(&penalty)?;
     }
@@ -515,6 +800,7 @@ fn forward_bf16(
     q_len: usize,
     k_len: usize,
     d_q: usize,
+    causal: bool,
 ) -> SdpaResult<Tensor> {
     let scale = 1.0 / (d_q as f32).sqrt();
 
@@ -531,7 +817,7 @@ fn forward_bf16(
     // (see `flame-core/tests/cudnn_sdpa_parity.rs`).
     #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
     if (d_q == 64 || d_q == 96 || d_q == 128) && mask.is_none() {
-        return forward_cudnn_sdpa_bf16(q, k, v, b, h, q_len, k_len, d_q).map_err(|e| {
+        return forward_cudnn_sdpa_bf16(q, k, v, b, h, q_len, k_len, d_q, causal).map_err(|e| {
             log::error!("cudnn SDPA failed (no WMMA fallback): {:?}", e);
             e
         });
@@ -558,7 +844,7 @@ fn forward_bf16(
             > threshold
     };
     if !force_stream && !auto_stream {
-        return forward_bf16_fallback(q, k, v, mask, b, h, q_len, k_len, d_q, scale);
+        return forward_bf16_fallback(q, k, v, mask, b, h, q_len, k_len, d_q, scale, causal);
     }
     if auto_stream && !force_stream {
         log::debug!(
@@ -585,7 +871,7 @@ fn forward_bf16(
             chunk,
             limit
         );
-        match cuda_ops_bf16::sdpa_stream_bf16(q, k, v, mask, chunk, false, Some(scale)) {
+        match cuda_ops_bf16::sdpa_stream_bf16(q, k, v, mask, chunk, causal, Some(scale)) {
             Ok(out) => {
                 let dims = out.shape().dims();
                 if dims.len() != 4 || dims[0] != b || dims[1] != h || dims[2] != q_len {
@@ -632,6 +918,7 @@ fn forward_cudnn_sdpa_bf16(
     q_len: usize,
     k_len: usize,
     d_q: usize,
+    causal: bool,
 ) -> SdpaResult<Tensor> {
     use crate::cuda::device_lt;
 
@@ -710,6 +997,7 @@ fn forward_cudnn_sdpa_bf16(
             k_off,
             v_off,
             o_off,
+            if causal { 1 } else { 0 },
             stream,
         )
     };
@@ -734,6 +1022,8 @@ fn forward_cudnn_sdpa_train_bf16(
     q_len: usize,
     k_len: usize,
     d_q: usize,
+    causal: bool,
+    padding_lens: Option<(usize, usize)>,
 ) -> SdpaResult<(Tensor, Tensor)> {
     use crate::cuda::device_lt;
     use cudarc::driver::DevicePtr;
@@ -772,12 +1062,12 @@ fn forward_cudnn_sdpa_train_bf16(
             ))
         }
     };
-
     let q_off = q.offset() as i64;
     let k_off = k.offset() as i64;
     let v_off = v.offset() as i64;
     let o_off = output.offset() as i64;
     let stats_off = stats.offset() as i64;
+    let (real_q_len, real_k_len) = padding_lens.unwrap_or((q_len, k_len));
 
     let q_strides: [i64; 4] = q_strides_4d;
     let k_strides: [i64; 4] = k_strides_4d;
@@ -806,6 +1096,9 @@ fn forward_cudnn_sdpa_train_bf16(
             v_off,
             o_off,
             stats_off,
+            if causal { 1 } else { 0 },
+            real_q_len as i32,
+            real_k_len as i32,
             stream,
         )
     };
@@ -843,6 +1136,7 @@ fn forward_bf16_fallback(
     k_len: usize,
     d_q: usize,
     scale: f32,
+    causal: bool,
 ) -> SdpaResult<Tensor> {
     // Materialized SDPA: two batched BF16 GEMMs (FP32 acc) + FP32 softmax.
     //
@@ -924,7 +1218,11 @@ fn forward_bf16_fallback(
 
     // Run one Q chunk through the materialized pipeline. Returns `[bh, len, d_q]` BF16.
     let run_one_tile =
-        |q_chunk: &Tensor, mask_slice: Option<&Tensor>, len: usize| -> SdpaResult<Tensor> {
+        |q_chunk: &Tensor,
+         mask_slice: Option<&Tensor>,
+         len: usize,
+         q_start: usize|
+         -> SdpaResult<Tensor> {
             // QK^T tile → [bh, len, K] via cuBLASLt (tensor cores)
             let logits_shape = Shape::from_dims(&[bh, len, k_len]);
             let mut logits_bf16 = Tensor::empty_dtype(logits_shape, DType::BF16, device.clone())?;
@@ -939,6 +1237,17 @@ fn forward_bf16_fallback(
                 // mask_tile comes in as `[bh, len, K]` F32 already prepared.
                 let ones = full_like(mask_tile, 1.0)?;
                 let complement = ones.sub(mask_tile)?;
+                let penalty = complement.mul_scalar(NEG_INF)?;
+                scores = scores.add(&penalty)?;
+            }
+            if causal {
+                let causal_mask =
+                    causal_keep_mask(len, k_len, q_start, device.clone(), DType::F32)?;
+                let causal_bcast =
+                    causal_mask.broadcast_to(&Shape::from_dims(&[b, h, len, k_len]))?;
+                let causal_tile = causal_bcast.reshape(&[bh, len, k_len])?;
+                let ones = full_like(&causal_tile, 1.0)?;
+                let complement = ones.sub(&causal_tile)?;
                 let penalty = complement.mul_scalar(NEG_INF)?;
                 scores = scores.add(&penalty)?;
             }
@@ -977,7 +1286,7 @@ fn forward_bf16_fallback(
         } else {
             None
         };
-        run_one_tile(&q_flat, mask_prepared.as_ref(), q_len)?
+        run_one_tile(&q_flat, mask_prepared.as_ref(), q_len, 0)?
     } else {
         // Tiled path: iterate Q chunks, concat outputs on dim=1.
         let mut tile_outputs: Vec<Tensor> = Vec::with_capacity(num_tiles);
@@ -986,7 +1295,7 @@ fn forward_bf16_fallback(
             let len = (q_len - start).min(q_tile);
             let q_chunk = q_flat.narrow(1, start, len)?;
             // No mask on the tiled path (gated above).
-            let out_tile = run_one_tile(&q_chunk, None, len)?;
+            let out_tile = run_one_tile(&q_chunk, None, len, start)?;
             tile_outputs.push(out_tile);
             start += len;
         }

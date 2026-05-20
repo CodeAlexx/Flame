@@ -392,6 +392,7 @@ pub enum Op {
         mask: Option<TensorId>,
         scale: f32,
         causal: bool,
+        padding_lens: Option<(usize, usize)>,
         /// Saved output tensor id (recorded by `sdpa::forward_train`).
         /// `None` keeps backward-compat with any older record sites.
         /// Stage 2 fix (2026-05-12): replaces the broken shape-find heuristic
@@ -875,7 +876,7 @@ pub fn backward(loss: &Tensor, _retain_graph: bool) -> Result<crate::GradientMap
 ///
 /// Requirements for the cuDNN path:
 ///   - 4D BF16 Q/K/V/O/dO, head_dim ∈ {64, 96, 128}
-///   - unmasked (no causal, no padding)
+///   - no arbitrary binary mask; causal is supported through cuDNN's flag
 ///   - Stats tensor saved from forward — contiguous FP32 `[B*H, N_q]`
 ///
 /// Uses the tensors' native strides so permute-views work without
@@ -894,6 +895,22 @@ fn sdpa_bwd_log(msg: &str) {
     eprintln!("[sdpa-bwd] {msg}");
 }
 
+fn causal_keep_mask_for_logits(
+    q_len: usize,
+    k_len: usize,
+    device: Arc<cudarc::driver::CudaDevice>,
+) -> Result<Tensor> {
+    let mut data = vec![0.0f32; q_len * k_len];
+    for q_idx in 0..q_len {
+        let cutoff = q_idx.min(k_len.saturating_sub(1));
+        let row = q_idx * k_len;
+        for k_idx in 0..=cutoff {
+            data[row + k_idx] = 1.0;
+        }
+    }
+    Tensor::from_vec_dtype(data, Shape::from_dims(&[1, 1, q_len, k_len]), device, DType::F32)
+}
+
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 fn try_cudnn_sdpa_backward(
     q: &Tensor,
@@ -903,6 +920,8 @@ fn try_cudnn_sdpa_backward(
     d_o: &Tensor,
     stats: Option<&Tensor>,
     mask: Option<&Tensor>,
+    causal: bool,
+    padding_lens: Option<(usize, usize)>,
     scale: f32,
     device: &Arc<cudarc::driver::CudaDevice>,
 ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
@@ -915,6 +934,15 @@ fn try_cudnn_sdpa_backward(
     // against the cuDNN kernel cost (~10-15 ms).
     if std::env::var("FLAME_NO_CUDNN_SDPA_BWD").ok().as_deref() == Some("1") {
         sdpa_bwd_log("disabled-by-env");
+        return Ok(None);
+    }
+    if causal
+        && std::env::var("FLAME_CUDNN_SDPA_BWD_CAUSAL")
+            .ok()
+            .as_deref()
+            != Some("1")
+    {
+        sdpa_bwd_log("bail:causal-disabled");
         return Ok(None);
     }
     // All the reasons to bail out.
@@ -946,6 +974,13 @@ fn try_cudnn_sdpa_backward(
     // assumptions. Fall back to decomposed for non-aligned shapes.
     if n_q % 64 != 0 || n_kv % 64 != 0 {
         sdpa_bwd_log(&format!("bail:nq-nkv-align Nq={n_q} Nkv={n_kv}"));
+        return Ok(None);
+    }
+    let (real_n_q, real_n_kv) = padding_lens.unwrap_or((n_q, n_kv));
+    if real_n_q == 0 || real_n_q > n_q || real_n_kv == 0 || real_n_kv > n_kv {
+        sdpa_bwd_log(&format!(
+            "bail:padding-lens real_Nq={real_n_q} real_Nkv={real_n_kv} Nq={n_q} Nkv={n_kv}"
+        ));
         return Ok(None);
     }
     // Q/K/V/O must be BF16 (saved from the BF16 forward). If they aren't,
@@ -990,7 +1025,7 @@ fn try_cudnn_sdpa_backward(
         return Ok(None);
     }
     sdpa_bwd_log(&format!(
-        "fired cuDNN bf16 [B={b},H={h},Nq={n_q},Nkv={n_kv},d={d}]"
+        "fired cuDNN bf16 [B={b},H={h},Nq={n_q},Nkv={n_kv},d={d},causal={causal}]"
     ));
 
     // Read each tensor's native 4D strides.
@@ -1072,6 +1107,9 @@ fn try_cudnn_sdpa_backward(
             dq_off,
             dk_off,
             dv_off,
+            if causal { 1 } else { 0 },
+            real_n_q as i32,
+            real_n_kv as i32,
             stream,
         )
     };
@@ -1090,6 +1128,8 @@ fn try_cudnn_sdpa_backward(
     _d_o: &Tensor,
     _stats: Option<&Tensor>,
     _mask: Option<&Tensor>,
+    _causal: bool,
+    _padding_lens: Option<(usize, usize)>,
     _scale: f32,
     _device: &Arc<cudarc::driver::CudaDevice>,
 ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
@@ -1119,6 +1159,7 @@ fn attention_backward_recompute(
     v: &Tensor,
     dout: &Tensor,
     mask: Option<&Tensor>,
+    causal: bool,
     scale: f32,
     cached_attn: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
@@ -1157,8 +1198,37 @@ fn attention_backward_recompute(
         let kt = k.transpose_dims(2, 3)?;
         let mut logits = q.bmm(&kt)?;
         logits = logits.mul_scalar(scale)?;
-        if let Some(m) = mask {
-            logits = logits.add(m)?;
+        if let Some(mask_raw) = mask {
+            let target_dims = logits.shape().dims().to_vec();
+            let mask_f32 = if mask_raw.dtype() == DType::F32 {
+                mask_raw.clone()
+            } else {
+                mask_raw.to_dtype_no_grad(DType::F32)?
+            };
+            let mask_bcast = if mask_f32.shape().dims() == target_dims.as_slice() {
+                mask_f32
+            } else {
+                mask_f32.broadcast_to(&Shape::from_dims(&target_dims))?
+            };
+            let ones = mask_bcast.full_like(1.0)?;
+            let complement = ones.sub(&mask_bcast)?;
+            let penalty = complement.mul_scalar(-1.0e9)?;
+            logits = logits.add(&penalty)?;
+        }
+        if causal {
+            let target_dims = logits.shape().dims().to_vec();
+            let q_len = q.shape().dims()[2];
+            let k_len = k.shape().dims()[2];
+            let causal_mask = causal_keep_mask_for_logits(q_len, k_len, q.device().clone())?;
+            let causal_bcast = if causal_mask.shape().dims() == target_dims.as_slice() {
+                causal_mask
+            } else {
+                causal_mask.broadcast_to(&Shape::from_dims(&target_dims))?
+            };
+            let ones = causal_bcast.full_like(1.0)?;
+            let complement = ones.sub(&causal_bcast)?;
+            let penalty = complement.mul_scalar(-1.0e9)?;
+            logits = logits.add(&penalty)?;
         }
         attn_owned = logits.softmax(-1)?;
         &attn_owned
@@ -5428,7 +5498,8 @@ fn compute_gradients(
             value,
             mask,
             scale,
-            causal: _,
+            causal,
+            padding_lens,
             output,
             stats,
         } => {
@@ -5490,6 +5561,8 @@ fn compute_gradients(
                 output_grad,
                 stats_tensor,
                 mask_tensor,
+                *causal,
+                *padding_lens,
                 *scale,
                 device,
             )?;
@@ -5516,6 +5589,7 @@ fn compute_gradients(
                     value_tensor,
                     output_grad,
                     mask_tensor,
+                    *causal,
                     *scale,
                     cached_attn,
                 )?

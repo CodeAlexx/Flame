@@ -1140,7 +1140,8 @@ large tensors until it's rewritten.
 | `FLAME_GEMM_BF16_WORKSPACE_BYTES` | Bytes of persistent cuBLASLt workspace per device for BF16 GEMMs (Fix #C; `0` = no workspace) | `0` |
 | `FLAME_HOT_FAST_PATH_DISABLE` | `1` disables direct-kernel fast path on `Tensor::silu/gelu/add/mul/mul_scalar` for BF16-contig (Fix #F); falls through to TensorIterator | fast path on |
 | `FLAME_PERMUTE_FASTPATH` | `0` disables tuned rank-2 `[1,0]` and rank-4 `[0,1,3,2]` permute kernels (Fix #G); routes to generic scatter | fast path on |
-| `FLAME_NO_CUDNN_SDPA_BWD` | `1` forces decomposed SDPA backward (skip `try_cudnn_sdpa_backward`); rollback for Stage 2 cuDNN bwd re-enable | cuDNN on for aligned shapes |
+| `FLAME_NO_CUDNN_SDPA_BWD` | `1` forces decomposed SDPA backward (skip `try_cudnn_sdpa_backward`); rollback for Stage 2 cuDNN bwd re-enable | cuDNN on for unmasked BF16 shapes, with auto-padding for non-64 token counts |
+| `FLAME_CUDNN_SDPA_BWD_CAUSAL` | `1` opts causal SDPA backward into the cuDNN graph; keep off until per-model probes show it beats the fallback | off |
 
 ### Phase 2 `SavedRef` caveat — version counter is in a side table, not in `TensorStorage`
 
@@ -1753,16 +1754,35 @@ automatically.
 
 ---
 
-## cuDNN SDPA backward — Nq 64-alignment + saved-O lookup (2026-05-12, Stage 2)
+## cuDNN SDPA backward — padding-mask alignment + saved-O lookup (2026-05-12, updated 2026-05-20)
 
-`try_cudnn_sdpa_backward` (`autograd.rs:817`) requires **`Nq` divisible by
-64** or cuDNN's flash-bwd graph returns `CUDA_ERROR_MISALIGNED_ADDRESS` at
-launch. Guard added at the top of the function — non-64-aligned shapes
-fall back to the decomposed path. Klein 9B production attention uses
-`Nq ∈ {1536, 1568, 1632}`; only `Nq=1536` is aligned and hits cuDNN. To
-extract klein's full predicted gain, would need to pad Q/K/V/O/Stats to
-the next 64-aligned dim and slice the result (~64-element pad = +4%
-memory at Nq=1568, negligible compute) — deferred follow-up.
+cuDNN's flash-bwd graph still expects the physical Q/KV dimensions to be
+64-aligned. Launching odd sequence lengths directly can return
+`CUDA_ERROR_MISALIGNED_ADDRESS`. The training dispatcher handles that for
+normal unmasked BF16 attention by padding Q/K/V to the next 64-token
+boundary before cuDNN forward, saving Stats/O for the padded shape, and
+passing the real Q/KV lengths to cuDNN forward/backward as padding-mask
+sequence-length tensors. The public output is sliced back to the real Q
+length.
+
+This is the default for unmasked BF16 SDPA with head dim 64/96/128 and is
+intended for every model, not only HiDream-O1. Arbitrary binary masks and
+attention biases still route through the compatibility fallback because the
+current cuDNN wrapper only wires causal and padding-mask semantics, not an
+arbitrary additive mask tensor.
+
+If a model's mask is actually structured, expose the structure instead of
+materializing `[B, H, Q, K]`. HiDream-O1's mixed mask is represented by
+`attention::sdpa_prefix_causal_full`: causal prefix rows plus full suffix rows.
+That keeps the hot full pass on cuDNN and avoids maintaining a second O1 road
+through generic masked SDPA. Do not reintroduce a cuDNN additive-bias route for
+binary masks without both SDPA parity tests and finite end-to-end training
+proof; a previous attempt produced non-finite LoRA gradients.
+
+Causal cuDNN backward is guarded by `FLAME_CUDNN_SDPA_BWD_CAUSAL=1`.
+It is correct enough to run the O1 probe without the old crash, but it was
+slower than the fallback in a 10-step O1 measurement, so do not make it the
+default until a model-specific speed probe proves it wins.
 
 ### ⚠️ Hidden bug class: saved-tensor id-exclusion is broken
 

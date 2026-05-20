@@ -210,17 +210,28 @@ all materialize views).
 
 ## Attention / SDPA — multiple paths!
 
-This is a critical area with several implementations. **Use these for inference**:
+This is a critical area with several implementations. **Use these from model
+code**:
 
 ### ⭐ The live API (use these)
-- `flame_core::attention::sdpa(q, k, v, mask)` — `attention/sdpa.rs:521`
-  Public dispatcher. Routes BF16 to wmma flash kernel (`flash_attention_fwd.cu`),
-  F32 to fallback. **This is what `inference-flame` model files call.**
+- `flame_core::attention::sdpa(q, k, v, mask)`
+  Public dispatcher. Unmasked BF16 head_dim ∈ {64, 96, 128} routes to cuDNN
+  SDPA. In training it records `Op::FlashAttention` with saved O/Stats so
+  backward can use cuDNN instead of decomposed recompute. `mask=Some(...)` is
+  the generic compatibility path for true arbitrary masks, not the hot road for
+  structured model attention.
+- `flame_core::attention::sdpa_causal(q, k, v)`
+  Structured top-left causal self-attention. Use this instead of building a
+  lower-triangular binary mask.
+- `flame_core::attention::sdpa_prefix_causal_full(q, k, v, prefix_len)`
+  Structured mixed self-attention: prefix rows are causal, suffix rows are full.
+  HiDream-O1 uses this for its AR/text + image-token pattern so the full pass
+  remains unmasked and cuDNN-backed.
 - `flame_core::attention::sdpa_with_bias(q, k, v, bias, scale)` — `attention/sdpa.rs:542`
   T5-style additive bias variant. Same dispatch but accepts a `[*, H|1, Q, K]` bias tensor.
 - `flame_core::attention::attend(q, k, v, mask)` — `attention/sdpa.rs:534` — alias for sdpa
 - `flame_core::attention::attention_impl(...)` — `attention/sdpa.rs:395` — lower-level impl
-- `flame_core::sdpa::forward(q, k, v, mask)` — `sdpa.rs:94`
+- `flame_core::sdpa::forward(q, k, v, mask)`
   Used directly by `inference-flame::vae::ldm_decoder` and `vae::wan21_vae`
   for cases where the dispatch overhead isn't wanted.
   **2026-04 update**: the BF16 path now auto-routes to the streaming kernel
@@ -229,6 +240,8 @@ This is a critical area with several implementations. **Use these for inference*
   tensor and OOM on 24 GB cards for LTX-2 stage-2 self-attn (11 k tokens).
   The threshold is env-tunable. `FLAME_SDPA_FORCE_STREAM=1` still forces
   the stream for any shape.
+- `flame_core::sdpa::forward_causal(q, k, v)`
+- `flame_core::sdpa::forward_prefix_causal_full(q, k, v, prefix_len)`
 - `flame_core::sdpa::forward_with_bias(...)` — `sdpa.rs:125`
 - `flame_core::cuda_ops_bf16::sdpa_stream_bf16(q, k, v, mask, chunk, causal, scale)` — `cuda_ops_bf16.rs:1599`
   The chunked streaming SDPA used by LTX-2. Takes a `causal` flag and chunk size.
@@ -254,11 +267,11 @@ This is a critical area with several implementations. **Use these for inference*
   Called from `sdpa::forward` when `AutogradContext::is_recording()` and
   any input requires grad. Routes unmasked BF16 head_dim ∈ {64, 96, 128}
   through `flame_cudnn_sdpa_bf16_train_fwd` (emits O + Stats in one graph
-  execute), records `Op::FlashAttention` with `output: Some(out.id())` +
-  `stats: stats_tensor.as_ref().map(|s| s.id())` (added 2026-05-12 — see
-  Stage 2 below). Backward then calls `flame_cudnn_sdpa_bwd_bf16` via
-  `autograd::try_cudnn_sdpa_backward`. Unsupported shapes fall through to
-  the decomposed recompute.
+  execute). Non-64-aligned Q/KV lengths are physically padded before cuDNN and
+  sliced back afterward; real lengths are saved on `Op::FlashAttention` and
+  passed into cuDNN as padding-mask sequence lengths. Backward then calls
+  `flame_cudnn_sdpa_bwd_bf16` via `autograd::try_cudnn_sdpa_backward`.
+  Unsupported shapes and true arbitrary masks fall through to recompute.
 
 ### Stage 2 (2026-05-12) — cuDNN SDPA backward re-enabled
 **Bug fixed**: `autograd.rs:4231-4240` shape-find heuristic returned Q as O
@@ -269,10 +282,11 @@ fields (autograd.rs:332-348).
 - New tests at `tests/sdpa_bwd_parity.rs` — 8 cases: 4 same-path
   determinism + 4 cuDNN-vs-decomposed cross-path. cos ≥ 0.99996,
   max_abs_diff ≤ 1.2e-2.
-- **Nq 64-alignment guard** at `autograd.rs:817` — cuDNN flash bwd requires
-  Nq divisible by 64 or returns `CUDA_ERROR_MISALIGNED_ADDRESS`. Falls
-  back to decomposed for non-aligned shapes (klein production Nq=1568/1632
-  bail; Nq=1536 hits cuDNN).
+- **Q/KV 64-alignment handling** — cuDNN flash bwd still wants physical
+  sequence lengths aligned to 64. The dispatcher pads unmasked BF16 attention
+  to satisfy cuDNN and supplies real lengths through cuDNN padding-mask
+  sequence tensors, so models no longer fall back solely because token counts
+  are not 64-aligned.
 - Loss bit-equal at 4 decimal places vs `FLAME_NO_CUDNN_SDPA_BWD=1`
   rollback path.
 - Real savings: zimage -200 ms/step (1.8 → 1.6); klein 9B -100 ms (4.7 →

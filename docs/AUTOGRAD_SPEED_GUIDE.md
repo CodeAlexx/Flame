@@ -2,7 +2,7 @@
 
 Current state, profiling methodology, and next steps for closing the backward pass speed gap with PyTorch.
 
-Last updated: 2026-04-13
+Last updated: 2026-05-20
 
 ---
 
@@ -102,29 +102,45 @@ A complete wmma tensor core backward kernel exists at `src/cuda/flash_attention_
 
 **Currently disabled** — gated behind `FLAME_FUSED_ATTN_BWD=1`. At seq_len=1024 (Z-Image), the 7-stage pipeline with per-stage `__syncthreads` is slower than 12 separate fully-pipelined kernel launches (4.2s vs 2.8s/step). May win at larger sequence lengths (4096+).
 
-### HiDream-O1 masked SDPA caveat (2026-05-20)
+### HiDream-O1 SDPA fast-path status (2026-05-20)
 
-The current cuDNN SDPA backward fast path only fires for unmasked BF16
-4D attention with supported head dimensions and 64-aligned sequence lengths.
-`try_cudnn_sdpa_backward()` intentionally bails when `mask.is_some()`.
+The production cuDNN SDPA backward fast path now covers unmasked BF16
+4D attention with supported head dimensions even when sequence lengths are
+not 64-aligned. `sdpa::forward_train()` pads Q/K/V to the next 64-token
+boundary, records the real Q/KV lengths in `Op::FlashAttention`, and passes
+those lengths into the cuDNN padding-mask graph for forward and backward.
+The returned output is sliced back to the real Q length, so callers keep the
+same tensor contract while avoiding the slow recompute path for padded
+unmasked attention.
 
-HiDream-O1 uses a two-pass attention layout: causal AR/text attention plus
-full image-token attention. The causal AR/text pass still arrives as a
-mask-present `Op::FlashAttention`, so training falls back to decomposed
-masked recompute for that pass. A 3-step EDV2 O1 probe produced:
+`try_cudnn_sdpa_backward()` still intentionally bails when `mask.is_some()`.
+The generic masked path is a compatibility route for arbitrary binary masks
+and attention biases. Do not route normal unmasked model attention through it
+just because the raw token count is not divisible by 64.
+
+HiDream-O1 uses a structured prefix-causal/full attention pattern: AR/text
+prefix rows are causal, while image rows use full attention over all tokens.
+The model now calls `attention::sdpa_prefix_causal_full` instead of
+materializing the old `[B, 1, S, S]` mixed binary mask. Internally that
+primitive runs a small causal prefix pass plus a full unmasked pass, then
+replaces the prefix rows. The large full pass stays on the padded cuDNN SDPA
+train-forward/backward path. Before that change, a 3-step EDV2 O1 probe
+produced:
 
 ```text
 FLAME_LOG_SDPA_BWD=1 train_hidream_o1 --steps 3 ...
 108 [sdpa-bwd] bail:mask-present
 ```
 
-That is a speed problem, not a correctness proof. The fallback remains the
-mathematical backward path, but it explains why O1 training is around
-3.1 s/step in EDV2 while ai-toolkit's resident PyTorch/HF path can be near
-1 s/step. Closing this requires a real causal/masked SDPA training fast path,
-or a high-memory O1 mode that reduces checkpointed/masked replay. Retuning
-the block offloader slot window alone will not remove the masked SDPA
-backward fallback.
+Causal cuDNN backward is available behind `FLAME_CUDNN_SDPA_BWD_CAUSAL=1`.
+It no longer crashes on O1 after the padding-mask wiring, but a 10-step O1
+probe measured it slower than the default fallback (about 3.3 s/step vs
+about 3.0 s/step), so it remains opt-in. With `FLAME_LOG_SDPA_BWD=1`, O1
+should now show full-pass cuDNN hits and causal-prefix `bail:causal-disabled`
+entries, not `bail:mask-present`. The remaining O1 speed gap is now dominated
+by decoder checkpoint/recompute and block offload boundaries, not by the
+full image-token SDPA alignment fallback. Retuning the block offloader slot
+window alone is still unlikely to reach the resident PyTorch/HF speed.
 
 ---
 
