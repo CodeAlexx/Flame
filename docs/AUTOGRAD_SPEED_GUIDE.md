@@ -102,6 +102,30 @@ A complete wmma tensor core backward kernel exists at `src/cuda/flash_attention_
 
 **Currently disabled** — gated behind `FLAME_FUSED_ATTN_BWD=1`. At seq_len=1024 (Z-Image), the 7-stage pipeline with per-stage `__syncthreads` is slower than 12 separate fully-pipelined kernel launches (4.2s vs 2.8s/step). May win at larger sequence lengths (4096+).
 
+### HiDream-O1 masked SDPA caveat (2026-05-20)
+
+The current cuDNN SDPA backward fast path only fires for unmasked BF16
+4D attention with supported head dimensions and 64-aligned sequence lengths.
+`try_cudnn_sdpa_backward()` intentionally bails when `mask.is_some()`.
+
+HiDream-O1 uses a two-pass attention layout: causal AR/text attention plus
+full image-token attention. The causal AR/text pass still arrives as a
+mask-present `Op::FlashAttention`, so training falls back to decomposed
+masked recompute for that pass. A 3-step EDV2 O1 probe produced:
+
+```text
+FLAME_LOG_SDPA_BWD=1 train_hidream_o1 --steps 3 ...
+108 [sdpa-bwd] bail:mask-present
+```
+
+That is a speed problem, not a correctness proof. The fallback remains the
+mathematical backward path, but it explains why O1 training is around
+3.1 s/step in EDV2 while ai-toolkit's resident PyTorch/HF path can be near
+1 s/step. Closing this requires a real causal/masked SDPA training fast path,
+or a high-memory O1 mode that reduces checkpointed/masked replay. Retuning
+the block offloader slot window alone will not remove the masked SDPA
+backward fallback.
+
 ---
 
 ## Next Steps: CUDA Graph for Checkpoint Sub-Backward
