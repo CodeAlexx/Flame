@@ -2449,8 +2449,9 @@ const CUDA_SWIGLU_FUSED: &str = r#"
 // Each thread processes 2 contiguous BF16 elements with one 4-byte load
 // per input. Scalar fallback for the tail when total % 2 != 0.
 //
-// Math is still per-element F32 (silu = x / (1 + exp(-x))) to preserve
-// BF16-storage / F32-accumulation contract from the legacy kernel.
+// Math matches PyTorch BF16 `F.silu(gate) * up`: compute SiLU in F32, round
+// that SiLU result to BF16, then multiply by BF16 `up` and round output to
+// BF16. The intermediate round is observable in HiDream-O1 trainer parity.
 extern "C" __global__
 void swiglu_fused_bf16_vec2_kernel(
     const __nv_bfloat16* __restrict__ GATE,
@@ -2474,8 +2475,10 @@ void swiglu_fused_bf16_vec2_kernel(
         float u_hi = __bfloat162float(__high2bfloat16(u2));
         float silu_lo = g_lo / (1.0f + expf(-g_lo));
         float silu_hi = g_hi / (1.0f + expf(-g_hi));
-        __nv_bfloat16 y_lo = __float2bfloat16(silu_lo * u_lo);
-        __nv_bfloat16 y_hi = __float2bfloat16(silu_hi * u_hi);
+        float silu_lo_bf16 = __bfloat162float(__float2bfloat16(silu_lo));
+        float silu_hi_bf16 = __bfloat162float(__float2bfloat16(silu_hi));
+        __nv_bfloat16 y_lo = __float2bfloat16(silu_lo_bf16 * u_lo);
+        __nv_bfloat16 y_hi = __float2bfloat16(silu_hi_bf16 * u_hi);
         Y2[idx] = __halves2bfloat162(y_lo, y_hi);
     }
 
@@ -2486,7 +2489,8 @@ void swiglu_fused_bf16_vec2_kernel(
             float g = __bfloat162float(GATE[t]);
             float u = __bfloat162float(UP[t]);
             float s = g / (1.0f + expf(-g));
-            Y[t] = __float2bfloat16(s * u);
+            float s_bf16 = __bfloat162float(__float2bfloat16(s));
+            Y[t] = __float2bfloat16(s_bf16 * u);
         }
     }
 }
@@ -2503,7 +2507,8 @@ void swiglu_fused_bf16_kernel(
         float g = __bfloat162float(GATE[idx]);
         float u = __bfloat162float(UP[idx]);
         float silu_g = g / (1.0f + expf(-g));
-        Y[idx] = __float2bfloat16(silu_g * u);
+        float silu_bf16 = __bfloat162float(__float2bfloat16(silu_g));
+        Y[idx] = __float2bfloat16(silu_bf16 * u);
         idx += gridDim.x * blockDim.x;
     }
 }
@@ -2546,7 +2551,8 @@ void swiglu_fused_strided_bf16_kernel(
         float g = __bfloat162float(GATE[g_addr]);
         float u = __bfloat162float(UP[u_addr]);
         float silu_g = g / (1.0f + expf(-g));
-        Y[idx] = __float2bfloat16(silu_g * u);
+        float silu_bf16 = __bfloat162float(__float2bfloat16(silu_g));
+        Y[idx] = __float2bfloat16(silu_bf16 * u);
         idx += step;
     }
 }
@@ -2583,13 +2589,16 @@ void swiglu_split_lastdim_bf16_kernel(
         float g = __bfloat162float(X[in_addr + d * last_stride]);
         float u = __bfloat162float(X[in_addr + (half + d) * last_stride]);
         float silu_g = g / (1.0f + expf(-g));
-        Y[idx] = __float2bfloat16(silu_g * u);
+        float silu_bf16 = __bfloat162float(__float2bfloat16(silu_g));
+        Y[idx] = __float2bfloat16(silu_bf16 * u);
         idx += step;
     }
 }
 "#;
 
-/// Fused SwiGLU: silu(gate) * up in one kernel (no intermediate silu tensor).
+/// Fused SwiGLU: `BF16(silu(gate)) * up` in one kernel. It does not store an
+/// intermediate SiLU tensor, but it does perform the PyTorch-visible BF16
+/// round between SiLU and the multiply.
 ///
 /// Stride-aware as of Phase 2b (2026-04-23). Contig fast path when both
 /// inputs are already contiguous; strided path indexes strided-view inputs

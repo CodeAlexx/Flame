@@ -1405,6 +1405,7 @@ fn parity_klein_apply_rope_prod_diag() {
                         input: x.id(),
                         cos: pe_cos.id(),
                         sin: pe_sin.id(),
+                        layout: flame_core::autograd::RopeLayout::Interleaved,
                     },
                     vec![
                         (x.id(), x.clone()),
@@ -1643,6 +1644,7 @@ fn parity_klein_attn_chain_prod_diag() {
                         input: x_in.id(),
                         cos: pe_cos.id(),
                         sin: pe_sin.id(),
+                        layout: flame_core::autograd::RopeLayout::Interleaved,
                     },
                     vec![
                         (x_in.id(), x_in.clone()),
@@ -1790,6 +1792,7 @@ fn parity_klein_attn_chain_no_sdpa_prod_diag() {
                         input: x_in.id(),
                         cos: pe_cos.id(),
                         sin: pe_sin.id(),
+                        layout: flame_core::autograd::RopeLayout::Interleaved,
                     },
                     vec![
                         (x_in.id(), x_in.clone()),
@@ -2260,6 +2263,7 @@ fn parity_klein_full_single_block_prod_diag() {
                         input: x_in.id(),
                         cos: pe_cos.id(),
                         sin: pe_sin.id(),
+                        layout: flame_core::autograd::RopeLayout::Interleaved,
                     },
                     vec![
                         (x_in.id(), x_in.clone()),

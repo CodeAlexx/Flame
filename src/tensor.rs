@@ -1806,7 +1806,21 @@ extern "C" __global__ void masked_fill_kernel(
                     DType::F32,
                     self.device.clone(),
                 )?;
-                crate::ops::gemm::launch_gemm_strided_batched(self, other, &mut out)?;
+                let lhs_owned;
+                let rhs_owned;
+                let lhs = if self.is_contiguous() {
+                    self
+                } else {
+                    lhs_owned = self.contiguous()?;
+                    &lhs_owned
+                };
+                let rhs = if other.is_contiguous() {
+                    other
+                } else {
+                    rhs_owned = other.contiguous()?;
+                    &rhs_owned
+                };
+                crate::ops::gemm::launch_gemm_strided_batched(lhs, rhs, &mut out)?;
                 out
             }
             DType::BF16 => {

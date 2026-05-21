@@ -406,17 +406,28 @@ via runtime dispatch and accepts a runtime `causal` flag.
 | `launch_fwd` | `:263` | Per-head_dim dispatch into the template specialization. |
 | `mask_tail_2d_float_neg_inf` | `:71` | Softmax-safe tail mask — fills invalid cells with `-INFINITY`. See gotcha in CONVENTIONS. |
 
-**Tile sizes**: `TILE_Q=64, TILE_KV=64, NUM_WARPS=16, THREADS=512`.
-Warp layout is 4 row-groups × 4 col-groups (each warp owns one 16×16
-QK^T block). PV matmul scatters across `row_group × hd_tile` pairs
-with an atomicAdd into `s_O`.
+**Tile sizes**: HD64/HD96 use `TILE_Q=64, TILE_KV=64, NUM_WARPS=16`.
+HD128 causal also uses `64x64`; HD128 non-causal uses `TILE_Q=64,
+TILE_KV=32, NUM_WARPS=8` to track PyTorch FlashAttention's narrower K tile
+for O1 full-suffix attention while staying inside Flame's shared-memory
+`s_O` accumulator budget. Warp layout is row-groups x col-groups (each warp
+owns one 16x16 QK^T block). PV matmul scatters across `row_group x hd_tile`
+pairs with an atomicAdd into `s_O`.
 
-**2026-05-21 HiDream-O1 FA2 parity work**: the forward kernel now keeps
-raw QK logits until softmax, applies `exp2((score - max) * log2(e) /
-sqrt(head_dim))`, scans K/V tiles right-to-left, and applies runtime causal
-masking. This tracks PyTorch's FlashAttention numerics more closely while
-preserving Flame's existing shared-memory accumulator kernel. It is not yet
-a full CUTLASS/CUTE port.
+**2026-05-21 HiDream-O1 FA2 parity work**: the forward kernel keeps raw QK
+logits until softmax, scans K/V tiles right-to-left, applies runtime causal
+masking, and mirrors PyTorch FlashAttention's `UNFUSE_FMA` softmax form:
+`exp2(__fmul_rn(score, log2(e)/sqrt(head_dim)) - max_scaled)`. This tracks
+PyTorch numerics more closely while preserving Flame's existing shared-memory
+accumulator kernel. It is not yet a full CUTLASS/CUTE port.
+
+Verification trap: `cargo test -p flame-core --features "cuda bf16_u16"
+--test fa2_parity_naive -- --nocapture` passes for `N={512,4096}` and
+`HD={64,128}` against a materialized FP32 reference (`cos_sim=0.999997`,
+`max_abs<=3.906e-3`). `tests/sdpa_ragged_sk.rs` also passes for
+`Sk={64,71,72,128,200}`. The O1 production parity gate still fails at
+`layer00.attn_out`; `layer00.sdpa_out` is within the current threshold and
+the sparse one-ULP attention differences are amplified by `o_proj`.
 
 **PyTorch reference tile targets, deferred**: local PyTorch FlashAttention
 dispatch uses SM8x HD64 non-causal `128x128`, HD96 non-causal `128x64`,

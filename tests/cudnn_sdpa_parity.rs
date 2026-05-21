@@ -69,6 +69,7 @@ fn run_parity(b: usize, h: usize, n: usize, d: usize) {
             n as i32,
             n as i32,
             d as i32,
+            0,
             stream,
         )
     };

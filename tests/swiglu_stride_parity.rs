@@ -74,7 +74,8 @@ fn swiglu_strided_on_klein_mlp_shape() {
     let out = flame_core::bf16_ops::swiglu_fused_bf16(&gate, &up).unwrap();
     assert_eq!(out.shape().dims(), &[b, n, half]);
 
-    // Reference math: silu(g) * u where g, u are taken at the right offsets.
+    // Reference math: PyTorch BF16 `F.silu(g) * u` where the SiLU result is
+    // itself BF16 before the multiply.
     let data_ref = hash_fill(&[b, n, full]);
     let out_vec = out.to_vec().unwrap();
     for i in 0..b * n * half {
@@ -89,12 +90,13 @@ fn swiglu_strided_on_klein_mlp_shape() {
         let g_back = f32_from_bf16_bits(g_bf16);
         let u_back = f32_from_bf16_bits(u_bf16);
         let silu_g = g_back / (1.0 + (-g_back).exp());
-        let expected = silu_g * u_back;
-        // BF16 round-trip tolerance
+        let silu_bf16 = f32_from_bf16_bits(half_from_f32(silu_g));
+        let expected_bf16 = half_from_f32(silu_bf16 * u_back);
+        let expected = f32_from_bf16_bits(expected_bf16);
         let got = out_vec[i];
-        let diff = (got - expected).abs();
-        assert!(
-            diff < 0.02 * expected.abs().max(1.0),
+        assert_eq!(
+            got.to_bits(),
+            expected.to_bits(),
             "swiglu mismatch at idx {}: got={} expected={} (g={}, u={})",
             i,
             got,

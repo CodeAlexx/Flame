@@ -69,6 +69,7 @@ fn launch_fa2(q_3d: &Tensor, k_3d: &Tensor, v_3d: &Tensor) -> Result<Tensor> {
             sq,
             sk,
             hd,
+            0,
             stream,
         )
     };

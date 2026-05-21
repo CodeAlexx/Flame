@@ -102,7 +102,7 @@ A complete wmma tensor core backward kernel exists at `src/cuda/flash_attention_
 
 **Currently disabled** — gated behind `FLAME_FUSED_ATTN_BWD=1`. At seq_len=1024 (Z-Image), the 7-stage pipeline with per-stage `__syncthreads` is slower than 12 separate fully-pipelined kernel launches (4.2s vs 2.8s/step). May win at larger sequence lengths (4096+).
 
-### HiDream-O1 SDPA fast-path status (2026-05-20)
+### HiDream-O1 SDPA fast-path status (2026-05-21)
 
 The production cuDNN SDPA backward fast path now covers unmasked BF16
 4D attention with supported head dimensions even when sequence lengths are
@@ -127,6 +127,10 @@ causal pass plus a suffix all-ones masked pass; backward recomputes once
 against the exact prefix-causal/full mask. This is the current fastest path
 proved by the O1 SDPA trap on 2026-05-21; the unmasked suffix/cuDNN attempts
 failed this machine's cuDNN plan builder at O1's non-aligned suffix shape.
+The in-tree FA2 forward supports head dimensions 64/96/128 with a runtime
+causal flag; HD128 non-causal uses a 64x32 K tile and PyTorch-style
+`UNFUSE_FMA` softmax scaling. Direct FA2-vs-FP32-reference tests pass, so the
+remaining O1 failure is not a gross FA2 correctness bug.
 Before structured attention, a 3-step EDV2 O1 probe produced:
 
 ```text
@@ -139,9 +143,12 @@ but keep it opt-in: O1's prefix shape has produced cuDNN plan failures and
 slower timings in local probes. With `FLAME_LOG_SDPA_BWD=1`, the mixed O1
 path should show `PrefixCausalFullAttention` / masked recompute behavior for
 the custom op, not a generic full `[S,S]` mask in the model. The remaining O1
-speed gap is dominated by decoder checkpoint/recompute, lower-layer parity
-issues, and block offload boundaries. Retuning the block offloader slot window
-alone is still unlikely to reach the resident PyTorch/HF speed.
+gate is a strict parity issue: the fixed production harness now returns FAIL
+when forward/objective/per-layer metrics fail, and the current first failing
+stage is `forward::layer00.attn_out`. `layer00.sdpa_out` is within threshold
+(`max_abs=1.953125e-3` on the pinned Full-model dump), but the sparse attention
+rounding differences spread through `o_proj` and later residuals. Do not run
+the 1000-step `/eri2` training proof until this parity gate is green.
 
 North-star reminder: structured SDPA only proves the old masked hot road is
 gone. O1 is not fixed until a real trained LoRA renders clean trigger-bound

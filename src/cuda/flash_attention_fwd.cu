@@ -238,10 +238,14 @@ __global__ void flash_attn_fwd_kernel(
 
             s_l[qi] *= corr;
             float tile_sum = 0.0f;
+            float new_max_scaled = (new_max == -INFINITY) ? 0.0f : new_max * scale_log2;
 
             #pragma unroll
             for (int j = 0; j < TILE_KV; j++) {
-                float p = exp2f((s_S[qi * TILE_KV + j] - new_max) * scale_log2);
+                // Match PyTorch's FlashAttention build. PyTorch defines
+                // UNFUSE_FMA, so `score * scale - max_scaled` is explicitly
+                // rounded as a standalone multiply before the subtraction.
+                float p = exp2f(__fmul_rn(s_S[qi * TILE_KV + j], scale_log2) - new_max_scaled);
                 s_S[qi * TILE_KV + j] = p;
                 tile_sum += p;
             }
@@ -348,8 +352,33 @@ static inline int launch_fwd(
             (__nv_bfloat16*)O, seq_len_q, seq_len_kv, scale_log2, causal
         );
     } else if (head_dim == 128) {
-        // K/V-reuse layout frees 16 KB shared, enabling TILE_KV=64 at HD=128
-        // within the SM_86 100 KB opt-in budget.
+        // PyTorch/FlashAttention uses a narrower K tile for HD=128
+        // non-causal (128x32 with register-resident O). Flame keeps Q=64
+        // because this shared-memory O accumulator cannot fit Q=128 on SM86,
+        // but using K/V=32 brings the online-softmax traversal closer to the
+        // PyTorch reference for O1 full-suffix attention.
+        if (!causal) {
+            constexpr int TILE_Q = 64, TILE_KV = 32, HD = 128, NUM_WARPS = 8;
+            dim3 grid(batch_heads, (seq_len_q + TILE_Q - 1) / TILE_Q);
+            dim3 block(NUM_WARPS * 32);
+            size_t smem =
+                (TILE_Q*HD + TILE_KV*HD + TILE_Q*TILE_KV) * sizeof(__nv_bfloat16) +
+                (TILE_Q*TILE_KV + TILE_Q*HD + TILE_Q + TILE_Q) * sizeof(float);
+            cudaFuncSetAttribute(
+                flash_attn_fwd_kernel<TILE_Q, TILE_KV, HD, NUM_WARPS>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)smem
+            );
+            flash_attn_fwd_kernel<TILE_Q, TILE_KV, HD, NUM_WARPS><<<grid, block, smem, s>>>(
+                (const __nv_bfloat16*)Q, (const __nv_bfloat16*)K, (const __nv_bfloat16*)V,
+                (__nv_bfloat16*)O, seq_len_q, seq_len_kv, scale_log2, causal
+            );
+            return (int)cudaGetLastError();
+        }
+
+        // Causal HD=128 keeps the existing 64x64 shape; PyTorch's causal
+        // HD128 path also uses a 64x64 tile class, and O1 prefix parity is
+        // already tighter than the full-suffix path.
         constexpr int TILE_Q = 64, TILE_KV = 64, HD = 128, NUM_WARPS = 16;
         dim3 grid(batch_heads, (seq_len_q + TILE_Q - 1) / TILE_Q);
         dim3 block(NUM_WARPS * 32);
