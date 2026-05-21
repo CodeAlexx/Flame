@@ -204,7 +204,18 @@ all materialize views).
   `take_retained_intermediate_grads()`** — test-only API for probing
   intermediate gradients during backward. Used by
   `parity_klein_full_single_block_prod_diag` to bisect bug-#4-class
-  hazards. See `src/autograd.rs:910-940`.
+  hazards. See `src/autograd.rs:1395` / `:1420`.
+- ⭐ **`AutogradContext::retain_intermediate_grads_add(ids)`** — additive
+  variant of the above (2026-05-20). Extends the existing retain set
+  instead of replacing. Required when probe IDs are registered *during*
+  a checkpoint recompute closure: the outer-tape snapshot at
+  `autograd.rs:2058` already fired before the closure runs, but the
+  sub-tape walk re-reads `RETAINED_INTERMEDIATE_GRAD_IDS` inside
+  `Op::Checkpoint` (`autograd.rs:3551`) and `Op::CheckpointOffloadBoundary`
+  (`autograd.rs:3800`) backward. Gate the registration with
+  `AutogradContext::is_checkpoint_recompute()` so the same forward path
+  doesn't double-record. See `src/autograd.rs:1412` and
+  [`FLAME_DIAGNOSTICS.md`](./FLAME_DIAGNOSTICS.md) §0 + §1.
 
 ---
 
@@ -321,13 +332,17 @@ directly at backward).
   Symptom of misuse: `Shape mismatch: expected [..., D/2_from_x], got
   [..., ROPE_DIM/2]` from the cos/sin reshape inside the kernel. See
   `inference-flame/src/models/magihuman_dit.rs::rope_partial_halfsplit`.
-- ⚠️ **`Op::RoPePrecomputed` backward dispatches by `cos` shape**
-  (commit dfe85b8): broadcast cos `[1,_,N,half]` →
-  `rope_fused_bf16` (Interleaved); per-head cos `[BH,N,half]` →
-  `rope_halfsplit_bf16` (Halfsplit). Pre-fix it unconditionally called
-  halfsplit, giving cos_sim ≈ 0.05 backward gradients on Klein
-  (orthogonal-direction at correct magnitude — magnitude-only checks
-  hid this for sessions). See `src/autograd.rs:2515-2570`.
+- ⭐ **`Op::RoPePrecomputed` backward dispatches by explicit
+  `RopeLayout` tag** (2026-05-20). Variants: `RopeLayout::Interleaved` →
+  `rope_fused_bf16`; `RopeLayout::Halfsplit` → `rope_halfsplit_bf16`.
+  See `src/autograd.rs:4207-4230` for the dispatch. Forward sites at
+  `bf16_ops.rs:923` (`rope_fused_bf16`), `bf16_ops.rs:1068`
+  (`rope_fused_bf16_f32pe`), `bf16_ops.rs:1183` (`rope_halfsplit_bf16`)
+  pass the correct tag. Replaces the shape-sniffing fallback (commit
+  dfe85b8), which mis-classified HiDream-O1 MRoPE cos `[1,S,half]`
+  (rank-3 but Halfsplit) as Interleaved — that was the HiDream-O1 Q/K
+  LoRA-B grad collapse pattern. See [`RopeLayout` doc at
+  `src/autograd.rs:155-177`].
 - ⚠️ **Interleaved `rope_fused_bf16` autograd-recording fix** (commit
   fa3291e). Pre-fix: output had `requires_grad: false` hardcoded and no
   `Op::RoPePrecomputed` recording, severing Q/K LoRA gradient chains in
@@ -438,8 +453,20 @@ directly at backward).
   Autograd flows into A and B (frozen base weight). Added 2026-05 for HiDream-O1
   LoRA injection where decoder owns weights via `HashMap<String, Tensor>`
   (decoder.rs:346-419) rather than `Linear` modules.
-- C side: `flame_linear3d_bf16` / `flame_linear3d_bf16_native` in
-  `src/cuda/fused_linear3d.cu`.
+- ⭐ `ops::fused_inference::fused_linear3d_native_pytorch_parity(input, weight, bias)`
+  — `ops/fused_inference.rs:479` (added 2026-05-20). Same signature/semantics
+  as `fused_linear3d_native` but mirrors PyTorch's
+  `at::cuda::blas::gemm_and_bias<at::BFloat16>` cuBLASLt configuration
+  bit-exactly (1 MiB workspace, per-call heuristic, BIAS_POINTER set
+  before `cublasLtMatmulAlgoGetHeuristic`, no BIAS_DATA_TYPE / batch /
+  alignment attrs). ~1% perf overhead vs the non-parity variant. Use
+  this where ai-toolkit / PyTorch bit-exact per-op parity matters
+  (HiDream-O1 TimestepEmbedder, BottleneckPatchEmbed). For established
+  Klein / Z-Image baselines, keep using `fused_linear3d_native` to
+  preserve their existing parity numbers.
+- C side: `flame_linear3d_bf16` / `flame_linear3d_bf16_native` /
+  `flame_linear3d_bf16_pytorch_parity` in `src/cuda/fused_linear3d.cu`
+  (FFI bindings at `src/cuda/ffi.rs:906` for the parity variant).
 
 ### Other linear / GEMM
 - `linear::Linear / linear::linear(in, out, bias, device)` — `linear.rs:11+` —
@@ -658,6 +685,7 @@ The "kernel calls that bypass autograd entirely". Used by every FLUX-style block
 | ⭐ `fused_linear3d` | `:276` | cuBLASLt 3D linear (pre-transposed weight) |
 | ⭐ `fused_linear3d_native` | `:357` | cuBLASLt 3D linear (PyTorch weight layout, TRANSA=T) |
 | ⭐ `fused_linear3d_native_lora` | `:489` | Additive LoRA over `fused_linear3d_native`; byte-identical at LoRA=None |
+| ⭐ `fused_linear3d_native_pytorch_parity` | `:479` | Bit-exact PyTorch `gemm_and_bias<BF16>` mirror (2026-05-20); use when ai-toolkit per-op parity matters |
 | ⭐ `fused_rms_norm_modulate` | `:552` | RMSNorm + modulate fused |
 | ⭐ `fused_residual_gate` | `:599` | `x + gate * attn` fused |
 
@@ -1021,8 +1049,15 @@ Recently-added variants:
   `cuda_ops::GpuOps::upsample2d_nearest`, backward at
   `cuda_kernels::CudaKernels::upsample2d_nearest_backward` (NVRTC F32
   atomicAdd kernel; BF16 grad_outputs are cast to F32 internally).
-- ⭐ `Op::RoPePrecomputed` — forward at `bf16_ops::rope_fused_bf16`
-  (added 2026-04-25 — was the Q/K LoRA gradient blockade).
+- ⭐ `Op::RoPePrecomputed { input, cos, sin, layout: RopeLayout }`
+  — forward at `bf16_ops::rope_fused_bf16` / `rope_fused_bf16_f32pe` /
+  `rope_halfsplit_bf16`. Carries an explicit `RopeLayout` tag (added
+  2026-05-20) so backward never has to shape-sniff cos. Was the Q/K
+  LoRA gradient blockade pre-2026-04-25 (recording missing), and the
+  HiDream-O1 MRoPE shape-sniff mis-classification pre-2026-05-20.
+- ⭐ `RopeLayout::{Interleaved, Halfsplit}` — `src/autograd.rs:177`.
+  Public enum tagging fused-RoPE autograd variants. See doc at
+  `src/autograd.rs:155-177` for which model uses which layout.
 
 ### `autograd_v4` (feature gated)
 - `autograd_v4::*` — newer experimental engine. Off by default.

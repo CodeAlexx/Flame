@@ -909,8 +909,8 @@ pub fn rope_fused_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor>
     // this RoPE before SDPA; without recording, `result.requires_grad`
     // stays false and the gradient chain is severed at this point —
     // Q_B/K_B never receive non-zero gradient, while V (which skips RoPE)
-    // trains normally. The dispatching backward handler in `autograd.rs`
-    // picks fused/Interleaved when the saved cos shape is `[1, N, half]`.
+    // trains normally. Backward dispatches on the explicit `layout` tag
+    // (Interleaved here), not by shape-sniffing cos.
     if x.requires_grad {
         result.requires_grad = true;
         if crate::autograd::AutogradContext::is_recording() {
@@ -920,6 +920,7 @@ pub fn rope_fused_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor>
                     input: x.id,
                     cos: cos_flat.id,
                     sin: sin_flat.id,
+                    layout: crate::autograd::RopeLayout::Interleaved,
                 },
                 vec![
                     (x.id, x.clone()),
@@ -1064,6 +1065,7 @@ pub fn rope_fused_bf16_f32pe(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<T
                     input: x.id,
                     cos: cos_bf16.id,
                     sin: sin_bf16.id,
+                    layout: crate::autograd::RopeLayout::Interleaved,
                 },
                 vec![
                     (x.id, x.clone()),
@@ -1165,8 +1167,10 @@ pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Ten
     let mut result = out.reshape(&[b, h, n, d])?;
 
     // Record autograd op so gradients flow through RoPE during training.
-    // Save the 3D-flattened cos/sin so backward's rope_fused_bf16 gets
-    // the layout it expects ([cos_bh, N, half]).
+    // Layout tag is Halfsplit — backward dispatches on this, not by
+    // shape-sniffing cos. (Previously the shape sniff mis-classified
+    // HiDream-O1's MRoPE `[1, S, half]` as Interleaved → Q/K LoRA-B
+    // gradient direction collapse.)
     if x.requires_grad {
         result.requires_grad = true;
         if crate::autograd::AutogradContext::is_recording() {
@@ -1176,6 +1180,7 @@ pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Ten
                     input: x.id,
                     cos: cos_flat.id,
                     sin: sin_flat.id,
+                    layout: crate::autograd::RopeLayout::Halfsplit,
                 },
                 vec![
                     (x.id, x.clone()),

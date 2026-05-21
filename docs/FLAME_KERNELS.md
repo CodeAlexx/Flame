@@ -515,8 +515,9 @@ on each of dQ, dK, dV).
 |---|---|---|
 | `flame_linear3d_bf16` | `:24` | cuBLASLt BF16 matmul + bias epilogue. Weight is `[Cin, Cout]` row-major (pre-transposed). Used by Klein. |
 | `flame_linear3d_bf16_native` | `:135` | Same but takes weight in standard PyTorch `[Cout, Cin]` row-major layout. Uses `TRANSA=T` so the transpose happens inside the GEMM. **This is what every FLUX/Chroma/QwenImage block forward calls.** Added 2026-04. |
+| `flame_linear3d_bf16_pytorch_parity` | `:369` | Bit-exact mirror of PyTorch's `at::cuda::blas::gemm_and_bias<at::BFloat16>` (added 2026-05-20). Same weight layout as `_native`. Differences vs `_native` (sourced from `CUBLASLT_LOG_LEVEL=5` capture of PyTorch): (1) workspace = 1 MiB on the preference (not 4 MiB); (2) `BIAS_POINTER` set on descriptor *before* `cublasLtMatmulAlgoGetHeuristic` — the heuristic uses it to pick a bias-pointer-specialized algo (for 4096×4096 BF16: algoId=13 customOption=11 vs the no-bias algoId=31); (3) heuristic called **per-call**, not cached, because the bias pointer changes each invocation; (4) `BIAS_DATA_TYPE` not set explicitly (PyTorch leaves it default); (5) no `BATCH_COUNT` / `STRIDED_BATCH_OFFSET` on layouts; (6) no `MIN_ALIGNMENT_*` preferences. The descriptor + layouts are still cached per-shape (`g_linear_parity_cache` at `:365`); only the algo is heuristic-selected per call. ~1% perf overhead, byte-identical output vs PyTorch. C entry wrapped by `ops::fused_inference::fused_linear3d_native_pytorch_parity` (Rust at `ops/fused_inference.rs:479`, FFI at `cuda/ffi.rs:906`). |
 
-Both use `CUBLAS_COMPUTE_32F` accumulation, BF16 inputs/outputs, and the
+All three use `CUBLAS_COMPUTE_32F` accumulation, BF16 inputs/outputs, and the
 `CUBLASLT_EPILOGUE_BIAS` epilogue (so the bias add is fused into the GEMM —
 no separate add kernel).
 

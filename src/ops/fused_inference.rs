@@ -460,6 +460,122 @@ pub fn fused_linear3d_native(
     Ok(output)
 }
 
+/// PyTorch-bit-exact parity variant of [`fused_linear3d_native`].
+///
+/// Same signature, same semantics, same fused-perf advantage. The only
+/// difference is the underlying cuBLASLt configuration — this variant mirrors
+/// `at::cuda::blas::gemm_and_bias<at::BFloat16>`'s knobs exactly, so the
+/// output is byte-equivalent to `torch.nn.functional.linear(x_bf16, w_bf16, b_bf16)`
+/// under `torch.autocast(bf16)`. The default `fused_linear3d_native` deviates
+/// by 1 BF16 ULP (different `BIAS_DATA_TYPE`, no heuristic algo, no alignment
+/// prefs, batch attrs set on layouts).
+///
+/// Use this in any inference/training path where strict per-op parity against
+/// ai-toolkit / PyTorch matters (HiDream-O1 TimestepEmbedder, predecoder
+/// linears, etc.). For models where the existing fused path is the
+/// established baseline (Klein/Z-Image post-validation), keep using
+/// `fused_linear3d_native` to preserve their existing parity.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub fn fused_linear3d_native_pytorch_parity(
+    input: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+) -> Result<Tensor> {
+    if input.dtype() != DType::BF16 || weight.dtype() != DType::BF16 {
+        return Err(Error::InvalidInput(
+            "fused_linear3d_native_pytorch_parity: input and weight must be BF16".into(),
+        ));
+    }
+
+    let in_shape = input.shape().dims();
+    if in_shape.len() != 3 {
+        return Err(Error::InvalidShape(format!(
+            "fused_linear3d_native_pytorch_parity: input must be 3D [B,N,Cin], got {:?}",
+            in_shape
+        )));
+    }
+    let batch_size = in_shape[0];
+    let seq_len = in_shape[1];
+    let in_features = in_shape[2];
+
+    let w_shape = weight.shape().dims();
+    if w_shape.len() != 2 || w_shape[1] != in_features {
+        return Err(Error::InvalidShape(format!(
+            "fused_linear3d_native_pytorch_parity: weight must be [Cout, Cin={in_features}] (PyTorch layout), got {:?}",
+            w_shape
+        )));
+    }
+    let out_features = w_shape[0];
+
+    let out_shape = Shape::from_dims(&[batch_size, seq_len, out_features]);
+    let output = Tensor::empty_dtype(out_shape, DType::BF16, input.device().clone())?;
+
+    let device = input.device();
+    let stream = device_lt::stream_ptr(device)?;
+    let lt = device_lt::cublaslt_handle_ptr(device)?;
+
+    let bias_ptr = if let Some(b) = bias {
+        b.as_device_ptr_bf16("fused_linear3d_native_pytorch_parity:bias")? as *const _
+    } else {
+        std::ptr::null()
+    };
+
+    let workspace_size: usize = 4 * 1024 * 1024;
+    let ws = linear_workspace::acquire(device, workspace_size)?;
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_linear3d_bf16_pytorch_parity(
+            lt,
+            input.as_device_ptr_bf16("fused_linear3d_native_pytorch_parity:input")? as *const _,
+            weight.as_device_ptr_bf16("fused_linear3d_native_pytorch_parity:weight")? as *const _,
+            bias_ptr,
+            output.as_device_ptr_bf16("fused_linear3d_native_pytorch_parity:output")? as *mut _,
+            batch_size as i32,
+            seq_len as i32,
+            in_features as i32,
+            out_features as i32,
+            ws.ptr() as *mut _,
+            ws.size(),
+            stream,
+        )
+    };
+    drop(ws);
+
+    if ret != 0 {
+        return Err(Error::Cuda(format!(
+            "fused_linear3d_native_pytorch_parity cublasLt error: {ret}"
+        )));
+    }
+
+    // Autograd recording — same logic as fused_linear3d_native: when training-
+    // context tape is recording and any input requires_grad, record Op::Linear
+    // so backward flows through to weights/inputs/LoRA. Without this, the
+    // gradient stops at the linear's output (silently invalid LoRA-B).
+    let need_grad = input.requires_grad
+        || weight.requires_grad
+        || bias.map(|b| b.requires_grad).unwrap_or(false);
+    if need_grad && crate::autograd::AutogradContext::is_recording() {
+        let mut output = output;
+        output.requires_grad = true;
+        let mut saved = vec![(input.id, input.clone()), (weight.id, weight.clone())];
+        if let Some(b) = bias {
+            saved.push((b.id, b.clone()));
+        }
+        crate::autograd::AutogradContext::record_op(
+            output.id,
+            crate::autograd::Op::Linear {
+                input: input.id,
+                weight: weight.id,
+                bias: bias.map(|b| b.id),
+            },
+            saved,
+        );
+        return Ok(output);
+    }
+
+    Ok(output)
+}
+
 /// Fused 3D linear with optional LoRA pair.
 ///
 /// When `lora_a` and `lora_b` are both `None`, behavior is byte-identical to

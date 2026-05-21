@@ -176,7 +176,7 @@ force a recompile.
 | Inference, BF16 pointwise binary (add/sub/mul/div/max/min, broadcast or strided) | `tensor_iterator::ops::binary::*_bf16_iter` (auto-routed by `Tensor::*`) |
 | Inference, BF16 pointwise unary (silu/gelu/sqrt/exp/abs/neg/square/…) | `tensor_iterator::ops::{unary,transcendentals}::*_bf16_iter` (auto-routed by `Tensor::*`) |
 | Inference, BF16 comparison (ge/gt/le/lt/eq/ne) | `tensor_iterator::ops::comparison::*_bf16_iter` (output is BF16 0.0/1.0) |
-| Inference, BF16 matmul | `Tensor::matmul` (auto-routes) or `ops::fused_inference::fused_linear3d_native` for the cuBLASLt+bias path |
+| Inference, BF16 matmul | `Tensor::matmul` (auto-routes) or `ops::fused_inference::fused_linear3d_native` for the cuBLASLt+bias path; `fused_linear3d_native_pytorch_parity` (2026-05-20) for bit-exact PyTorch parity at ~1% overhead |
 | Inference, last-dim softmax | `Tensor::softmax` BF16 fast path → `bf16_elementwise::softmax_lastdim_bf16` |
 | Inference, 2D transpose | `bf16_elementwise::transpose2d_bf16` |
 | Inference, DiT patchify/unpatchify | `bf16_elementwise::patchify_bf16 / unpatchify_bf16` |
@@ -217,9 +217,36 @@ diagnostic: identical config, only Q/K stuck.
 
 The fix at `bf16_ops.rs:735-757` propagates `requires_grad` and records
 the op when the input requires grad. The `Op::RoPePrecomputed`
-backward dispatcher was already correct (broadcast cos `[1, N, half]`
-→ interleaved, per-head cos `[BH, N, half]` → halfsplit); the recording
-side was the missing link.
+backward dispatcher was correct *for the models it had seen so far*
+(broadcast cos `[1, N, half]` → interleaved, per-head cos
+`[BH, N, half]` → halfsplit); the recording side was the missing link.
+
+#### `Op::RoPePrecomputed` carries an explicit layout tag (2026-05-20)
+
+The shape-sniffing dispatcher above had a hidden hazard: HiDream-O1's
+MRoPE emits cos of shape `[1, S, half]` — rank-3 — but the forward is
+`rope_halfsplit_bf16` (HuggingFace `rotate_half` convention used by the
+Qwen3-VL backbone). The old shape-sniff classified rank-3 broadcast cos
+as Interleaved, so backward applied the wrong rotation while forward
+applied the right one. Symptom: Q/K LoRA-B grad cos ≈ 0.01-0.05 vs
+PyTorch with magnitude in the right ballpark (orthogonal direction,
+correct length — the trap meta-pattern catches this; magnitude-only
+checks do not).
+
+`Op::RoPePrecomputed` now carries an explicit
+`autograd::RopeLayout` tag (`autograd.rs:177`, variants `Interleaved`
+and `Halfsplit`). The three fused-RoPE forwards each pass the correct
+tag at their `record_op` site:
+
+- `bf16_ops::rope_fused_bf16` at `bf16_ops.rs:923` → `Interleaved`
+- `bf16_ops::rope_fused_bf16_f32pe` at `bf16_ops.rs:1068` → `Interleaved`
+- `bf16_ops::rope_halfsplit_bf16` at `bf16_ops.rs:1183` → `Halfsplit`
+
+Backward dispatches by tag (`autograd.rs:4207-4230`), never by shape.
+**When adding a new fused-RoPE primitive, pass the correct
+`RopeLayout` at the record site. Don't sniff the cos tensor.** New
+record_op callers outside `bf16_ops.rs` (e.g. trainer code in
+`EriDiffusion-v2/.../chroma.rs:2332`) must also supply the tag.
 
 **Pattern to remember:** any new BF16 inference primitive in
 `bf16_ops.rs` / `ops/fused_inference.rs` that's reachable from a trainer's
@@ -370,6 +397,30 @@ The exception is `fused_linear3d` (without `_native`): it wants
 **pre-transposed** `[Cin, Cout]` row-major. Klein and a few other models
 pre-transpose all linear weights at load time. New code should use
 `fused_linear3d_native` instead.
+
+### Picking `fused_linear3d_native` vs `_pytorch_parity` (2026-05-20)
+
+Both take PyTorch `[Cout, Cin]` weight layout and produce the same
+mathematical result, but with 1-2 BF16 ULP differences from PyTorch's
+shipping cuBLASLt invocation.
+
+- **`fused_linear3d_native`** — default. Cached descriptor + cached
+  algo. ~1% faster. Use for all established baselines (Klein, Z-Image,
+  Chroma, FLUX, QwenImage, Wan, LTX-2) — they were validated against
+  this path and changing the algo will regress their parity numbers.
+- **`fused_linear3d_native_pytorch_parity`** — strict PyTorch
+  bit-exact. Workspace = 1 MiB, BIAS_POINTER on descriptor before
+  `cublasLtMatmulAlgoGetHeuristic`, per-call heuristic, no
+  BIAS_DATA_TYPE / batch / alignment attrs. Use where ai-toolkit
+  per-op parity is the contract: HiDream-O1 `TimestepEmbedder`,
+  `BottleneckPatchEmbed` proj1/proj2 (no-LoRA paths). After the swap,
+  `pre.t_emb` is bit-exact and `pre.patch_emb` mean_abs drops from
+  3e-3 to 5.7e-5 (53× improvement).
+
+**Do not flip established models to the parity variant** to "improve
+parity" — their reference points are against `fused_linear3d_native`
+output, not against PyTorch's raw output. You'd make their parity
+worse.
 
 ---
 

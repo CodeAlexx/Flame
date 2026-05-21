@@ -154,6 +154,33 @@ pub fn clear_grow_activation_cache() {
     }
 }
 
+/// Rotation layout for fused-RoPE autograd ops.
+///
+/// RoPE is an orthogonal rotation of `head_dim` channels; two layouts are in
+/// use in this codebase:
+/// - `Interleaved`: pairs `(2d, 2d+1)` rotate together. Used by FLUX, Klein,
+///   Chroma, Wan, Z-Image, HiDream-O1 MRoPE.
+/// - `Halfsplit`: pairs `(d, d+half)` rotate together (HuggingFace
+///   `rotate_half` convention). Used by Qwen3, LLaMA, Mistral.
+///
+/// The two are different rotations of `head_dim`. Backward MUST apply the
+/// same layout as forward — otherwise the gradient direction is essentially
+/// random while its magnitude looks fine. Symptom: dx cos ≈ 0.01-0.05
+/// against the autograd reference, dx norm matches within BF16 noise.
+///
+/// Previously the backward dispatcher shape-sniffed the saved `cos` tensor
+/// (rank-3 → assumed Interleaved). HiDream-O1's MRoPE emits cos of shape
+/// `[1, S, half]` (rank-3) but the forward was Halfsplit → backward applied
+/// the wrong rotation, collapsing Q/K LoRA-B gradients. The fix is this
+/// explicit tag carried alongside `Op::RoPePrecomputed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeLayout {
+    /// (2d, 2d+1) pairs. `bf16_ops::rope_fused_bf16`.
+    Interleaved,
+    /// (d, d+half) pairs. `bf16_ops::rope_halfsplit_bf16`.
+    Halfsplit,
+}
+
 /// Operation types for autograd
 #[derive(Debug, Clone)]
 pub enum Op {
@@ -472,11 +499,14 @@ pub enum Op {
         head_dim: usize,
     },
     /// Fused RoPE with precomputed cos/sin.
-    /// Backward: apply_rope(grad, cos, -sin) via same fused kernel.
+    /// Backward: apply_rope(grad, cos, -sin) via the SAME fused kernel that the
+    /// forward used — selected by the `layout` field, NOT shape-sniffing the
+    /// cos tensor. See `RopeLayout` doc for why the explicit tag matters.
     RoPePrecomputed {
         input: TensorId,
         cos: TensorId,
         sin: TensorId,
+        layout: RopeLayout,
     },
     /// Fused gate-residual: out = residual + gate.unsqueeze(1) * x
     /// where residual,x are [B,N,dim] and gate is [B,dim].
@@ -1371,6 +1401,20 @@ impl AutogradContext {
         }
     }
 
+    /// Additive variant of [`retain_intermediate_grads`]: extend the existing
+    /// retain set (creating it if not present) with `ids`. Used by diagnostic
+    /// trap code that needs to register intermediate `TensorId`s mid-backward
+    /// (specifically, during `Op::CheckpointOffloadBoundary` recompute — the
+    /// outer-tape retain snapshot has already been taken at that point, but
+    /// the sub-tape backward in `Op::CheckpointOffloadBoundary` re-reads the
+    /// static set when draining sub_grads, so additions there are honored).
+    /// Does NOT clear `RETAINED_INTERMEDIATE_GRADS`.
+    pub fn retain_intermediate_grads_add(ids: std::collections::HashSet<TensorId>) {
+        if let Ok(mut slot) = RETAINED_INTERMEDIATE_GRAD_IDS.lock() {
+            slot.get_or_insert_with(std::collections::HashSet::new).extend(ids);
+        }
+    }
+
     /// Test-only: take the captured intermediate gradients and reset the
     /// retain-set. Returns a HashMap keyed by `TensorId`.
     pub fn take_retained_intermediate_grads() -> HashMap<TensorId, Tensor> {
@@ -1829,7 +1873,7 @@ impl AutogradContext {
                             Op::QkvSplitPermute { input, .. } => {
                                 ids.push(*input);
                             }
-                            Op::RoPePrecomputed { input, cos, sin } => {
+                            Op::RoPePrecomputed { input, cos, sin, layout: _ } => {
                                 ids.push(*input);
                                 ids.push(*cos);
                                 ids.push(*sin);
@@ -3500,8 +3544,23 @@ fn compute_gradients(
             let mut sub_accum_time = std::time::Duration::ZERO;
             let mut n_bf16_casts = 0u32;
             sub_tape.reverse();
+            // Soul.md trap support: snapshot the retain set so the inner walk
+            // can capture intermediate grads from recompute-pass IDs. Mirrors
+            // the same logic in `Op::CheckpointOffloadBoundary` backward.
+            let sub_retain_ids: Option<std::collections::HashSet<TensorId>> =
+                RETAINED_INTERMEDIATE_GRAD_IDS
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.clone());
             for sub_entry in sub_tape.drain(..) {
                 if let Some(sg) = sub_grads.take(sub_entry.output_id) {
+                    if let Some(ref ids) = sub_retain_ids {
+                        if ids.contains(&sub_entry.output_id) {
+                            if let Ok(mut store) = RETAINED_INTERMEDIATE_GRADS.lock() {
+                                store.insert(sub_entry.output_id, sg.clone());
+                            }
+                        }
+                    }
                     let sub_tag = op_tag(&sub_entry.op);
                     let sub_t0 = std::time::Instant::now();
                     let input_grads = compute_gradients(&sub_entry, &sg, device)?;
@@ -3731,8 +3790,26 @@ fn compute_gradients(
             }
 
             sub_tape.reverse();
+            // Soul.md trap support: snapshot the retain set NOW so the inner
+            // walk can capture intermediate grads. The outer `backward()`
+            // snapshot at line ~2044 only sees IDs registered BEFORE backward
+            // started; checkpoint recompute creates fresh IDs that the
+            // `retain_intermediate_grads_add` API registers DURING recompute,
+            // so we re-read here.
+            let sub_retain_ids: Option<std::collections::HashSet<TensorId>> =
+                RETAINED_INTERMEDIATE_GRAD_IDS
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.clone());
             for sub_entry in sub_tape.drain(..) {
                 if let Some(sg) = sub_grads.take(sub_entry.output_id) {
+                    if let Some(ref ids) = sub_retain_ids {
+                        if ids.contains(&sub_entry.output_id) {
+                            if let Ok(mut store) = RETAINED_INTERMEDIATE_GRADS.lock() {
+                                store.insert(sub_entry.output_id, sg.clone());
+                            }
+                        }
+                    }
                     let input_grads = compute_gradients(&sub_entry, &sg, device)?;
                     for (tid, g) in input_grads {
                         if all_needed.contains(&tid) {
@@ -4127,26 +4204,15 @@ fn compute_gradients(
             ])
         }
 
-        Op::RoPePrecomputed { input, cos, sin } => {
-            // RoPE is an orthogonal rotation; backward = forward with
-            // -sin. LAYOUT MUST MATCH FORWARD or the gradient direction
-            // is essentially random while magnitude looks fine.
-            //
-            // Klein, Chroma, Wan, FLUX call `bf16_ops::rope_fused_bf16`
-            // (Interleaved layout: pairs (2d, 2d+1)). The previous
-            // backward called `rope_halfsplit_bf16` (Halfsplit layout:
-            // pairs (d, d+half)) — different rotation entirely. The
-            // bug surfaced as cos_sim ≈ 0.05 on `dx` against PyTorch
-            // (almost orthogonal) at production HD=128/N=1536, while
-            // ||dx|| matched within bf16 noise — a magnitude-only
-            // sanity check was hiding it.
-            //
-            // Dispatch by cos shape: broadcast cos (`[1,1,N,half]` or
-            // `[1,N,half]`) → forward used Interleaved fused → backward
-            // uses fused. Per-head cos (`[BH,N,half]`) is the LTX-2
-            // path → halfsplit. Until `Op::RoPePrecomputed` carries an
-            // explicit `layout` field, this shape sniff is the most
-            // robust dispatch.
+        Op::RoPePrecomputed { input, cos, sin, layout } => {
+            // RoPE is an orthogonal rotation; backward = forward with -sin
+            // applied via the SAME layout the forward used. The layout tag
+            // is carried alongside the op (set by the forward call site),
+            // not shape-sniffed from cos — the previous shape-sniff
+            // incorrectly classified HiDream-O1's MRoPE cos `[1, S, half]`
+            // as Interleaved while the forward was Halfsplit, collapsing
+            // Q/K LoRA-B gradients to a near-random direction.
+            // See [`RopeLayout`] doc.
             let grad_bf16 = if output_grad.dtype() != DType::BF16 {
                 output_grad.to_dtype_no_grad(DType::BF16)?
             } else {
@@ -4155,12 +4221,13 @@ fn compute_gradients(
             let cos_tensor = fetch_saved(cos)?;
             let sin_tensor = fetch_saved(sin)?;
             let neg_sin = GpuOps::mul_scalar(&sin_tensor, -1.0)?;
-            let cos_dims = cos_tensor.shape().dims();
-            let is_broadcast_cos = matches!(cos_dims, [1, _, _, _] | [1, 1, _, _] | [1, _, _]);
-            let grad_input = if is_broadcast_cos {
-                crate::bf16_ops::rope_fused_bf16(&grad_bf16, &cos_tensor, &neg_sin)?
-            } else {
-                crate::bf16_ops::rope_halfsplit_bf16(&grad_bf16, &cos_tensor, &neg_sin)?
+            let grad_input = match layout {
+                RopeLayout::Interleaved => {
+                    crate::bf16_ops::rope_fused_bf16(&grad_bf16, &cos_tensor, &neg_sin)?
+                }
+                RopeLayout::Halfsplit => {
+                    crate::bf16_ops::rope_halfsplit_bf16(&grad_bf16, &cos_tensor, &neg_sin)?
+                }
             };
             Ok(smallvec![(*input, grad_input)])
         }

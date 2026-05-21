@@ -899,6 +899,25 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// PyTorch-bit-exact parity variant of `flame_linear3d_bf16_native`.
+    /// Mirrors `at::cuda::blas::gemm_and_bias` cuBLASLt configuration so BF16
+    /// linear outputs match PyTorch byte-for-byte. Use where strict ai-toolkit
+    /// train-step parity matters. Same signature as the native variant.
+    pub fn flame_linear3d_bf16_pytorch_parity(
+        handle: *mut core::ffi::c_void,
+        input: *const core::ffi::c_void,
+        weight: *const core::ffi::c_void,
+        bias: *const core::ffi::c_void,
+        output: *mut core::ffi::c_void,
+        batch_size: i32,
+        seq_len: i32,
+        in_features: i32,
+        out_features: i32,
+        workspace: *mut core::ffi::c_void,
+        workspace_size: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// Fused gated scatter-add for MoE unpermute:
     /// `accum[indices[t]] += expert_out[t] * gating[t]`, in-place.
     ///

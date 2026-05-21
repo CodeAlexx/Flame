@@ -239,6 +239,7 @@ thin wrapper around a `flame_*_bf16` C entry in `cuda::ffi`. Nine pub fns:
 - `fused_linear3d` — cuBLASLt 3D linear with pre-transposed weight
 - `fused_linear3d_native` — same but takes PyTorch `[Cout, Cin]` weight (added 2026-04, used by every FLUX/Chroma/QwenImage block forward)
 - `fused_linear3d_native_lora` — additive LoRA over `fused_linear3d_native`; byte-identical at LoRA=None, otherwise computes `base + scale * (x @ A^T @ B^T)` with autograd flowing into A/B only (added 2026-05 for HiDream-O1 decoder which owns weights via `HashMap<String, Tensor>`)
+- `fused_linear3d_native_pytorch_parity` — bit-exact PyTorch `gemm_and_bias<BF16>` mirror (added 2026-05-20). Same signature as `_native` but uses 1 MiB workspace, per-call heuristic, BIAS_POINTER set before `cublasLtMatmulAlgoGetHeuristic`. ~1% perf overhead; use when ai-toolkit per-op parity is the contract (HiDream-O1 TimestepEmbedder, BottleneckPatchEmbed). FAQ on which to pick is in [`FLAME_CONVENTIONS.md`](./FLAME_CONVENTIONS.md).
 - `fused_rms_norm_modulate` — RMSNorm + modulate fused
 - `fused_residual_gate` — `x + gate*attn` fused
 
@@ -780,6 +781,20 @@ Narrow, Cat, Softmax, Sdpa, LayerNorm, GroupNorm, Conv2d, Conv3d, ...).
 - RoPE: record `Op::RoPePrecomputed` when input requires_grad (was inference-only)
 - RMSNorm: use autograd-aware `to_dtype` (not `to_dtype_no_grad`) when input requires_grad
 - LayerNorm backward: pass saved weight/bias to backward kernel (was `None, None`)
+
+**Autograd update (2026-05-20):**
+- `Op::RoPePrecomputed` now carries an explicit `autograd::RopeLayout`
+  (`Interleaved` / `Halfsplit`) tag instead of shape-sniffing the saved
+  cos tensor at backward time. Fixes HiDream-O1 MRoPE which emits
+  rank-3 cos `[1,S,half]` but uses `rope_halfsplit_bf16` — the
+  shape-sniffer mis-classified it as Interleaved and applied the wrong
+  rotation in backward. See `FLAME_INDEX.md` and `FLAME_CONVENTIONS.md`.
+- `AutogradContext::retain_intermediate_grads_add(ids)` — additive
+  retain-set variant for probes registered *during* checkpoint
+  recompute (the outer-tape snapshot already fired). Sub-tape backward
+  in `Op::Checkpoint` and `Op::CheckpointOffloadBoundary` re-reads
+  `RETAINED_INTERMEDIATE_GRAD_IDS` so additions inside recompute are
+  honored. See `FLAME_DIAGNOSTICS.md` §0 + §1.
 
 **Training performance caveat (2026-04-09):** The tape-based backward is
 synchronous and has ~1s overhead per entry on 3090 Ti (HashMap lookup + GPU

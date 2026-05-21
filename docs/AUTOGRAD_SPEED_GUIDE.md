@@ -148,6 +148,11 @@ samples and step speed is beating, matching, or close to the ai-toolkit O1
 trainer reference. Always record same-seed no-LoRA vs LoRA samples after the
 run; image quality is the validity gate, not short-run loss alone.
 
+Trainer parity note: EDV2's O1 default LoRA surface must stay aligned with
+ai-toolkit/public O1 LoRAs: 252 Qwen language-layer adapters plus the five
+pixel/timestep/final heads (`x_embedder`, `t_embedder1`, `final_layer2`).
+The transformer-only route is an explicit ablation, not the default path.
+
 ---
 
 ## Next Steps: CUDA Graph for Checkpoint Sub-Backward

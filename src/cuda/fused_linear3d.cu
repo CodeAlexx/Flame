@@ -326,4 +326,191 @@ int flame_linear3d_bf16_native(
     return (int)status;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// flame_linear3d_bf16_pytorch_parity
+//
+// Bit-exact parity variant of `flame_linear3d_bf16_native`. Mirrors PyTorch's
+// `at::cuda::blas::gemm_and_bias<at::BFloat16>` cuBLASLt configuration
+// (aten/src/ATen/cuda/CUDABlas.cpp gemm_and_bias) exactly so that BF16 linear
+// outputs match PyTorch byte-for-byte. Use this where strict ai-toolkit train-
+// step parity matters.
+//
+// PyTorch's exact dispatch — confirmed by capturing CUBLASLT_LOG_LEVEL=5 logs:
+//   1) workspace = 1 MiB on the PREFERENCE (parseCUDABlasLtWorkspaceSize
+//      default = 1 MiB). Larger workspace causes heuristic to pick a different
+//      algo.
+//   2) BIAS_POINTER is set on the descriptor BEFORE calling heuristic. The
+//      heuristic uses this to pick a bias-pointer-specialized algo (in our
+//      test: algoId=13 customOption=11 vs the no-bias-info algoId=31).
+//   3) BIAS_DATA_TYPE NOT set explicitly (PyTorch leaves it default).
+//   4) BATCH_COUNT / STRIDED_BATCH_OFFSET on layouts NOT set (PyTorch path).
+//   5) MIN_ALIGNMENT_* NOT set unless the values are known per-buffer (PyTorch
+//      uses _getAlignment dynamically; setting a static value picks a wrong
+//      algo).
+//   6) Heuristic algo is called PER-CALL, not cached — because the bias
+//      pointer changes per call and the heuristic depends on it.
+//
+// The descriptor + layouts ARE cached per shape (cheap) but the algo is
+// re-selected per call via heuristic — that's a few microseconds but exactly
+// what PyTorch does.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct LinearParityEntry {
+    cublasLtMatmulDesc_t              op       = nullptr;
+    cublasLtMatrixLayout_t            layoutA  = nullptr;
+    cublasLtMatrixLayout_t            layoutB  = nullptr;
+    cublasLtMatrixLayout_t            layoutC  = nullptr;
+};
+
+static std::mutex g_linear_parity_cache_mutex;
+static std::unordered_map<LinearKey, LinearParityEntry, LinearKeyHash, LinearKeyEq>
+                                                                     g_linear_parity_cache;
+
+extern "C" int flame_linear3d_bf16_pytorch_parity(
+    cublasLtHandle_t handle,
+    const void* input,       // [B, N, Cin] BF16, row-major
+    const void* weight,      // [Cout, Cin] BF16, row-major (PyTorch layout)
+    const void* bias,        // [Cout] BF16 or NULL
+    void* output,            // [B, N, Cout] BF16, row-major
+    int batch_size,
+    int seq_len,
+    int in_features,         // Cin
+    int out_features,        // Cout
+    void* workspace,
+    size_t workspace_size,
+    void* stream
+) {
+    int n_eff = (batch_size > 0 ? batch_size : 1) * seq_len;
+
+    int m = out_features;
+    int n = n_eff;
+    int k = in_features;
+
+    LinearKey key{};
+    key.m = m;
+    key.n = n;
+    key.k = k;
+    key.has_bias = (bias != NULL) ? 1 : 0;
+
+    LinearParityEntry entry;
+    bool hit = false;
+    {
+        std::lock_guard<std::mutex> lock(g_linear_parity_cache_mutex);
+        auto it = g_linear_parity_cache.find(key);
+        if (it != g_linear_parity_cache.end()) {
+            entry = it->second;
+            hit = true;
+        }
+    }
+
+    if (!hit) {
+        cublasLtMatmulDesc_t   matmulDesc = nullptr;
+        cublasLtMatrixLayout_t layoutA = nullptr, layoutB = nullptr, layoutC = nullptr;
+        cublasStatus_t status;
+
+        // 1) Descriptor: COMPUTE_32F, scale=R_32F (matches PyTorch BF16 path).
+        status = cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+        if (status != CUBLAS_STATUS_SUCCESS) return (int)status;
+
+        cublasOperation_t opT = CUBLAS_OP_T;
+        cublasOperation_t opN = CUBLAS_OP_N;
+        cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
+        cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+
+        // 2) Epilogue — bias fused. DO NOT set BIAS_DATA_TYPE (leave default
+        //    so cuBLASLt picks the same value as PyTorch).
+        if (bias != NULL) {
+            cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+            cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue));
+            // BIAS_POINTER set per-call below (BEFORE heuristic).
+        }
+
+        // 3) Layouts — NO batch attributes (PyTorch only sets these for
+        //    explicit batched GEMM; we collapse batch into seq dim).
+        cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_16BF, k, m, k);
+        cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_16BF, k, n, k);
+        cublasLtMatrixLayoutCreate(&layoutC, CUDA_R_16BF, m, n, m);
+
+        entry.op      = matmulDesc;
+        entry.layoutA = layoutA;
+        entry.layoutB = layoutB;
+        entry.layoutC = layoutC;
+
+        {
+            std::lock_guard<std::mutex> lock(g_linear_parity_cache_mutex);
+            auto [it, inserted] = g_linear_parity_cache.emplace(key, entry);
+            if (!inserted) {
+                // Another thread beat us; free ours, use theirs.
+                if (entry.op)      cublasLtMatmulDescDestroy(entry.op);
+                if (entry.layoutA) cublasLtMatrixLayoutDestroy(entry.layoutA);
+                if (entry.layoutB) cublasLtMatrixLayoutDestroy(entry.layoutB);
+                if (entry.layoutC) cublasLtMatrixLayoutDestroy(entry.layoutC);
+                entry = it->second;
+            }
+        }
+    }
+
+    // Per-call: set bias pointer BEFORE running heuristic. PyTorch does this,
+    // and the heuristic uses bias-pointer alignment / presence to pick a
+    // bias-pointer-specialized algo (e.g. algoId=13 customOption=11 for the
+    // 4096x4096 case, vs algoId=31 without bias_pointer info).
+    if (bias != NULL) {
+        cublasLtMatmulDescSetAttribute(
+            entry.op,
+            CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+            &bias,
+            sizeof(bias));
+    }
+
+    // Per-call heuristic — exactly what PyTorch does. Slightly slower than
+    // caching the algo, but correctness > perf and the call is microseconds.
+    cublasLtMatmulPreference_t preference = nullptr;
+    cublasLtMatmulPreferenceCreate(&preference);
+    // PyTorch default cuBLASLt workspace = 1 MiB (parseCUDABlasLtWorkspaceSize
+    // in CublasHandlePool.cpp). Heuristic algo selection is workspace-size
+    // dependent — we tell it the same budget so it picks the same algo.
+    size_t pytorch_workspace = 1024 * 1024;
+    cublasLtMatmulPreferenceSetAttribute(
+        preference,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &pytorch_workspace,
+        sizeof(pytorch_workspace));
+    // NOTE: NOT setting alignment prefs. Empirically (workspace=1MB + align=256
+    // breaks even the no-bias parity), so we leave alignment at default.
+
+    cublasLtMatmulHeuristicResult_t heuristicResult = {};
+    int returnedResult = 0;
+    cublasStatus_t heur_status = cublasLtMatmulAlgoGetHeuristic(
+        handle,
+        entry.op,
+        entry.layoutA, entry.layoutB, entry.layoutC, entry.layoutC,
+        preference,
+        1,
+        &heuristicResult,
+        &returnedResult);
+    cublasLtMatmulPreferenceDestroy(preference);
+    if (heur_status != CUBLAS_STATUS_SUCCESS) {
+        return (int)heur_status;
+    }
+    if (returnedResult == 0) {
+        return (int)CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+
+    cublasStatus_t status = cublasLtMatmul(
+        handle, entry.op, &alpha,
+        weight, entry.layoutA,
+        input,  entry.layoutB,
+        &beta,
+        output, entry.layoutC,
+        output, entry.layoutC,
+        &heuristicResult.algo,
+        workspace, workspace_size,
+        (cudaStream_t)stream
+    );
+    return (int)status;
+}
+
 } // extern "C"

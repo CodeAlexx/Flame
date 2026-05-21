@@ -10,8 +10,8 @@ and load-bearing. Read before making non-trivial changes.
 | [`../TENETS.md`](../TENETS.md) | Non-negotiable principles. "flame-core is one framework. Fix the primitive once → every model is fast." If a change violates a tenet, it's wrong even if it works. |
 | [`SPEED_CONTRACT.md`](./SPEED_CONTRACT.md) | The 5-clause audit gate that operationalizes the tenets. Every PR touching a primitive, kernel, launch wrapper, autograd op, or memory subsystem must satisfy (or request exemption from) the relevant clauses. The TENETS doc tells you *why*, this one tells you *what to check*. |
 
-**Tier 2 — symbol / module / kernel / convention index.** The four
-grep-able reference files in this directory, curated for LLM agents:
+**Tier 2 — symbol / module / kernel / convention / diagnostics index.**
+The grep-able reference files in this directory, curated for LLM agents:
 
 | File | When to read it |
 |---|---|
@@ -19,6 +19,7 @@ grep-able reference files in this directory, curated for LLM agents:
 | [`FLAME_MODULES.md`](./FLAME_MODULES.md) | "What does this codebase contain?" One paragraph per public module — what lives here, what depends on it, key types/functions. Read at session start to orient. |
 | [`FLAME_KERNELS.md`](./FLAME_KERNELS.md) | "What CUDA kernels exist? Where? What's their layout?" Catalog of every NVRTC + `.cu` kernel with file, perf notes, layout assumptions. Critical for any perf work. |
 | [`FLAME_CONVENTIONS.md`](./FLAME_CONVENTIONS.md) | "What's the convention for X?" Naming, file layout, dispatch patterns, gotchas. The stuff that takes 3 grep rounds to figure out each session. |
+| [`FLAME_DIAGNOSTICS.md`](./FLAME_DIAGNOSTICS.md) | "I have a symptom — which probe finds the bug?" Symptom-first index of autograd probes, SDPA flags, parity harness, allocator knobs, and the trap meta-pattern for localizing gradient-direction bugs. |
 
 The tier-2 docs cross-reference the tier-1 docs. When you see a "Reference
 impl for SPEED_CONTRACT clause N" annotation in FLAME_INDEX or
