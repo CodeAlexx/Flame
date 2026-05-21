@@ -258,6 +258,22 @@ pub fn rms_norm_bf16(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> Result<Te
     crate::norm::rms_norm(x, &[last_dim], weight, eps)
 }
 
+#[doc(hidden)]
+pub fn rms_norm_bf16_inv_rms(x: &Tensor, eps: f32) -> Result<Tensor> {
+    ensure_bf16(x, "rms_norm_bf16_inv_rms:x")?;
+    let last_dim =
+        *x.shape().dims().last().ok_or_else(|| {
+            Error::InvalidInput("rms_norm_bf16_inv_rms: input must have rank >= 1".into())
+        })?;
+    crate::norm::rms_norm_inv_rms(x, &[last_dim], eps)
+}
+
+#[doc(hidden)]
+pub fn rms_norm_bf16_mean_sq_head128(x: &Tensor) -> Result<Tensor> {
+    ensure_bf16(x, "rms_norm_bf16_mean_sq_head128:x")?;
+    crate::norm::rms_norm_head128_mean_sq(x)
+}
+
 /// RMSNorm with BF16 input → F32 output (no weight).
 /// Used for Gemma3-style `(1+weight)` formulation where the multiply
 /// must happen in F32 precision to match PyTorch's `norm(x.float())`.

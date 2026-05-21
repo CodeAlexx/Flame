@@ -282,6 +282,20 @@ pub enum Op {
         input: TensorId,
         dims: Vec<usize>,
     },
+    /// Broadcast `input` (shape `src_shape`) to `dst_shape`. Backward sums
+    /// `output_grad` along every broadcast axis (size mismatch or left-padded
+    /// axes), then reshapes back to `src_shape`. Without this op, autograd
+    /// silently detached any grad-bearing tensor passed through
+    /// `Tensor::broadcast_to` whenever the shapes actually differed (the
+    /// fast-path reshape branch was fine). Surfaced 2026-05-21 as the
+    /// HiDream-O1 `t_embedder1.mlp.{0,2}` LoRA dead-grad — the LoRA output
+    /// reached `scatter_tms_token` via `reshape().broadcast_to(...)` and
+    /// the broadcast detached it.
+    Broadcast {
+        input: TensorId,
+        src_shape: Vec<usize>,
+        dst_shape: Vec<usize>,
+    },
     /// Nearest-neighbor 2D upsample. SDXL/SD3/Cascade up-blocks use this.
     UpsampleNearest2D {
         input: TensorId,
@@ -429,6 +443,17 @@ pub enum Op {
         output: Option<TensorId>,
         /// Saved Stats (LSE) tensor id for cuDNN backward.
         stats: Option<TensorId>,
+    },
+    /// HiDream-O1 mixed self-attention: prefix rows are causal within the
+    /// prefix, suffix rows attend to the full sequence. Forward is allowed to
+    /// use a faster structured decomposition, but backward recomputes as one
+    /// masked SDPA so shared K/V gradients match the PyTorch single-op oracle.
+    PrefixCausalFullAttention {
+        query: TensorId,
+        key: TensorId,
+        value: TensorId,
+        prefix_len: usize,
+        scale: f32,
     },
     SageAttention {
         query_id: TensorId,
@@ -925,6 +950,18 @@ fn sdpa_bwd_log(msg: &str) {
     eprintln!("[sdpa-bwd] {msg}");
 }
 
+fn add_unsaved_view_inputs_to_needed(
+    op: &Op,
+    ids: &mut std::collections::HashSet<TensorId>,
+) {
+    match op {
+        Op::Split { input, .. } | Op::Slice { input, .. } => {
+            ids.insert(*input);
+        }
+        _ => {}
+    }
+}
+
 fn causal_keep_mask_for_logits(
     q_len: usize,
     k_len: usize,
@@ -939,6 +976,32 @@ fn causal_keep_mask_for_logits(
         }
     }
     Tensor::from_vec_dtype(data, Shape::from_dims(&[1, 1, q_len, k_len]), device, DType::F32)
+}
+
+fn prefix_causal_full_keep_mask_for_logits(
+    seq_len: usize,
+    prefix_len: usize,
+    device: Arc<cudarc::driver::CudaDevice>,
+) -> Result<Tensor> {
+    let mut data = vec![1.0f32; seq_len * seq_len];
+    for q_idx in 0..seq_len {
+        if q_idx < prefix_len {
+            let row = q_idx * seq_len;
+            for k_idx in 0..seq_len {
+                data[row + k_idx] = if k_idx <= q_idx && k_idx < prefix_len {
+                    1.0
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+    Tensor::from_vec_dtype(
+        data,
+        Shape::from_dims(&[1, 1, seq_len, seq_len]),
+        device,
+        DType::F32,
+    )
 }
 
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
@@ -1710,6 +1773,7 @@ impl AutogradContext {
                             | Op::Transpose { input }
                             | Op::Reshape { input, .. }
                             | Op::Permute { input, .. }
+                            | Op::Broadcast { input, .. }
                             | Op::UpsampleNearest2D { input, .. }
                             | Op::SumDim { input, .. }
                             | Op::SumDimKeepdim { input, .. }
@@ -1853,6 +1917,13 @@ impl AutogradContext {
                                     ids.push(*m);
                                 }
                             }
+                            Op::PrefixCausalFullAttention {
+                                query, key, value, ..
+                            } => {
+                                ids.push(*query);
+                                ids.push(*key);
+                                ids.push(*value);
+                            }
                             Op::SageAttention {
                                 query_id,
                                 key_id,
@@ -1895,6 +1966,7 @@ impl AutogradContext {
                     ids.insert(loss.id);
                     for e in ctx.tape.iter() {
                         ids.insert(e.output_id);
+                        add_unsaved_view_inputs_to_needed(&e.op, &mut ids);
                         for (tid, tensor) in &e.saved_tensors {
                             if tensor.requires_grad() {
                                 ids.insert(*tid);
@@ -3483,6 +3555,7 @@ fn compute_gradients(
             all_needed.insert(*input);
             for e in &sub_tape {
                 all_needed.insert(e.output_id);
+                add_unsaved_view_inputs_to_needed(&e.op, &mut all_needed);
                 for (sid, st) in &e.saved_tensors {
                     if st.requires_grad() {
                         trainable_ids.insert(*sid);
@@ -3750,6 +3823,7 @@ fn compute_gradients(
             }
             for e in &sub_tape {
                 all_needed.insert(e.output_id);
+                add_unsaved_view_inputs_to_needed(&e.op, &mut all_needed);
                 for (sid, st) in &e.saved_tensors {
                     if st.requires_grad() {
                         trainable_ids.insert(*sid);
@@ -4707,6 +4781,43 @@ fn compute_gradients(
             Ok(smallvec![(*input, ensure_bf16(grad)?)])
         }
 
+        Op::Broadcast { input, src_shape, dst_shape } => {
+            // dInput/dOutput = sum(output_grad) along every broadcast axis.
+            // Two kinds of broadcast axes:
+            //   1. Left-padded axes: dst has rank > src. Sum (collapse) every
+            //      left-padded dim out.
+            //   2. Same-rank broadcasts: dst[d] > 1 where src[d] == 1.
+            //      sum_dim_keepdim along d so the dim becomes 1.
+            // Then reshape to src_shape.
+            //
+            // Implementation uses GpuOps::sum_dim_keepdim directly (no
+            // autograd recording inside the backward handler — we're already
+            // in the tape walk).
+            let pad = dst_shape.len().saturating_sub(src_shape.len());
+            let mut current = output_grad.clone();
+            // Walk dst axes in DESCENDING order so each sum-keepdim doesn't
+            // shift the indices of the remaining axes.
+            for d in (0..dst_shape.len()).rev() {
+                let must_reduce = if d < pad {
+                    true
+                } else {
+                    let src_d = d - pad;
+                    src_shape[src_d] == 1 && dst_shape[d] > 1
+                };
+                if must_reduce {
+                    current = crate::cuda_ops::GpuOps::sum_dim_keepdim(&current, d)?;
+                }
+            }
+            // current.shape is now src_shape left-padded to dst rank with 1s.
+            // Reshape back to src_shape (drops the padded 1s).
+            let grad = if current.shape().dims() != &src_shape[..] {
+                current.reshape(src_shape)?
+            } else {
+                current
+            };
+            Ok(smallvec![(*input, ensure_bf16(grad)?)])
+        }
+
         Op::Permute { input, dims } => {
             // Gradient of permute is inverse permute
             let inverse_dims = inverse_permutation(dims);
@@ -5638,8 +5749,55 @@ fn compute_gradients(
                 triple
             } else {
                 // Decomposed recompute fallback.
-                let expected_attn_shape = if q_dims.len() == 4 && k_dims.len() == 4 {
-                    Some([q_dims[0], q_dims[1], q_dims[2], k_dims[2]])
+                //
+                // 2026-05-21 fix: when cuDNN forward used `maybe_pad_for_cudnn`
+                // to zero-pad Q/K/V to a 64-aligned sequence (e.g. HiDream-O1
+                // seq=497 → padded 512), the saved Q/K/V are PADDED but the
+                // recompute backward treated them as the real attention
+                // sequence. Softmax over `seq+pad` keys yields different
+                // weights than softmax over `seq` keys (the pad keys at
+                // K=zeros have logit=0 → exp(0)=1 → absorb probability mass),
+                // and dQ/dK/dV from that contaminated softmax are wrong
+                // direction. Symptom: HiDream-O1 attention LoRA-B grads cos
+                // ~0.01 (essentially random) vs Python ref, while MLP/o_proj
+                // LoRA-B grads matched at cos>0.999.
+                //
+                // Fix: slice padded Q/K/V/output_grad to the real lengths
+                // recorded in `padding_lens`, run the recompute on the real
+                // shape (correct softmax), then zero-pad dQ/dK/dV back to the
+                // saved padded shape so the upstream cat-pad backward routes
+                // grad to the original (unpadded) parameter ids correctly.
+                let (q_for_bwd, k_for_bwd, v_for_bwd, dout_for_bwd, pad_info) =
+                    if let Some((real_q_len, real_kv_len)) = *padding_lens {
+                        if real_q_len < q_dims[2] || real_kv_len < k_dims[2] {
+                            let q_s = query_tensor.narrow(2, 0, real_q_len)?.contiguous()?;
+                            let k_s = key_tensor.narrow(2, 0, real_kv_len)?.contiguous()?;
+                            let v_s = value_tensor.narrow(2, 0, real_kv_len)?.contiguous()?;
+                            let dout_s = output_grad.narrow(2, 0, real_q_len)?.contiguous()?;
+                            (q_s, k_s, v_s, dout_s, Some((q_dims[2], k_dims[2], real_q_len, real_kv_len)))
+                        } else {
+                            (
+                                query_tensor.clone(),
+                                key_tensor.clone(),
+                                value_tensor.clone(),
+                                output_grad.clone(),
+                                None,
+                            )
+                        }
+                    } else {
+                        (
+                            query_tensor.clone(),
+                            key_tensor.clone(),
+                            value_tensor.clone(),
+                            output_grad.clone(),
+                            None,
+                        )
+                    };
+
+                let q_bwd_dims = q_for_bwd.shape().dims();
+                let k_bwd_dims = k_for_bwd.shape().dims();
+                let expected_attn_shape = if q_bwd_dims.len() == 4 && k_bwd_dims.len() == 4 {
+                    Some([q_bwd_dims[0], q_bwd_dims[1], q_bwd_dims[2], k_bwd_dims[2]])
                 } else {
                     None
                 };
@@ -5650,17 +5808,106 @@ fn compute_gradients(
                         .map(|(_, t)| t)
                         .find(|t| t.shape().dims() == s)
                 });
-                attention_backward_recompute(
-                    query_tensor,
-                    key_tensor,
-                    value_tensor,
-                    output_grad,
+                let (dq, dk, dv) = attention_backward_recompute(
+                    &q_for_bwd,
+                    &k_for_bwd,
+                    &v_for_bwd,
+                    &dout_for_bwd,
                     mask_tensor,
                     *causal,
                     *scale,
                     cached_attn,
-                )?
+                )?;
+
+                if let Some((padded_q_len, padded_kv_len, real_q_len, real_kv_len)) = pad_info {
+                    let device = dq.device().clone();
+                    let dtype = dq.dtype();
+                    let pad_q_rows = padded_q_len - real_q_len;
+                    let pad_kv_rows = padded_kv_len - real_kv_len;
+                    let dq_padded = if pad_q_rows > 0 {
+                        let dq_dims = dq.shape().dims().to_vec();
+                        let zero = Tensor::zeros_dtype(
+                            Shape::from_dims(&[dq_dims[0], dq_dims[1], pad_q_rows, dq_dims[3]]),
+                            dtype,
+                            device.clone(),
+                        )?;
+                        Tensor::cat(&[&dq, &zero], 2)?
+                    } else {
+                        dq
+                    };
+                    let dk_padded = if pad_kv_rows > 0 {
+                        let dk_dims = dk.shape().dims().to_vec();
+                        let zero = Tensor::zeros_dtype(
+                            Shape::from_dims(&[dk_dims[0], dk_dims[1], pad_kv_rows, dk_dims[3]]),
+                            dtype,
+                            device.clone(),
+                        )?;
+                        Tensor::cat(&[&dk, &zero], 2)?
+                    } else {
+                        dk
+                    };
+                    let dv_padded = if pad_kv_rows > 0 {
+                        let dv_dims = dv.shape().dims().to_vec();
+                        let zero = Tensor::zeros_dtype(
+                            Shape::from_dims(&[dv_dims[0], dv_dims[1], pad_kv_rows, dv_dims[3]]),
+                            dtype,
+                            device.clone(),
+                        )?;
+                        Tensor::cat(&[&dv, &zero], 2)?
+                    } else {
+                        dv
+                    };
+                    (dq_padded, dk_padded, dv_padded)
+                } else {
+                    (dq, dk, dv)
+                }
             };
+            Ok(smallvec![
+                (*query, grad_q),
+                (*key, grad_k),
+                (*value, grad_v)
+            ])
+        }
+
+        Op::PrefixCausalFullAttention {
+            query,
+            key,
+            value,
+            prefix_len,
+            scale,
+        } => {
+            let query_tensor_owned = fetch_saved(query)?;
+            let key_tensor_owned = fetch_saved(key)?;
+            let value_tensor_owned = fetch_saved(value)?;
+            let q_dims = query_tensor_owned.shape().dims().to_vec();
+            let k_dims = key_tensor_owned.shape().dims().to_vec();
+            if q_dims.len() != 4 || k_dims.len() != 4 || q_dims[2] != k_dims[2] {
+                return Err(Error::InvalidOperation(format!(
+                    "PrefixCausalFullAttention backward expects self-attention [B,H,S,D], got q={:?} k={:?}",
+                    q_dims, k_dims
+                )));
+            }
+            if *prefix_len > q_dims[2] {
+                return Err(Error::InvalidOperation(format!(
+                    "PrefixCausalFullAttention backward prefix_len {} exceeds seq_len {}",
+                    prefix_len, q_dims[2]
+                )));
+            }
+            let mask = prefix_causal_full_keep_mask_for_logits(
+                q_dims[2],
+                *prefix_len,
+                query_tensor_owned.device().clone(),
+            )?;
+            let (grad_q, grad_k, grad_v) = attention_backward_recompute(
+                &query_tensor_owned,
+                &key_tensor_owned,
+                &value_tensor_owned,
+                output_grad,
+                Some(&mask),
+                false,
+                *scale,
+                None,
+            )?;
             Ok(smallvec![
                 (*query, grad_q),
                 (*key, grad_k),
@@ -5877,6 +6124,7 @@ fn op_tag(op: &Op) -> &'static str {
         Op::Transpose { .. } => "Transpose",
         Op::Reshape { .. } => "Reshape",
         Op::Permute { .. } => "Permute",
+        Op::Broadcast { .. } => "Broadcast",
         Op::UpsampleNearest2D { .. } => "UpsampleNearest2D",
         Op::Repeat { .. } => "Repeat",
         Op::Cast { .. } => "Cast",
@@ -5899,6 +6147,7 @@ fn op_tag(op: &Op) -> &'static str {
         Op::BCELoss { .. } => "BCELoss",
         Op::NLLLoss { .. } => "NLLLoss",
         Op::FlashAttention { .. } => "FlashAttention",
+        Op::PrefixCausalFullAttention { .. } => "PrefixCausalFullAttention",
         Op::SageAttention { .. } => "SageAttention",
         Op::FusedSwiGLU { .. } => "FusedSwiGLU",
         Op::FusedSwiGLUSplit { .. } => "FusedSwiGLUSplit",

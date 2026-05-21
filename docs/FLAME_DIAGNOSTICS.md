@@ -61,10 +61,11 @@ first decoder layer:
 | `attn_out` (SDPA output, pre-`o_proj` reshape) | 0.999 | Entering SDPA-bwd cleanly |
 | `v_post_repeat_kv` (V tensor going into SDPA on the next iter; really tests SDPA-bwd exit) | 0.012 | Corrupt |
 
-Localized: bug is between `attn_out` and `v_post_repeat_kv`, i.e. inside
-`sdpa_prefix_causal_full`'s narrow+cat backward chain or its 2×SDPA
-forward composition. Without the trap, all you saw was `v_proj.lora_B`
-grad cos ~0.05 — useless.
+Localized: bug is between `attn_out` and `v_post_repeat_kv`, i.e. inside the
+old `sdpa_prefix_causal_full` narrow+cat backward chain or its 2×SDPA forward
+composition. The 2026-05-21 fix records `Op::PrefixCausalFullAttention` so
+the forward can stay split but backward recomputes as one exact masked SDPA.
+Without the trap, all you saw was `v_proj.lora_B` grad cos ~0.05 — useless.
 
 ---
 
@@ -211,15 +212,19 @@ it for parity-harness comparisons.
 
 - **Where**: `flame-core/src/ops/fused_inference.rs:479` (Rust),
   `flame-core/src/cuda/fused_linear3d.cu:369` (`flame_linear3d_bf16_pytorch_parity`).
-- **What**: Bit-exact PyTorch `at::cuda::blas::gemm_and_bias<at::BFloat16>`
-  mirror. Default `fused_linear3d_native` deviates by 1 BF16 ULP — wrong
-  `BIAS_DATA_TYPE`, no heuristic algo selection, no alignment prefs,
-  batch attrs set on layouts. This variant fixes all of that.
+- **What**: Bit-exact PyTorch linear mirror. Biased calls mirror
+  `at::cuda::blas::gemm_and_bias<at::BFloat16>`: default
+  `fused_linear3d_native` can deviate by 1 BF16 ULP due to
+  `BIAS_DATA_TYPE`, heuristic algo selection, alignment prefs, and
+  layout attrs. No-bias calls delegate to `fused_linear3d_native`,
+  matching PyTorch's matmul path and avoiding the slower biased
+  heuristic.
 - **When**: ai-toolkit / PyTorch bit-exact parity matters at the per-op
   level. HiDream-O1 TimestepEmbedder, predecoder linears, etc. For
   established baselines (Klein / Z-Image post-validation) keep using
   `fused_linear3d_native` to preserve their existing parity.
-- **Cost**: ~1% perf overhead vs the non-parity variant.
+- **Cost**: ~1% perf overhead vs the non-parity variant for biased
+  calls; no-bias calls use the native path.
 
 ### `CUBLASLT_LOG_LEVEL=5 CUBLASLT_LOG_FILE=/tmp/cublaslt.log`
 
@@ -322,7 +327,9 @@ exact shapes and dtypes from the real model. Template at
 
 | Test | Coverage |
 |---|---|
-| `sdpa_prefix_causal_full_grad_matches_masked_sdpa` | Structured SDPA backward vs explicit-mask reference at HiDream-O1 shape (B=1, H=32, S=497, D=128, prefix=263). |
+| `sdpa_prefix_causal_full_grad_matches_masked_sdpa` | Structured SDPA backward vs explicit-mask reference at HiDream-O1 shape (B=1, H=32, S=497, D=128, prefix=262). |
+| `sdpa_prefix_causal_full_public_image_weighted_grad_matches_masked_sdpa` | Public single-op default vs explicit-mask reference for the O1 image-row loss. |
+| `sdpa_prefix_causal_full_public_checkpoint_image_weighted_grad_matches_eager` | Public single-op default through checkpoint replay vs eager public default. |
 | `hidream_o1_attention_block_grad` | Full attention chain: LoRA-fused Q/K/V proj + q_norm/k_norm + halfsplit RoPE + repeat_kv + structured SDPA. |
 | `hidream_o1_attention_block_grad_checkpointed` | Same chain wrapped in `Op::CheckpointOffloadBoundary` with the grow-activation-cache + retain-id mechanism. |
 

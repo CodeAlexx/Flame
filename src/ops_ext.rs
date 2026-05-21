@@ -68,11 +68,20 @@ pub fn where_mask(mask: &Tensor, a: &Tensor, b: &Tensor) -> OpResult<Tensor> {
         )));
     }
 
+    // NEVER use `Tensor::clone_result()` on grad-bearing inputs here.
+    // `clone_result()` returns a tensor with a FRESH `TensorId` and records
+    // NO autograd Op linking it back to the source — it's a silent detach.
+    // The previous implementation cloned `a` and `b` defensively, which
+    // killed gradient flow back to any LoRA branch routed through where_mask
+    // (specifically the HiDream-O1 `t_embedder1.mlp.{0,2}` adapters via
+    // `scatter_tms_token`). `Tensor::clone()` is an Arc-bump that preserves
+    // `id` + `requires_grad`, and `mul`/`add` handle non-contiguous inputs
+    // through `tensor_iterator`, so passing `a`/`b` directly is correct.
     let target_shape = a.shape().clone();
     let mask_cast = if mask.shape() != &target_shape {
         mask.broadcast_to(&target_shape)?
     } else {
-        mask.clone_result()?
+        mask.clone()
     };
 
     let dtype = a.dtype();
@@ -84,8 +93,8 @@ pub fn where_mask(mask: &Tensor, a: &Tensor, b: &Tensor) -> OpResult<Tensor> {
 
     let ones = full_like(&mask_typed, 1.0)?;
     let inv_mask = ones.sub(&mask_typed)?;
-    let a_term = mask_typed.mul(&a.clone_result()?)?;
-    let b_term = inv_mask.mul(&b.clone_result()?)?;
+    let a_term = mask_typed.mul(a)?;
+    let b_term = inv_mask.mul(b)?;
     a_term.add(&b_term)
 }
 

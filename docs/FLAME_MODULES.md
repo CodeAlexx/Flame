@@ -239,7 +239,7 @@ thin wrapper around a `flame_*_bf16` C entry in `cuda::ffi`. Nine pub fns:
 - `fused_linear3d` — cuBLASLt 3D linear with pre-transposed weight
 - `fused_linear3d_native` — same but takes PyTorch `[Cout, Cin]` weight (added 2026-04, used by every FLUX/Chroma/QwenImage block forward)
 - `fused_linear3d_native_lora` — additive LoRA over `fused_linear3d_native`; byte-identical at LoRA=None, otherwise computes `base + scale * (x @ A^T @ B^T)` with autograd flowing into A/B only (added 2026-05 for HiDream-O1 decoder which owns weights via `HashMap<String, Tensor>`)
-- `fused_linear3d_native_pytorch_parity` — bit-exact PyTorch `gemm_and_bias<BF16>` mirror (added 2026-05-20). Same signature as `_native` but uses 1 MiB workspace, per-call heuristic, BIAS_POINTER set before `cublasLtMatmulAlgoGetHeuristic`. ~1% perf overhead; use when ai-toolkit per-op parity is the contract (HiDream-O1 TimestepEmbedder, BottleneckPatchEmbed). FAQ on which to pick is in [`FLAME_CONVENTIONS.md`](./FLAME_CONVENTIONS.md).
+- `fused_linear3d_native_pytorch_parity` — bit-exact PyTorch linear mirror (added 2026-05-20). Same signature as `_native`; biased calls mirror `gemm_and_bias<BF16>` with 1 MiB heuristic workspace and BIAS_POINTER set before `cublasLtMatmulAlgoGetHeuristic`, while no-bias calls delegate to `_native` to match PyTorch's matmul path. ~1% perf overhead for biased calls; use when ai-toolkit per-op parity is the contract (HiDream-O1 TimestepEmbedder, BottleneckPatchEmbed). FAQ on which to pick is in [`FLAME_CONVENTIONS.md`](./FLAME_CONVENTIONS.md).
 - `fused_rms_norm_modulate` — RMSNorm + modulate fused
 - `fused_residual_gate` — `x + gate*attn` fused
 
@@ -332,9 +332,9 @@ scalar Rust references. 7 tests total. First time the underlying
 The public attention surface. `sdpa(q, k, v, mask)`, `sdpa_with_bias(q, k, v, bias, scale)`,
 `sdpa_causal(q, k, v)`, `sdpa_prefix_causal_full(q, k, v, prefix_len)`,
 `attend(...)`, `attention_impl(...)`. Routes unmasked BF16+head_dim∈{64,96,128}
-to cuDNN SDPA; structured causal and prefix-causal/full masks should use the
-structured helpers instead of materializing binary masks. True arbitrary masks
-remain on the compatibility path. Also defines
+to the fastest available SDPA backend; structured causal and prefix-causal/full
+masks should use the structured helpers instead of materializing binary masks.
+True arbitrary masks remain on the compatibility path. Also defines
 `MultiHeadAttention`, `RotaryEmbedding`, `TransformerBlock`, `GeGLU`,
 `FeedForward`, and (legacy duplicate) `LayerNorm` structs used by training
 code.
@@ -344,11 +344,16 @@ Lower-level dispatcher used by `attention::sdpa::sdpa` and called directly
 by some inference code. `forward(q, k, v, mask)`, `forward_causal(...)`,
 `forward_prefix_causal_full(...)`, `forward_with_bias(...)`, `forward_v4(...)`
 (feature-gated). Dispatch order:
-1. **cuDNN SDPA** — primary unmasked BF16 path, with training O/Stats and
+1. **cuDNN SDPA** — primary unmasked BF16 training path, with O/Stats and
    padded Q/KV sequence lengths for backward.
-2. **Streaming SDPA** (`sdpa_stream_bf16`) — chunked path for large masked or
+2. **In-tree FA2 BF16** (`flame_flash_attention_bf16`) — unmasked/causal
+   forward path for supported head dimensions `{64, 96, 128}` when cuDNN is
+   not applicable or is explicitly bypassed. The 2026-05-21 O1 path added the
+   causal flag, raw-logit online softmax, `exp2`/log2 scaling, and reverse
+   K/V tile traversal to mirror PyTorch FlashAttention more closely.
+3. **Streaming SDPA** (`sdpa_stream_bf16`) — chunked path for large masked or
    oversized shapes.
-3. **cuBLASLt materialized fallback** (`forward_bf16_fallback`) — tensor cores
+4. **cuBLASLt materialized fallback** (`forward_bf16_fallback`) — tensor cores
    but full S×S matrix allocation.
 
 The retained in-tree wmma reference path calls FFI `flame_flash_attention_bf16` whose
@@ -360,6 +365,15 @@ BQ=32 kernel. Further double-buffering of K is an open investment —
 two attempts (BKV=48, s_P/s_S fold) either regressed perf or hit
 `store_matrix_sync` corruption; see `FA2_CP_ASYNC_DESIGN.md` for
 the investigation trail.
+
+**Deferred PyTorch tile parity**: local PyTorch/FlashAttention dispatch uses
+SM8x tile shapes HD64 non-causal `128x128`, HD96 non-causal `128x64`,
+HD128 non-causal `128x32`, and HD96/HD128 causal `64x64`, normally with
+4 warps and register-resident output accumulators. Flame's current kernel is
+still the shared-memory accumulator design (`TILE_Q=64`, `TILE_KV=64`,
+`NUM_WARPS=16`) because it fits HD128 inside the SM86 shared-memory budget.
+Porting the exact CUTLASS/CUTE-style tiled kernel is intentionally deferred
+until the HiDream-O1 trainer parity gate is closed.
 
 ### `attention/rope.rs`
 RoPE precompute + apply helpers. Most callers use the inline `rope_fused_bf16`

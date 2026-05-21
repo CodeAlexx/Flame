@@ -122,25 +122,26 @@ HiDream-O1 uses a structured prefix-causal/full attention pattern: AR/text
 prefix rows are causal, while image rows use full attention over all tokens.
 The model now calls `attention::sdpa_prefix_causal_full` instead of
 materializing the old `[B, 1, S, S]` mixed binary mask. Internally that
-primitive runs a small causal prefix pass plus a full unmasked pass, then
-replaces the prefix rows. The large full pass stays on the padded cuDNN SDPA
-train-forward/backward path. Before that change, a 3-step EDV2 O1 probe
-produced:
+primitive records a single custom autograd op. Forward runs the smaller prefix
+causal pass plus a suffix all-ones masked pass; backward recomputes once
+against the exact prefix-causal/full mask. This is the current fastest path
+proved by the O1 SDPA trap on 2026-05-21; the unmasked suffix/cuDNN attempts
+failed this machine's cuDNN plan builder at O1's non-aligned suffix shape.
+Before structured attention, a 3-step EDV2 O1 probe produced:
 
 ```text
 FLAME_LOG_SDPA_BWD=1 train_hidream_o1 --steps 3 ...
 108 [sdpa-bwd] bail:mask-present
 ```
 
-Causal cuDNN backward is available behind `FLAME_CUDNN_SDPA_BWD_CAUSAL=1`.
-It no longer crashes on O1 after the padding-mask wiring, but a 10-step O1
-probe measured it slower than the default fallback (about 3.3 s/step vs
-about 3.0 s/step), so it remains opt-in. With `FLAME_LOG_SDPA_BWD=1`, O1
-should now show full-pass cuDNN hits and causal-prefix `bail:causal-disabled`
-entries, not `bail:mask-present`. The remaining O1 speed gap is now dominated
-by decoder checkpoint/recompute and block offload boundaries, not by the
-full image-token SDPA alignment fallback. Retuning the block offloader slot
-window alone is still unlikely to reach the resident PyTorch/HF speed.
+Causal cuDNN backward is available behind `FLAME_CUDNN_SDPA_BWD_CAUSAL=1`,
+but keep it opt-in: O1's prefix shape has produced cuDNN plan failures and
+slower timings in local probes. With `FLAME_LOG_SDPA_BWD=1`, the mixed O1
+path should show `PrefixCausalFullAttention` / masked recompute behavior for
+the custom op, not a generic full `[S,S]` mask in the model. The remaining O1
+speed gap is dominated by decoder checkpoint/recompute, lower-layer parity
+issues, and block offload boundaries. Retuning the block offloader slot window
+alone is still unlikely to reach the resident PyTorch/HF speed.
 
 North-star reminder: structured SDPA only proves the old masked hot road is
 gone. O1 is not fixed until a real trained LoRA renders clean trigger-bound

@@ -242,6 +242,13 @@ code**:
   backward recomputes as one exact prefix-causal/full masked SDPA. This avoids
   the old two-SDPA shared-K/V gradient collapse without paying the full-mask
   cost on forward.
+  **2026-05-21 HiDream-O1 parity note**: the forward hot path is intentionally
+  flame-core-only and uses the in-tree FA2-style BF16 kernel for supported
+  head dimensions `{64, 96, 128}`. The FFI now accepts a `causal` flag, and
+  the kernel uses raw logits, `exp2`/log2 softmax scaling, and reverse K/V tile
+  traversal to track PyTorch FlashAttention more closely. Exact PyTorch/CUTLASS
+  tile-shape parity is deferred until after the O1 trainer gate; do not claim
+  trainer validity until the O1 parity smoke passes.
 - `flame_core::attention::sdpa_with_bias(q, k, v, bias, scale)` — `attention/sdpa.rs:542`
   T5-style additive bias variant. Same dispatch but accepts a `[*, H|1, Q, K]` bias tensor.
 - `flame_core::attention::attend(q, k, v, mask)` — `attention/sdpa.rs:534` — alias for sdpa
@@ -263,6 +270,9 @@ code**:
   `FLAME_PREFIX_CAUSAL_FULL_STRUCTURED=1`,
   `FLAME_PREFIX_CAUSAL_FULL_SUFFIX_ONLY=1`, and
   `FLAME_PREFIX_CAUSAL_FULL_SUFFIX_MASKED=1` are diagnostic toggles.
+  `FLAME_PREFIX_CAUSAL_FULL_TRY_CUDNN=1` re-enables the experimental cuDNN
+  full-suffix attempt; keep it off for O1 parity unless explicitly bisecting
+  cuDNN plan behavior.
 - `flame_core::sdpa::forward_with_bias(...)` — `sdpa.rs:125`
 - `flame_core::cuda_ops_bf16::sdpa_stream_bf16(q, k, v, mask, chunk, causal, scale)` — `cuda_ops_bf16.rs:1599`
   The chunked streaming SDPA used by LTX-2. Takes a `causal` flag and chunk size.

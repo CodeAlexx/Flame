@@ -672,6 +672,7 @@ extern "C" {
         seq_len_q: i32,
         seq_len_kv: i32,
         head_dim: i32,
+        causal: i32,
         stream: *mut core::ffi::c_void,
     ) -> i32;
 

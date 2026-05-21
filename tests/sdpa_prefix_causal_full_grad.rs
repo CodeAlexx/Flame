@@ -27,14 +27,14 @@
 use flame_core::{sdpa, set_default_dtype, DType, Device, Shape, Tensor};
 
 // Match HiDream-O1 layer 35's exact attention shape so the bug can be
-// reproduced in isolation. head_dim=128 routes through cuDNN flash; S=497
-// triggers the cuDNN backward alignment bail (Nq % 64 != 0) and falls to
-// `attention_backward_recompute`. prefix=263 matches the AR-prefix length.
+// reproduced in isolation. head_dim=128 routes through cuDNN flash; S=497.
+// The production training cache has 262 AR rows (`token_types == 0`), then
+// the TMS/image generation rows (`token_types > 0`).
 const B: usize = 1;
 const H: usize = 32;
 const S: usize = 497;
 const D: usize = 128;
-const PREFIX: usize = 263;
+const PREFIX: usize = 262;
 
 /// Build deterministic Q/K/V at [B, H, S, D] from sin/cos waves. Returns
 /// requires_grad=true tensors so backward flows.
@@ -56,6 +56,97 @@ fn make_qkv(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> (Tensor, Ten
         .expect("from_vec_dtype v")
         .requires_grad_(true);
     (q, k, v)
+}
+
+/// Test-only copy of the original structured implementation of
+/// `sdpa::forward_prefix_causal_full`.
+///
+/// Production currently routes that API through the explicit-mask workaround
+/// while the root cause is being investigated. These tests need to exercise the
+/// old two-pass composition directly, otherwise "structured vs masked" compares
+/// the mask path against itself.
+fn forward_prefix_causal_full_structured_for_test(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    prefix_len: usize,
+) -> flame_core::Result<Tensor> {
+    let seq_len = q.shape().dims()[2];
+    if prefix_len == 0 {
+        return sdpa::forward(q, k, v, None);
+    }
+    if prefix_len == seq_len {
+        return sdpa::forward_causal(q, k, v);
+    }
+
+    let q_prefix = q.narrow(2, 0, prefix_len)?.contiguous()?;
+    let k_prefix = k.narrow(2, 0, prefix_len)?.contiguous()?;
+    let v_prefix = v.narrow(2, 0, prefix_len)?.contiguous()?;
+    let out_prefix = sdpa::forward_causal(&q_prefix, &k_prefix, &v_prefix)?;
+
+    let out_full = sdpa::forward(q, k, v, None)?;
+    let out_suffix = out_full.narrow(2, prefix_len, seq_len - prefix_len)?;
+    Tensor::cat(&[&out_prefix, &out_suffix], 2)
+}
+
+/// Test-only variant for the faster structured implementation:
+/// prefix queries attend causally within the prefix, while only suffix queries
+/// run the full-attention pass against all K/V.
+fn forward_prefix_causal_full_suffix_only_for_test(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    prefix_len: usize,
+) -> flame_core::Result<Tensor> {
+    let seq_len = q.shape().dims()[2];
+    if prefix_len == 0 {
+        return sdpa::forward(q, k, v, None);
+    }
+    if prefix_len == seq_len {
+        return sdpa::forward_causal(q, k, v);
+    }
+
+    let q_prefix = q.narrow(2, 0, prefix_len)?.contiguous()?;
+    let k_prefix = k.narrow(2, 0, prefix_len)?.contiguous()?;
+    let v_prefix = v.narrow(2, 0, prefix_len)?.contiguous()?;
+    let out_prefix = sdpa::forward_causal(&q_prefix, &k_prefix, &v_prefix)?;
+
+    let q_suffix = q.narrow(2, prefix_len, seq_len - prefix_len)?.contiguous()?;
+    let out_suffix = sdpa::forward(&q_suffix, k, v, None)?;
+    Tensor::cat(&[&out_prefix, &out_suffix], 2)
+}
+
+/// Test-only correctness fallback: keep the prefix causal fast pass, but run
+/// only suffix queries through the masked path with an all-ones suffix mask.
+fn forward_prefix_causal_full_suffix_masked_for_test(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    prefix_len: usize,
+) -> flame_core::Result<Tensor> {
+    let seq_len = q.shape().dims()[2];
+    if prefix_len == 0 {
+        return sdpa::forward(q, k, v, None);
+    }
+    if prefix_len == seq_len {
+        return sdpa::forward_causal(q, k, v);
+    }
+
+    let q_prefix = q.narrow(2, 0, prefix_len)?.contiguous()?;
+    let k_prefix = k.narrow(2, 0, prefix_len)?.contiguous()?;
+    let v_prefix = v.narrow(2, 0, prefix_len)?.contiguous()?;
+    let out_prefix = sdpa::forward_causal(&q_prefix, &k_prefix, &v_prefix)?;
+
+    let suffix_len = seq_len - prefix_len;
+    let q_suffix = q.narrow(2, prefix_len, suffix_len)?.contiguous()?;
+    let mask = Tensor::from_vec_dtype(
+        vec![1.0f32; suffix_len * seq_len],
+        Shape::from_dims(&[1, 1, suffix_len, seq_len]),
+        q.device().clone(),
+        DType::F32,
+    )?;
+    let out_suffix = sdpa::forward(&q_suffix, k, v, Some(&mask))?;
+    Tensor::cat(&[&out_prefix, &out_suffix], 2)
 }
 
 /// Prefix-causal-full mask matching the semantics of
@@ -114,6 +205,50 @@ fn metrics(a: &Tensor, b: &Tensor) -> (f32, f32, f32) {
     (cos, max_abs, mean_abs)
 }
 
+fn image_rows_square_loss(out: &Tensor) -> Tensor {
+    out.narrow(2, PREFIX + 1, S - PREFIX - 1)
+        .expect("image rows narrow")
+        .to_dtype(DType::F32)
+        .expect("image rows to f32")
+        .square()
+        .expect("image rows square")
+        .sum()
+        .expect("image rows sum")
+}
+
+fn image_rows_weighted_loss(
+    out: &Tensor,
+    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+) -> Tensor {
+    let image_rows = S - PREFIX - 1;
+    let n = B * H * image_rows * D;
+    let weights: Vec<f32> = (0..n)
+        .map(|i| ((i as f32 * 0.031).sin() + (i as f32 * 0.017).cos()) * 0.25)
+        .collect();
+    let weight = Tensor::from_vec_dtype(
+        weights,
+        Shape::from_dims(&[B, H, image_rows, D]),
+        device.clone(),
+        DType::F32,
+    )
+    .expect("image weight from_vec_dtype");
+    out.narrow(2, PREFIX + 1, image_rows)
+        .expect("image rows narrow")
+        .to_dtype(DType::F32)
+        .expect("image rows to f32")
+        .mul(&weight)
+        .expect("image rows mul weight")
+        .sum()
+        .expect("image rows weighted sum")
+}
+
+fn print_region_metrics(label: &str, a: &Tensor, b: &Tensor, start: usize, len: usize) {
+    let a_region = a.narrow(2, start, len).expect("region narrow a");
+    let b_region = b.narrow(2, start, len).expect("region narrow b");
+    let (cos, max_abs, mean_abs) = metrics(&a_region, &b_region);
+    println!("{label} rows {start}..{} cos={cos:.6} max_abs={max_abs:.3e} mean_abs={mean_abs:.3e}", start + len);
+}
+
 #[test]
 fn sdpa_prefix_causal_full_grad_matches_masked_sdpa() {
     let device = Device::cuda(0).expect("CUDA required");
@@ -122,7 +257,7 @@ fn sdpa_prefix_causal_full_grad_matches_masked_sdpa() {
 
     // ───────────────────────────── Path A: structured ────────────────────
     let (q_a, k_a, v_a) = make_qkv(&cuda);
-    let out_a = sdpa::forward_prefix_causal_full(&q_a, &k_a, &v_a, PREFIX)
+    let out_a = forward_prefix_causal_full_structured_for_test(&q_a, &k_a, &v_a, PREFIX)
         .expect("forward_prefix_causal_full");
     // Loss = sum(out²). Square + sum keeps the test self-contained.
     let loss_a = out_a
@@ -202,6 +337,314 @@ fn sdpa_prefix_causal_full_grad_matches_masked_sdpa() {
     assert!(dk_cos > 0.99, "dK diverges: cos={dk_cos:.6}");
 }
 
+#[test]
+fn sdpa_prefix_causal_full_suffix_only_grad_matches_masked_sdpa() {
+    let device = Device::cuda(0).expect("CUDA required");
+    set_default_dtype(DType::BF16);
+    let cuda = device.cuda_device().clone();
+
+    let (q_a, k_a, v_a) = make_qkv(&cuda);
+    let out_a = forward_prefix_causal_full_suffix_only_for_test(&q_a, &k_a, &v_a, PREFIX)
+        .expect("suffix-only forward_prefix_causal_full");
+    let loss_a = out_a.to_dtype(DType::F32).unwrap().square().unwrap().sum().unwrap();
+    let grads_a = loss_a.backward().expect("backward A");
+    let dq_a = grads_a.get(q_a.id()).expect("dq_a missing").clone();
+    let dk_a = grads_a.get(k_a.id()).expect("dk_a missing").clone();
+    let dv_a = grads_a.get(v_a.id()).expect("dv_a missing").clone();
+
+    let (q_b, k_b, v_b) = make_qkv(&cuda);
+    let mask = prefix_causal_full_mask(&cuda);
+    let out_b = sdpa::forward(&q_b, &k_b, &v_b, Some(&mask)).expect("masked forward");
+    let loss_b = out_b.to_dtype(DType::F32).unwrap().square().unwrap().sum().unwrap();
+    let grads_b = loss_b.backward().expect("backward B");
+    let dq_b = grads_b.get(q_b.id()).expect("dq_b missing").clone();
+    let dk_b = grads_b.get(k_b.id()).expect("dk_b missing").clone();
+    let dv_b = grads_b.get(v_b.id()).expect("dv_b missing").clone();
+
+    let (fwd_cos, fwd_max, fwd_mean) = metrics(&out_a, &out_b);
+    println!("suffix-only forward parity: cos={fwd_cos:.6} max_abs={fwd_max:.3e} mean_abs={fwd_mean:.3e}");
+    assert!(fwd_cos > 0.999, "suffix-only forward diverges: cos={fwd_cos:.6}");
+
+    let (dv_cos, dv_max, dv_mean) = metrics(&dv_a, &dv_b);
+    let (dq_cos, dq_max, dq_mean) = metrics(&dq_a, &dq_b);
+    let (dk_cos, dk_max, dk_mean) = metrics(&dk_a, &dk_b);
+    println!("suffix-only dV cos={dv_cos:.6} max_abs={dv_max:.3e} mean_abs={dv_mean:.3e}");
+    println!("suffix-only dQ cos={dq_cos:.6} max_abs={dq_max:.3e} mean_abs={dq_mean:.3e}");
+    println!("suffix-only dK cos={dk_cos:.6} max_abs={dk_max:.3e} mean_abs={dk_mean:.3e}");
+    assert!(dv_cos > 0.99, "suffix-only dV diverges: cos={dv_cos:.6}");
+    assert!(dq_cos > 0.99, "suffix-only dQ diverges: cos={dq_cos:.6}");
+    assert!(dk_cos > 0.99, "suffix-only dK diverges: cos={dk_cos:.6}");
+}
+
+#[test]
+#[ignore = "diagnostic for the known-bad old structured path; public API uses single-op fallback"]
+fn sdpa_prefix_causal_full_image_rows_grad_matches_masked_sdpa() {
+    let device = Device::cuda(0).expect("CUDA required");
+    set_default_dtype(DType::BF16);
+    let cuda = device.cuda_device().clone();
+
+    let (q_a, k_a, v_a) = make_qkv(&cuda);
+    let out_a = forward_prefix_causal_full_structured_for_test(&q_a, &k_a, &v_a, PREFIX)
+        .expect("structured forward_prefix_causal_full");
+    let loss_a = image_rows_square_loss(&out_a);
+    let grads_a = loss_a.backward().expect("backward A");
+    let dq_a = grads_a.get(q_a.id()).expect("dq_a missing").clone();
+    let dk_a = grads_a.get(k_a.id()).expect("dk_a missing").clone();
+    let dv_a = grads_a.get(v_a.id()).expect("dv_a missing").clone();
+
+    let (q_b, k_b, v_b) = make_qkv(&cuda);
+    let mask = prefix_causal_full_mask(&cuda);
+    let out_b = sdpa::forward(&q_b, &k_b, &v_b, Some(&mask)).expect("masked forward");
+    let loss_b = image_rows_square_loss(&out_b);
+    let grads_b = loss_b.backward().expect("backward B");
+    let dq_b = grads_b.get(q_b.id()).expect("dq_b missing").clone();
+    let dk_b = grads_b.get(k_b.id()).expect("dk_b missing").clone();
+    let dv_b = grads_b.get(v_b.id()).expect("dv_b missing").clone();
+
+    let (dv_cos, dv_max, dv_mean) = metrics(&dv_a, &dv_b);
+    let (dq_cos, dq_max, dq_mean) = metrics(&dq_a, &dq_b);
+    let (dk_cos, dk_max, dk_mean) = metrics(&dk_a, &dk_b);
+    println!("image-rows structured dV cos={dv_cos:.6} max_abs={dv_max:.3e} mean_abs={dv_mean:.3e}");
+    println!("image-rows structured dQ cos={dq_cos:.6} max_abs={dq_max:.3e} mean_abs={dq_mean:.3e}");
+    println!("image-rows structured dK cos={dk_cos:.6} max_abs={dk_max:.3e} mean_abs={dk_mean:.3e}");
+    print_region_metrics("image-rows structured dQ prefix", &dq_a, &dq_b, 0, PREFIX);
+    print_region_metrics("image-rows structured dQ tms", &dq_a, &dq_b, PREFIX, 1);
+    print_region_metrics("image-rows structured dQ image", &dq_a, &dq_b, PREFIX + 1, S - PREFIX - 1);
+    assert!(dv_cos > 0.99, "image-rows structured dV diverges: cos={dv_cos:.6}");
+    assert!(dq_cos > 0.99, "image-rows structured dQ diverges: cos={dq_cos:.6}");
+    assert!(dk_cos > 0.99, "image-rows structured dK diverges: cos={dk_cos:.6}");
+}
+
+#[test]
+#[ignore = "diagnostic for the known-bad unmasked suffix path; public API uses single-op fallback"]
+fn sdpa_prefix_causal_full_suffix_only_image_rows_grad_matches_masked_sdpa() {
+    let device = Device::cuda(0).expect("CUDA required");
+    set_default_dtype(DType::BF16);
+    let cuda = device.cuda_device().clone();
+
+    let (q_a, k_a, v_a) = make_qkv(&cuda);
+    let q_prefix = q_a.narrow(2, 0, PREFIX).expect("q_prefix narrow").contiguous().expect("q_prefix contiguous");
+    let k_prefix = k_a.narrow(2, 0, PREFIX).expect("k_prefix narrow").contiguous().expect("k_prefix contiguous");
+    let v_prefix = v_a.narrow(2, 0, PREFIX).expect("v_prefix narrow").contiguous().expect("v_prefix contiguous");
+    let out_prefix = sdpa::forward_causal(&q_prefix, &k_prefix, &v_prefix).expect("prefix causal forward");
+
+    let q_suffix = q_a
+        .narrow(2, PREFIX, S - PREFIX)
+        .expect("q_suffix narrow")
+        .contiguous()
+        .expect("q_suffix contiguous");
+    let q_suffix_id = q_suffix.id();
+    let out_suffix = sdpa::forward(&q_suffix, &k_a, &v_a, None).expect("suffix full forward");
+    let out_a = Tensor::cat(&[&out_prefix, &out_suffix], 2).expect("suffix-only cat");
+    flame_core::autograd::AutogradContext::retain_intermediate_grads(
+        std::iter::once(q_suffix_id).collect(),
+    );
+    let loss_a = image_rows_square_loss(&out_a);
+    let grads_a = loss_a.backward().expect("backward A");
+    let retained_a = flame_core::autograd::AutogradContext::take_retained_intermediate_grads();
+    let dq_suffix_a = retained_a
+        .get(&q_suffix_id)
+        .expect("dq_suffix_a missing")
+        .clone();
+    let dq_a = grads_a.get(q_a.id()).expect("dq_a missing").clone();
+    let dk_a = grads_a.get(k_a.id()).expect("dk_a missing").clone();
+    let dv_a = grads_a.get(v_a.id()).expect("dv_a missing").clone();
+
+    let (q_b, k_b, v_b) = make_qkv(&cuda);
+    let mask = prefix_causal_full_mask(&cuda);
+    let out_b = sdpa::forward(&q_b, &k_b, &v_b, Some(&mask)).expect("masked forward");
+    let loss_b = image_rows_square_loss(&out_b);
+    let grads_b = loss_b.backward().expect("backward B");
+    let dq_b = grads_b.get(q_b.id()).expect("dq_b missing").clone();
+    let dk_b = grads_b.get(k_b.id()).expect("dk_b missing").clone();
+    let dv_b = grads_b.get(v_b.id()).expect("dv_b missing").clone();
+
+    let (dv_cos, dv_max, dv_mean) = metrics(&dv_a, &dv_b);
+    let (dq_cos, dq_max, dq_mean) = metrics(&dq_a, &dq_b);
+    let (dk_cos, dk_max, dk_mean) = metrics(&dk_a, &dk_b);
+    println!("image-rows suffix-only dV cos={dv_cos:.6} max_abs={dv_max:.3e} mean_abs={dv_mean:.3e}");
+    println!("image-rows suffix-only dQ cos={dq_cos:.6} max_abs={dq_max:.3e} mean_abs={dq_mean:.3e}");
+    println!("image-rows suffix-only dK cos={dk_cos:.6} max_abs={dk_max:.3e} mean_abs={dk_mean:.3e}");
+    print_region_metrics("image-rows suffix-only dQ prefix", &dq_a, &dq_b, 0, PREFIX);
+    print_region_metrics("image-rows suffix-only dQ tms", &dq_a, &dq_b, PREFIX, 1);
+    print_region_metrics("image-rows suffix-only dQ image", &dq_a, &dq_b, PREFIX + 1, S - PREFIX - 1);
+    let dq_suffix_image_a = dq_suffix_a
+        .narrow(2, 1, S - PREFIX - 1)
+        .expect("dq_suffix image narrow");
+    let dq_b_image = dq_b
+        .narrow(2, PREFIX + 1, S - PREFIX - 1)
+        .expect("dq_b image narrow");
+    let dq_a_image = dq_a
+        .narrow(2, PREFIX + 1, S - PREFIX - 1)
+        .expect("dq_a image narrow");
+    let (dq_suffix_cos, dq_suffix_max, dq_suffix_mean) = metrics(&dq_suffix_image_a, &dq_b_image);
+    let (dq_scatter_cos, dq_scatter_max, dq_scatter_mean) = metrics(&dq_a_image, &dq_suffix_image_a);
+    println!("image-rows suffix-only retained dQ_suffix image vs masked dQ image cos={dq_suffix_cos:.6} max_abs={dq_suffix_max:.3e} mean_abs={dq_suffix_mean:.3e}");
+    println!("image-rows suffix-only scattered dQ image vs retained dQ_suffix image cos={dq_scatter_cos:.6} max_abs={dq_scatter_max:.3e} mean_abs={dq_scatter_mean:.3e}");
+    assert!(dv_cos > 0.99, "image-rows suffix-only dV diverges: cos={dv_cos:.6}");
+    assert!(dq_cos > 0.99, "image-rows suffix-only dQ diverges: cos={dq_cos:.6}");
+    assert!(dk_cos > 0.99, "image-rows suffix-only dK diverges: cos={dk_cos:.6}");
+}
+
+#[test]
+#[ignore = "diagnostic for the known-bad unmasked suffix path; public API uses single-op fallback"]
+fn sdpa_prefix_causal_full_suffix_only_image_weighted_grad_matches_masked_sdpa() {
+    let device = Device::cuda(0).expect("CUDA required");
+    set_default_dtype(DType::BF16);
+    let cuda = device.cuda_device().clone();
+
+    let (q_a, k_a, v_a) = make_qkv(&cuda);
+    let out_a = forward_prefix_causal_full_suffix_only_for_test(&q_a, &k_a, &v_a, PREFIX)
+        .expect("suffix-only forward_prefix_causal_full");
+    let loss_a = image_rows_weighted_loss(&out_a, &cuda);
+    let grads_a = loss_a.backward().expect("backward A");
+    let dq_a = grads_a.get(q_a.id()).expect("dq_a missing").clone();
+    let dk_a = grads_a.get(k_a.id()).expect("dk_a missing").clone();
+    let dv_a = grads_a.get(v_a.id()).expect("dv_a missing").clone();
+
+    let (q_b, k_b, v_b) = make_qkv(&cuda);
+    let mask = prefix_causal_full_mask(&cuda);
+    let out_b = sdpa::forward(&q_b, &k_b, &v_b, Some(&mask)).expect("masked forward");
+    let loss_b = image_rows_weighted_loss(&out_b, &cuda);
+    let grads_b = loss_b.backward().expect("backward B");
+    let dq_b = grads_b.get(q_b.id()).expect("dq_b missing").clone();
+    let dk_b = grads_b.get(k_b.id()).expect("dk_b missing").clone();
+    let dv_b = grads_b.get(v_b.id()).expect("dv_b missing").clone();
+
+    let (dv_cos, dv_max, dv_mean) = metrics(&dv_a, &dv_b);
+    let (dq_cos, dq_max, dq_mean) = metrics(&dq_a, &dq_b);
+    let (dk_cos, dk_max, dk_mean) = metrics(&dk_a, &dk_b);
+    println!("image-weighted suffix-only dV cos={dv_cos:.6} max_abs={dv_max:.3e} mean_abs={dv_mean:.3e}");
+    println!("image-weighted suffix-only dQ cos={dq_cos:.6} max_abs={dq_max:.3e} mean_abs={dq_mean:.3e}");
+    println!("image-weighted suffix-only dK cos={dk_cos:.6} max_abs={dk_max:.3e} mean_abs={dk_mean:.3e}");
+    print_region_metrics("image-weighted suffix-only dQ image", &dq_a, &dq_b, PREFIX + 1, S - PREFIX - 1);
+    assert!(dv_cos > 0.99, "image-weighted suffix-only dV diverges: cos={dv_cos:.6}");
+    assert!(dq_cos > 0.99, "image-weighted suffix-only dQ diverges: cos={dq_cos:.6}");
+    assert!(dk_cos > 0.99, "image-weighted suffix-only dK diverges: cos={dk_cos:.6}");
+}
+
+#[test]
+fn sdpa_prefix_causal_full_suffix_masked_image_weighted_grad_matches_masked_sdpa() {
+    let device = Device::cuda(0).expect("CUDA required");
+    set_default_dtype(DType::BF16);
+    let cuda = device.cuda_device().clone();
+
+    let (q_a, k_a, v_a) = make_qkv(&cuda);
+    let out_a = forward_prefix_causal_full_suffix_masked_for_test(&q_a, &k_a, &v_a, PREFIX)
+        .expect("suffix-masked forward_prefix_causal_full");
+    let loss_a = image_rows_weighted_loss(&out_a, &cuda);
+    let grads_a = loss_a.backward().expect("backward A");
+    let dq_a = grads_a.get(q_a.id()).expect("dq_a missing").clone();
+    let dk_a = grads_a.get(k_a.id()).expect("dk_a missing").clone();
+    let dv_a = grads_a.get(v_a.id()).expect("dv_a missing").clone();
+
+    let (q_b, k_b, v_b) = make_qkv(&cuda);
+    let mask = prefix_causal_full_mask(&cuda);
+    let out_b = sdpa::forward(&q_b, &k_b, &v_b, Some(&mask)).expect("masked forward");
+    let loss_b = image_rows_weighted_loss(&out_b, &cuda);
+    let grads_b = loss_b.backward().expect("backward B");
+    let dq_b = grads_b.get(q_b.id()).expect("dq_b missing").clone();
+    let dk_b = grads_b.get(k_b.id()).expect("dk_b missing").clone();
+    let dv_b = grads_b.get(v_b.id()).expect("dv_b missing").clone();
+
+    let (dv_cos, dv_max, dv_mean) = metrics(&dv_a, &dv_b);
+    let (dq_cos, dq_max, dq_mean) = metrics(&dq_a, &dq_b);
+    let (dk_cos, dk_max, dk_mean) = metrics(&dk_a, &dk_b);
+    println!("image-weighted suffix-masked dV cos={dv_cos:.6} max_abs={dv_max:.3e} mean_abs={dv_mean:.3e}");
+    println!("image-weighted suffix-masked dQ cos={dq_cos:.6} max_abs={dq_max:.3e} mean_abs={dq_mean:.3e}");
+    println!("image-weighted suffix-masked dK cos={dk_cos:.6} max_abs={dk_max:.3e} mean_abs={dk_mean:.3e}");
+    print_region_metrics("image-weighted suffix-masked dQ image", &dq_a, &dq_b, PREFIX + 1, S - PREFIX - 1);
+    assert!(dv_cos > 0.99, "image-weighted suffix-masked dV diverges: cos={dv_cos:.6}");
+    assert!(dq_cos > 0.99, "image-weighted suffix-masked dQ diverges: cos={dq_cos:.6}");
+    assert!(dk_cos > 0.99, "image-weighted suffix-masked dK diverges: cos={dk_cos:.6}");
+}
+
+#[test]
+fn sdpa_prefix_causal_full_public_image_weighted_grad_matches_masked_sdpa() {
+    let device = Device::cuda(0).expect("CUDA required");
+    set_default_dtype(DType::BF16);
+    let cuda = device.cuda_device().clone();
+
+    let (q_a, k_a, v_a) = make_qkv(&cuda);
+    let out_a = sdpa::forward_prefix_causal_full(&q_a, &k_a, &v_a, PREFIX)
+        .expect("public forward_prefix_causal_full");
+    let loss_a = image_rows_weighted_loss(&out_a, &cuda);
+    let grads_a = loss_a.backward().expect("backward A");
+    let dq_a = grads_a.get(q_a.id()).expect("dq_a missing").clone();
+    let dk_a = grads_a.get(k_a.id()).expect("dk_a missing").clone();
+    let dv_a = grads_a.get(v_a.id()).expect("dv_a missing").clone();
+
+    let (q_b, k_b, v_b) = make_qkv(&cuda);
+    let mask = prefix_causal_full_mask(&cuda);
+    let out_b = sdpa::forward(&q_b, &k_b, &v_b, Some(&mask)).expect("masked forward");
+    let loss_b = image_rows_weighted_loss(&out_b, &cuda);
+    let grads_b = loss_b.backward().expect("backward B");
+    let dq_b = grads_b.get(q_b.id()).expect("dq_b missing").clone();
+    let dk_b = grads_b.get(k_b.id()).expect("dk_b missing").clone();
+    let dv_b = grads_b.get(v_b.id()).expect("dv_b missing").clone();
+
+    let (dv_cos, dv_max, dv_mean) = metrics(&dv_a, &dv_b);
+    let (dq_cos, dq_max, dq_mean) = metrics(&dq_a, &dq_b);
+    let (dk_cos, dk_max, dk_mean) = metrics(&dk_a, &dk_b);
+    println!("image-weighted public dV cos={dv_cos:.6} max_abs={dv_max:.3e} mean_abs={dv_mean:.3e}");
+    println!("image-weighted public dQ cos={dq_cos:.6} max_abs={dq_max:.3e} mean_abs={dq_mean:.3e}");
+    println!("image-weighted public dK cos={dk_cos:.6} max_abs={dk_max:.3e} mean_abs={dk_mean:.3e}");
+    assert!(dv_cos > 0.99, "image-weighted public dV diverges: cos={dv_cos:.6}");
+    assert!(dq_cos > 0.99, "image-weighted public dQ diverges: cos={dq_cos:.6}");
+    assert!(dk_cos > 0.99, "image-weighted public dK diverges: cos={dk_cos:.6}");
+}
+
+#[test]
+fn sdpa_prefix_causal_full_public_checkpoint_image_weighted_grad_matches_eager() {
+    let device = Device::cuda(0).expect("CUDA required");
+    set_default_dtype(DType::BF16);
+    let cuda = device.cuda_device().clone();
+
+    {
+        use std::sync::{Arc, Mutex};
+        let cache = flame_core::activation_offload::GrowOnDemandActivationCache::new(
+            cuda.clone(),
+            64 * 1024 * 1024,
+        )
+        .expect("grow cache new");
+        flame_core::autograd::set_grow_activation_cache(Arc::new(Mutex::new(cache)))
+            .expect("install grow cache");
+    }
+
+    let (q_a, k_a, v_a) = make_qkv(&cuda);
+    let out_a = sdpa::forward_prefix_causal_full(&q_a, &k_a, &v_a, PREFIX)
+        .expect("public eager forward_prefix_causal_full");
+    let loss_a = image_rows_weighted_loss(&out_a, &cuda);
+    let grads_a = loss_a.backward().expect("backward A");
+    let dq_a = grads_a.get(q_a.id()).expect("dq_a missing").clone();
+    let dk_a = grads_a.get(k_a.id()).expect("dk_a missing").clone();
+    let dv_a = grads_a.get(v_a.id()).expect("dv_a missing").clone();
+
+    let (q_b, k_b, v_b) = make_qkv(&cuda);
+    let out_b = flame_core::autograd::AutogradContext::checkpoint_offload_boundary(
+        &[q_b.clone(), k_b.clone(), v_b.clone()],
+        move |inputs: &[Tensor]| {
+            sdpa::forward_prefix_causal_full(&inputs[0], &inputs[1], &inputs[2], PREFIX)
+        },
+    )
+    .expect("checkpoint public forward_prefix_causal_full");
+    let loss_b = image_rows_weighted_loss(&out_b, &cuda);
+    let grads_b = loss_b.backward().expect("backward B");
+    let dq_b = grads_b.get(q_b.id()).expect("dq_b missing").clone();
+    let dk_b = grads_b.get(k_b.id()).expect("dk_b missing").clone();
+    let dv_b = grads_b.get(v_b.id()).expect("dv_b missing").clone();
+
+    let (dv_cos, dv_max, dv_mean) = metrics(&dv_a, &dv_b);
+    let (dq_cos, dq_max, dq_mean) = metrics(&dq_a, &dq_b);
+    let (dk_cos, dk_max, dk_mean) = metrics(&dk_a, &dk_b);
+    println!("checkpoint public vs eager dV cos={dv_cos:.6} max_abs={dv_max:.3e} mean_abs={dv_mean:.3e}");
+    println!("checkpoint public vs eager dQ cos={dq_cos:.6} max_abs={dq_max:.3e} mean_abs={dq_mean:.3e}");
+    println!("checkpoint public vs eager dK cos={dk_cos:.6} max_abs={dk_max:.3e} mean_abs={dk_mean:.3e}");
+    assert!(dv_cos > 0.99, "checkpoint public dV diverges: cos={dv_cos:.6}");
+    assert!(dq_cos > 0.99, "checkpoint public dQ diverges: cos={dq_cos:.6}");
+    assert!(dk_cos > 0.99, "checkpoint public dK diverges: cos={dk_cos:.6}");
+}
+
 /// HiDream-O1 attention block: Q/K/V projections + RoPE + repeat_kv +
 /// `sdpa_prefix_causal_full`. Designed to match the layer-35 chain that
 /// shows V LoRA-B grad cos=0.05. If THIS test passes at HiDream-O1's
@@ -210,7 +653,7 @@ fn sdpa_prefix_causal_full_grad_matches_masked_sdpa() {
 /// else upstream/downstream.
 ///
 /// Shapes match HiDream-O1 8B:
-///   B=1, H_q=32, H_kv=8, S=497, D=128, prefix=263.
+///   B=1, H_q=32, H_kv=8, S=497, D=128, prefix=262.
 ///
 /// We don't bother with the LoRA adapter here — just dense linears with
 /// requires_grad on the weights. The bug would still surface in dW for the
@@ -424,7 +867,7 @@ fn hidream_o1_attention_block_grad() {
     assert_eq!(v.shape().dims(), &[B, H_Q, S, D]);
 
     // Structured path: forward_prefix_causal_full.
-    let out_a = sdpa::forward_prefix_causal_full(&q, &k, &v, PREFIX)
+    let out_a = forward_prefix_causal_full_structured_for_test(&q, &k, &v, PREFIX)
         .expect("forward_prefix_causal_full");
     let loss_a = out_a
         .to_dtype(DType::F32)
@@ -783,13 +1226,13 @@ fn hidream_o1_attention_block_grad_checkpointed() {
 
     // Closure: runs the full attention block forward. Used by BOTH paths,
     // so the two only differ in whether they're wrapped in checkpoint.
-    let run_block = |hidden: &Tensor,
-                     w_q: &Tensor, w_k: &Tensor, w_v: &Tensor,
-                     lora_a_q: &Tensor, lora_b_q: &Tensor,
-                     lora_a_k: &Tensor, lora_b_k: &Tensor,
-                     lora_a_v: &Tensor, lora_b_v: &Tensor,
-                     q_norm_w: &Tensor, k_norm_w: &Tensor,
-                     pe_cos: &Tensor, pe_sin: &Tensor| -> flame_core::Result<Tensor> {
+    let _run_block = |hidden: &Tensor,
+                      w_q: &Tensor, w_k: &Tensor, w_v: &Tensor,
+                      lora_a_q: &Tensor, lora_b_q: &Tensor,
+                      lora_a_k: &Tensor, lora_b_k: &Tensor,
+                      lora_a_v: &Tensor, lora_b_v: &Tensor,
+                      q_norm_w: &Tensor, k_norm_w: &Tensor,
+                      pe_cos: &Tensor, pe_sin: &Tensor| -> flame_core::Result<Tensor> {
         use flame_core::ops::fused_inference::fused_linear3d_native_lora;
         let q = fused_linear3d_native_lora(hidden, w_q, None, Some(lora_a_q), Some(lora_b_q), LORA_SCALE)?;
         let k = fused_linear3d_native_lora(hidden, w_k, None, Some(lora_a_k), Some(lora_b_k), LORA_SCALE)?;
@@ -807,7 +1250,7 @@ fn hidream_o1_attention_block_grad_checkpointed() {
         let k = flame_core::bf16_ops::rope_halfsplit_bf16(&k, pe_cos, pe_sin)?;
         let k = hidream_repeat_kv(&k, n_rep)?;
         let v = hidream_repeat_kv(&v, n_rep)?;
-        sdpa::forward_prefix_causal_full(&q, &k, &v, PREFIX)
+        forward_prefix_causal_full_structured_for_test(&q, &k, &v, PREFIX)
     };
 
     // ───────────────────────────── Path A: NON-checkpointed ─────────────
@@ -848,7 +1291,7 @@ fn hidream_o1_attention_block_grad_checkpointed() {
     let k_a = hidream_repeat_kv(&k_a, n_rep).unwrap();
     let v_a = hidream_repeat_kv(&v_a_pre, n_rep).unwrap();
     let v_a_probe_id = v_a.id();
-    let out_a = sdpa::forward_prefix_causal_full(&q_a, &k_a, &v_a, PREFIX).unwrap();
+    let out_a = forward_prefix_causal_full_structured_for_test(&q_a, &k_a, &v_a, PREFIX).unwrap();
     let loss_a = out_a.to_dtype(DType::F32).unwrap().square().unwrap().sum().unwrap();
 
     // Register v_a's id (post-repeat_kv) AND v_proj_out_id_a (pre-reshape)
@@ -871,7 +1314,7 @@ fn hidream_o1_attention_block_grad_checkpointed() {
     // rearrangement formula is correct. If not, the rearrangement is the bug.
     if let (Some(dv_post), Some(dv_proj)) = (dv_intermediate_a.as_ref(), dv_proj_out_a.as_ref()) {
         let dims = dv_post.shape().dims().to_vec();
-        let (b, hq, s, d) = (dims[0], dims[1], dims[2], dims[3]);
+        let (b, _hq, s, d) = (dims[0], dims[1], dims[2], dims[3]);
         let rearranged = dv_post
             .reshape(&[b, H_KV, n_rep, s, d])
             .unwrap()
@@ -966,7 +1409,7 @@ fn hidream_o1_attention_block_grad_checkpointed() {
                 ids.insert(v.id());
                 flame_core::autograd::AutogradContext::retain_intermediate_grads_add(ids);
             }
-            sdpa::forward_prefix_causal_full(&q, &k, &v, PREFIX)
+            forward_prefix_causal_full_structured_for_test(&q, &k, &v, PREFIX)
         },
     ).expect("checkpoint forward");
     let loss_b = out_b.to_dtype(DType::F32).unwrap().square().unwrap().sum().unwrap();
@@ -1064,4 +1507,317 @@ fn prefix_causal_full_mask_for(
         DType::F32,
     )
     .expect("mask")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-layer chained-blocks reproduction test (added 2026-05-21)
+//
+// `hidream_o1_attention_block_grad_checkpointed` (above) wraps ONE attention
+// block in `checkpoint_offload_boundary` and proves LoRA-B grad parity at
+// cos=1.0. The 2026-05-21 HiDream-O1 trainer parity binary reports cos≈0.01
+// for the SAME Q/K/V LoRA-B grads at the SAME shapes — and the model wraps
+// 36 stacked decoder blocks in checkpoint boundaries. The hypothesis: the
+// bug only manifests when N>1 boundaries share the activation cache + alloc
+// pool, due to either (a) save-tensor backing-buffer recycling across layers,
+// (b) tape-walk ordering with multiple Op::CheckpointOffloadBoundary nodes,
+// or (c) cross-layer Op::FlashAttention saved-tensor lifetime not surviving
+// to its own bwd dispatch.
+//
+// This test chains N=8 attention blocks at the exact HiDream-O1 shapes,
+// each in its own checkpoint boundary, with a residual connection between
+// blocks. Compares structured-SDPA Path A vs masked-SDPA Path B LoRA-B grads
+// at every block, walking from output side to input side. If 1-block isolated
+// tests pass but THIS fails, the bug is in the multi-layer interaction, and
+// that narrows the search space dramatically.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CHAIN_N: usize = 8;
+
+struct ChainLayerWeights {
+    w_q: Tensor,
+    w_k: Tensor,
+    w_v: Tensor,
+    la_q: Tensor,
+    lb_q: Tensor,
+    la_k: Tensor,
+    lb_k: Tensor,
+    la_v: Tensor,
+    lb_v: Tensor,
+    w_o: Tensor,
+    qn: Tensor,
+    kn: Tensor,
+}
+
+fn build_chain_weights(
+    n_layers: usize,
+    h_q: usize,
+    h_kv: usize,
+    d: usize,
+    hidden: usize,
+    rank: usize,
+    cuda: &std::sync::Arc<cudarc::driver::CudaDevice>,
+) -> Vec<ChainLayerWeights> {
+    let make_w = |out: usize, in_: usize, salt: f32| -> Tensor {
+        let n = out * in_;
+        let data: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.07 + salt).cos()) * 0.02).collect();
+        Tensor::from_vec_dtype(data, Shape::from_dims(&[out, in_]), cuda.clone(), DType::BF16)
+            .unwrap()
+            .requires_grad_(true)
+    };
+    let make_norm = |salt: f32| -> Tensor {
+        let data: Vec<f32> = (0..d).map(|i| 1.0 + (i as f32 * 0.05 + salt).sin() * 0.1).collect();
+        Tensor::from_vec_dtype(data, Shape::from_dims(&[d]), cuda.clone(), DType::BF16)
+            .unwrap()
+            .requires_grad_(true)
+    };
+    let make_lora_a = |salt: f32| -> Tensor {
+        let n = rank * hidden;
+        let data: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.0017 + salt).sin()) * 0.01).collect();
+        Tensor::from_vec_dtype(data, Shape::from_dims(&[rank, hidden]), cuda.clone(), DType::BF16)
+            .unwrap()
+            .requires_grad_(true)
+    };
+    let make_lora_b = |out: usize, salt: f32| -> Tensor {
+        let n = out * rank;
+        let data: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.0029 + salt).cos()) * 0.005).collect();
+        Tensor::from_vec_dtype(data, Shape::from_dims(&[out, rank]), cuda.clone(), DType::BF16)
+            .unwrap()
+            .requires_grad_(true)
+    };
+    (0..n_layers)
+        .map(|l| {
+            let s = l as f32;
+            ChainLayerWeights {
+                w_q: make_w(h_q * d, hidden, 1.0 + s * 10.0),
+                w_k: make_w(h_kv * d, hidden, 2.0 + s * 10.0),
+                w_v: make_w(h_kv * d, hidden, 3.0 + s * 10.0),
+                la_q: make_lora_a(10.0 + s * 100.0),
+                lb_q: make_lora_b(h_q * d, 11.0 + s * 100.0),
+                la_k: make_lora_a(20.0 + s * 100.0),
+                lb_k: make_lora_b(h_kv * d, 21.0 + s * 100.0),
+                la_v: make_lora_a(30.0 + s * 100.0),
+                lb_v: make_lora_b(h_kv * d, 31.0 + s * 100.0),
+                w_o: make_w(hidden, h_q * d, 4.0 + s * 10.0),
+                qn: make_norm(0.5 + s),
+                kn: make_norm(0.7 + s),
+            }
+        })
+        .collect()
+}
+
+/// Returns (out_b_s_hidden, layer_weights_used).
+/// `use_mask` switches between structured prefix-causal-full and masked single SDPA.
+fn run_chain_n_blocks(
+    weights: &[ChainLayerWeights],
+    hidden_in: &Tensor,
+    pe_cos: &Tensor,
+    pe_sin: &Tensor,
+    mask: Option<&Tensor>,
+    n_q: usize,
+    n_kv: usize,
+    s: usize,
+    d: usize,
+    _hidden: usize,
+    prefix: usize,
+    rms_eps: f32,
+    lora_scale: f32,
+) -> flame_core::Result<Tensor> {
+    let b = hidden_in.shape().dims()[0];
+    let n_rep = n_q / n_kv;
+    let mut h = hidden_in.clone();
+    for w in weights.iter() {
+        let w_q = w.w_q.clone();
+        let w_k = w.w_k.clone();
+        let w_v = w.w_v.clone();
+        let la_q = w.la_q.clone();
+        let lb_q = w.lb_q.clone();
+        let la_k = w.la_k.clone();
+        let lb_k = w.lb_k.clone();
+        let la_v = w.la_v.clone();
+        let lb_v = w.lb_v.clone();
+        let w_o = w.w_o.clone();
+        let qn = w.qn.clone();
+        let kn = w.kn.clone();
+        let pe_cos = pe_cos.clone();
+        let pe_sin = pe_sin.clone();
+        let mask = mask.cloned();
+        let prefix = prefix;
+        let h_in = h.clone();
+        let out = flame_core::autograd::AutogradContext::checkpoint_offload_boundary(
+            &[h_in.clone()],
+            move |inputs: &[Tensor]| {
+                let h = inputs[0].clone();
+                use flame_core::ops::fused_inference::fused_linear3d_native_lora;
+                let q = fused_linear3d_native_lora(&h, &w_q, None, Some(&la_q), Some(&lb_q), lora_scale)?;
+                let k = fused_linear3d_native_lora(&h, &w_k, None, Some(&la_k), Some(&lb_k), lora_scale)?;
+                let v = fused_linear3d_native_lora(&h, &w_v, None, Some(&la_v), Some(&lb_v), lora_scale)?;
+                let q = q.reshape(&[b, s, n_q, d])?.permute(&[0, 2, 1, 3])?.contiguous()?;
+                let k = k.reshape(&[b, s, n_kv, d])?.permute(&[0, 2, 1, 3])?.contiguous()?;
+                let v = v.reshape(&[b, s, n_kv, d])?.permute(&[0, 2, 1, 3])?.contiguous()?;
+                let q_flat = q.reshape(&[b * n_q * s, d])?;
+                let q_normed = flame_core::cuda_ops_bf16::rms_norm_bf16(&q_flat, Some(&qn), rms_eps)?;
+                let q = q_normed.reshape(&[b, n_q, s, d])?;
+                let k_flat = k.reshape(&[b * n_kv * s, d])?;
+                let k_normed = flame_core::cuda_ops_bf16::rms_norm_bf16(&k_flat, Some(&kn), rms_eps)?;
+                let k = k_normed.reshape(&[b, n_kv, s, d])?;
+                let q = flame_core::bf16_ops::rope_halfsplit_bf16(&q, &pe_cos, &pe_sin)?;
+                let k = flame_core::bf16_ops::rope_halfsplit_bf16(&k, &pe_cos, &pe_sin)?;
+                let k = hidream_repeat_kv(&k, n_rep)?;
+                let v = hidream_repeat_kv(&v, n_rep)?;
+                let attn = if let Some(ref m) = mask {
+                    sdpa::forward(&q, &k, &v, Some(m))?
+                } else {
+                    forward_prefix_causal_full_structured_for_test(&q, &k, &v, prefix)?
+                };
+                // attn: [B, n_q, S, D]  →  [B, S, n_q*D]  →  o_proj  →  [B, S, hidden]
+                let attn = attn.permute(&[0, 2, 1, 3])?.contiguous()?.reshape(&[b, s, n_q * d])?;
+                let attn_out = flame_core::ops::fused_inference::fused_linear3d_native(
+                    &attn, &w_o, None,
+                )?;
+                // Residual add.
+                attn_out.add(&h)
+            },
+        )?;
+        h = out;
+    }
+    Ok(h)
+}
+
+/// Chains N=8 attention blocks at HiDream-O1 shapes, each in its own
+/// `checkpoint_offload_boundary`, with residual connections between blocks.
+/// Path A uses `sdpa::forward_prefix_causal_full` (structured); Path B uses
+/// `sdpa::forward(... Some(mask))` (workaround). Compares LoRA-B grads at
+/// every layer, starting from the output side where backward arrives first.
+///
+/// If isolated 1-block tests pass but this fails, the bug lives in the
+/// multi-layer / multi-checkpoint composition — not in any single op.
+#[test]
+fn hidream_o1_chained_blocks_struct_vs_masked() {
+    let device = Device::cuda(0).expect("CUDA required");
+    set_default_dtype(DType::BF16);
+    let cuda = device.cuda_device().clone();
+
+    // HiDream-O1 trainer installs 1 GiB; use a smaller slab here since each
+    // layer is small but we have 8 layers. Reinstall before each path so A and
+    // B start with equivalent cache cursor/epoch state.
+    let install_grow_cache = || {
+        use std::sync::{Arc as A2, Mutex as M2};
+        let cache = flame_core::activation_offload::GrowOnDemandActivationCache::new(
+            cuda.clone(),
+            256 * 1024 * 1024,
+        )
+        .expect("grow cache new");
+        flame_core::autograd::set_grow_activation_cache(A2::new(M2::new(cache)))
+            .expect("install grow cache");
+    };
+
+    const B: usize = 1;
+    const H_Q: usize = 32;
+    const H_KV: usize = 8;
+    const S: usize = 497;
+    const D: usize = 128;
+    const PREFIX: usize = 263;
+    const HIDDEN: usize = H_Q * D;
+    const RANK: usize = 32;
+    const RMS_EPS: f32 = 1e-6;
+    const LORA_SCALE: f32 = 1.0;
+
+    let half = D / 2;
+
+    // Hidden input (one per path so backward IDs don't collide).
+    let make_hidden = || -> Tensor {
+        let n = B * S * HIDDEN;
+        let data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013).sin() * 0.3).collect();
+        Tensor::from_vec_dtype(data, Shape::from_dims(&[B, S, HIDDEN]), cuda.clone(), DType::BF16)
+            .unwrap()
+            .requires_grad_(true)
+    };
+
+    // PE tables (same for both paths).
+    let make_pe = |salt: f32| -> Tensor {
+        let n = S * half;
+        let data: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.001 + salt).cos()).clamp(-0.999, 0.999))
+            .collect();
+        Tensor::from_vec_dtype(data, Shape::from_dims(&[1, S, half]), cuda.clone(), DType::BF16)
+            .unwrap()
+    };
+
+    let pe_cos_a = make_pe(0.0);
+    let pe_sin_a = make_pe(1.5);
+    let pe_cos_b = make_pe(0.0);
+    let pe_sin_b = make_pe(1.5);
+
+    // Path A: structured.
+    install_grow_cache();
+    let weights_a = build_chain_weights(CHAIN_N, H_Q, H_KV, D, HIDDEN, RANK, &cuda);
+    let hidden_a = make_hidden();
+    let out_a = run_chain_n_blocks(
+        &weights_a, &hidden_a, &pe_cos_a, &pe_sin_a, None,
+        H_Q, H_KV, S, D, HIDDEN, PREFIX, RMS_EPS, LORA_SCALE,
+    )
+    .expect("chain A");
+    let loss_a = out_a.to_dtype(DType::F32).unwrap().square().unwrap().sum().unwrap();
+    let grads_a = loss_a.backward().expect("backward A");
+
+    // Path B: masked. SAME weights data (rebuild fresh so IDs don't collide).
+    install_grow_cache();
+    let weights_b = build_chain_weights(CHAIN_N, H_Q, H_KV, D, HIDDEN, RANK, &cuda);
+    let hidden_b = make_hidden();
+    let mask = prefix_causal_full_mask_for(S, PREFIX, &cuda);
+    let out_b = run_chain_n_blocks(
+        &weights_b, &hidden_b, &pe_cos_b, &pe_sin_b, Some(&mask),
+        H_Q, H_KV, S, D, HIDDEN, PREFIX, RMS_EPS, LORA_SCALE,
+    )
+    .expect("chain B");
+    let loss_b = out_b.to_dtype(DType::F32).unwrap().square().unwrap().sum().unwrap();
+    let grads_b = loss_b.backward().expect("backward B");
+
+    // Forward parity (sanity: should match within BF16 over N layers).
+    let (fwd_cos, fwd_max, _) = metrics(&out_a, &out_b);
+    println!(
+        "chained-{CHAIN_N} forward parity: cos={fwd_cos:.6} max_abs={fwd_max:.3e}"
+    );
+    assert!(
+        fwd_cos > 0.99,
+        "chained forward diverges between structured and masked paths at N={CHAIN_N} layers — cos={fwd_cos:.6}"
+    );
+
+    // Compare LoRA-B grads at EVERY layer. Walk from output side (last layer
+    // bwd hits first) to input side (first layer bwd hits last — most
+    // cascade-noise exposed). The first layer below cos=0.99 names the depth
+    // at which the bug emerges.
+    let mut first_failing_layer: Option<usize> = None;
+    println!("layer   dQ_lora_B    dK_lora_B    dV_lora_B");
+    for l in (0..CHAIN_N).rev() {
+        let wa = &weights_a[l];
+        let wb = &weights_b[l];
+        let dlbq_a = grads_a.get(wa.lb_q.id()).expect("lb_q_a grad").clone();
+        let dlbq_b = grads_b.get(wb.lb_q.id()).expect("lb_q_b grad").clone();
+        let dlbk_a = grads_a.get(wa.lb_k.id()).expect("lb_k_a grad").clone();
+        let dlbk_b = grads_b.get(wb.lb_k.id()).expect("lb_k_b grad").clone();
+        let dlbv_a = grads_a.get(wa.lb_v.id()).expect("lb_v_a grad").clone();
+        let dlbv_b = grads_b.get(wb.lb_v.id()).expect("lb_v_b grad").clone();
+        let (q_cos, _, _) = metrics(&dlbq_a, &dlbq_b);
+        let (k_cos, _, _) = metrics(&dlbk_a, &dlbk_b);
+        let (v_cos, _, _) = metrics(&dlbv_a, &dlbv_b);
+        let tag = if q_cos < 0.99 || k_cos < 0.99 || v_cos < 0.99 {
+            "FAIL"
+        } else {
+            "OK"
+        };
+        println!(
+            "{l:>5}   {q_cos:.6}   {k_cos:.6}   {v_cos:.6}   {tag}"
+        );
+        if (q_cos < 0.99 || k_cos < 0.99 || v_cos < 0.99) && first_failing_layer.is_none() {
+            first_failing_layer = Some(l);
+        }
+    }
+    if let Some(l) = first_failing_layer {
+        panic!(
+            "Chained-{CHAIN_N} structured vs masked: first layer below cos=0.99 is layer {l} \
+             (counting from output-side; bwd reached this layer at step {})",
+            CHAIN_N - 1 - l
+        );
+    }
 }

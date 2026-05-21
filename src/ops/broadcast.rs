@@ -30,8 +30,11 @@ pub fn broadcast_to_impl(tensor: &Tensor, target_shape: &[i64]) -> Result<Tensor
             let out_shape = Shape::from_dims(&target);
 
             if tensor.shape() == &out_shape {
-                let _clone_guard = strict::allow_clone();
-                return tensor.clone_result();
+                // Same-shape "broadcast" — `clone()` preserves `id` and
+                // `requires_grad`, so autograd stays intact. The previous
+                // `clone_result()` (deep dtod_copy with a fresh id, no Op
+                // record) silently detached the input.
+                return Ok(tensor.clone());
             }
 
             let device = tensor.device();
@@ -182,6 +185,26 @@ pub fn broadcast_to_impl(tensor: &Tensor, target_shape: &[i64]) -> Result<Tensor
                             other
                         )));
                     }
+                }
+            }
+
+            // Record Op::Broadcast so backward can sum-reduce the gradient
+            // along broadcast axes back to the input shape. Without this,
+            // any grad-bearing tensor passed through broadcast_to is
+            // silently detached (root cause of HiDream-O1
+            // t_embedder1.mlp.{0,2} LoRA dead-grad, 2026-05-21).
+            if tensor.requires_grad {
+                output.requires_grad = true;
+                if crate::autograd::AutogradContext::is_recording() {
+                    crate::autograd::AutogradContext::record_op(
+                        output.id,
+                        crate::autograd::Op::Broadcast {
+                            input: tensor.id,
+                            src_shape: tensor.shape().dims().to_vec(),
+                            dst_shape: target.clone(),
+                        },
+                        vec![(tensor.id, tensor.clone())],
+                    );
                 }
             }
 

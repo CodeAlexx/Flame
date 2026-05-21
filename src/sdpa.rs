@@ -245,11 +245,16 @@ pub fn forward_causal(q: &Tensor, k: &Tensor, v: &Tensor) -> SdpaResult<Tensor> 
 /// Scaled dot-product self-attention where the prefix rows are causal and the
 /// remaining rows attend to the full sequence.
 ///
-/// This is the structured equivalent of a common mixed binary mask:
+/// Prefix-causal-full self-attention:
 /// rows `[0, prefix_len)` use a top-left causal mask over the prefix, while
-/// rows `[prefix_len, S)` use unmasked full attention over all keys. Keeping
-/// it structured avoids a materialized `[B,1,S,S]` binary mask and lets the
-/// large full pass stay on the cuDNN SDPA path.
+/// rows `[prefix_len, S)` use unmasked full attention over all keys.
+///
+/// Current training implementation records this as one autograd op. Forward is
+/// computed as causal prefix plus an FA2 full pass sliced to suffix rows, while
+/// backward recomputes against the exact materialized prefix-causal/full mask.
+/// This avoids the production O1 K/V gradient collapse from taping two
+/// independent SDPA nodes over shared K/V, and avoids cuDNN plan failures on
+/// O1's non-aligned full/suffix shapes.
 pub fn forward_prefix_causal_full(
     q: &Tensor,
     k: &Tensor,
@@ -289,16 +294,259 @@ pub fn forward_prefix_causal_full(
                 return forward_causal(q, k, v);
             }
 
-            let q_prefix = q.narrow(2, 0, prefix_len)?.contiguous()?;
-            let k_prefix = k.narrow(2, 0, prefix_len)?.contiguous()?;
-            let v_prefix = v.narrow(2, 0, prefix_len)?.contiguous()?;
-            let out_prefix = forward_causal(&q_prefix, &k_prefix, &v_prefix)?;
+            let full_mask = || -> SdpaResult<Tensor> {
+                let mask = prefix_causal_full_mask(q, prefix_len)?;
+                forward(q, k, v, Some(&mask))
+            };
 
-            let out_full = forward(q, k, v, None)?;
-            let out_suffix = out_full.narrow(2, prefix_len, seq_len - prefix_len)?;
-            Tensor::cat(&[&out_prefix, &out_suffix], 2)
+            if std::env::var("FLAME_PREFIX_CAUSAL_FULL_STRUCTURED")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                return prefix_causal_full_structured_forward(q, k, v, prefix_len, true);
+            }
+
+            if std::env::var("FLAME_PREFIX_CAUSAL_FULL_SUFFIX_ONLY")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                return prefix_causal_full_structured_forward(q, k, v, prefix_len, false);
+            }
+
+            if std::env::var("FLAME_PREFIX_CAUSAL_FULL_FULL_MASK")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                return full_mask();
+            }
+
+            if std::env::var("FLAME_PREFIX_CAUSAL_FULL_SUFFIX_MASKED")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                return prefix_causal_full_suffix_masked_forward(q, k, v, prefix_len);
+            }
+
+            if crate::autograd::AutogradContext::is_recording()
+                && (q.requires_grad || k.requires_grad || v.requires_grad)
+            {
+                let output = {
+                    let _guard = crate::autograd::AutogradContext::no_grad();
+                    prefix_causal_full_flash_forward(q, k, v, prefix_len)?
+                };
+                let out = output.requires_grad_(true);
+                let scale = 1.0 / (q_dims[3] as f32).sqrt();
+                crate::autograd::AutogradContext::record_op(
+                    out.id(),
+                    crate::autograd::Op::PrefixCausalFullAttention {
+                        query: q.id(),
+                        key: k.id(),
+                        value: v.id(),
+                        prefix_len,
+                        scale,
+                    },
+                    vec![
+                        (q.id(), q.clone()),
+                        (k.id(), k.clone()),
+                        (v.id(), v.clone()),
+                    ],
+                );
+                return Ok(out);
+            }
+
+            prefix_causal_full_flash_forward(q, k, v, prefix_len)
         },
     )
+}
+
+fn prefix_causal_full_mask(q: &Tensor, prefix_len: usize) -> SdpaResult<Tensor> {
+    let seq_len = q.shape().dims()[2];
+    let mut mask_data = vec![1.0f32; seq_len * seq_len];
+    for q_idx in 0..seq_len {
+        if q_idx < prefix_len {
+            let row = q_idx * seq_len;
+            for k_idx in 0..seq_len {
+                mask_data[row + k_idx] = if k_idx <= q_idx && k_idx < prefix_len {
+                    1.0
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+    Tensor::from_vec_dtype(
+        mask_data,
+        Shape::from_dims(&[1, 1, seq_len, seq_len]),
+        q.device().clone(),
+        DType::F32,
+    )
+}
+
+fn prefix_causal_full_structured_forward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    prefix_len: usize,
+    full_then_slice: bool,
+) -> SdpaResult<Tensor> {
+    let seq_len = q.shape().dims()[2];
+    let q_prefix = q.narrow(2, 0, prefix_len)?.contiguous()?;
+    let k_prefix = k.narrow(2, 0, prefix_len)?.contiguous()?;
+    let v_prefix = v.narrow(2, 0, prefix_len)?.contiguous()?;
+    let out_prefix = forward_causal(&q_prefix, &k_prefix, &v_prefix)?;
+
+    let out_suffix = if full_then_slice {
+        let out_full = forward_train_inner(q, k, v, None, false)?;
+        out_full.narrow(2, prefix_len, seq_len - prefix_len)?
+    } else {
+        let q_suffix = q.narrow(2, prefix_len, seq_len - prefix_len)?.contiguous()?;
+        forward_train_inner(&q_suffix, k, v, None, false)?
+    };
+    Tensor::cat(&[&out_prefix, &out_suffix], 2)
+}
+
+fn prefix_causal_full_suffix_masked_forward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    prefix_len: usize,
+) -> SdpaResult<Tensor> {
+    let seq_len = q.shape().dims()[2];
+    let q_prefix = q.narrow(2, 0, prefix_len)?.contiguous()?;
+    let k_prefix = k.narrow(2, 0, prefix_len)?.contiguous()?;
+    let v_prefix = v.narrow(2, 0, prefix_len)?.contiguous()?;
+    let out_prefix = forward_causal(&q_prefix, &k_prefix, &v_prefix)?;
+
+    let suffix_len = seq_len - prefix_len;
+    let q_suffix = q.narrow(2, prefix_len, suffix_len)?.contiguous()?;
+    let mask = Tensor::from_vec_dtype(
+        vec![1.0f32; suffix_len * seq_len],
+        Shape::from_dims(&[1, 1, suffix_len, seq_len]),
+        q.device().clone(),
+        DType::F32,
+    )?;
+    let out_suffix = forward(&q_suffix, k, v, Some(&mask))?;
+    Tensor::cat(&[&out_prefix, &out_suffix], 2)
+}
+
+fn prefix_causal_full_flash_forward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    prefix_len: usize,
+) -> SdpaResult<Tensor> {
+    let seq_len = q.shape().dims()[2];
+    let q_prefix = q.narrow(2, 0, prefix_len)?.contiguous()?;
+    let k_prefix = k.narrow(2, 0, prefix_len)?.contiguous()?;
+    let v_prefix = v.narrow(2, 0, prefix_len)?.contiguous()?;
+    let out_prefix = forward_causal(&q_prefix, &k_prefix, &v_prefix)?;
+
+    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+    {
+        if std::env::var("FLAME_PREFIX_CAUSAL_FULL_TRY_CUDNN")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            match prefix_causal_full_cudnn_full_forward(q, k, v) {
+                Ok(out_full) => {
+                    let out_suffix = out_full.narrow(2, prefix_len, seq_len - prefix_len)?;
+                    return Tensor::cat(&[&out_prefix, &out_suffix], 2);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "sdpa_prefix_causal_full: padded cuDNN full pass failed ({}); trying FA2 fallback",
+                        err
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+    {
+        let q_dims = q.shape().dims();
+        let k_dims = k.shape().dims();
+        if q.dtype() == DType::BF16
+            && k.dtype() == DType::BF16
+            && v.dtype() == DType::BF16
+            && q_dims.len() == 4
+            && k_dims.len() == 4
+            && q_dims[3] == k_dims[3]
+            && (q_dims[3] == 64 || q_dims[3] == 96 || q_dims[3] == 128)
+        {
+            let out_full =
+                forward_fa2_bf16(q, k, v, q_dims[0], q_dims[1], q_dims[2], k_dims[2], q_dims[3], false)?;
+            let out_suffix = out_full.narrow(2, prefix_len, seq_len - prefix_len)?;
+            return Tensor::cat(&[&out_prefix, &out_suffix], 2);
+        }
+    }
+
+    let suffix_len = seq_len - prefix_len;
+    let q_suffix = q.narrow(2, prefix_len, suffix_len)?.contiguous()?;
+    let mask = Tensor::from_vec_dtype(
+        vec![1.0f32; suffix_len * seq_len],
+        Shape::from_dims(&[1, 1, suffix_len, seq_len]),
+        q.device().clone(),
+        DType::F32,
+    )?;
+    let out_suffix = forward(&q_suffix, k, v, Some(&mask))?;
+    Tensor::cat(&[&out_prefix, &out_suffix], 2)
+}
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn prefix_causal_full_cudnn_full_forward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+) -> SdpaResult<Tensor> {
+    let q_dims = q.shape().dims();
+    let k_dims = k.shape().dims();
+    let v_dims = v.shape().dims();
+    if q_dims.len() != 4 || k_dims.len() != 4 || v_dims.len() != 4 {
+        return Err(Error::InvalidInput(
+            "sdpa_prefix_causal_full: cuDNN full pass expects 4D tensors".into(),
+        ));
+    }
+    let (b, h, q_len, head_dim) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
+    if q.dtype() != DType::BF16
+        || k.dtype() != DType::BF16
+        || v.dtype() != DType::BF16
+        || !(head_dim == 64 || head_dim == 96 || head_dim == 128)
+    {
+        return Err(Error::Unsupported(
+            "sdpa_prefix_causal_full: cuDNN full pass requires BF16 head_dim in {64,96,128}"
+                .into(),
+        ));
+    }
+
+    let (q_work, k_work, v_work, slice_q_len, padding_lens) =
+        maybe_pad_for_cudnn(q, k, v, None, false)?;
+    let work_q_dims = q_work.shape().dims();
+    let work_k_dims = k_work.shape().dims();
+    let (out, _stats) = forward_cudnn_sdpa_train_bf16(
+        &q_work,
+        &k_work,
+        &v_work,
+        b,
+        h,
+        work_q_dims[2],
+        work_k_dims[2],
+        head_dim,
+        false,
+        padding_lens,
+    )?;
+    if let Some(orig_q_len) = slice_q_len {
+        out.narrow(2, 0, orig_q_len)
+    } else if work_q_dims[2] != q_len {
+        out.narrow(2, 0, q_len)
+    } else {
+        Ok(out)
+    }
 }
 
 /// Fused SDPA entry point for training.
@@ -371,6 +619,7 @@ fn forward_train_inner(
 
             if mask.is_none()
                 && (hd == 64 || hd == 96 || hd == 128)
+                && (!causal || allow_cudnn_sdpa_bwd_causal())
                 && q_ref.dtype() == DType::BF16
                 && k_ref.dtype() == DType::BF16
                 && v_ref.dtype() == DType::BF16
@@ -816,11 +1065,23 @@ fn forward_bf16(
     // validated on Klein+Chroma shapes at cos_sim = 1.000000 / mean_rel ~4e-6
     // (see `flame-core/tests/cudnn_sdpa_parity.rs`).
     #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
-    if (d_q == 64 || d_q == 96 || d_q == 128) && mask.is_none() {
+    if (d_q == 64 || d_q == 96 || d_q == 128)
+        && mask.is_none()
+        && (!causal || allow_cudnn_sdpa_bwd_causal())
+    {
         return forward_cudnn_sdpa_bf16(q, k, v, b, h, q_len, k_len, d_q, causal).map_err(|e| {
             log::error!("cudnn SDPA failed (no WMMA fallback): {:?}", e);
             e
         });
+    }
+
+    #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+    if causal
+        && mask.is_none()
+        && q_len == k_len
+        && (d_q == 64 || d_q == 96 || d_q == 128)
+    {
+        return forward_fa2_bf16(q, k, v, b, h, q_len, k_len, d_q, true);
     }
 
     // Auto-stream policy: the materialized fallback allocates an FP32 scores
@@ -1122,6 +1383,64 @@ fn tensor_strides_as_4d_bhnd(t: &Tensor) -> SdpaResult<[i64; 4]> {
         )));
     }
     Ok([s[0] as i64, s[1] as i64, s[2] as i64, s[3] as i64])
+}
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn forward_fa2_bf16(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    b: usize,
+    h: usize,
+    q_len: usize,
+    k_len: usize,
+    d_q: usize,
+    causal: bool,
+) -> SdpaResult<Tensor> {
+    use crate::cuda::device_lt;
+
+    if !(d_q == 64 || d_q == 96 || d_q == 128) {
+        return Err(Error::Unsupported(format!(
+            "FA2 BF16 forward supports head_dim 64/96/128, got {d_q}"
+        )));
+    }
+
+    let bh = b * h;
+    let q3 = q.reshape(&[bh, q_len, d_q])?;
+    let k3 = k.reshape(&[bh, k_len, d_q])?;
+    let v3 = v.reshape(&[bh, k_len, d_q])?;
+    let out3 = Tensor::empty_dtype(
+        Shape::from_dims(&[bh, q_len, d_q]),
+        DType::BF16,
+        q.device().clone(),
+    )?;
+
+    let q_ptr = q3.as_device_ptr_bf16("fa2_sdpa:q")? as *const core::ffi::c_void;
+    let k_ptr = k3.as_device_ptr_bf16("fa2_sdpa:k")? as *const core::ffi::c_void;
+    let v_ptr = v3.as_device_ptr_bf16("fa2_sdpa:v")? as *const core::ffi::c_void;
+    let o_ptr = out3.as_device_ptr_bf16("fa2_sdpa:o")? as *mut core::ffi::c_void;
+    let stream = device_lt::stream_ptr(q.device())?;
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_flash_attention_bf16(
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            o_ptr,
+            core::ptr::null_mut(),
+            bh as i32,
+            q_len as i32,
+            k_len as i32,
+            d_q as i32,
+            if causal { 1 } else { 0 },
+            stream,
+        )
+    };
+    if ret != 0 {
+        return Err(Error::Cuda(format!("flame_flash_attention_bf16 error: {ret}")));
+    }
+
+    out3.reshape(&[b, h, q_len, d_q])
 }
 
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]

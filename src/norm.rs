@@ -762,12 +762,17 @@ fn rms_norm_forward_bf16(
             .map(|v| v == "0")
             .unwrap_or(true);
 
-    let kernel_src = if use_vec {
+    let use_head128 = use_vec && norm_size == 128;
+    let kernel_src = if use_head128 {
+        RMS_NORM_FWD_KERNEL_BF16_HEAD128
+    } else if use_vec {
         RMS_NORM_FWD_KERNEL_BF16_VEC
     } else {
         RMS_NORM_FWD_KERNEL_BF16
     };
-    let kernel_name = if use_vec {
+    let kernel_name = if use_head128 {
+        "rms_norm_forward_bf16_head128"
+    } else if use_vec {
         "rms_norm_forward_bf16_vec"
     } else {
         "rms_norm_forward_bf16"
@@ -783,13 +788,21 @@ fn rms_norm_forward_bf16(
 
     use cudarc::driver::DevicePtr;
 
-    let cfg = if use_vec {
-        // 256 threads per block, one block per row. Shared memory holds
-        // n_warps=8 floats for the inter-warp reduction in the kernel.
+    let cfg = if use_head128 {
+        LaunchConfig {
+            grid_dim: (((batch_size as u32) + 15) / 16, 1, 1),
+            block_dim: (32, 16, 1),
+            shared_mem_bytes: 0,
+        }
+    } else if use_vec {
+        // Match PyTorch's vectorized RMSNorm launch:
+        // dim3 threads(warp_size, num_threads() / warp_size) == (32, 8).
+        // Shared memory holds `threads.y * 3 / 2` floats for the same
+        // inter-warp combine tree used by layer_norm_kernel.cu.
         LaunchConfig {
             grid_dim: (batch_size as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 8 * std::mem::size_of::<f32>() as u32,
+            block_dim: (32, 8, 1),
+            shared_mem_bytes: 12 * std::mem::size_of::<f32>() as u32,
         }
     } else {
         LaunchConfig {
@@ -1342,6 +1355,111 @@ pub fn rms_norm(
     Ok(output)
 }
 
+#[doc(hidden)]
+pub fn rms_norm_inv_rms(
+    input: &Tensor,
+    normalized_shape: &[usize],
+    eps: f32,
+) -> Result<Tensor> {
+    let input = if input.dtype() != DType::BF16 {
+        input.to_dtype_no_grad(DType::BF16)?
+    } else {
+        input.alias()
+    };
+    let norm_size: usize = normalized_shape.iter().product();
+    if norm_size == 0 {
+        return Err(Error::InvalidOperation(
+            "RMSNorm normalized_shape must be non-empty".into(),
+        ));
+    }
+    let batch_size = input.shape().elem_count() / norm_size;
+    let artifacts = rms_norm_forward(&input, normalized_shape, None, eps)?;
+    Ok(Tensor {
+        storage: TensorStorage::F32 {
+            data: artifacts.inv_rms.into(),
+            numel: batch_size,
+        },
+        shape: Shape::from_dims(&[batch_size]),
+        device: input.device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
+    })
+}
+
+#[doc(hidden)]
+pub fn rms_norm_head128_mean_sq(input: &Tensor) -> Result<Tensor> {
+    if input.dtype() != DType::BF16 || input.storage.dtype() != DType::BF16 {
+        return Err(Error::InvalidInput(
+            "RMSNorm head128 mean_sq expects BF16 input storage".into(),
+        ));
+    }
+    let norm_size = *input
+        .shape()
+        .dims()
+        .last()
+        .ok_or_else(|| Error::InvalidInput("RMSNorm head128 mean_sq needs rank >= 1".into()))?;
+    if norm_size != 128 {
+        return Err(Error::InvalidInput(format!(
+            "RMSNorm head128 mean_sq expects last dim 128, got {norm_size}",
+        )));
+    }
+    let input_owned;
+    let input = if input.is_contiguous() {
+        input
+    } else {
+        input_owned = input.contiguous()?;
+        &input_owned
+    };
+
+    use crate::cuda_kernels::CudaKernels;
+    use cudarc::driver::DevicePtr;
+
+    let device = input.device();
+    let batch_size = input.shape().elem_count() / norm_size;
+    CudaKernels::ensure_kernel(
+        device,
+        "rms_norm_mean_sq_bf16_head128",
+        RMS_NORM_MEAN_SQ_KERNEL_BF16_HEAD128,
+    )?;
+    let f = device
+        .get_func("rms_norm_mean_sq_bf16_head128", "rms_norm_mean_sq_bf16_head128")
+        .ok_or_else(|| Error::Cuda("Failed to get rms_norm_mean_sq_bf16_head128 kernel".into()))?;
+    let mean_sq_data = crate::tensor::alloc_zeros_from_pool(device, batch_size)?;
+    let input_ptr = input.as_device_ptr_bf16("rms_norm_mean_sq_bf16_head128:input")? as u64;
+    let cfg = LaunchConfig {
+        grid_dim: (((batch_size as u32) + 15) / 16, 1, 1),
+        block_dim: (32, 16, 1),
+        shared_mem_bytes: 0,
+    };
+    launch_kernel!(
+        f,
+        cfg,
+        input_ptr,
+        &mean_sq_data,
+        batch_size as i32,
+        norm_size as i32
+    );
+
+    Ok(Tensor {
+        storage: TensorStorage::F32 {
+            data: mean_sq_data.into(),
+            numel: batch_size,
+        },
+        shape: Shape::from_dims(&[batch_size]),
+        device: device.clone(),
+        id: TensorId::new(),
+        requires_grad: false,
+        custom_strides: None,
+        view_offset: 0,
+        #[cfg(feature = "autograd_v2")]
+        autograd_meta: None,
+    })
+}
+
 impl Tensor {
     /// Functional RMSNorm convenience wrapper.
     pub fn rms_norm(
@@ -1382,11 +1500,13 @@ extern "C" __global__ void rms_norm_forward_bf16(
     float sum_sq = 0.0f;
     for (int i = 0; i < norm_size; ++i) {
         float v = rms_bf16_load(input, base + i);
-        sum_sq += v * v;
+        float sq = __fmul_rn(v, v);
+        sum_sq = __fadd_rn(sum_sq, sq);
     }
 
-    float mean_sq = sum_sq / norm_size;
-    float inv_rms = rsqrtf(mean_sq + eps);
+    float mean_sq = __fmul_rn(sum_sq, 1.0f / (float)norm_size);
+    float denom = __fadd_rn(mean_sq, eps);
+    float inv_rms = __frsqrt_rn(denom);
     inv_rms_out[row] = inv_rms;
 
     for (int i = 0; i < norm_size; ++i) {
@@ -1402,9 +1522,10 @@ extern "C" __global__ void rms_norm_forward_bf16(
 /// Vectorized RMSNorm forward (BF16) — parallel reduction within a block.
 ///
 /// 2026-05-12 perf: replaces the legacy single-thread-per-row scalar loop.
-/// Uses 256 threads per block, vec_size=4 BF16 loads (8-byte aligned),
-/// per-thread F32 partial sum_sq, warp-shuffle intra-warp reduction, and a
-/// single shared-memory slot for inter-warp reduction. Mirrors the design of
+/// Uses PyTorch's `(warp_size, num_threads/warp_size) == (32, 8)` launch,
+/// vec_size=4 BF16 loads (8-byte aligned), per-thread F32 partial sum_sq,
+/// `shfl_down` intra-warp reduction, and the same shared-memory inter-warp
+/// combine tree. Mirrors the design of
 /// PyTorch `aten/src/ATen/native/cuda/layer_norm_kernel.cu::vectorized_layer_norm_kernel_impl`
 /// stripped to RMSNorm (no mean, no beta).
 ///
@@ -1417,6 +1538,88 @@ pub const RMS_NORM_FWD_KERNEL_BF16_VEC: &str = r#"
 struct __align__(8) bf16x4 {
     __nv_bfloat16 v[4];
 };
+
+struct WelfordDataLN {
+    float mean;
+    float sigma2;
+    float count;
+};
+
+__device__ __forceinline__ WelfordDataLN welford_online_sum_rms(float val, WelfordDataLN curr) {
+    float sq = __fmul_rn(val, val);
+    return WelfordDataLN{0.0f, __fadd_rn(curr.sigma2, sq), 0.0f};
+}
+
+__device__ __forceinline__ WelfordDataLN welford_combine_rms(WelfordDataLN data_b, WelfordDataLN data_a) {
+    return WelfordDataLN{0.0f, __fadd_rn(data_b.sigma2, data_a.sigma2), 0.0f};
+}
+
+__device__ __forceinline__ WelfordDataLN compute_rms_stats_pytorch(
+    const __nv_bfloat16* __restrict__ row_input,
+    int norm_size,
+    float* smem
+) {
+    const int VEC = 4;
+    const int n_vec = norm_size / VEC;
+    const int numx = blockDim.x * blockDim.y;
+    const int thrx = threadIdx.x + threadIdx.y * blockDim.x;
+    const bf16x4* X = reinterpret_cast<const bf16x4*>(row_input);
+
+    WelfordDataLN wd{0.0f, 0.0f, 0.0f};
+    for (int i = thrx; i < n_vec; i += numx) {
+        bf16x4 data = X[i];
+        _Pragma("unroll")
+        for (int k = 0; k < VEC; ++k) {
+            wd = welford_online_sum_rms(__bfloat162float(data.v[k]), wd);
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        WelfordDataLN wd_b{
+            __shfl_down_sync(0xffffffff, wd.mean, offset),
+            __shfl_down_sync(0xffffffff, wd.sigma2, offset),
+            __shfl_down_sync(0xffffffff, wd.count, offset)
+        };
+        wd = welford_combine_rms(wd, wd_b);
+    }
+
+    if (blockDim.y > 1) {
+        float* meansigmabuf = smem;
+        float* countbuf = smem + blockDim.y;
+        for (int offset = blockDim.y / 2; offset > 0; offset /= 2) {
+            if (threadIdx.x == 0 && threadIdx.y >= offset && threadIdx.y < 2 * offset) {
+                const int wrt_y = threadIdx.y - offset;
+                meansigmabuf[2 * wrt_y] = wd.mean;
+                meansigmabuf[2 * wrt_y + 1] = wd.sigma2;
+                countbuf[wrt_y] = wd.count;
+            }
+            __syncthreads();
+
+            if (threadIdx.x == 0 && threadIdx.y < offset) {
+                WelfordDataLN wd_b{
+                    meansigmabuf[2 * threadIdx.y],
+                    meansigmabuf[2 * threadIdx.y + 1],
+                    countbuf[threadIdx.y]
+                };
+                wd = welford_combine_rms(wd, wd_b);
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            meansigmabuf[0] = wd.mean;
+            meansigmabuf[1] = __fmul_rn(wd.sigma2, 1.0f / (float)norm_size);
+        }
+        __syncthreads();
+        return WelfordDataLN{meansigmabuf[0], meansigmabuf[1], 0.0f};
+    }
+
+    return WelfordDataLN{
+        __shfl_sync(0xffffffff, wd.mean, 0),
+        __fmul_rn(__shfl_sync(0xffffffff, wd.sigma2, 0), 1.0f / (float)norm_size),
+        0.0f
+    };
+}
 
 extern "C" __global__ void rms_norm_forward_bf16_vec(
     const __nv_bfloat16* __restrict__ input,
@@ -1433,56 +1636,23 @@ extern "C" __global__ void rms_norm_forward_bf16_vec(
     if (row >= batch_size) return;
 
     const int n_vec = norm_size / VEC;
-    const int tid = threadIdx.x;
-    const int n_threads = blockDim.x;
+    const int thrx = threadIdx.x + threadIdx.y * blockDim.x;
+    const int numx = blockDim.x * blockDim.y;
 
-    const bf16x4* X = reinterpret_cast<const bf16x4*>(input + row * norm_size);
+    const __nv_bfloat16* row_input = input + row * norm_size;
+    const bf16x4* X = reinterpret_cast<const bf16x4*>(row_input);
     bf16x4* Y = reinterpret_cast<bf16x4*>(output + row * norm_size);
     const bf16x4* W = (has_weight && weight != nullptr)
         ? reinterpret_cast<const bf16x4*>(weight) : nullptr;
 
-    // Pass 1: per-thread partial sum_sq with vectorized loads.
-    float sum_sq = 0.0f;
-    for (int i = tid; i < n_vec; i += n_threads) {
-        bf16x4 d = X[i];
-        _Pragma("unroll")
-        for (int k = 0; k < VEC; ++k) {
-            float v = __bfloat162float(d.v[k]);
-            sum_sq += v * v;
-        }
-    }
-
-    // Intra-warp reduction (no smem).
-    for (int off = 16; off > 0; off >>= 1) {
-        sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, off);
-    }
-
-    // Inter-warp reduction via shared memory.
-    extern __shared__ float smem[];  // sized to (n_warps) floats from launch
-    const int warp_id = tid >> 5;
-    const int lane = tid & 31;
-    const int n_warps = (n_threads + 31) >> 5;
-
-    if (lane == 0) smem[warp_id] = sum_sq;
-    __syncthreads();
-
-    // Warp 0 reduces the per-warp partials.
-    if (warp_id == 0) {
-        float v = (lane < n_warps) ? smem[lane] : 0.0f;
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_xor_sync(0xffffffff, v, off);
-        }
-        if (lane == 0) smem[0] = v;
-    }
-    __syncthreads();
-
-    const float total_sum_sq = smem[0];
-    const float mean_sq = total_sum_sq / (float)norm_size;
-    const float inv_rms = rsqrtf(mean_sq + eps);
-    if (tid == 0) inv_rms_out[row] = inv_rms;
+    extern __shared__ float smem[];
+    WelfordDataLN wd = compute_rms_stats_pytorch(row_input, norm_size, smem);
+    const float denom = __fadd_rn(wd.sigma2, eps);
+    const float inv_rms = __frsqrt_rn(denom);
+    if (thrx == 0) inv_rms_out[row] = inv_rms;
 
     // Pass 2: vectorized normalize + write.
-    for (int i = tid; i < n_vec; i += n_threads) {
+    for (int i = thrx; i < n_vec; i += numx) {
         bf16x4 d = X[i];
         bf16x4 w_val;
         if (W != nullptr) w_val = W[i];
@@ -1494,6 +1664,123 @@ extern "C" __global__ void rms_norm_forward_bf16_vec(
             out.v[k] = __float2bfloat16_rn(v);
         }
         Y[i] = out;
+    }
+}
+"#;
+
+/// PyTorch generic-mean RMSNorm forward for head_dim=128.
+///
+/// Mirrors `Reduce.cuh` for `pow(2).mean(-1)` on a contiguous FP32 tensor:
+/// block=(32,16), one warp per output row, four strided values per lane
+/// (`lane + {0,32,64,96}`), lane-local four-accumulator combine, then
+/// decreasing-offset warp reduce.
+/// This path is both faster for 128-wide per-head RMSNorm and closer to
+/// HiDream/Qwen3-VL's Python RMSNorm than the layer-norm-style 8-warp row
+/// reduction above.
+pub const RMS_NORM_FWD_KERNEL_BF16_HEAD128: &str = r#"
+#include <cuda_bf16.h>
+
+struct __align__(8) bf16x4 {
+    __nv_bfloat16 v[4];
+};
+
+extern "C" __global__ void rms_norm_forward_bf16_head128(
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ weight,
+    float* __restrict__ inv_rms_out,
+    int batch_size,
+    int norm_size,
+    float eps,
+    int has_weight
+) {
+    if (norm_size != 128) return;
+
+    const int lane = threadIdx.x;
+    const int warp_row = threadIdx.y;
+    const int row = blockIdx.x * blockDim.y + warp_row;
+    if (row >= batch_size) return;
+
+    const __nv_bfloat16* row_input = input + (long long)row * 128;
+    __nv_bfloat16* row_output = output + (long long)row * 128;
+    const bf16x4* X = reinterpret_cast<const bf16x4*>(row_input);
+    bf16x4* Y = reinterpret_cast<bf16x4*>(row_output);
+    const bf16x4* W = (has_weight && weight != nullptr)
+        ? reinterpret_cast<const bf16x4*>(weight) : nullptr;
+
+    float v0 = __bfloat162float(row_input[lane]);
+    float v1 = __bfloat162float(row_input[lane + 32]);
+    float v2 = __bfloat162float(row_input[lane + 64]);
+    float v3 = __bfloat162float(row_input[lane + 96]);
+    float acc0 = v0 * v0;
+    float acc1 = v1 * v1;
+    float acc2 = v2 * v2;
+    float acc3 = v3 * v3;
+
+    float sum = acc0 + acc1;
+    sum = sum + acc2;
+    sum = sum + acc3;
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum = sum + __shfl_down_sync(0xffffffff, sum, offset);
+    }
+
+    const float mean_sq = __shfl_sync(0xffffffff, sum, 0) * (1.0f / 128.0f);
+    const float denom = mean_sq + eps;
+    const float inv_rms = rsqrtf(denom);
+    if (lane == 0) inv_rms_out[row] = inv_rms;
+
+    bf16x4 out;
+    bf16x4 w_val;
+    bf16x4 data = X[lane];
+    if (W != nullptr) w_val = W[lane];
+    _Pragma("unroll")
+    for (int k = 0; k < 4; ++k) {
+        float v = __bfloat162float(data.v[k]) * inv_rms;
+        if (W != nullptr) {
+            v = v * __bfloat162float(w_val.v[k]);
+        }
+        out.v[k] = __float2bfloat16_rn(v);
+    }
+    Y[lane] = out;
+}
+"#;
+
+pub const RMS_NORM_MEAN_SQ_KERNEL_BF16_HEAD128: &str = r#"
+#include <cuda_bf16.h>
+
+struct __align__(8) bf16x4 {
+    __nv_bfloat16 v[4];
+};
+
+extern "C" __global__ void rms_norm_mean_sq_bf16_head128(
+    const __nv_bfloat16* __restrict__ input,
+    float* __restrict__ mean_sq_out,
+    int batch_size,
+    int norm_size
+) {
+    if (norm_size != 128) return;
+
+    const int lane = threadIdx.x;
+    const int warp_row = threadIdx.y;
+    const int row = blockIdx.x * blockDim.y + warp_row;
+    if (row >= batch_size) return;
+
+    const __nv_bfloat16* row_input = input + (long long)row * 128;
+    float v0 = __bfloat162float(row_input[lane]);
+    float v1 = __bfloat162float(row_input[lane + 32]);
+    float v2 = __bfloat162float(row_input[lane + 64]);
+    float v3 = __bfloat162float(row_input[lane + 96]);
+    float sum = (v0 * v0) + (v1 * v1);
+    sum = sum + (v2 * v2);
+    sum = sum + (v3 * v3);
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum = sum + __shfl_down_sync(0xffffffff, sum, offset);
+    }
+
+    if (lane == 0) {
+        mean_sq_out[row] = __shfl_sync(0xffffffff, sum, 0) * (1.0f / 128.0f);
     }
 }
 "#;

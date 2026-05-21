@@ -463,12 +463,14 @@ pub fn fused_linear3d_native(
 /// PyTorch-bit-exact parity variant of [`fused_linear3d_native`].
 ///
 /// Same signature, same semantics, same fused-perf advantage. The only
-/// difference is the underlying cuBLASLt configuration — this variant mirrors
-/// `at::cuda::blas::gemm_and_bias<at::BFloat16>`'s knobs exactly, so the
-/// output is byte-equivalent to `torch.nn.functional.linear(x_bf16, w_bf16, b_bf16)`
-/// under `torch.autocast(bf16)`. The default `fused_linear3d_native` deviates
-/// by 1 BF16 ULP (different `BIAS_DATA_TYPE`, no heuristic algo, no alignment
-/// prefs, batch attrs set on layouts).
+/// difference is the underlying cuBLASLt configuration for the biased case:
+/// this variant mirrors `at::cuda::blas::gemm_and_bias<at::BFloat16>`'s knobs
+/// exactly, so the output is byte-equivalent to
+/// `torch.nn.functional.linear(x_bf16, w_bf16, b_bf16)` under
+/// `torch.autocast(bf16)`. For `bias=None`, PyTorch follows the no-bias
+/// matmul path; the CUDA entry delegates to [`fused_linear3d_native`]'s native
+/// no-bias kernel because that is the byte-exact and faster match for O1 Full's
+/// `x_embedder.proj1`.
 ///
 /// Use this in any inference/training path where strict per-op parity against
 /// ai-toolkit / PyTorch matters (HiDream-O1 TimestepEmbedder, predecoder
@@ -670,8 +672,8 @@ pub fn fused_linear3d_native_lora(
         let xab = xa.matmul(&lora_b_t)?; // [B, S, Cout]
         xab.mul_scalar(lora_scale)?
     } else {
-        let lora_a_t = a.transpose()?; // [Cin, rank]
-        let lora_b_t = b.transpose()?; // [rank, Cout]
+        let lora_a_t = a.transpose()?.contiguous()?; // [Cin, rank]
+        let lora_b_t = b.transpose()?.contiguous()?; // [rank, Cout]
         let xa = input.matmul(&lora_a_t)?; // [B, S, rank]
         let xab = xa.matmul(&lora_b_t)?; // [B, S, Cout]
         xab.mul_scalar(lora_scale)?

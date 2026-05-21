@@ -397,12 +397,12 @@ The single most-important file in this directory. Current kernel is a
 templated K/V-reuse WMMA design swapped in 2026-04-17 (replacing the
 Phase 1.6 `cp.async`-vectorized kernel, kept on disk as
 `flash_attention_fwd.phase16.cu.bak`). Supports HD ∈ {64, 96, 128}
-via runtime dispatch.
+via runtime dispatch and accepts a runtime `causal` flag.
 
 | Symbol | Line | Notes |
 |---|---|---|
 | `flash_attn_fwd_kernel<TILE_Q, TILE_KV, HD, NUM_WARPS>` | `:87` | Templated WMMA kernel — FP32 accumulators, online softmax, K/V-reuse shared buffer. |
-| `flame_flash_attention_bf16` | `:333` | C entry point: `(Q, K, V, O, LSE, batch_heads, seq_q, seq_kv, head_dim, stream)`. LSE output unused (backward path stores it separately). |
+| `flame_flash_attention_bf16` | `:333` | C entry point: `(Q, K, V, O, LSE, batch_heads, seq_q, seq_kv, head_dim, causal, stream)`. LSE output unused (backward path stores it separately). |
 | `launch_fwd` | `:263` | Per-head_dim dispatch into the template specialization. |
 | `mask_tail_2d_float_neg_inf` | `:71` | Softmax-safe tail mask — fills invalid cells with `-INFINITY`. See gotcha in CONVENTIONS. |
 
@@ -410,6 +410,22 @@ via runtime dispatch.
 Warp layout is 4 row-groups × 4 col-groups (each warp owns one 16×16
 QK^T block). PV matmul scatters across `row_group × hd_tile` pairs
 with an atomicAdd into `s_O`.
+
+**2026-05-21 HiDream-O1 FA2 parity work**: the forward kernel now keeps
+raw QK logits until softmax, applies `exp2((score - max) * log2(e) /
+sqrt(head_dim))`, scans K/V tiles right-to-left, and applies runtime causal
+masking. This tracks PyTorch's FlashAttention numerics more closely while
+preserving Flame's existing shared-memory accumulator kernel. It is not yet
+a full CUTLASS/CUTE port.
+
+**PyTorch reference tile targets, deferred**: local PyTorch FlashAttention
+dispatch uses SM8x HD64 non-causal `128x128`, HD96 non-causal `128x64`,
+HD128 non-causal `128x32`, and HD96/HD128 causal `64x64`, typically with
+4 warps and register-resident output accumulators. Flame remains `64x64`
+with 16 warps for now because the current `s_O` shared-memory design cannot
+drop in the HD128 `128x32` path without exceeding the SM86 budget. Finish
+that exact tiled port only if O1 trainer parity still needs it after the
+current gate.
 
 **Shared-memory layout** (HD=128 worst case):
 | Region | Dtype | Size (HD=128) | Role |

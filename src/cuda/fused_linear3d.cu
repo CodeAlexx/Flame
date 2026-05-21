@@ -329,11 +329,14 @@ int flame_linear3d_bf16_native(
 // ─────────────────────────────────────────────────────────────────────────────
 // flame_linear3d_bf16_pytorch_parity
 //
-// Bit-exact parity variant of `flame_linear3d_bf16_native`. Mirrors PyTorch's
-// `at::cuda::blas::gemm_and_bias<at::BFloat16>` cuBLASLt configuration
-// (aten/src/ATen/cuda/CUDABlas.cpp gemm_and_bias) exactly so that BF16 linear
-// outputs match PyTorch byte-for-byte. Use this where strict ai-toolkit train-
-// step parity matters.
+// Bit-exact parity variant of `flame_linear3d_bf16_native`. For biased BF16
+// linear, mirrors PyTorch's `at::cuda::blas::gemm_and_bias<at::BFloat16>`
+// cuBLASLt configuration (aten/src/ATen/cuda/CUDABlas.cpp gemm_and_bias)
+// exactly so outputs match PyTorch byte-for-byte. For no-bias BF16 linear,
+// PyTorch's `F.linear(x, w, None)` follows the matmul path; on O1 Full's
+// `x_embedder.proj1` shape that matches `flame_linear3d_bf16_native` exactly
+// while the biased parity heuristic differs by one BF16 ULP. Delegate no-bias
+// calls to native to preserve both parity and speed.
 //
 // PyTorch's exact dispatch — confirmed by capturing CUBLASLT_LOG_LEVEL=5 logs:
 //   1) workspace = 1 MiB on the PREFERENCE (parseCUDABlasLtWorkspaceSize
@@ -380,6 +383,22 @@ extern "C" int flame_linear3d_bf16_pytorch_parity(
     size_t workspace_size,
     void* stream
 ) {
+    if (bias == NULL) {
+        return flame_linear3d_bf16_native(
+            handle,
+            input,
+            weight,
+            NULL,
+            output,
+            batch_size,
+            seq_len,
+            in_features,
+            out_features,
+            workspace,
+            workspace_size,
+            stream);
+    }
+
     int n_eff = (batch_size > 0 ? batch_size : 1) * seq_len;
 
     int m = out_features;

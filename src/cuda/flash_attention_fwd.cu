@@ -88,6 +88,29 @@ __device__ __forceinline__ void mask_tail_2d_float_neg_inf(
 }
 
 template<int TILE_ROWS, int TILE_COLS>
+__device__ __forceinline__ void mask_scores_2d_float_neg_inf(
+    float* ptr,
+    int valid_rows,
+    int valid_cols,
+    int q_start,
+    int kv_start,
+    int causal,
+    int tid,
+    int num_threads
+) {
+    const int total = TILE_ROWS * TILE_COLS;
+    for (int i = tid; i < total; i += num_threads) {
+        int r = i / TILE_COLS;
+        int c = i % TILE_COLS;
+        bool masked = r >= valid_rows || c >= valid_cols;
+        if (causal) {
+            masked = masked || (kv_start + c > q_start + r);
+        }
+        if (masked) ptr[i] = -INFINITY;
+    }
+}
+
+template<int TILE_ROWS, int TILE_COLS>
 __device__ __forceinline__ void zero_tail_2d_bf16(
     __nv_bfloat16* ptr,
     int valid_rows,
@@ -111,7 +134,8 @@ __global__ void flash_attn_fwd_kernel(
     __nv_bfloat16* __restrict__ O,
     int N_q,
     int N_kv,
-    float scale
+    float scale_log2,
+    int causal
 ) {
     constexpr int THREADS = NUM_WARPS * 32;
 
@@ -163,7 +187,7 @@ __global__ void flash_attn_fwd_kernel(
 
     const int num_kv_tiles = (N_kv + TILE_KV - 1) / TILE_KV;
 
-    for (int kv_t = 0; kv_t < num_kv_tiles; kv_t++) {
+    for (int kv_t = num_kv_tiles - 1; kv_t >= 0; kv_t--) {
         const int kv_start = kv_t * TILE_KV;
         const int kv_rows = min(TILE_KV, N_kv - kv_start);
 
@@ -186,7 +210,6 @@ __global__ void flash_attn_fwd_kernel(
                 wmma::mma_sync(acc, q_frag, k_frag, acc);
             }
 
-            for (int i = 0; i < acc.num_elements; i++) acc.x[i] *= scale;
             wmma::store_matrix_sync(s_S + warp_qi * TILE_KV + warp_kj, acc, TILE_KV, wmma::mem_row_major);
         }
         __syncthreads();
@@ -198,7 +221,9 @@ __global__ void flash_attn_fwd_kernel(
             s_V, V_base + (size_t)kv_start * HD, kv_rows, HD, HD, tid, THREADS
         );
 
-        mask_tail_2d_float_neg_inf<TILE_Q, TILE_KV>(s_S, q_rows, kv_rows, tid, THREADS);
+        mask_scores_2d_float_neg_inf<TILE_Q, TILE_KV>(
+            s_S, q_rows, kv_rows, q_start, kv_start, causal, tid, THREADS
+        );
         __syncthreads();
 
         for (int qi = tid; qi < q_rows; qi += THREADS) {
@@ -209,14 +234,14 @@ __global__ void flash_attn_fwd_kernel(
             for (int j = 0; j < TILE_KV; j++) tile_max = fmaxf(tile_max, s_S[qi * TILE_KV + j]);
 
             float new_max = fmaxf(old_max, tile_max);
-            float corr = __expf(old_max - new_max);
+            float corr = exp2f((old_max - new_max) * scale_log2);
 
             s_l[qi] *= corr;
             float tile_sum = 0.0f;
 
             #pragma unroll
             for (int j = 0; j < TILE_KV; j++) {
-                float p = __expf(s_S[qi * TILE_KV + j] - new_max);
+                float p = exp2f((s_S[qi * TILE_KV + j] - new_max) * scale_log2);
                 s_S[qi * TILE_KV + j] = p;
                 tile_sum += p;
             }
@@ -281,10 +306,10 @@ extern "C" {
 
 static inline int launch_fwd(
     const void* Q, const void* K, const void* V, void* O,
-    int batch_heads, int seq_len_q, int seq_len_kv, int head_dim, void* stream
+    int batch_heads, int seq_len_q, int seq_len_kv, int head_dim, int causal, void* stream
 ) {
     cudaStream_t s = (cudaStream_t)stream;
-    float scale = 1.0f / sqrtf((float)head_dim);
+    float scale_log2 = M_LOG2E / sqrtf((float)head_dim);
 
     if (head_dim == 64) {
         constexpr int TILE_Q = 64, TILE_KV = 64, HD = 64, NUM_WARPS = 16;
@@ -302,7 +327,7 @@ static inline int launch_fwd(
         );
         flash_attn_fwd_kernel<TILE_Q, TILE_KV, HD, NUM_WARPS><<<grid, block, smem, s>>>(
             (const __nv_bfloat16*)Q, (const __nv_bfloat16*)K, (const __nv_bfloat16*)V,
-            (__nv_bfloat16*)O, seq_len_q, seq_len_kv, scale
+            (__nv_bfloat16*)O, seq_len_q, seq_len_kv, scale_log2, causal
         );
     } else if (head_dim == 96) {
         constexpr int TILE_Q = 64, TILE_KV = 64, HD = 96, NUM_WARPS = 16;
@@ -320,7 +345,7 @@ static inline int launch_fwd(
         );
         flash_attn_fwd_kernel<TILE_Q, TILE_KV, HD, NUM_WARPS><<<grid, block, smem, s>>>(
             (const __nv_bfloat16*)Q, (const __nv_bfloat16*)K, (const __nv_bfloat16*)V,
-            (__nv_bfloat16*)O, seq_len_q, seq_len_kv, scale
+            (__nv_bfloat16*)O, seq_len_q, seq_len_kv, scale_log2, causal
         );
     } else if (head_dim == 128) {
         // K/V-reuse layout frees 16 KB shared, enabling TILE_KV=64 at HD=128
@@ -340,7 +365,7 @@ static inline int launch_fwd(
         );
         flash_attn_fwd_kernel<TILE_Q, TILE_KV, HD, NUM_WARPS><<<grid, block, smem, s>>>(
             (const __nv_bfloat16*)Q, (const __nv_bfloat16*)K, (const __nv_bfloat16*)V,
-            (__nv_bfloat16*)O, seq_len_q, seq_len_kv, scale
+            (__nv_bfloat16*)O, seq_len_q, seq_len_kv, scale_log2, causal
         );
     } else {
         return -1;
@@ -359,10 +384,11 @@ int flame_flash_attention_bf16(
     int seq_len_q,
     int seq_len_kv,
     int head_dim,
+    int causal,
     void* stream
 ) {
     (void)LSE;  // inference-only kernel; backward path stores LSE separately
-    return launch_fwd(Q, K, V, O, batch_heads, seq_len_q, seq_len_kv, head_dim, stream);
+    return launch_fwd(Q, K, V, O, batch_heads, seq_len_q, seq_len_kv, head_dim, causal, stream);
 }
 
 } // extern "C"
