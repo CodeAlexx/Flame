@@ -409,13 +409,15 @@ shipping cuBLASLt invocation.
   Chroma, FLUX, QwenImage, Wan, LTX-2) — they were validated against
   this path and changing the algo will regress their parity numbers.
 - **`fused_linear3d_native_pytorch_parity`** — strict PyTorch
-  bit-exact. Workspace = 1 MiB, BIAS_POINTER on descriptor before
+  bit-exact. Biased calls mirror PyTorch `gemm_and_bias`: workspace =
+  1 MiB, BIAS_POINTER on descriptor before
   `cublasLtMatmulAlgoGetHeuristic`, per-call heuristic, no
-  BIAS_DATA_TYPE / batch / alignment attrs. Use where ai-toolkit
-  per-op parity is the contract: HiDream-O1 `TimestepEmbedder`,
-  `BottleneckPatchEmbed` proj1/proj2 (no-LoRA paths). After the swap,
-  `pre.t_emb` is bit-exact and `pre.patch_emb` mean_abs drops from
-  3e-3 to 5.7e-5 (53× improvement).
+  BIAS_DATA_TYPE / batch / alignment attrs. No-bias calls delegate to
+  `fused_linear3d_native`, because PyTorch no-bias `F.linear` follows
+  the matmul path and O1 Full `x_embedder.proj1` matches native
+  byte-exactly. Use where ai-toolkit per-op parity is the contract:
+  HiDream-O1 `TimestepEmbedder`, `BottleneckPatchEmbed` proj1/proj2
+  (no-LoRA paths).
 
 **Do not flip established models to the parity variant** to "improve
 parity" — their reference points are against `fused_linear3d_native`
@@ -766,7 +768,7 @@ mismatch. `clamp` now builds constants in the source's dtype. Any future
 op that needs a "constant like" tensor in the caller's dtype should follow
 the same pattern.
 
-### Three paths for silu/gelu (only one is live)
+### Three paths for silu/gelu (only one is live), plus a fourth for gelu_exact
 
 Historical debris — there are THREE BF16 silu/gelu implementations:
 1. `tensor_iterator::ops::unary::silu_bf16_iter / gelu_bf16_iter` (LIVE — the
@@ -785,6 +787,27 @@ will shift but the live path will NOT change. To edit the live path, touch
 the `.cu` functor under `src/cuda/unary/`.
 
 This bit me during the elementwise perf work.
+
+**Two GELU math forms, four paths total (added 2026-05-21).** The default
+`Tensor::gelu()` is the **tanh approximation** —
+`y = 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))`. This matches
+PyTorch's `F.gelu(x, approximate='tanh')` and is used by Z-Image, Klein,
+Chroma, and every other flame-core model trained or ported to date. Don't
+change which form `Tensor::gelu` calls — trained LoRAs would silently
+invalidate.
+
+For PyTorch parity with bare `nn.GELU()` (default `approximate='none'`,
+exact erf), use `Tensor::gelu_exact()` instead. Math:
+`y = 0.5 * x * (1 + erff(x/√2))`. Added for Cosmos-Predict2.5
+(`inference-flame/src/models/cosmos_predict25_dit.rs::mlp`); kernel in
+`src/cuda/unary/gelu_exact.cu`. **Forward-only** — no autograd
+registration; do not use in trainers. Fast-path: `bf16_ops::
+gelu_exact_bf16_contig_direct`; iterator: `tensor_iterator::ops::unary::
+gelu_exact_bf16_iter`. Parity test:
+`tests/tensor_iterator_gelu_exact_parity.rs` against PyTorch GPU reference
+at `tests/data/gelu_exact_ref.safetensors`. The reference was generated on
+CUDA (see `gen_gelu_exact_ref.py`); NEVER regenerate from CPU per
+CONTEXT.md.
 
 ### `tensor.to_dtype()` has BF16↔F32 fast paths (`!requires_grad` only)
 
@@ -1825,12 +1848,19 @@ arbitrary additive mask tensor.
 If a model's mask is actually structured, expose the structure instead of
 materializing `[B, H, Q, K]`. HiDream-O1's mixed mask is represented by
 `attention::sdpa_prefix_causal_full`: causal prefix rows plus full suffix rows.
-That keeps the hot full pass on cuDNN and avoids maintaining a second O1 road
-through generic masked SDPA. Do not reintroduce a cuDNN additive-bias route for
-binary masks without both SDPA parity tests and finite end-to-end training
-proof; a previous attempt produced non-finite LoRA gradients.
+The default implementation is an O1-safe single-op hybrid: forward uses the
+smaller prefix-causal pass plus a suffix all-ones masked pass, and backward
+recomputes once against the exact prefix-causal/full mask via
+`Op::PrefixCausalFullAttention`. This avoids both the older full `[S,S]`
+materialized mask on forward and the two-SDPA shared-K/V gradient collapse.
+The fully unmasked suffix diagnostic path and the old structured full-then-
+slice path are not production defaults; do not promote either without
+`tests/sdpa_prefix_causal_full_grad.rs` coverage and finite end-to-end
+training proof. Do not reintroduce a cuDNN additive-bias route for binary masks
+without both SDPA parity tests and finite end-to-end training proof; a previous
+attempt produced non-finite LoRA gradients.
 
-Causal cuDNN backward is guarded by `FLAME_CUDNN_SDPA_BWD_CAUSAL=1`.
+Causal cuDNN forward/backward is guarded by `FLAME_CUDNN_SDPA_BWD_CAUSAL=1`.
 It is correct enough to run the O1 probe without the old crash, but it was
 slower than the fallback in a 10-step O1 measurement, so do not make it the
 default until a model-specific speed probe proves it wins.

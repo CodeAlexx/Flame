@@ -185,6 +185,10 @@ fn main() {
     // `flame::iter::launch_gpu_kernel<NARGS, Op>(meta, Op{}, stream)`.
     cuda_sources.push("src/cuda/unary/silu.cu");
     cuda_sources.push("src/cuda/unary/gelu.cu");
+    // gelu_exact: exact-erf BF16 GELU for PyTorch parity (Cosmos-Predict2.5,
+    // 2026-05-21). Same functor scaffolding as gelu.cu; only the math
+    // differs (erff vs tanh-approx).
+    cuda_sources.push("src/cuda/unary/gelu_exact.cu");
     cuda_sources.push("src/cuda/unary/square.cu");
     cuda_sources.push("src/cuda/binary/add.cu");
     // Phase 5b: 5 binary ops + 2 scalar ops. Scalar ops bypass DispatchStub

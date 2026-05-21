@@ -2410,6 +2410,30 @@ extern "C" __global__ void f32_to_bool_kernel(
         Ok(output)
     }
 
+    /// GELU activation using the **exact-erf** formula
+    /// `y = 0.5 * x * (1 + erff(x / √2))`. Matches PyTorch's bare
+    /// `torch.nn.GELU()` (default `approximate='none'`).
+    ///
+    /// Distinct from [`Self::gelu`] which uses the tanh approximation
+    /// `y = 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))`. For x=1
+    /// the two differ by about 9e-4. Use this variant when porting a model
+    /// that calls bare `nn.GELU()` and parity matters (e.g. Cosmos-Predict2.5).
+    ///
+    /// BF16 only. Forward-only — no backward is registered (Cosmos is
+    /// inference-only and flame-core's existing `gelu_backward.cu` uses the
+    /// tanh-approx derivative).
+    pub fn gelu_exact(&self) -> Result<Tensor> {
+        if self.dtype() != DType::BF16 {
+            return Err(crate::Error::InvalidOperation(
+                "gelu_exact requires BF16 input (forward-only, inference path)".into(),
+            ));
+        }
+        if !crate::env_flags::hot_fast_path_disabled() && self.is_contiguous() {
+            return crate::bf16_ops::gelu_exact_bf16_contig_direct(self);
+        }
+        crate::tensor_iterator::ops::unary::gelu_exact_bf16_iter(self)
+    }
+
     /// SiLU (Swish) activation via the [`crate::structured`] kernel pattern.
     ///
     /// Phase 4 exemplar: behaves identically to [`Self::silu`] for BF16

@@ -236,8 +236,12 @@ code**:
   lower-triangular binary mask.
 - `flame_core::attention::sdpa_prefix_causal_full(q, k, v, prefix_len)`
   Structured mixed self-attention: prefix rows are causal, suffix rows are full.
-  HiDream-O1 uses this for its AR/text + image-token pattern so the full pass
-  remains unmasked and cuDNN-backed.
+  HiDream-O1 uses this for its AR/text + image-token pattern. The current
+  training implementation records a single `PrefixCausalFullAttention` autograd
+  op: forward uses prefix causal + suffix all-ones masked attention, while
+  backward recomputes as one exact prefix-causal/full masked SDPA. This avoids
+  the old two-SDPA shared-K/V gradient collapse without paying the full-mask
+  cost on forward.
 - `flame_core::attention::sdpa_with_bias(q, k, v, bias, scale)` — `attention/sdpa.rs:542`
   T5-style additive bias variant. Same dispatch but accepts a `[*, H|1, Q, K]` bias tensor.
 - `flame_core::attention::attend(q, k, v, mask)` — `attention/sdpa.rs:534` — alias for sdpa
@@ -253,6 +257,12 @@ code**:
   the stream for any shape.
 - `flame_core::sdpa::forward_causal(q, k, v)`
 - `flame_core::sdpa::forward_prefix_causal_full(q, k, v, prefix_len)`
+  Public core implementation for prefix-causal-full self-attention. Default
+  path is the O1-safe single-op hybrid. `FLAME_PREFIX_CAUSAL_FULL_FULL_MASK=1`
+  forces the explicit full-mask control, while
+  `FLAME_PREFIX_CAUSAL_FULL_STRUCTURED=1`,
+  `FLAME_PREFIX_CAUSAL_FULL_SUFFIX_ONLY=1`, and
+  `FLAME_PREFIX_CAUSAL_FULL_SUFFIX_MASKED=1` are diagnostic toggles.
 - `flame_core::sdpa::forward_with_bias(...)` — `sdpa.rs:125`
 - `flame_core::cuda_ops_bf16::sdpa_stream_bf16(q, k, v, mask, chunk, causal, scale)` — `cuda_ops_bf16.rs:1599`
   The chunked streaming SDPA used by LTX-2. Takes a `causal` flag and chunk size.
@@ -455,12 +465,13 @@ directly at backward).
   (decoder.rs:346-419) rather than `Linear` modules.
 - ⭐ `ops::fused_inference::fused_linear3d_native_pytorch_parity(input, weight, bias)`
   — `ops/fused_inference.rs:479` (added 2026-05-20). Same signature/semantics
-  as `fused_linear3d_native` but mirrors PyTorch's
+  as `fused_linear3d_native`; biased calls mirror PyTorch's
   `at::cuda::blas::gemm_and_bias<at::BFloat16>` cuBLASLt configuration
   bit-exactly (1 MiB workspace, per-call heuristic, BIAS_POINTER set
   before `cublasLtMatmulAlgoGetHeuristic`, no BIAS_DATA_TYPE / batch /
-  alignment attrs). ~1% perf overhead vs the non-parity variant. Use
-  this where ai-toolkit / PyTorch bit-exact per-op parity matters
+  alignment attrs). No-bias calls delegate to `_native` to match
+  PyTorch's matmul path. ~1% perf overhead vs the non-parity variant
+  for biased calls. Use this where ai-toolkit / PyTorch bit-exact per-op parity matters
   (HiDream-O1 TimestepEmbedder, BottleneckPatchEmbed). For established
   Klein / Z-Image baselines, keep using `fused_linear3d_native` to
   preserve their existing parity numbers.
@@ -576,10 +587,12 @@ port, this file only hosts fused and memory-layout kernels. Pointwise
 ### `tensor_iterator/ops/` — BF16 elementwise via PyTorch-style TensorIterator (Phases 4–11)
 All entries are `pub fn <op>_bf16_iter(...)` and route through the shared
 dispatch registry in `tensor_iterator/dispatch.rs`.
-- `unary.rs` — ⭐ `silu_bf16_iter` `:58`, ⭐ `gelu_bf16_iter` `:102`,
-  ⭐ `square_bf16_iter` `:144`, `abs_bf16_iter` `:186`,
-  `relu_bf16_iter` `:228`, `sigmoid_bf16_iter` `:270`,
-  `tanh_bf16_iter` `:312`, `neg_bf16_iter` `:354`.
+- `unary.rs` — ⭐ `silu_bf16_iter` `:58`, ⭐ `gelu_bf16_iter` `:102` (tanh-approx),
+  ⭐ `gelu_exact_bf16_iter` `:147` (exact-erf, used by Cosmos-Predict2.5;
+  forward-only, no backward — see `Tensor::gelu_exact` docstring),
+  ⭐ `square_bf16_iter` `:193`, `abs_bf16_iter` `:239`,
+  `relu_bf16_iter` `:281`, `sigmoid_bf16_iter` `:323`,
+  `tanh_bf16_iter` `:369`, `neg_bf16_iter` `:411`.
 - `transcendentals.rs` — `exp_bf16_iter` `:46`, `log_bf16_iter` `:88`,
   `sqrt_bf16_iter` `:130`, `rsqrt_bf16_iter` `:172`,
   `recip_bf16_iter` `:214`. (f32-opmath inside: bf16→f32→op→`__float2bfloat16_rn`.)
@@ -600,8 +613,9 @@ dispatch registry in `tensor_iterator/dispatch.rs`.
 - `silu_bf16(x)` — `:322` — same role for `silu_bf16_iter`.
 - ⭐ `add_bf16_contig_direct(a, b)` / `mul_bf16_contig_direct(a, b)` /
   `mul_scalar_bf16_contig_direct(x, scalar)` / `silu_bf16_contig_direct(x)`
-  / `gelu_bf16_contig_direct(x)` — hot-path collapse helpers added
-  2026-05-12. Direct C-FFI into `flame_{add,mul,mul_scalar,silu,gelu}_bf16_kernel`
+  / `gelu_bf16_contig_direct(x)` / `gelu_exact_bf16_contig_direct(x)` (added
+  2026-05-21 for Cosmos-Predict2.5) — hot-path collapse helpers added
+  2026-05-12. Direct C-FFI into `flame_{add,mul,mul_scalar,silu,gelu,gelu_exact}_bf16_kernel`
   with an inline-populated `IterMetadata` (1-D contig, same-shape, no
   broadcasting). Skip `TensorIteratorConfig::build()` / `build_iter_metadata()`
   on the hot path. Same kernel as the corresponding `*_iter` slow path, so
@@ -685,7 +699,7 @@ The "kernel calls that bypass autograd entirely". Used by every FLUX-style block
 | ⭐ `fused_linear3d` | `:276` | cuBLASLt 3D linear (pre-transposed weight) |
 | ⭐ `fused_linear3d_native` | `:357` | cuBLASLt 3D linear (PyTorch weight layout, TRANSA=T) |
 | ⭐ `fused_linear3d_native_lora` | `:489` | Additive LoRA over `fused_linear3d_native`; byte-identical at LoRA=None |
-| ⭐ `fused_linear3d_native_pytorch_parity` | `:479` | Bit-exact PyTorch `gemm_and_bias<BF16>` mirror (2026-05-20); use when ai-toolkit per-op parity matters |
+| ⭐ `fused_linear3d_native_pytorch_parity` | `:479` | Bit-exact PyTorch linear mirror (biased `gemm_and_bias`, no-bias native matmul path; 2026-05-20); use when ai-toolkit per-op parity matters |
 | ⭐ `fused_rms_norm_modulate` | `:552` | RMSNorm + modulate fused |
 | ⭐ `fused_residual_gate` | `:599` | `x + gate * attn` fused |
 

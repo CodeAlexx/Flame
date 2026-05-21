@@ -487,6 +487,10 @@ extern "C" {
         meta: *const crate::tensor_iterator::IterMetadata,
         stream: *mut std::os::raw::c_void,
     ) -> i32;
+    fn flame_gelu_exact_bf16_kernel(
+        meta: *const crate::tensor_iterator::IterMetadata,
+        stream: *mut std::os::raw::c_void,
+    ) -> i32;
 }
 
 /// Direct BF16-contig fast path for `Tensor::silu`. Precondition: `x` is BF16,
@@ -571,6 +575,54 @@ pub fn gelu_bf16_contig_direct(x: &Tensor) -> Result<Tensor> {
         let _ = x;
         Err(Error::InvalidOperation(
             "gelu_bf16_contig_direct requires the cuda feature".into(),
+        ))
+    }
+}
+
+/// Direct BF16-contig fast path for `Tensor::gelu_exact` (exact-erf GELU).
+/// Same kernel as `gelu_exact_bf16_iter`. Mirrors `gelu_bf16_contig_direct`
+/// in shape; only the underlying functor differs (uses `erff` instead of
+/// the tanh approximation). Used by Cosmos-Predict2.5 to match PyTorch's
+/// bare `torch.nn.GELU()` (approximate='none').
+///
+/// Forward-only: no autograd registration here (the caller — `Tensor::gelu_exact`
+/// — also does not record a backward, since flame-core's `gelu_backward.cu`
+/// implements the tanh-approx derivative).
+pub fn gelu_exact_bf16_contig_direct(x: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        debug_assert_eq!(x.dtype(), DType::BF16);
+        debug_assert!(x.is_contiguous());
+
+        let mut out = alloc_contig_bf16_like(x)?;
+        let numel = x.shape().elem_count();
+        let x_ptr =
+            x.as_device_ptr_bf16("gelu_exact_bf16_contig_direct: x")? as *mut std::os::raw::c_void;
+        let out_ptr = match &mut out.storage {
+            TensorStorage::BF16 { data, .. } => {
+                let s = ensure_unique_slice(data)?;
+                use cudarc::driver::DevicePtrMut as _;
+                (*s.device_ptr_mut()) as *mut std::os::raw::c_void
+            }
+            _ => unreachable!("alloc_contig_bf16_like returns BF16"),
+        };
+        let meta = make_contig_iter_metadata_1d_unary(out_ptr, x_ptr, numel);
+        use crate::device::CudaStreamRawPtrExt;
+        let stream = x.device.cuda_stream_raw_ptr();
+        let status = unsafe { flame_gelu_exact_bf16_kernel(&meta, stream) };
+        if status != 0 {
+            return Err(Error::Cuda(format!(
+                "flame_gelu_exact_bf16_kernel (contig fast path) failed with code {}",
+                status
+            )));
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = x;
+        Err(Error::InvalidOperation(
+            "gelu_exact_bf16_contig_direct requires the cuda feature".into(),
         ))
     }
 }
@@ -811,6 +863,52 @@ void rope_halfsplit_bf16_kernel(
 
         Y[base + d]        = __float2bfloat16(x_first * c - x_second * s);
         Y[base + half + d] = __float2bfloat16(x_second * c + x_first * s);
+
+        idx += gridDim.x * blockDim.x;
+    }
+}
+
+extern "C" __global__
+void rope_halfsplit_bf16_pytorch_kernel(
+    const __nv_bfloat16* __restrict__ X,   // [BH, N, D]  (D = 2*half)
+    const __nv_bfloat16* __restrict__ COS,  // [cos_bh, N, half] — 1 or BH
+    const __nv_bfloat16* __restrict__ SIN,  // [cos_bh, N, half]
+    __nv_bfloat16* __restrict__ Y,          // [BH, N, D]
+    long bh, long n, long half, long cos_bh)
+{
+    // PyTorch/HF expression parity for:
+    //   q * cos + rotate_half(q) * sin
+    // Each BF16 mul materializes before the BF16 add materializes. Keeping
+    // those round points matters when large Q/K values meet high-frequency
+    // MRoPE coefficients.
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    long total = bh * n * half;
+    while (idx < total) {
+        long tmp = idx;
+        long d = tmp % half; tmp /= half;
+        long seq = tmp % n;   tmp /= n;
+        long b = tmp;
+
+        long base = (b * n + seq) * (2 * half);
+        long cb = (cos_bh == 1) ? 0 : b;
+        long cos_idx = (cb * n + seq) * half + d;
+
+        float x_first  = __bfloat162float(X[base + d]);
+        float x_second = __bfloat162float(X[base + half + d]);
+        float c = __bfloat162float(COS[cos_idx]);
+        float s = __bfloat162float(SIN[cos_idx]);
+
+        __nv_bfloat16 first_cos = __float2bfloat16_rn(x_first * c);
+        __nv_bfloat16 second_sin = __float2bfloat16_rn(x_second * s);
+        __nv_bfloat16 second_cos = __float2bfloat16_rn(x_second * c);
+        __nv_bfloat16 first_sin = __float2bfloat16_rn(x_first * s);
+
+        Y[base + d] = __float2bfloat16_rn(
+            __bfloat162float(first_cos) - __bfloat162float(second_sin)
+        );
+        Y[base + half + d] = __float2bfloat16_rn(
+            __bfloat162float(second_cos) + __bfloat162float(first_sin)
+        );
 
         idx += gridDim.x * blockDim.x;
     }
@@ -1085,6 +1183,24 @@ pub fn rope_fused_bf16_f32pe(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<T
 /// `(d, d+half)` instead of adjacent `(2d, 2d+1)`.
 /// Used by Qwen3, LLaMA, Mistral.
 pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    rope_halfsplit_bf16_impl(x, cos, sin, "rope_halfsplit_bf16_kernel")
+}
+
+/// Half-split RoPE with PyTorch expression round points.
+///
+/// Matches HuggingFace `q * cos + rotate_half(q) * sin` when all tensors are
+/// BF16: both multiplies round to BF16 before the final BF16 add/sub rounds.
+/// This keeps HiDream-O1 training parity while remaining a single fused kernel.
+pub fn rope_halfsplit_bf16_pytorch(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    rope_halfsplit_bf16_impl(x, cos, sin, "rope_halfsplit_bf16_pytorch_kernel")
+}
+
+fn rope_halfsplit_bf16_impl(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    kernel_name: &'static str,
+) -> Result<Tensor> {
     debug_assert_eq!(x.dtype(), DType::BF16);
     let x_dims = x.shape().dims();
     if x_dims.len() != 4 {
@@ -1124,11 +1240,11 @@ pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Ten
         autograd_meta: None,
     };
 
-    ensure(&x.device, "rope_halfsplit_bf16_kernel", CUDA_ROPE_FUSED)?;
+    ensure(&x.device, kernel_name, CUDA_ROPE_FUSED)?;
     let f = x
         .device
-        .get_func("rope_halfsplit_bf16_kernel", "rope_halfsplit_bf16_kernel")
-        .ok_or_else(|| Error::Cuda("rope_halfsplit_bf16_kernel missing".into()))?;
+        .get_func(kernel_name, kernel_name)
+        .ok_or_else(|| Error::Cuda(format!("{kernel_name} missing")))?;
 
     let xs = match &x_flat.storage {
         TensorStorage::BF16 { data, .. } => data,

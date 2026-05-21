@@ -169,6 +169,13 @@ pub fn register_all_bf16_kernels() {
         crate::tensor_iterator::ops::unary::GELU_STUB,
         crate::tensor_iterator::ops::unary::gelu_bf16_kernel
     );
+    // Exact-erf GELU (Cosmos-Predict2.5 PyTorch parity, 2026-05-21).
+    // Separate stub: `Tensor::gelu` keeps tanh-approx; `Tensor::gelu_exact`
+    // routes here.
+    crate::register_stub!(
+        crate::tensor_iterator::ops::unary::GELU_EXACT_STUB,
+        crate::tensor_iterator::ops::unary::gelu_exact_bf16_kernel
+    );
     crate::register_stub!(
         crate::tensor_iterator::ops::unary::SQUARE_STUB,
         crate::tensor_iterator::ops::unary::square_bf16_kernel
