@@ -762,15 +762,25 @@ fn rms_norm_forward_bf16(
             .map(|v| v == "0")
             .unwrap_or(true);
 
+    let use_hidden4096_pytorch = use_vec
+        && norm_size == 4096
+        && weight.is_none()
+        && std::env::var("FLAME_RMS_NORM_PYTORCH_HIDDEN4096")
+            .map(|v| v != "0")
+            .unwrap_or(true);
     let use_head128 = use_vec && norm_size == 128;
-    let kernel_src = if use_head128 {
+    let kernel_src = if use_hidden4096_pytorch {
+        RMS_NORM_FWD_KERNEL_BF16_HIDDEN4096_PYTORCH
+    } else if use_head128 {
         RMS_NORM_FWD_KERNEL_BF16_HEAD128
     } else if use_vec {
         RMS_NORM_FWD_KERNEL_BF16_VEC
     } else {
         RMS_NORM_FWD_KERNEL_BF16
     };
-    let kernel_name = if use_head128 {
+    let kernel_name = if use_hidden4096_pytorch {
+        "rms_norm_forward_bf16_hidden4096_pytorch"
+    } else if use_head128 {
         "rms_norm_forward_bf16_head128"
     } else if use_vec {
         "rms_norm_forward_bf16_vec"
@@ -788,7 +798,13 @@ fn rms_norm_forward_bf16(
 
     use cudarc::driver::DevicePtr;
 
-    let cfg = if use_head128 {
+    let cfg = if use_hidden4096_pytorch {
+        LaunchConfig {
+            grid_dim: (((batch_size as u32) + 15) / 16, 1, 1),
+            block_dim: (32, 16, 1),
+            shared_mem_bytes: 0,
+        }
+    } else if use_head128 {
         LaunchConfig {
             grid_dim: (((batch_size as u32) + 15) / 16, 1, 1),
             block_dim: (32, 16, 1),
@@ -1648,7 +1664,7 @@ extern "C" __global__ void rms_norm_forward_bf16_vec(
     extern __shared__ float smem[];
     WelfordDataLN wd = compute_rms_stats_pytorch(row_input, norm_size, smem);
     const float denom = __fadd_rn(wd.sigma2, eps);
-    const float inv_rms = __frsqrt_rn(denom);
+    const float inv_rms = rsqrtf(denom);
     if (thrx == 0) inv_rms_out[row] = inv_rms;
 
     // Pass 2: vectorized normalize + write.
@@ -1668,12 +1684,90 @@ extern "C" __global__ void rms_norm_forward_bf16_vec(
 }
 "#;
 
+/// PyTorch Python-op RMSNorm forward for hidden_size=4096, no weight.
+///
+/// HiDream-O1's RMSNorm module is not native layer_norm; it executes
+/// `x.float().pow(2).mean(-1)`, `torch.rsqrt`, then casts the unit-normalized
+/// result back to BF16 before the caller multiplies by weight. PyTorch's F32
+/// mean kernel uses one warp per row with vec4 loads for this shape. The
+/// layer-norm-style 8-warp reduction above is faster but differs by a few ULPs
+/// on high-magnitude rows, enough to flip BF16 ties.
+pub const RMS_NORM_FWD_KERNEL_BF16_HIDDEN4096_PYTORCH: &str = r#"
+#include <cuda_bf16.h>
+
+struct __align__(8) f32x4 {
+    float v[4];
+};
+
+extern "C" __global__ void rms_norm_forward_bf16_hidden4096_pytorch(
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ weight,
+    float* __restrict__ inv_rms_out,
+    int batch_size,
+    int norm_size,
+    float eps,
+    int has_weight
+) {
+    if (norm_size != 4096 || has_weight != 0 || weight != nullptr) return;
+
+    const int lane = threadIdx.x;
+    const int warp_row = threadIdx.y;
+    const int row = blockIdx.x * blockDim.y + warp_row;
+    if (row >= batch_size) return;
+
+    const __nv_bfloat16* row_input = input + (long long)row * 4096;
+    __nv_bfloat16* row_output = output + (long long)row * 4096;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    // Mirrors PyTorch's generic F32 mean reduction for a contiguous
+    // [rows,4096] tensor after the separate pow(2) kernel: vt0=4,
+    // input_vec_size=4, block=(32,16), one warp per row.
+    for (int idx = lane; idx < 1024; idx += 32) {
+        const int base = idx * 4;
+        float v0 = __bfloat162float(row_input[base + 0]);
+        float v1 = __bfloat162float(row_input[base + 1]);
+        float v2 = __bfloat162float(row_input[base + 2]);
+        float v3 = __bfloat162float(row_input[base + 3]);
+        acc0 = acc0 + (v0 * v0);
+        acc1 = acc1 + (v1 * v1);
+        acc2 = acc2 + (v2 * v2);
+        acc3 = acc3 + (v3 * v3);
+    }
+
+    float sum = acc0;
+    sum = sum + acc1;
+    sum = sum + acc2;
+    sum = sum + acc3;
+
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        sum = sum + __shfl_down_sync(0xffffffff, sum, offset);
+    }
+
+    const float mean_sq = __shfl_sync(0xffffffff, sum, 0) * (1.0f / 4096.0f);
+    const float inv_rms = rsqrtf(mean_sq + eps);
+    if (lane == 0) inv_rms_out[row] = inv_rms;
+
+    for (int idx = lane; idx < 4096; idx += 32) {
+        float v = __bfloat162float(row_input[idx]) * inv_rms;
+        row_output[idx] = __float2bfloat16_rn(v);
+    }
+}
+"#;
+
 /// PyTorch generic-mean RMSNorm forward for head_dim=128.
 ///
-/// Mirrors `Reduce.cuh` for `pow(2).mean(-1)` on a contiguous FP32 tensor:
+/// Mirrors PyTorch 2.7 `Reduce.cuh` for `pow(2).mean(-1)` on a contiguous
+/// FP32 tensor of width 128:
 /// block=(32,16), one warp per output row, four strided values per lane
 /// (`lane + {0,32,64,96}`), lane-local four-accumulator combine, then
-/// decreasing-offset warp reduce.
+/// ascending-offset warp reduce. The `dim0 > 128` vectorization gate in
+/// PyTorch 2.7 is intentionally strict; width 128 uses this non-vectorized
+/// path.
 /// This path is both faster for 128-wide per-head RMSNorm and closer to
 /// HiDream/Qwen3-VL's Python RMSNorm than the layer-norm-style 8-warp row
 /// reduction above.
@@ -1721,7 +1815,7 @@ extern "C" __global__ void rms_norm_forward_bf16_head128(
     sum = sum + acc2;
     sum = sum + acc3;
 
-    for (int offset = 16; offset > 0; offset >>= 1) {
+    for (int offset = 1; offset < 32; offset <<= 1) {
         sum = sum + __shfl_down_sync(0xffffffff, sum, offset);
     }
 
@@ -1775,7 +1869,7 @@ extern "C" __global__ void rms_norm_mean_sq_bf16_head128(
     sum = sum + (v2 * v2);
     sum = sum + (v3 * v3);
 
-    for (int offset = 16; offset > 0; offset >>= 1) {
+    for (int offset = 1; offset < 32; offset <<= 1) {
         sum = sum + __shfl_down_sync(0xffffffff, sum, offset);
     }
 

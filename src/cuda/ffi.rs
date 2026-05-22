@@ -676,6 +676,71 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// PyTorch/FlashAttention HD128 BF16 forward: raw-pointer wrapper around
+    /// the SM80 FlashAttention instantiations used by PyTorch. Q,K,V,O use
+    /// logical [B,H,N,128] strides in elements. LSE is [B,H,Nq] F32.
+    pub fn flame_pytorch_flash_attn_bf16_hd128(
+        Q: *const core::ffi::c_void,
+        K: *const core::ffi::c_void,
+        V: *const core::ffi::c_void,
+        O: *mut core::ffi::c_void,
+        LSE: *mut f32,
+        B: i32,
+        Hq: i32,
+        Hkv: i32,
+        Nq: i32,
+        Nk: i32,
+        q_strides: *const i64,
+        k_strides: *const i64,
+        v_strides: *const i64,
+        o_strides: *const i64,
+        q_offset_elems: i64,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        o_offset_elems: i64,
+        softmax_scale: f32,
+        causal: i32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// PyTorch/FlashAttention HD128 BF16 backward. Q,K,V,O,dO,dQ,dK,dV use
+    /// logical [B,H,N,128] strides in elements. LSE is contiguous [B,H,Nq] F32.
+    pub fn flame_pytorch_flash_attn_bf16_hd128_bwd(
+        dO: *const core::ffi::c_void,
+        Q: *const core::ffi::c_void,
+        K: *const core::ffi::c_void,
+        V: *const core::ffi::c_void,
+        O: *const core::ffi::c_void,
+        LSE: *const f32,
+        dQ: *mut core::ffi::c_void,
+        dK: *mut core::ffi::c_void,
+        dV: *mut core::ffi::c_void,
+        B: i32,
+        Hq: i32,
+        Hkv: i32,
+        Nq: i32,
+        Nk: i32,
+        do_strides: *const i64,
+        q_strides: *const i64,
+        k_strides: *const i64,
+        v_strides: *const i64,
+        o_strides: *const i64,
+        dq_strides: *const i64,
+        dk_strides: *const i64,
+        dv_strides: *const i64,
+        do_offset_elems: i64,
+        q_offset_elems: i64,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        o_offset_elems: i64,
+        dq_offset_elems: i64,
+        dk_offset_elems: i64,
+        dv_offset_elems: i64,
+        softmax_scale: f32,
+        causal: i32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// cuDNN v9 Flash SDPA forward (host shim in `src/cuda/cudnn_sdpa.cpp`
     /// via vendored NVIDIA `cudnn_frontend`). BF16 in/out, FP32 compute.
     /// Q, K, V, O: 4D BF16 tensors on GPU with per-tensor 4-element stride

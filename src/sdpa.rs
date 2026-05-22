@@ -24,6 +24,17 @@ fn allow_cudnn_sdpa_bwd_causal() -> bool {
         == Some("1")
 }
 
+fn trace_sdpa_dispatch_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| parse_env_flag("FLAME_SDPA_DISPATCH_TRACE").unwrap_or(false))
+}
+
+fn trace_sdpa_dispatch(args: std::fmt::Arguments<'_>) {
+    if trace_sdpa_dispatch_enabled() {
+        eprintln!("[sdpa-dispatch] {args}");
+    }
+}
+
 #[inline]
 fn align_up(value: usize, align: usize) -> usize {
     if align == 0 {
@@ -79,6 +90,9 @@ fn maybe_pad_for_cudnn(
     let k_len = k_dims[2];
     let v_len = v_dims[2];
     let head_dim = q_dims[3];
+    if q_dims[1] != k_dims[1] || k_dims[1] != v_dims[1] {
+        return Ok((q.clone(), k.clone(), v.clone(), None, None));
+    }
     if k_len != v_len
         || q.dtype() != DType::BF16
         || k.dtype() != DType::BF16
@@ -440,9 +454,24 @@ fn prefix_causal_full_flash_forward(
     prefix_len: usize,
 ) -> SdpaResult<Tensor> {
     let seq_len = q.shape().dims()[2];
+    let q_dims = q.shape().dims();
+    trace_sdpa_dispatch(format_args!(
+        "prefix_causal_full enter B={} H={} S={} D={} prefix={}",
+        q_dims.get(0).copied().unwrap_or(0),
+        q_dims.get(1).copied().unwrap_or(0),
+        q_dims.get(2).copied().unwrap_or(0),
+        q_dims.get(3).copied().unwrap_or(0),
+        prefix_len
+    ));
     let q_prefix = q.narrow(2, 0, prefix_len)?.contiguous()?;
     let k_prefix = k.narrow(2, 0, prefix_len)?.contiguous()?;
     let v_prefix = v.narrow(2, 0, prefix_len)?.contiguous()?;
+    trace_sdpa_dispatch(format_args!(
+        "prefix_causal_full prefix -> causal Q={} K={} D={}",
+        prefix_len,
+        prefix_len,
+        q_dims.get(3).copied().unwrap_or(0)
+    ));
     let out_prefix = forward_causal(&q_prefix, &k_prefix, &v_prefix)?;
 
     #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
@@ -479,6 +508,14 @@ fn prefix_causal_full_flash_forward(
             && q_dims[3] == k_dims[3]
             && (q_dims[3] == 64 || q_dims[3] == 96 || q_dims[3] == 128)
         {
+            trace_sdpa_dispatch(format_args!(
+                "prefix_causal_full suffix source -> FA2 full-pass B={} H={} Q={} K={} D={}",
+                q_dims[0],
+                q_dims[1],
+                q_dims[2],
+                k_dims[2],
+                q_dims[3]
+            ));
             let out_full =
                 forward_fa2_bf16(q, k, v, q_dims[0], q_dims[1], q_dims[2], k_dims[2], q_dims[3], false)?;
             let out_suffix = out_full.narrow(2, prefix_len, seq_len - prefix_len)?;
@@ -488,6 +525,12 @@ fn prefix_causal_full_flash_forward(
 
     let suffix_len = seq_len - prefix_len;
     let q_suffix = q.narrow(2, prefix_len, suffix_len)?.contiguous()?;
+    trace_sdpa_dispatch(format_args!(
+        "prefix_causal_full suffix source -> masked fallback Q={} K={} D={}",
+        suffix_len,
+        seq_len,
+        q_dims.get(3).copied().unwrap_or(0)
+    ));
     let mask = Tensor::from_vec_dtype(
         vec![1.0f32; suffix_len * seq_len],
         Shape::from_dims(&[1, 1, suffix_len, seq_len]),
@@ -510,6 +553,11 @@ fn prefix_causal_full_cudnn_full_forward(
     if q_dims.len() != 4 || k_dims.len() != 4 || v_dims.len() != 4 {
         return Err(Error::InvalidInput(
             "sdpa_prefix_causal_full: cuDNN full pass expects 4D tensors".into(),
+        ));
+    }
+    if q_dims[1] != k_dims[1] || k_dims[1] != v_dims[1] {
+        return Err(Error::Unsupported(
+            "sdpa_prefix_causal_full: cuDNN full pass does not support GQA heads".into(),
         ));
     }
     let (b, h, q_len, head_dim) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
@@ -591,6 +639,13 @@ fn forward_train_inner(
                 k_dims
             )));
         }
+        let v_dims = v.shape().dims();
+        if v_dims.len() != 4 {
+            return Err(Error::InvalidInput(format!(
+                "sdpa.forward_train expects v shaped [B,H,K,D], got {:?}",
+                v_dims
+            )));
+        }
         let scale = if head_dim > 0 {
             1.0 / (head_dim as f32).sqrt()
         } else {
@@ -619,6 +674,8 @@ fn forward_train_inner(
 
             if mask.is_none()
                 && (hd == 64 || hd == 96 || hd == 128)
+                && work_dims[1] == work_k_dims[1]
+                && work_k_dims[1] == v_ref.shape().dims()[1]
                 && (!causal || allow_cudnn_sdpa_bwd_causal())
                 && q_ref.dtype() == DType::BF16
                 && k_ref.dtype() == DType::BF16
@@ -858,7 +915,9 @@ fn forward_inner(
     let (bk, hk, k_len, d_k) = shape4(k)?;
     let (bv, hv, v_len, d_v) = shape4(v)?;
 
-    if !(bq == bk && bq == bv && hq == hk && hq == hv) {
+    let gqa_heads = hk == hv && hk > 0 && hq % hk == 0;
+    let heads_compatible = (hq == hk && hq == hv) || (mask.is_none() && gqa_heads);
+    if !(bq == bk && bq == bv && heads_compatible) {
         return Err(Error::InvalidInput(format!(
             "batch/head mismatch: q={:?}, k={:?}, v={:?}",
             q.shape(),
@@ -883,6 +942,15 @@ fn forward_inner(
         return Err(Error::Unsupported(
             "sdpa.forward: combined mask + causal attention is not supported".into(),
         ));
+    }
+    if (hq != hk || hq != hv) && !(q.dtype() == DType::BF16 && d_q == 128 && mask.is_none()) {
+        return Err(Error::Unsupported(format!(
+            "sdpa.forward: GQA requires the mask-free BF16 head_dim=128 PyTorch FlashAttention path, got q={:?}, k={:?}, v={:?}, mask={}",
+            q.shape(),
+            k.shape(),
+            v.shape(),
+            mask.is_some()
+        )));
     }
 
     if let Some(m) = mask {
@@ -1052,6 +1120,29 @@ fn forward_bf16(
     causal: bool,
 ) -> SdpaResult<Tensor> {
     let scale = 1.0 / (d_q as f32).sqrt();
+    let k_dims = k.shape().dims();
+    let v_dims = v.shape().dims();
+    let hkv = k_dims.get(1).copied().unwrap_or(h);
+    let v_heads = v_dims.get(1).copied().unwrap_or(hkv);
+    let is_gqa = h != hkv || h != v_heads;
+
+    if is_gqa {
+        if mask.is_none() && hkv == v_heads && hkv > 0 && h % hkv == 0 && d_q == 128 {
+            trace_sdpa_dispatch(format_args!(
+                "forward_bf16 -> PyTorch FlashAttention GQA HD128 B={} Hq={} Hkv={} Q={} K={} causal={}",
+                b, h, hkv, q_len, k_len, causal
+            ));
+            return forward_fa2_bf16(q, k, v, b, h, q_len, k_len, d_q, causal);
+        }
+        return Err(Error::Unsupported(format!(
+            "sdpa.forward: GQA BF16 path requires mask-free head_dim=128 with Hq multiple of Hkv, got Hq={} Hk={} Hv={} D={} mask={}",
+            h,
+            hkv,
+            v_heads,
+            d_q,
+            mask.is_some()
+        )));
+    }
 
     // Single SDPA path: the in-tree FA2 WMMA kernel (`flash_attention_fwd.cu`).
     // The former opt-in libtorch/AOTI bridge has been removed — FA2 Phase 1.6
@@ -1069,6 +1160,10 @@ fn forward_bf16(
         && mask.is_none()
         && (!causal || allow_cudnn_sdpa_bwd_causal())
     {
+        trace_sdpa_dispatch(format_args!(
+            "forward_bf16 -> cuDNN B={} H={} Q={} K={} D={} causal={}",
+            b, h, q_len, k_len, d_q, causal
+        ));
         return forward_cudnn_sdpa_bf16(q, k, v, b, h, q_len, k_len, d_q, causal).map_err(|e| {
             log::error!("cudnn SDPA failed (no WMMA fallback): {:?}", e);
             e
@@ -1081,6 +1176,10 @@ fn forward_bf16(
         && q_len == k_len
         && (d_q == 64 || d_q == 96 || d_q == 128)
     {
+        trace_sdpa_dispatch(format_args!(
+            "forward_bf16 -> FA2 causal B={} H={} Q={} K={} D={}",
+            b, h, q_len, k_len, d_q
+        ));
         return forward_fa2_bf16(q, k, v, b, h, q_len, k_len, d_q, true);
     }
 
@@ -1105,6 +1204,16 @@ fn forward_bf16(
             > threshold
     };
     if !force_stream && !auto_stream {
+        trace_sdpa_dispatch(format_args!(
+            "forward_bf16 -> materialized fallback B={} H={} Q={} K={} D={} mask={} causal={}",
+            b,
+            h,
+            q_len,
+            k_len,
+            d_q,
+            mask.is_some(),
+            causal
+        ));
         return forward_bf16_fallback(q, k, v, mask, b, h, q_len, k_len, d_q, scale, causal);
     }
     if auto_stream && !force_stream {
@@ -1134,6 +1243,17 @@ fn forward_bf16(
         );
         match cuda_ops_bf16::sdpa_stream_bf16(q, k, v, mask, chunk, causal, Some(scale)) {
             Ok(out) => {
+                trace_sdpa_dispatch(format_args!(
+                    "forward_bf16 -> stream B={} H={} Q={} K={} D={} chunk={} mask={} causal={}",
+                    b,
+                    h,
+                    q_len,
+                    k_len,
+                    d_q,
+                    chunk,
+                    mask.is_some(),
+                    causal
+                ));
                 let dims = out.shape().dims();
                 if dims.len() != 4 || dims[0] != b || dims[1] != h || dims[2] != q_len {
                     return Err(Error::InvalidOperation(format!(
@@ -1386,6 +1506,92 @@ fn tensor_strides_as_4d_bhnd(t: &Tensor) -> SdpaResult<[i64; 4]> {
 }
 
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn forward_pytorch_flash_hd128_bf16(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    b: usize,
+    hq: usize,
+    hkv: usize,
+    q_len: usize,
+    k_len: usize,
+    causal: bool,
+) -> SdpaResult<Tensor> {
+    use crate::cuda::device_lt;
+    use cudarc::driver::DevicePtr;
+
+    if hkv == 0 || hq % hkv != 0 {
+        return Err(Error::InvalidInput(format!(
+            "pytorch_flash_hd128: invalid head counts Hq={} Hkv={}",
+            hq, hkv
+        )));
+    }
+
+    let q_strides = tensor_strides_as_4d_bhnd(q)?;
+    let k_strides = tensor_strides_as_4d_bhnd(k)?;
+    let v_strides = tensor_strides_as_4d_bhnd(v)?;
+    if q_strides[3] != 1 || k_strides[3] != 1 || v_strides[3] != 1 {
+        return Err(Error::Unsupported(format!(
+            "pytorch_flash_hd128 requires contiguous head dimension, got q={:?} k={:?} v={:?}",
+            q_strides, k_strides, v_strides
+        )));
+    }
+
+    let device = q.device();
+    let stream = device_lt::stream_ptr(device)?;
+    let output = Tensor::empty_dtype(q.shape().clone(), DType::BF16, device.clone())?;
+    let o_strides = tensor_strides_as_4d_bhnd(&output)?;
+    if o_strides[3] != 1 {
+        return Err(Error::Unsupported(format!(
+            "pytorch_flash_hd128 requires contiguous output head dimension, got {:?}",
+            o_strides
+        )));
+    }
+
+    let q_ptr = q.as_device_ptr_bf16("pytorch_flash_hd128:q")? as *const core::ffi::c_void;
+    let k_ptr = k.as_device_ptr_bf16("pytorch_flash_hd128:k")? as *const core::ffi::c_void;
+    let v_ptr = v.as_device_ptr_bf16("pytorch_flash_hd128:v")? as *const core::ffi::c_void;
+    let o_ptr = output.as_device_ptr_bf16("pytorch_flash_hd128:o")? as *mut core::ffi::c_void;
+
+    trace_sdpa_dispatch(format_args!(
+        "forward_fa2_bf16 -> PyTorch FlashAttention HD128 B={} Hq={} Hkv={} Q={} K={} causal={}",
+        b, hq, hkv, q_len, k_len, causal
+    ));
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_pytorch_flash_attn_bf16_hd128(
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            o_ptr,
+            core::ptr::null_mut(),
+            b as i32,
+            hq as i32,
+            hkv as i32,
+            q_len as i32,
+            k_len as i32,
+            q_strides.as_ptr(),
+            k_strides.as_ptr(),
+            v_strides.as_ptr(),
+            o_strides.as_ptr(),
+            q.offset() as i64,
+            k.offset() as i64,
+            v.offset() as i64,
+            output.offset() as i64,
+            1.0 / 128.0f32.sqrt(),
+            if causal { 1 } else { 0 },
+            stream,
+        )
+    };
+    if ret != 0 {
+        return Err(Error::Cuda(format!(
+            "pytorch_flash_hd128 CUDA error: {ret}"
+        )));
+    }
+    Ok(output)
+}
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 fn forward_fa2_bf16(
     q: &Tensor,
     k: &Tensor,
@@ -1405,7 +1611,17 @@ fn forward_fa2_bf16(
         )));
     }
 
+    if d_q == 128 {
+        let k_dims = k.shape().dims();
+        let hkv = k_dims.get(1).copied().unwrap_or(h);
+        return forward_pytorch_flash_hd128_bf16(q, k, v, b, h, hkv, q_len, k_len, causal);
+    }
+
     let bh = b * h;
+    trace_sdpa_dispatch(format_args!(
+        "forward_fa2_bf16 ffi B={} H={} BH={} Q={} K={} D={} causal={}",
+        b, h, bh, q_len, k_len, d_q, causal
+    ));
     let q3 = q.reshape(&[bh, q_len, d_q])?;
     let k3 = k.reshape(&[bh, k_len, d_q])?;
     let v3 = v.reshape(&[bh, k_len, d_q])?;

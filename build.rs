@@ -22,6 +22,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
+    println!("cargo:rerun-if-env-changed=FLAME_PT_FLASH_NO_FAST_MATH");
+    println!("cargo:rerun-if-env-changed=FLAME_PT_FLASH_MATCH_TORCH_DEFS");
     println!("cargo:rerun-if-changed=cuda");
     println!("cargo:rerun-if-changed=src/cuda");
 
@@ -116,6 +118,29 @@ fn main() {
     println!("cargo:warning=NVCC path={nvcc}");
 
     println!("cargo:warning=flame-core: compiling CUDA kernels");
+    let pytorch_flash_src_dir =
+        "/home/alex/pytorch/third_party/flash-attention/csrc/flash_attn/src";
+    let pytorch_flash_csrc_dir = "/home/alex/pytorch/third_party/flash-attention/csrc";
+    let cutlass_include_candidates = [
+        "/home/alex/pytorch/third_party/cutlass/include",
+        "/home/alex/pytorch/third_party/flash-attention/csrc/cutlass/include",
+        "/home/alex/.cache/uv/sdists-v9/pypi/flash-attn/2.8.3/F-aJSrBFOGj56vmnioaki/src/csrc/cutlass/include",
+        "/home/alex/.local/lib/python3.10/site-packages/flashinfer/data/cutlass/include",
+    ];
+    for candidate in cutlass_include_candidates.iter() {
+        println!("cargo:rerun-if-changed={candidate}/cute/tensor.hpp");
+    }
+    let cutlass_include = cutlass_include_candidates
+        .iter()
+        .find(|p| Path::new(p).join("cute/tensor.hpp").exists())
+        .unwrap_or_else(|| {
+            panic!(
+                "CUTLASS/CUTE headers not found for PyTorch FlashAttention HD128 path; looked in {:?}",
+                cutlass_include_candidates
+            )
+        });
+    println!("cargo:warning=flame-core: PyTorch FlashAttention CUTLASS include={cutlass_include}");
+
     let mut cuda_sources = vec![
         "cuda/narrow_strided.cu",
         "cuda/permute0213.cu",
@@ -167,6 +192,19 @@ fn main() {
     cuda_sources.push("src/cuda/fused_modulate.cu");
     cuda_sources.push("src/cuda/fused_linear3d.cu");
     cuda_sources.push("src/cuda/flash_attention_fwd.cu");
+    cuda_sources.push("src/cuda/pytorch_flash_attn_hd128_bf16.cu");
+    cuda_sources.push(
+        "/home/alex/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu",
+    );
+    cuda_sources.push(
+        "/home/alex/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash_fwd_hdim128_bf16_causal_sm80.cu",
+    );
+    cuda_sources.push(
+        "/home/alex/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash_bwd_hdim128_bf16_sm80.cu",
+    );
+    cuda_sources.push(
+        "/home/alex/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash_bwd_hdim128_bf16_causal_sm80.cu",
+    );
     // flash_attention_bwd.cu removed in Phase 2c (2026-04-23): training
     // backward now goes through cuDNN SDPA backward via cudnn_sdpa_bwd.cpp
     // below, which is 30-50× faster than the decomposed-recompute path the
@@ -253,6 +291,9 @@ fn main() {
     let mut objects = Vec::new();
     for src in &cuda_sources {
         println!("cargo:rerun-if-changed={}", src);
+        let is_pytorch_flash_src = src.contains("flash_fwd_hdim128_bf16")
+            || src.contains("flash_bwd_hdim128_bf16")
+            || src.ends_with("pytorch_flash_attn_hd128_bf16.cu");
         let obj_path = out_dir
             .join(Path::new(src).file_name().expect("cuda source filename"))
             .with_extension("o");
@@ -260,7 +301,6 @@ fn main() {
         let mut cmd = Command::new(&nvcc);
         cmd.arg("-std=c++17")
             .arg("-O3")
-            .arg("--use_fast_math")
             .arg("-Xcompiler")
             .arg("-fPIC")
             .arg("-rdc=true")
@@ -275,9 +315,46 @@ fn main() {
             .arg("-gencode")
             .arg("arch=compute_89,code=sm_89")
             .arg(format!("-I{cuda_home}/include"));
+        if !(is_pytorch_flash_src
+            && env::var("FLAME_PT_FLASH_NO_FAST_MATH")
+                .ok()
+                .as_deref()
+                == Some("1"))
+        {
+            cmd.arg("--use_fast_math");
+        }
         cmd.arg("-I").arg("cuda/include");
         if src.ends_with("streaming_attn_bf16.cu") {
             cmd.arg("-Xptxas").arg("-v");
+        }
+        if is_pytorch_flash_src {
+            cmd.arg("--expt-relaxed-constexpr")
+                .arg("--expt-extended-lambda")
+                .arg("-I")
+                .arg("src/cuda/torch_flash_shim")
+                .arg("-I")
+                .arg(pytorch_flash_csrc_dir)
+                .arg("-I")
+                .arg(pytorch_flash_src_dir)
+                .arg("-I")
+                .arg(*cutlass_include)
+                .arg("-DFLASH_NAMESPACE=pytorch_flash")
+                .arg("-DFLASHATTENTION_DISABLE_ALIBI")
+                .arg("-DFLASHATTENTION_DISABLE_SOFTCAP")
+                .arg("-DUNFUSE_FMA")
+                .arg("-U__CUDA_NO_HALF_OPERATORS__")
+                .arg("-U__CUDA_NO_HALF_CONVERSIONS__")
+                .arg("-U__CUDA_NO_HALF2_OPERATORS__")
+                .arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__");
+            if env::var("FLAME_PT_FLASH_MATCH_TORCH_DEFS")
+                .ok()
+                .as_deref()
+                != Some("1")
+            {
+                cmd.arg("-DFLASHATTENTION_DISABLE_DROPOUT")
+                    .arg("-DFLASHATTENTION_DISABLE_LOCAL")
+                    .arg("-DFLASHATTENTION_DISABLE_UNEVEN_K");
+            }
         }
 
         let status = cmd.status().expect("failed to invoke nvcc");

@@ -162,6 +162,8 @@ pub fn clear_grow_activation_cache() {
 ///   Chroma, Wan, Z-Image, HiDream-O1 MRoPE.
 /// - `Halfsplit`: pairs `(d, d+half)` rotate together (HuggingFace
 ///   `rotate_half` convention). Used by Qwen3, LLaMA, Mistral.
+/// - `HalfsplitPytorch`: same channel pairing as `Halfsplit`, but preserves
+///   PyTorch/HF BF16 expression round points in both forward and backward.
 ///
 /// The two are different rotations of `head_dim`. Backward MUST apply the
 /// same layout as forward — otherwise the gradient direction is essentially
@@ -179,6 +181,9 @@ pub enum RopeLayout {
     Interleaved,
     /// (d, d+half) pairs. `bf16_ops::rope_halfsplit_bf16`.
     Halfsplit,
+    /// (d, d+half) pairs with PyTorch BF16 expression round points.
+    /// `bf16_ops::rope_halfsplit_bf16_pytorch`.
+    HalfsplitPytorch,
 }
 
 /// Operation types for autograd
@@ -303,6 +308,20 @@ pub enum Op {
         input_w: usize,
         output_h: usize,
         output_w: usize,
+    },
+    /// 2D max pooling. Backward is the scatter of upstream grad to the
+    /// max-arg positions (recomputed from the saved input, since the
+    /// forward kernel does not currently emit indices — see
+    /// `pooling::MaxPool2d::backward` which takes `_indices: Option<&Tensor>`
+    /// and ignores it).
+    MaxPool2D {
+        input: TensorId,
+        kernel_h: usize,
+        kernel_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        padding_h: usize,
+        padding_w: usize,
     },
     AddBias {
         input: TensorId,
@@ -950,6 +969,58 @@ fn sdpa_bwd_log(msg: &str) {
     eprintln!("[sdpa-bwd] {msg}");
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttentionBwdRecomputeMode {
+    Bf16,
+    Bf16ScoreF32Softmax,
+    F32,
+}
+
+#[inline]
+fn attention_bwd_recompute_mode() -> AttentionBwdRecomputeMode {
+    match std::env::var("FLAME_ATTENTION_BWD_RECOMPUTE").ok().as_deref() {
+        Some("fp32") | Some("f32") => AttentionBwdRecomputeMode::F32,
+        Some("bf16-score-fp32-softmax") | Some("f32-softmax") => {
+            AttentionBwdRecomputeMode::Bf16ScoreF32Softmax
+        }
+        Some("bf16") | None => {
+            if std::env::var("FLAME_ATTENTION_BWD_FP32_RECOMPUTE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                AttentionBwdRecomputeMode::F32
+            } else {
+                AttentionBwdRecomputeMode::Bf16
+            }
+        }
+        Some(other) => {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[sdpa-bwd] unknown FLAME_ATTENTION_BWD_RECOMPUTE={other:?}; using bf16"
+                );
+            }
+            AttentionBwdRecomputeMode::Bf16
+        }
+    }
+}
+
+fn softmax_lastdim_no_default_cast(logits: &Tensor) -> Result<Tensor> {
+    let dim = logits.shape().rank().saturating_sub(1);
+    let mut max_vals = GpuOps::max_dim(logits, dim, true)?;
+    if max_vals.dtype() != logits.dtype() {
+        max_vals = max_vals.to_dtype_no_grad(logits.dtype())?;
+    }
+    let shifted = logits.sub(&max_vals)?;
+    let exp_vals = shifted.exp()?;
+    let mut sum_exp = GpuOps::sum_dim_keepdim(&exp_vals, dim)?;
+    if sum_exp.dtype() != exp_vals.dtype() {
+        sum_exp = sum_exp.to_dtype_no_grad(exp_vals.dtype())?;
+    }
+    exp_vals.div(&sum_exp)
+}
+
 fn add_unsaved_view_inputs_to_needed(
     op: &Op,
     ids: &mut std::collections::HashSet<TensorId>,
@@ -1049,12 +1120,20 @@ fn try_cudnn_sdpa_backward(
     };
     let q_dims = q.shape().dims();
     let k_dims = k.shape().dims();
-    if q_dims.len() != 4 || k_dims.len() != 4 {
+    let v_dims = v.shape().dims();
+    if q_dims.len() != 4 || k_dims.len() != 4 || v_dims.len() != 4 {
         sdpa_bwd_log(&format!("bail:rank q={} k={}", q_dims.len(), k_dims.len()));
         return Ok(None);
     }
     let (b, h, n_q, d) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
     let n_kv = k_dims[2];
+    if q_dims[1] != k_dims[1] || k_dims[1] != v_dims[1] {
+        sdpa_bwd_log(&format!(
+            "bail:gqa-not-cudnn Hq={} Hk={} Hv={}",
+            q_dims[1], k_dims[1], v_dims[1]
+        ));
+        return Ok(None);
+    }
     if !(d == 64 || d == 96 || d == 128) {
         sdpa_bwd_log(&format!("bail:head_dim={d}"));
         return Ok(None);
@@ -1242,6 +1321,343 @@ fn strides_4d(t: &Tensor) -> Result<[i64; 4]> {
     Ok([s[0] as i64, s[1] as i64, s[2] as i64, s[3] as i64])
 }
 
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn try_pytorch_flash_hd128_forward_with_lse(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    causal: bool,
+    scale: f32,
+) -> Result<Option<(Tensor, Tensor)>> {
+    let q_dims = q.shape().dims();
+    let k_dims = k.shape().dims();
+    let v_dims = v.shape().dims();
+    if q_dims.len() != 4 || k_dims.len() != 4 || v_dims.len() != 4 {
+        sdpa_bwd_log(&format!(
+            "pt-flash-hd128-fwd bail:rank q={} k={} v={}",
+            q_dims.len(),
+            k_dims.len(),
+            v_dims.len()
+        ));
+        return Ok(None);
+    }
+    let (b, hq, n_q, d) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
+    let (hkv, n_kv) = (k_dims[1], k_dims[2]);
+    if d != 128 || k_dims[3] != 128 || v_dims[3] != 128 {
+        sdpa_bwd_log(&format!("pt-flash-hd128-fwd bail:head_dim={d}"));
+        return Ok(None);
+    }
+    if q_dims[0] != k_dims[0]
+        || q_dims[0] != v_dims[0]
+        || k_dims[1] != v_dims[1]
+        || k_dims[2] != v_dims[2]
+    {
+        sdpa_bwd_log(&format!(
+            "pt-flash-hd128-fwd bail:shape q={:?} k={:?} v={:?}",
+            q_dims, k_dims, v_dims
+        ));
+        return Ok(None);
+    }
+    if hkv == 0 || hq % hkv != 0 {
+        sdpa_bwd_log(&format!("pt-flash-hd128-fwd bail:gqa Hq={hq} Hkv={hkv}"));
+        return Ok(None);
+    }
+    if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
+        sdpa_bwd_log(&format!(
+            "pt-flash-hd128-fwd bail:dtype q={:?} k={:?} v={:?}",
+            q.dtype(),
+            k.dtype(),
+            v.dtype()
+        ));
+        return Ok(None);
+    }
+    if scale <= 0.0 {
+        sdpa_bwd_log(&format!("pt-flash-hd128-fwd bail:scale={scale}"));
+        return Ok(None);
+    }
+
+    let q_strides = strides_4d(q)?;
+    let k_strides = strides_4d(k)?;
+    let v_strides = strides_4d(v)?;
+    if q_strides[3] != 1 || k_strides[3] != 1 || v_strides[3] != 1 {
+        sdpa_bwd_log(&format!(
+            "pt-flash-hd128-fwd bail:last-stride q={:?} k={:?} v={:?}",
+            q_strides, k_strides, v_strides
+        ));
+        return Ok(None);
+    }
+
+    let device = q.device();
+    let output = Tensor::empty_dtype(q.shape().clone(), DType::BF16, device.clone())?;
+    let mut lse = Tensor::empty_dtype(Shape::from_dims(&[b, hq, n_q]), DType::F32, device.clone())?;
+    let o_strides = strides_4d(&output)?;
+    let stream = crate::cuda::device_lt::stream_ptr(device)?;
+
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let q_ptr = q.as_device_ptr_bf16("pt_flash_hd128_fwd:q")? as *const core::ffi::c_void;
+    let k_ptr = k.as_device_ptr_bf16("pt_flash_hd128_fwd:k")? as *const core::ffi::c_void;
+    let v_ptr = v.as_device_ptr_bf16("pt_flash_hd128_fwd:v")? as *const core::ffi::c_void;
+    let o_ptr = output.as_device_ptr_bf16("pt_flash_hd128_fwd:o")? as *mut core::ffi::c_void;
+    let lse_ptr = {
+        let lse_slice = lse.as_mut_slice_f32("pt_flash_hd128_fwd:lse")?;
+        *lse_slice.device_ptr_mut() as *mut f32
+    };
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_pytorch_flash_attn_bf16_hd128(
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            o_ptr,
+            lse_ptr,
+            b as i32,
+            hq as i32,
+            hkv as i32,
+            n_q as i32,
+            n_kv as i32,
+            q_strides.as_ptr(),
+            k_strides.as_ptr(),
+            v_strides.as_ptr(),
+            o_strides.as_ptr(),
+            q.offset() as i64,
+            k.offset() as i64,
+            v.offset() as i64,
+            output.offset() as i64,
+            scale,
+            if causal { 1 } else { 0 },
+            stream,
+        )
+    };
+    if ret != 0 {
+        return Err(Error::Cuda(format!(
+            "pytorch_flash_hd128 forward CUDA error: {ret}"
+        )));
+    }
+    Ok(Some((output, lse)))
+}
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn try_pytorch_flash_hd128_backward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    dout: &Tensor,
+    causal: bool,
+    scale: f32,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    if std::env::var("FLAME_NO_PYTORCH_FLASH_HD128_BWD")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        sdpa_bwd_log("pt-flash-hd128-bwd disabled-by-env");
+        return Ok(None);
+    }
+
+    let Some((o, lse)) = try_pytorch_flash_hd128_forward_with_lse(q, k, v, causal, scale)? else {
+        return Ok(None);
+    };
+    let d_o_bf16_owned;
+    let d_o = if dout.dtype() != DType::BF16 {
+        d_o_bf16_owned = dout.to_dtype_no_grad(DType::BF16)?;
+        &d_o_bf16_owned
+    } else {
+        dout
+    };
+    let d_o_contig_owned;
+    let d_o = if strides_4d(d_o)?[3] != 1 {
+        d_o_contig_owned = d_o.contiguous()?;
+        &d_o_contig_owned
+    } else {
+        d_o
+    };
+
+    let q_dims = q.shape().dims();
+    let k_dims = k.shape().dims();
+    let (b, hq, n_q) = (q_dims[0], q_dims[1], q_dims[2]);
+    let (hkv, n_kv) = (k_dims[1], k_dims[2]);
+    let do_strides = strides_4d(d_o)?;
+    let q_strides = strides_4d(q)?;
+    let k_strides = strides_4d(k)?;
+    let v_strides = strides_4d(v)?;
+    let o_strides = strides_4d(&o)?;
+
+    let device = q.device();
+    let dq = Tensor::empty_dtype(q.shape().clone(), DType::BF16, device.clone())?;
+    let dk = Tensor::empty_dtype(k.shape().clone(), DType::BF16, device.clone())?;
+    let dv = Tensor::empty_dtype(v.shape().clone(), DType::BF16, device.clone())?;
+    let dq_strides = strides_4d(&dq)?;
+    let dk_strides = strides_4d(&dk)?;
+    let dv_strides = strides_4d(&dv)?;
+
+    use cudarc::driver::DevicePtr;
+    let stream = crate::cuda::device_lt::stream_ptr(device)?;
+    let do_ptr = d_o.as_device_ptr_bf16("pt_flash_hd128_bwd:do")? as *const core::ffi::c_void;
+    let q_ptr = q.as_device_ptr_bf16("pt_flash_hd128_bwd:q")? as *const core::ffi::c_void;
+    let k_ptr = k.as_device_ptr_bf16("pt_flash_hd128_bwd:k")? as *const core::ffi::c_void;
+    let v_ptr = v.as_device_ptr_bf16("pt_flash_hd128_bwd:v")? as *const core::ffi::c_void;
+    let o_ptr = o.as_device_ptr_bf16("pt_flash_hd128_bwd:o")? as *const core::ffi::c_void;
+    let dq_ptr = dq.as_device_ptr_bf16("pt_flash_hd128_bwd:dq")? as *mut core::ffi::c_void;
+    let dk_ptr = dk.as_device_ptr_bf16("pt_flash_hd128_bwd:dk")? as *mut core::ffi::c_void;
+    let dv_ptr = dv.as_device_ptr_bf16("pt_flash_hd128_bwd:dv")? as *mut core::ffi::c_void;
+    let lse_ptr = *lse.as_slice_f32("pt_flash_hd128_bwd:lse")?.device_ptr() as *const f32;
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_pytorch_flash_attn_bf16_hd128_bwd(
+            do_ptr,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            o_ptr,
+            lse_ptr,
+            dq_ptr,
+            dk_ptr,
+            dv_ptr,
+            b as i32,
+            hq as i32,
+            hkv as i32,
+            n_q as i32,
+            n_kv as i32,
+            do_strides.as_ptr(),
+            q_strides.as_ptr(),
+            k_strides.as_ptr(),
+            v_strides.as_ptr(),
+            o_strides.as_ptr(),
+            dq_strides.as_ptr(),
+            dk_strides.as_ptr(),
+            dv_strides.as_ptr(),
+            d_o.offset() as i64,
+            q.offset() as i64,
+            k.offset() as i64,
+            v.offset() as i64,
+            o.offset() as i64,
+            dq.offset() as i64,
+            dk.offset() as i64,
+            dv.offset() as i64,
+            scale,
+            if causal { 1 } else { 0 },
+            stream,
+        )
+    };
+    if ret != 0 {
+        return Err(Error::Cuda(format!(
+            "pytorch_flash_hd128 backward CUDA error: {ret}"
+        )));
+    }
+
+    sdpa_bwd_log(&format!(
+        "fired PyTorch flash hd128 [B={b},H={hq},Nq={n_q},Nkv={n_kv},causal={causal}]"
+    ));
+    Ok(Some((dq, dk, dv)))
+}
+
+#[cfg(not(all(feature = "cuda", feature = "bf16_u16")))]
+fn try_pytorch_flash_hd128_backward(
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _dout: &Tensor,
+    _causal: bool,
+    _scale: f32,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    Ok(None)
+}
+
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+fn try_prefix_causal_full_pytorch_flash_hd128_backward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    dout: &Tensor,
+    prefix_len: usize,
+    scale: f32,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    if std::env::var("FLAME_PREFIX_CAUSAL_FULL_NO_PT_FLASH_BWD")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        sdpa_bwd_log("prefix-pt-flash-hd128 disabled-by-env");
+        return Ok(None);
+    }
+
+    let q_dims = q.shape().dims();
+    let k_dims = k.shape().dims();
+    let v_dims = v.shape().dims();
+    if q_dims.len() != 4
+        || k_dims.len() != 4
+        || v_dims.len() != 4
+        || q_dims[3] != 128
+        || k_dims[3] != 128
+        || v_dims[3] != 128
+        || q.dtype() != DType::BF16
+    {
+        return Ok(None);
+    }
+    let seq_len = q_dims[2];
+    if prefix_len == 0 {
+        return try_pytorch_flash_hd128_backward(q, k, v, dout, false, scale);
+    }
+    if prefix_len == seq_len {
+        return try_pytorch_flash_hd128_backward(q, k, v, dout, true, scale);
+    }
+    if prefix_len > seq_len {
+        return Ok(None);
+    }
+
+    let dout_bf16_owned;
+    let dout_bf16 = if dout.dtype() != DType::BF16 {
+        dout_bf16_owned = dout.to_dtype_no_grad(DType::BF16)?;
+        &dout_bf16_owned
+    } else {
+        dout
+    };
+
+    let suffix_len = seq_len - prefix_len;
+    let q_prefix = q.narrow(2, 0, prefix_len)?.contiguous()?;
+    let k_prefix = k.narrow(2, 0, prefix_len)?.contiguous()?;
+    let v_prefix = v.narrow(2, 0, prefix_len)?.contiguous()?;
+    let dout_prefix = dout_bf16.narrow(2, 0, prefix_len)?.contiguous()?;
+    let Some((dq_prefix, dk_prefix, dv_prefix)) =
+        try_pytorch_flash_hd128_backward(&q_prefix, &k_prefix, &v_prefix, &dout_prefix, true, scale)?
+    else {
+        return Ok(None);
+    };
+
+    let zero_prefix_dout = Tensor::zeros_dtype(
+        Shape::from_dims(&[q_dims[0], q_dims[1], prefix_len, q_dims[3]]),
+        DType::BF16,
+        q.device().clone(),
+    )?;
+    let dout_suffix = dout_bf16.narrow(2, prefix_len, suffix_len)?.contiguous()?;
+    let dout_full = Tensor::cat(&[&zero_prefix_dout, &dout_suffix], 2)?;
+    let Some((dq_full, dk_full, dv_full)) =
+        try_pytorch_flash_hd128_backward(q, k, v, &dout_full, false, scale)?
+    else {
+        return Ok(None);
+    };
+
+    let dq_suffix = dq_full.narrow(2, prefix_len, suffix_len)?.contiguous()?;
+    let grad_q = Tensor::cat(&[&dq_prefix, &dq_suffix], 2)?;
+
+    let zero_k_tail = Tensor::zeros_dtype(
+        Shape::from_dims(&[k_dims[0], k_dims[1], suffix_len, k_dims[3]]),
+        dk_prefix.dtype(),
+        q.device().clone(),
+    )?;
+    let zero_v_tail = Tensor::zeros_dtype(
+        Shape::from_dims(&[v_dims[0], v_dims[1], suffix_len, v_dims[3]]),
+        dv_prefix.dtype(),
+        q.device().clone(),
+    )?;
+    let dk_prefix_padded = Tensor::cat(&[&dk_prefix, &zero_k_tail], 2)?;
+    let dv_prefix_padded = Tensor::cat(&[&dv_prefix, &zero_v_tail], 2)?;
+    let grad_k = dk_prefix_padded.add(&dk_full)?;
+    let grad_v = dv_prefix_padded.add(&dv_full)?;
+
+    Ok(Some((grad_q, grad_k, grad_v)))
+}
+
 // Local, dependency-free SDPA backward (recompute path)
 // SDPA backward (recompute path)
 /// SDPA backward via recompute. If `cached_attn` is Some, uses it directly
@@ -1256,6 +1672,21 @@ fn attention_backward_recompute(
     scale: f32,
     cached_attn: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
+    let recompute_mode = attention_bwd_recompute_mode();
+    if recompute_mode != AttentionBwdRecomputeMode::Bf16 {
+        return attention_backward_recompute_precise(
+            q,
+            k,
+            v,
+            dout,
+            mask,
+            causal,
+            scale,
+            cached_attn,
+            recompute_mode,
+        );
+    }
+
     // All ops in BF16 (bmm requires matching dtypes)
     let q = if q.dtype() != DType::BF16 {
         &q.to_dtype_no_grad(DType::BF16)?
@@ -1337,6 +1768,158 @@ fn attention_backward_recompute(
 
     let d_q = d_logits.bmm(k)?;
     let d_k = d_logits.transpose_dims(2, 3)?.bmm(q)?;
+
+    Ok((d_q, d_k, d_v))
+}
+
+fn attention_backward_recompute_precise(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    dout: &Tensor,
+    mask: Option<&Tensor>,
+    causal: bool,
+    scale: f32,
+    cached_attn: Option<&Tensor>,
+    mode: AttentionBwdRecomputeMode,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    sdpa_bwd_log(&format!("recompute-mode:{mode:?}"));
+
+    let score_dtype = match mode {
+        AttentionBwdRecomputeMode::Bf16ScoreF32Softmax => DType::BF16,
+        AttentionBwdRecomputeMode::F32 => DType::F32,
+        AttentionBwdRecomputeMode::Bf16 => DType::BF16,
+    };
+
+    let q_score_owned;
+    let q_score = if q.dtype() != score_dtype {
+        q_score_owned = q.to_dtype_no_grad(score_dtype)?;
+        &q_score_owned
+    } else {
+        q
+    };
+    let k_score_owned;
+    let k_score = if k.dtype() != score_dtype {
+        k_score_owned = k.to_dtype_no_grad(score_dtype)?;
+        &k_score_owned
+    } else {
+        k
+    };
+
+    let q_f32_owned;
+    let q_f32 = if q.dtype() != DType::F32 {
+        q_f32_owned = q.to_dtype_no_grad(DType::F32)?;
+        &q_f32_owned
+    } else {
+        q
+    };
+    let k_f32_owned;
+    let k_f32 = if k.dtype() != DType::F32 {
+        k_f32_owned = k.to_dtype_no_grad(DType::F32)?;
+        &k_f32_owned
+    } else {
+        k
+    };
+    let v_f32_owned;
+    let v_f32 = if v.dtype() != DType::F32 {
+        v_f32_owned = v.to_dtype_no_grad(DType::F32)?;
+        &v_f32_owned
+    } else {
+        v
+    };
+    let dout_f32_owned;
+    let dout_f32 = if dout.dtype() != DType::F32 {
+        dout_f32_owned = dout.to_dtype_no_grad(DType::F32)?;
+        &dout_f32_owned
+    } else {
+        dout
+    };
+
+    let attn_owned;
+    let attn: &Tensor = if let Some(cached) = cached_attn {
+        let cached = if cached.dtype() != DType::F32 {
+            attn_owned = cached.to_dtype_no_grad(DType::F32)?;
+            &attn_owned
+        } else {
+            cached
+        };
+        cached
+    } else {
+        let kt = k_score.transpose_dims(2, 3)?;
+        let mut logits = q_score.bmm(&kt)?;
+        logits = logits.mul_scalar(scale)?;
+        if logits.dtype() != DType::F32 {
+            logits = logits.to_dtype_no_grad(DType::F32)?;
+        }
+        if let Some(mask_raw) = mask {
+            let target_dims = logits.shape().dims().to_vec();
+            let mask_f32 = if mask_raw.dtype() == DType::F32 {
+                mask_raw.clone()
+            } else {
+                mask_raw.to_dtype_no_grad(DType::F32)?
+            };
+            let mask_bcast = if mask_f32.shape().dims() == target_dims.as_slice() {
+                mask_f32
+            } else {
+                mask_f32.broadcast_to(&Shape::from_dims(&target_dims))?
+            };
+            let ones = mask_bcast.full_like(1.0)?;
+            let complement = ones.sub(&mask_bcast)?;
+            let penalty = complement.mul_scalar(-1.0e9)?;
+            logits = logits.add(&penalty)?;
+        }
+        if causal {
+            let target_dims = logits.shape().dims().to_vec();
+            let q_len = q_score.shape().dims()[2];
+            let k_len = k_score.shape().dims()[2];
+            let causal_mask = causal_keep_mask_for_logits(q_len, k_len, q_score.device().clone())?;
+            let causal_bcast = if causal_mask.shape().dims() == target_dims.as_slice() {
+                causal_mask
+            } else {
+                causal_mask.broadcast_to(&Shape::from_dims(&target_dims))?
+            };
+            let ones = causal_bcast.full_like(1.0)?;
+            let complement = ones.sub(&causal_bcast)?;
+            let penalty = complement.mul_scalar(-1.0e9)?;
+            logits = logits.add(&penalty)?;
+        }
+        attn_owned = softmax_lastdim_no_default_cast(&logits)?;
+        &attn_owned
+    };
+
+    let d_v = attn.transpose_dims(2, 3)?.bmm(dout_f32)?;
+    let d_attn = dout_f32.bmm(&v_f32.transpose_dims(2, 3)?)?;
+
+    let dattn_times_attn = d_attn.mul(attn)?;
+    let sum_term = dattn_times_attn.sum_dim_keepdim(3)?;
+    let d_logits = d_attn.sub(&sum_term)?.mul(attn)?;
+    let d_logits = d_logits.mul_scalar(scale)?;
+
+    let d_q = d_logits.bmm(k_f32)?;
+    let d_k = d_logits.transpose_dims(2, 3)?.bmm(q_f32)?;
+
+    if std::env::var("FLAME_ATTENTION_BWD_RETURN_INPUT_DTYPE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        let d_q = if d_q.dtype() != q.dtype() {
+            d_q.to_dtype_no_grad(q.dtype())?
+        } else {
+            d_q
+        };
+        let d_k = if d_k.dtype() != k.dtype() {
+            d_k.to_dtype_no_grad(k.dtype())?
+        } else {
+            d_k
+        };
+        let d_v = if d_v.dtype() != v.dtype() {
+            d_v.to_dtype_no_grad(v.dtype())?
+        } else {
+            d_v
+        };
+        return Ok((d_q, d_k, d_v));
+    }
 
     Ok((d_q, d_k, d_v))
 }
@@ -1775,6 +2358,7 @@ impl AutogradContext {
                             | Op::Permute { input, .. }
                             | Op::Broadcast { input, .. }
                             | Op::UpsampleNearest2D { input, .. }
+                            | Op::MaxPool2D { input, .. }
                             | Op::SumDim { input, .. }
                             | Op::SumDimKeepdim { input, .. }
                             | Op::SumDims { input, .. }
@@ -4302,6 +4886,9 @@ fn compute_gradients(
                 RopeLayout::Halfsplit => {
                     crate::bf16_ops::rope_halfsplit_bf16(&grad_bf16, &cos_tensor, &neg_sin)?
                 }
+                RopeLayout::HalfsplitPytorch => {
+                    crate::bf16_ops::rope_halfsplit_bf16_pytorch(&grad_bf16, &cos_tensor, &neg_sin)?
+                }
             };
             Ok(smallvec![(*input, grad_input)])
         }
@@ -4839,6 +5426,43 @@ fn compute_gradients(
                 (*input_h, *input_w),
                 (*output_h, *output_w),
             )?;
+            Ok(smallvec![(*input, ensure_bf16(grad)?)])
+        }
+
+        Op::MaxPool2D {
+            input,
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+            padding_h,
+            padding_w,
+        } => {
+            // The forward kernel doesn't emit indices, so the backward
+            // re-derives the argmax from the saved input. The MaxPool2d
+            // backward method ignores its `indices` arg today
+            // (`pooling.rs:_indices: Option<&Tensor>`). Both the saved
+            // input and the upstream grad must be BF16-NHWC because
+            // `MaxPool2d::backward` enforces `assert_nhwc_bf16_public`
+            // on its inputs — backward grads from the autograd engine
+            // arrive in F32 by default, so we cast first.
+            let input_tensor = fetch_saved(input)?;
+            debug_assert_eq!(
+                input_tensor.dtype(),
+                DType::BF16,
+                "Op::MaxPool2D saved input must be BF16 — forward asserted this contract"
+            );
+            let input_bf16 = input_tensor;
+            let grad_bf16 = if output_grad.dtype() == DType::BF16 {
+                output_grad.clone()
+            } else {
+                output_grad.to_dtype(DType::BF16)?
+            };
+            let mut cfg = crate::pooling::MaxPool2dConfig::new((*kernel_h, *kernel_w));
+            cfg.stride = Some((*stride_h, *stride_w));
+            cfg.padding = (*padding_h, *padding_w);
+            let pool = crate::pooling::MaxPool2d::new(cfg);
+            let grad = pool.backward(&grad_bf16, &input_bf16, None)?;
             Ok(smallvec![(*input, ensure_bf16(grad)?)])
         }
 
@@ -5747,6 +6371,15 @@ fn compute_gradients(
 
             let (grad_q, grad_k, grad_v) = if let Some(triple) = cudnn_result {
                 triple
+            } else if let Some(triple) = try_pytorch_flash_hd128_backward(
+                query_tensor,
+                key_tensor,
+                value_tensor,
+                output_grad,
+                *causal,
+                *scale,
+            )? {
+                triple
             } else {
                 // Decomposed recompute fallback.
                 //
@@ -5881,10 +6514,16 @@ fn compute_gradients(
             let value_tensor_owned = fetch_saved(value)?;
             let q_dims = query_tensor_owned.shape().dims().to_vec();
             let k_dims = key_tensor_owned.shape().dims().to_vec();
-            if q_dims.len() != 4 || k_dims.len() != 4 || q_dims[2] != k_dims[2] {
+            let v_dims = value_tensor_owned.shape().dims().to_vec();
+            if q_dims.len() != 4
+                || k_dims.len() != 4
+                || v_dims.len() != 4
+                || q_dims[2] != k_dims[2]
+                || k_dims[2] != v_dims[2]
+            {
                 return Err(Error::InvalidOperation(format!(
-                    "PrefixCausalFullAttention backward expects self-attention [B,H,S,D], got q={:?} k={:?}",
-                    q_dims, k_dims
+                    "PrefixCausalFullAttention backward expects self-attention [B,H,S,D], got q={:?} k={:?} v={:?}",
+                    q_dims, k_dims, v_dims
                 )));
             }
             if *prefix_len > q_dims[2] {
@@ -5892,6 +6531,81 @@ fn compute_gradients(
                     "PrefixCausalFullAttention backward prefix_len {} exceeds seq_len {}",
                     prefix_len, q_dims[2]
                 )));
+            }
+            if std::env::var("FLAME_PREFIX_CAUSAL_FULL_BWD_STRUCTURED")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                let seq_len = q_dims[2];
+                let suffix_len = seq_len - *prefix_len;
+                let q_prefix = query_tensor_owned.narrow(2, 0, *prefix_len)?.contiguous()?;
+                let k_prefix = key_tensor_owned.narrow(2, 0, *prefix_len)?.contiguous()?;
+                let v_prefix = value_tensor_owned.narrow(2, 0, *prefix_len)?.contiguous()?;
+                let dout_prefix = output_grad.narrow(2, 0, *prefix_len)?.contiguous()?;
+                let (dq_prefix, dk_prefix, dv_prefix) = attention_backward_recompute(
+                    &q_prefix,
+                    &k_prefix,
+                    &v_prefix,
+                    &dout_prefix,
+                    None,
+                    true,
+                    *scale,
+                    None,
+                )?;
+
+                let q_suffix = query_tensor_owned
+                    .narrow(2, *prefix_len, suffix_len)?
+                    .contiguous()?;
+                let dout_suffix = output_grad.narrow(2, *prefix_len, suffix_len)?.contiguous()?;
+                let (dq_suffix, dk_suffix, dv_suffix) = attention_backward_recompute(
+                    &q_suffix,
+                    &key_tensor_owned,
+                    &value_tensor_owned,
+                    &dout_suffix,
+                    None,
+                    false,
+                    *scale,
+                    None,
+                )?;
+
+                let grad_q = Tensor::cat(&[&dq_prefix, &dq_suffix], 2)?;
+                let zero_k_tail = Tensor::zeros_dtype(
+                    Shape::from_dims(&[k_dims[0], k_dims[1], suffix_len, k_dims[3]]),
+                    dk_prefix.dtype(),
+                    query_tensor_owned.device().clone(),
+                )?;
+                let zero_v_tail = Tensor::zeros_dtype(
+                    Shape::from_dims(&[v_dims[0], v_dims[1], suffix_len, v_dims[3]]),
+                    dv_prefix.dtype(),
+                    query_tensor_owned.device().clone(),
+                )?;
+                let dk_prefix_padded = Tensor::cat(&[&dk_prefix, &zero_k_tail], 2)?;
+                let dv_prefix_padded = Tensor::cat(&[&dv_prefix, &zero_v_tail], 2)?;
+                let grad_k = dk_prefix_padded.add(&dk_suffix)?;
+                let grad_v = dv_prefix_padded.add(&dv_suffix)?;
+                return Ok(smallvec![
+                    (*query, grad_q),
+                    (*key, grad_k),
+                    (*value, grad_v)
+                ]);
+            }
+            #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+            if let Some((grad_q, grad_k, grad_v)) =
+                try_prefix_causal_full_pytorch_flash_hd128_backward(
+                    &query_tensor_owned,
+                    &key_tensor_owned,
+                    &value_tensor_owned,
+                    output_grad,
+                    *prefix_len,
+                    *scale,
+                )?
+            {
+                return Ok(smallvec![
+                    (*query, grad_q),
+                    (*key, grad_k),
+                    (*value, grad_v)
+                ]);
             }
             let mask = prefix_causal_full_keep_mask_for_logits(
                 q_dims[2],
@@ -6126,6 +6840,7 @@ fn op_tag(op: &Op) -> &'static str {
         Op::Permute { .. } => "Permute",
         Op::Broadcast { .. } => "Broadcast",
         Op::UpsampleNearest2D { .. } => "UpsampleNearest2D",
+        Op::MaxPool2D { .. } => "MaxPool2D",
         Op::Repeat { .. } => "Repeat",
         Op::Cast { .. } => "Cast",
         Op::Cat { .. } => "Cat",

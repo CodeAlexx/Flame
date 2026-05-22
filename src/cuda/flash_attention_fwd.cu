@@ -301,8 +301,9 @@ __global__ void flash_attn_fwd_kernel(
 
     for (int i = tid; i < q_rows * HD; i += THREADS) {
         int qi = i / HD;
-        float denom = fmaxf(s_l[qi], 1e-20f);
-        O_base[i] = __float2bfloat16(s_O[i] / denom);
+        float sum = s_l[qi];
+        float inv_sum = (sum == 0.0f || sum != sum) ? 1.0f : 1.0f / sum;
+        O_base[i] = __float2bfloat16(s_O[i] * inv_sum);
     }
 }
 

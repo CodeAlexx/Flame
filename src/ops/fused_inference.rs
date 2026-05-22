@@ -665,10 +665,15 @@ pub fn fused_linear3d_native_lora(
     // GEMM, reshapes back). Autograd is recorded by Op::MatMul + Op::Transpose
     // + Op::MulScalar.
     let residual = if a.dtype() == DType::F32 {
-        let input_f32 = input.to_dtype(DType::F32)?;
-        let lora_a_t = a.transpose()?.contiguous()?; // [Cin, rank]
-        let lora_b_t = b.transpose()?.contiguous()?; // [rank, Cout]
-        let xa = input_f32.matmul(&lora_a_t)?; // [B, S, rank]
+        // PyTorch runs ai-toolkit's F32 LoRA modules under CUDA autocast in the
+        // O1 trainer. The module weights stay F32 leaves, but linear compute is
+        // BF16. Cast through autograd so F32 params still receive F32 grads.
+        let input_bf16 = input.to_dtype(DType::BF16)?;
+        let a_bf16 = a.to_dtype(DType::BF16)?;
+        let b_bf16 = b.to_dtype(DType::BF16)?;
+        let lora_a_t = a_bf16.transpose()?.contiguous()?; // [Cin, rank]
+        let lora_b_t = b_bf16.transpose()?.contiguous()?; // [rank, Cout]
+        let xa = input_bf16.matmul(&lora_a_t)?; // [B, S, rank]
         let xab = xa.matmul(&lora_b_t)?; // [B, S, Cout]
         xab.mul_scalar(lora_scale)?
     } else {

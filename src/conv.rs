@@ -333,6 +333,29 @@ impl Conv2d {
             ));
         }
 
+        // Wave 0c: when the autograd tape is recording and any input/param
+        // requires grad, delegate to `ops::conv2d::conv2d_forward`. That entry
+        // point gates cuDNN on `!is_recording()` (see ops/conv2d.rs:735), falls
+        // back to its im2col path, and records `Op::Conv2d` on the tape so
+        // `loss.backward()` flows gradients back through this layer. The
+        // cuDNN/NHWC fast paths below bypass the tape entirely, which silently
+        // dropped grads in the L2P U-Net's 11 Conv2d calls (Phase 2 blocker).
+        // Inference (FLAME_AUTOGRAD_OFF=1 or no tape) skips this branch and
+        // takes the unchanged fast path.
+        let needs_grad = input.requires_grad
+            || self.weight.requires_grad
+            || self.bias.as_ref().map(|b| b.requires_grad).unwrap_or(false);
+        if needs_grad && crate::autograd::AutogradContext::is_recording() {
+            return crate::ops::conv2d::conv2d_forward(
+                input,
+                &self.weight,
+                self.bias.as_ref(),
+                (self.config.stride.0, self.config.stride.1),
+                (self.config.padding.0, self.config.padding.1),
+                self.config.groups,
+            );
+        }
+
         // Try cuDNN first — native BF16, no format conversion needed
         #[cfg(feature = "cudnn")]
         {
@@ -400,6 +423,26 @@ impl Conv2d {
             return Err(Error::InvalidInput(
                 "Conv2d::forward_nhwc expects BF16 inputs".into(),
             ));
+        }
+
+        // Wave 0c: same gating as Conv2d::forward — when autograd is recording
+        // and any input/param needs grad, route through the NCHW recording
+        // path (with format permutes to bridge NHWC↔NCHW). The fast `cuda_ops_bf16::conv2d_bf16`
+        // path below bypasses the tape and would drop gradients.
+        let needs_grad = input.requires_grad
+            || self.weight.requires_grad
+            || self.bias.as_ref().map(|b| b.requires_grad).unwrap_or(false);
+        if needs_grad && crate::autograd::AutogradContext::is_recording() {
+            let nchw_in = input.permute(&[0, 3, 1, 2])?;
+            let nchw_out = crate::ops::conv2d::conv2d_forward(
+                &nchw_in,
+                &self.weight,
+                self.bias.as_ref(),
+                (self.config.stride.0, self.config.stride.1),
+                (self.config.padding.0, self.config.padding.1),
+                self.config.groups,
+            )?;
+            return nchw_out.permute(&[0, 2, 3, 1]);
         }
 
         #[cfg(all(feature = "cuda", feature = "bf16_u16"))]

@@ -70,6 +70,33 @@ impl MaxPool2d {
         }
         assert_nhwc_bf16_public("MaxPool2d::forward out", &output)?;
 
+        // Autograd recording. Mirrors the pattern in `ops/conv2d.rs:846-869`:
+        // propagate requires_grad onto the output and record the tape entry
+        // only when the context is actively recording. The backward in
+        // `autograd.rs` recomputes the argmax from the saved input (kernel
+        // doesn't emit indices today), so we save only the input here.
+        if input.requires_grad {
+            output.requires_grad = true;
+            if crate::autograd::AutogradContext::is_recording() {
+                let (kh, kw) = self.config.kernel_size;
+                let (sh, sw) = self.config.stride.unwrap_or(self.config.kernel_size);
+                let (ph, pw) = self.config.padding;
+                crate::autograd::AutogradContext::record_op(
+                    output.id,
+                    crate::autograd::Op::MaxPool2D {
+                        input: input.id,
+                        kernel_h: kh,
+                        kernel_w: kw,
+                        stride_h: sh,
+                        stride_w: sw,
+                        padding_h: ph,
+                        padding_w: pw,
+                    },
+                    vec![(input.id, input.alias())],
+                );
+            }
+        }
+
         // Return tensor and optional indices (None for now as indices not implemented yet)
         Ok((output, None))
     }

@@ -1183,7 +1183,13 @@ pub fn rope_fused_bf16_f32pe(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<T
 /// `(d, d+half)` instead of adjacent `(2d, 2d+1)`.
 /// Used by Qwen3, LLaMA, Mistral.
 pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    rope_halfsplit_bf16_impl(x, cos, sin, "rope_halfsplit_bf16_kernel")
+    rope_halfsplit_bf16_impl(
+        x,
+        cos,
+        sin,
+        "rope_halfsplit_bf16_kernel",
+        crate::autograd::RopeLayout::Halfsplit,
+    )
 }
 
 /// Half-split RoPE with PyTorch expression round points.
@@ -1192,7 +1198,13 @@ pub fn rope_halfsplit_bf16(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Ten
 /// BF16: both multiplies round to BF16 before the final BF16 add/sub rounds.
 /// This keeps HiDream-O1 training parity while remaining a single fused kernel.
 pub fn rope_halfsplit_bf16_pytorch(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    rope_halfsplit_bf16_impl(x, cos, sin, "rope_halfsplit_bf16_pytorch_kernel")
+    rope_halfsplit_bf16_impl(
+        x,
+        cos,
+        sin,
+        "rope_halfsplit_bf16_pytorch_kernel",
+        crate::autograd::RopeLayout::HalfsplitPytorch,
+    )
 }
 
 fn rope_halfsplit_bf16_impl(
@@ -1200,6 +1212,7 @@ fn rope_halfsplit_bf16_impl(
     cos: &Tensor,
     sin: &Tensor,
     kernel_name: &'static str,
+    layout: crate::autograd::RopeLayout,
 ) -> Result<Tensor> {
     debug_assert_eq!(x.dtype(), DType::BF16);
     let x_dims = x.shape().dims();
@@ -1283,10 +1296,10 @@ fn rope_halfsplit_bf16_impl(
     let mut result = out.reshape(&[b, h, n, d])?;
 
     // Record autograd op so gradients flow through RoPE during training.
-    // Layout tag is Halfsplit — backward dispatches on this, not by
-    // shape-sniffing cos. (Previously the shape sniff mis-classified
-    // HiDream-O1's MRoPE `[1, S, half]` as Interleaved → Q/K LoRA-B
-    // gradient direction collapse.)
+    // Layout tag is the exact halfsplit kernel variant — backward dispatches
+    // on this, not by shape-sniffing cos. (Previously the shape sniff
+    // mis-classified HiDream-O1's MRoPE `[1, S, half]` as Interleaved; later
+    // it still lost the PyTorch BF16 expression round points.)
     if x.requires_grad {
         result.requires_grad = true;
         if crate::autograd::AutogradContext::is_recording() {
@@ -1296,7 +1309,7 @@ fn rope_halfsplit_bf16_impl(
                     input: x.id,
                     cos: cos_flat.id,
                     sin: sin_flat.id,
-                    layout: crate::autograd::RopeLayout::Halfsplit,
+                    layout,
                 },
                 vec![
                     (x.id, x.clone()),
