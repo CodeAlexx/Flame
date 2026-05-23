@@ -274,6 +274,18 @@ code**:
   full-suffix attempt; keep it off for O1 parity unless explicitly bisecting
   cuDNN plan behavior.
 - `flame_core::sdpa::forward_with_bias(...)` — `sdpa.rs:125`
+- `flame_core::sdpa::forward_with_sinks(q, k, v, mask, sinks)` — `sdpa.rs` ⭐
+  GPT-OSS / StreamingLLM attention with per-head learned sink logits
+  concatenated as an extra "virtual key" column before softmax (then
+  dropped from the V matmul). Manual FP32 path mirroring
+  `forward_with_bias`. `sinks` is `[H]` BF16 or F32; mask is the same
+  `[*, *, Q, K]` keep-mask semantics as `forward()`.
+- `flame_core::attention::sliding_window_causal_keep_mask(seq_len, window_size, device, dtype)`
+  — `attention/sliding_window_mask.rs` ⭐
+  Builds a `[1, 1, S, S]` keep-mask where position `q` attends to `k`
+  iff `q.saturating_sub(window_size - 1) <= k <= q`. Pure host build +
+  upload (same pattern as `causal_keep_mask` in `sdpa.rs`). Used by
+  GPT-OSS alternating sliding/full attention layers.
 - `flame_core::cuda_ops_bf16::sdpa_stream_bf16(q, k, v, mask, chunk, causal, scale)` — `cuda_ops_bf16.rs:1599`
   The chunked streaming SDPA used by LTX-2. Takes a `causal` flag and chunk size.
   **Note**: this is the catastrophically slow path for d=64 / causal — see
@@ -704,6 +716,8 @@ The "kernel calls that bypass autograd entirely". Used by every FLUX-style block
 | ⭐ `dequant_fp8_to_bf16` | `:98` | FP8 → BF16 dequant (one shot) |
 | ⭐ `dequant_fp8_to_bf16_into` | `:131` | Same, output-into |
 | ⭐ `dequant_fp8_transpose_into` | `:164` | Dequant + transpose in one kernel |
+| ⭐ `dequant_mxfp4_to_bf16` | `:220` | MXFP4 → BF16 dequant (GPT-OSS experts; FP4 LUT matches transformers `convert_moe_packed_tensors`) |
+| ⭐ `dequant_mxfp4_to_bf16_into` | `:281` | Same, output-into (zero-alloc) |
 | ⭐ `fused_rms_norm` | `:202` | RMSNorm with weight, single kernel |
 | ⭐ `fused_modulate` | `:241` | `(1+scale) * x + shift` — DiT modulate |
 | ⭐ `fused_linear3d` | `:276` | cuBLASLt 3D linear (pre-transposed weight) |
@@ -737,6 +751,8 @@ MoE forward composite. Used by Nucleus-Image (and queued for LLaDA2.0-Uni).
 | ⭐ `expert_choice_route` | `ops/moe_routing.rs:65` | `(B, E, S) F32 affinity` + `capacity`, `route_scale` → `ExpertRoutingPlan` (offsets, global_token_indices, gating_flat). Top-C per (batch,expert) host-side, gating renormalised per-token, scaled by `route_scale`. Mirrors `NucleusMoELayer.forward`'s routing block. |
 | ⭐ `permute_tokens` | `ops/moe_routing.rs:204` | `x: (B*S, D)` + plan → `(E*B*C, D)` expert-major, via `Tensor::index_select0`. |
 | ⭐ `nucleus_moe_expert_forward` | `ops/nucleus_moe.rs:51` | Full SwiGLU MoE expert FFN: route + permute + grouped_mm(gate_up) + SwiGLU + grouped_mm(down) + weighted scatter-add. Caller owns router matmul, modulation, and shared-expert addition. |
+| ⭐ `token_choice_route` | `ops/token_choice_routing.rs:127` | Dual of `expert_choice_route`: each of T tokens picks top-K experts. `(T, E) F32/BF16 router_logits` + `top_k` + `ScoreMode` (TopKSoftmax for GPT-OSS, SoftmaxRenorm for Mixtral/Nucleus-style) → `TokenChoiceRoutingPlan` with prefix-sum offsets (length E+1), expert-major permuted_token_indices (length T*K), expert_weights_flat (length T*K), plus token-major (T, K) expert_indices/expert_weights device tensors. Host-side topk + softmax. |
+| ⭐ `permute_tokens_for_token_choice` | `ops/token_choice_routing.rs:360` | `x: (T, D)` + token-choice plan → `(T*K, D)` expert-major, each source token appearing K times. |
 
 All five have `#[cfg(test)] mod tests` parity tests against hand-rolled
 scalar Rust references. **First time these CUDA kernels actually ran** —
@@ -760,6 +776,7 @@ to see what kernels are linked in. Notable groups:
 - `fc_upsample2d_nearest_bf16 / fc_upsample2d_nearest_f32` (`:382,394`) — VAE upsample
 - `fc_upsample2d_bilinear_bf16 / fc_upsample2d_bilinear_f32` (`:509,522`) — bilinear 2D upsample (BF16 + F32), PyTorch-matching index math with `align_corners`. Added 2026-04-19 to unblock Cascade.
 - `flame_fp8_to_bf16` (`:409`) — FP8 dequant
+- `flame_mxfp4_to_bf16` — MXFP4 dequant (32 FP4/block + E8M0 scale → 32 BF16). Used by `dequant_mxfp4_to_bf16{,_into}`. Source: `src/cuda/mxfp4_dequant.cu`.
 - `flame_fp16_to_bf16` (`:416`) — FP16 → BF16 conversion (in-place safe). Used by BlockOffloader for FP16 checkpoints.
 - `flame_flash_attention_bf16` (`:424`) — wmma flash attention forward (LIVE, inference dead-code fallback only; training uses cuDNN)
 - `flame_cudnn_sdpa_bf16` — cuDNN v9 SDPA inference forward (primary inference attention path; see `src/cuda/cudnn_sdpa.cpp`)
@@ -1975,6 +1992,8 @@ by `.cu` file with launch configs and perf notes.
 - **"Where is the global RNG seed?"** → `rng::set_seed`
 - **"Where is the FP8 dequant?"** → `ops::fused_inference::dequant_fp8_to_bf16` →
   `flame_fp8_to_bf16` → `src/cuda/fp8_dequant.cu`
+- **"Where is the MXFP4 dequant?"** → `ops::fused_inference::dequant_mxfp4_to_bf16` →
+  `flame_mxfp4_to_bf16` → `src/cuda/mxfp4_dequant.cu`. Used by Lens M2 (GPT-OSS encoder)
   `flame_fp16_to_bf16` → `src/cuda/fp16_to_bf16.cu`
 - **"Where is the activation offload pool?"** → `activation_offload::ActivationOffloadPool` →
   autograd integration via `autograd::checkpoint_offload` + `Op::CheckpointOffload`.

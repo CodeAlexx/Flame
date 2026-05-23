@@ -635,6 +635,26 @@ the pool currently uses a fixed scale assuming activation range [-8, 8].
 | `fp8_to_bf16_kernel` | `:10` | E4M3 / E5M2 unpack. Used by FlameSwap FP8 paths and `ActivationOffloadPool::pull`. |
 | `flame_fp8_to_bf16` | `:40` | C entry. |
 
+### `src/cuda/mxfp4_dequant.cu` — MXFP4 → BF16
+
+MXFP4 = 32 FP4 (E2M1) values share one 8-bit E8M0 exponent scale.
+FP4 LUT bit-exactly matches HuggingFace transformers `FP4_VALUES`
+(`[+0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6]`); see
+`transformers/integrations/mxfp4.py::convert_moe_packed_tensors`.
+
+Per-block layout: 16 packed bytes (2 nibbles each, low → even index, high → odd)
++ 1 E8M0 byte for the shared scale `2^(scale_byte - 127)`. Output: 32 BF16.
+
+| Symbol | Line | Notes |
+|---|---|---|
+| `FP4_LUT` (constant) | `:35` | 16-entry FP4 magnitude table. Indexed by 4-bit nibble; high bit = sign. |
+| `flame_mxfp4_to_bf16_kernel` | `:47` | Grid-stride loop, **one thread per 32-element block**. Each thread reads 16 bytes + 1 scale, writes 32 BF16. `#pragma unroll` on the 16-byte inner loop. |
+| `flame_mxfp4_to_bf16` | `:90` | C entry. Block=256, grid capped at 65535. `(blocks, scales, out, rows_total, stream) → int`. |
+
+Used by Lens M2 (GPT-OSS encoder MoE expert dequant). Pairs with the
+forthcoming `BLOCKOFF_MXFP4_PINNED=1` BlockOffloader path so raw MXFP4 stays
+in pinned host RAM and is dequantized on H2D prefetch.
+
 ### `src/cuda/fp16_to_bf16.cu` — FP16 (IEEE half) → BF16
 
 | Symbol | Line | Notes |

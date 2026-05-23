@@ -20,4 +20,5 @@ pub mod multi_tensor;
 pub mod nucleus_moe;
 pub mod reduce;
 pub mod tile;
+pub mod token_choice_routing;
 pub mod utils;

@@ -904,6 +904,183 @@ pub fn forward_with_bias(
     })
 }
 
+/// Scaled dot-product attention with **attention sinks** (per-head learned
+/// scalar logits attached as an extra "virtual key" column before softmax).
+///
+/// This variant is used by GPT-OSS and other StreamingLLM-style models that
+/// prevent attention from collapsing onto early tokens by giving every
+/// query a learned no-op "sink" target. The math is:
+///
+/// ```text
+/// logits      = Q @ K^T * scale + mask_penalty   # [B, H, Q, K]
+/// sink_logits = sinks.broadcast_to([B, H, Q, 1]) # [B, H, Q, 1]
+/// all_logits  = cat([logits, sink_logits], -1)   # [B, H, Q, K+1]
+/// attn        = softmax(all_logits, -1)          # [B, H, Q, K+1]
+/// attn_kv     = attn[..., :K]                    # drop the sink column
+/// out         = attn_kv @ V                      # [B, H, Q, D]
+/// ```
+///
+/// Because the sink column participates in softmax normalization but has
+/// no corresponding value, attention weights over real keys can sum to
+/// less than 1.0 — the sink absorbs the residual probability mass.
+///
+/// Arguments:
+/// - `q, k, v`: `[B, H, S, D]` BF16 (GQA not supported here; replicate KV
+///   heads at the call site).
+/// - `mask`: optional **keep-mask** `[*, *, Q, K]` (1.0 = attend, 0.0 = masked).
+///   Same semantics as [`forward`]. Applied as additive `-inf` on logits.
+/// - `sinks`: `[H]` BF16 (or F32). One learned scalar per head.
+///
+/// Softmax is computed in FP32; output is cast back to `q.dtype()`.
+///
+/// This is a correctness-first materialized fallback (cuBLASLt-free FP32
+/// `bmm` path mirroring [`forward_with_bias`]). GPT-OSS shapes
+/// (24 layers, ≤512 tokens) make perf-tuning a non-issue at this stage.
+pub fn forward_with_sinks(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    sinks: &Tensor,
+) -> SdpaResult<Tensor> {
+    scope("sdpa.forward_with_sinks", GuardMode::env_default(), || {
+        let (bq, hq, q_len, d_q) = shape4(q)?;
+        let (bk, hk, k_len, d_k) = shape4(k)?;
+        let (bv, hv, v_len, d_v) = shape4(v)?;
+
+        if !(bq == bk && bq == bv && hq == hk && hq == hv) {
+            return Err(Error::InvalidInput(format!(
+                "sdpa.forward_with_sinks batch/head mismatch: q={:?}, k={:?}, v={:?}",
+                q.shape(),
+                k.shape(),
+                v.shape()
+            )));
+        }
+        if !(d_q == d_k && d_q == d_v) {
+            return Err(Error::InvalidInput(format!(
+                "sdpa.forward_with_sinks embed mismatch: q_dim={} k_dim={} v_dim={}",
+                d_q, d_k, d_v
+            )));
+        }
+        if k_len != v_len {
+            return Err(Error::InvalidInput(format!(
+                "sdpa.forward_with_sinks sequence mismatch: k_len={} v_len={}",
+                k_len, v_len
+            )));
+        }
+
+        // Sinks: [H] one scalar per head.
+        let sinks_dims = sinks.shape().dims();
+        if sinks_dims.len() != 1 || sinks_dims[0] != hq {
+            return Err(Error::InvalidInput(format!(
+                "sdpa.forward_with_sinks: sinks shape {:?} must be [H={}]",
+                sinks_dims, hq
+            )));
+        }
+
+        // Mask shape validation (matches `forward` rules).
+        if let Some(m) = mask {
+            let dims = m.shape().dims();
+            if dims.len() != 4 {
+                return Err(Error::InvalidInput(format!(
+                    "sdpa.forward_with_sinks: mask must be 4D [B,H,Q,K], got {:?}",
+                    dims
+                )));
+            }
+            let bm = dims[0];
+            let hm = dims[1];
+            let qm = dims[2];
+            let km = dims[3];
+            if !(bm == bq || bm == 1)
+                || !(hm == hq || hm == 1)
+                || !(qm == q_len || qm == 1)
+                || km != k_len
+            {
+                return Err(Error::InvalidInput(format!(
+                    "sdpa.forward_with_sinks: mask dims {:?} not broadcastable to [B={},H={},Q={},K={}]",
+                    dims, bq, hq, q_len, k_len
+                )));
+            }
+        }
+
+        // Manual FP32 path. Mirrors `forward_with_bias` structure so the
+        // numerics line up with the existing materialized fallback.
+        let q32 = q.to_dtype(DType::F32)?;
+        let k32 = k.to_dtype(DType::F32)?;
+        let v32 = v.to_dtype(DType::F32)?;
+        let sinks32 = if sinks.dtype() == DType::F32 {
+            sinks.clone_result()?
+        } else {
+            sinks.to_dtype(DType::F32)?
+        };
+
+        let bh = bq * hq;
+        let q3 = q32.reshape(&[bh, q_len, d_q])?;
+        let k3 = k32.reshape(&[bh, k_len, d_q])?;
+        let v3 = v32.reshape(&[bh, v_len, d_v])?;
+
+        // [bh, q_len, k_len] = Q @ K^T
+        let k_t3 = transpose_last2(&k3)?;
+        let mut scores3 = q3.bmm(&k_t3)?;
+
+        let scale = 1.0f32 / (d_q as f32).sqrt();
+        scores3 = scores3.mul_scalar(scale)?;
+
+        // [B, H, Q, K] for mask add and sink concat.
+        let mut scores4 = scores3.reshape(&[bq, hq, q_len, k_len])?;
+
+        if let Some(mask_raw) = mask {
+            // Keep-mask → additive -inf on masked positions.
+            let target = [bq, hq, q_len, k_len];
+            let mask_f32 = if mask_raw.dtype() == DType::F32 {
+                mask_raw.clone_result()?
+            } else {
+                mask_raw.to_dtype(DType::F32)?
+            };
+            let mask_bcast = if mask_f32.shape().dims() == target {
+                mask_f32
+            } else {
+                mask_f32.broadcast_to(&Shape::from_dims(&target))?
+            };
+            let ones = full_like(&mask_bcast, 1.0)?;
+            let complement = ones.sub(&mask_bcast)?;
+            let penalty = complement.mul_scalar(NEG_INF)?;
+            scores4 = scores4.add(&penalty)?;
+        }
+
+        // Build sink-logit slab [B, H, Q, 1] by broadcasting sinks [H] →
+        // [1, H, 1, 1] → [B, H, Q, 1]. broadcast_to is a stride-0 view;
+        // contiguous-ify so the cat sees a real tensor.
+        let sink_view = sinks32
+            .reshape(&[1, hq, 1, 1])?
+            .broadcast_to(&Shape::from_dims(&[bq, hq, q_len, 1]))?;
+        let sink_col = sink_view.contiguous()?;
+
+        // Concat logits || sink along K dim → [B, H, Q, K+1].
+        let all_logits = Tensor::cat(&[&scores4, &sink_col], 3)?;
+
+        // Softmax over the extended K+1 axis. force F32 in case softmax
+        // downcasts internally.
+        let attn_full = all_logits.softmax(-1)?.to_dtype(DType::F32)?;
+
+        // Drop the sink column. Both shapes here are F32 contiguous from
+        // softmax; narrow gives a zero-copy view, so make it contiguous
+        // before the next BMM (the FP32 bmm path expects contiguous mem).
+        let attn_kv = attn_full.narrow(3, 0, k_len)?.contiguous()?;
+
+        let attn3 = attn_kv.reshape(&[bh, q_len, k_len])?;
+        let out3 = attn3.bmm(&v3)?;
+        let output32 = out3.reshape(&[bq, hq, q_len, d_v])?;
+
+        let out = if q.dtype() == DType::F32 {
+            output32
+        } else {
+            output32.to_dtype(q.dtype())?
+        };
+        Ok(out)
+    })
+}
+
 fn forward_inner(
     q: &Tensor,
     k: &Tensor,
@@ -1725,15 +1902,30 @@ fn forward_bf16_fallback(
     let k_t = k_flat.transpose_dims(1, 2)?; // [BH, d, K]
     let t_reshape = t0.elapsed().as_millis();
 
-    // Decide tile size for Q. If a mask is present we bypass tiling and
-    // take the single-shot path (masked shapes are small by construction).
+    // Decide tile size for Q. Tiling applies to masked paths too: we
+    // slice the mask along Q per tile (2026-05-23 fix to unblock Lens
+    // 1024² self-attn, where mask=[1,1,1,K] and a non-tiled scores
+    // materialization OOMs under tight memory pressure even though the
+    // mask itself is small).
     let full_elems = bh * q_len * k_len;
-    let do_tile = mask.is_none() && full_elems > SCORES_TILE_ELEMS_MAX;
+    // For masked shapes, reduce the per-tile budget because the F32 mask
+    // materialization adds ~bh*Q_tile*K_len*4 bytes on top of scores.
+    // For masked paths we materialize a F32 mask tile in addition to the
+    // BF16 scores tile + its F32 upcast + softmax temp. Aggregate peak is
+    // ~4× the bare scores tile (BF16 + F32_cast + F32_softmax + F32_mask),
+    // so divide by 8 to leave headroom for fragmentation on a 24 GB card
+    // under tight memory.
+    let tile_budget = if mask.is_some() {
+        SCORES_TILE_ELEMS_MAX / 8
+    } else {
+        SCORES_TILE_ELEMS_MAX
+    };
+    let do_tile = full_elems > tile_budget;
 
     let q_tile = if do_tile {
-        // Target: bh * q_tile * k_len ≤ SCORES_TILE_ELEMS_MAX.
+        // Target: bh * q_tile * k_len ≤ tile_budget.
         let per_q = bh * k_len;
-        (SCORES_TILE_ELEMS_MAX / per_q).max(1).min(q_len)
+        (tile_budget / per_q).max(1).min(q_len)
     } else {
         q_len
     };
@@ -1824,13 +2016,58 @@ fn forward_bf16_fallback(
         run_one_tile(&q_flat, mask_prepared.as_ref(), q_len, 0)?
     } else {
         // Tiled path: iterate Q chunks, concat outputs on dim=1.
+        // Per-tile mask prep: keep the source mask in its compact form
+        // (may be Q-broadcast as `[*, *, 1, K]`) and only broadcast +
+        // materialize at tile size. For full-Q masks (`[*, *, Q, K]`),
+        // slice along the Q dim per tile.
+        let mask_source_f32: Option<Tensor> = if let Some(mask_raw) = mask {
+            let mf32 = if mask_raw.dtype() == DType::F32 {
+                mask_raw.clone_result()?
+            } else {
+                mask_raw.to_dtype(DType::F32)?
+            };
+            Some(mf32)
+        } else {
+            None
+        };
         let mut tile_outputs: Vec<Tensor> = Vec::with_capacity(num_tiles);
         let mut start = 0;
         while start < q_len {
             let len = (q_len - start).min(q_tile);
             let q_chunk = q_flat.narrow(1, start, len)?;
-            // No mask on the tiled path (gated above).
-            let out_tile = run_one_tile(&q_chunk, None, len, start)?;
+            let mask_tile: Option<Tensor> = if let Some(ref mf32) = mask_source_f32 {
+                let dims = mf32.shape().dims();
+                if dims.len() != 4 {
+                    return Err(Error::InvalidInput(format!(
+                        "sdpa_fallback tiled: mask must be 4D, got {:?}",
+                        dims
+                    )));
+                }
+                // Slice along Q if the mask has a full Q dim; otherwise
+                // keep Q-broadcast as-is (will broadcast in the run_one_tile
+                // prep below).
+                let m_q = dims[2];
+                let mq_slice = if m_q == q_len {
+                    mf32.narrow(2, start, len)?
+                } else if m_q == 1 {
+                    mf32.clone_result()?
+                } else {
+                    return Err(Error::InvalidInput(format!(
+                        "sdpa_fallback tiled: mask Q dim {} not broadcastable to {}",
+                        m_q, q_len
+                    )));
+                };
+                let target = [b, h, len, k_len];
+                let bcast = if mq_slice.shape().dims() == target {
+                    mq_slice
+                } else {
+                    mq_slice.broadcast_to(&Shape::from_dims(&target))?
+                };
+                Some(bcast.reshape(&[bh, len, k_len])?)
+            } else {
+                None
+            };
+            let out_tile = run_one_tile(&q_chunk, mask_tile.as_ref(), len, start)?;
             tile_outputs.push(out_tile);
             start += len;
         }

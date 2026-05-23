@@ -212,6 +212,9 @@ fn main() {
     // unused `flash_attn` feature). See HANDOFF_2026-04-23.md §4.
     cuda_sources.push("src/cuda/fp8_dequant.cu");
     cuda_sources.push("src/cuda/fp8_quant.cu");
+    // MXFP4 → BF16 dequant for GPT-OSS MoE experts (Lens M2).
+    // 32 FP4 elements share one 8-bit E8M0 exponent scale.
+    cuda_sources.push("src/cuda/mxfp4_dequant.cu");
     cuda_sources.push("src/cuda/fp16_to_bf16.cu");
     cuda_sources.push("src/cuda/fused_norm_modulate.cu");
     cuda_sources.push("src/cuda/fused_residual_gate.cu");

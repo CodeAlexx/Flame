@@ -196,6 +196,142 @@ pub fn dequant_fp8_transpose_into(
     Ok(())
 }
 
+/// GPU-side MXFP4 → BF16 dequantization.
+///
+/// MXFP4 packs 32 FP4 (E2M1) values per block, sharing one 8-bit E8M0
+/// exponent scale. Used by GPT-OSS 20B (Lens text encoder) for MoE expert
+/// weights. The 16 representable FP4 magnitudes are
+/// `[0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6]` (matches HuggingFace transformers'
+/// `FP4_VALUES` exactly).
+///
+/// Inputs (both `CudaSlice<u8>` on GPU):
+///   - `blocks`: 16 bytes per 32-element block (2 FP4 nibbles per byte).
+///     Total length must be `rows_total * 16`.
+///   - `scales`: one E8M0 exponent byte per 32-element block.
+///     Total length must be `rows_total`.
+///
+/// Output: new BF16 tensor with shape `shape`. `shape.elem_count()` must
+/// equal `rows_total * 32`.
+///
+/// Reference: `transformers/integrations/mxfp4.py::convert_moe_packed_tensors`.
+/// The transpose at the end of that function is NOT done here — callers that
+/// want PyTorch-layout `[E, H, 2*I]` should follow with `.transpose(1, 2).contiguous()`.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub fn dequant_mxfp4_to_bf16(
+    blocks: &cudarc::driver::CudaSlice<u8>,
+    scales: &cudarc::driver::CudaSlice<u8>,
+    shape: Shape,
+    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+) -> Result<Tensor> {
+    use cudarc::driver::DeviceSlice;
+    let numel = shape.elem_count();
+    if numel % 32 != 0 {
+        return Err(Error::InvalidShape(format!(
+            "dequant_mxfp4_to_bf16: output element count {numel} must be a multiple of 32"
+        )));
+    }
+    let rows_total = numel / 32;
+    let blocks_bytes_expected = rows_total * 16;
+    if blocks.len() < blocks_bytes_expected {
+        return Err(Error::InvalidShape(format!(
+            "dequant_mxfp4_to_bf16: blocks has {} bytes, expected {} (rows_total={})",
+            blocks.len(),
+            blocks_bytes_expected,
+            rows_total
+        )));
+    }
+    if scales.len() < rows_total {
+        return Err(Error::InvalidShape(format!(
+            "dequant_mxfp4_to_bf16: scales has {} bytes, expected {} (rows_total={})",
+            scales.len(),
+            rows_total,
+            rows_total
+        )));
+    }
+
+    let bf16_out: cudarc::driver::CudaSlice<u16> = unsafe { device.alloc(numel)? };
+    let stream = device_lt::stream_ptr(device)?;
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_mxfp4_to_bf16(
+            *blocks.device_ptr() as *const _,
+            *scales.device_ptr() as *const _,
+            *bf16_out.device_ptr() as *mut _,
+            rows_total,
+            stream,
+        )
+    };
+    if ret != 0 {
+        return Err(Error::Cuda(format!("mxfp4_to_bf16 CUDA error: {ret}")));
+    }
+
+    Ok(Tensor::from_bf16_slice_gpu(
+        bf16_out,
+        shape,
+        std::sync::Arc::clone(device),
+    ))
+}
+
+/// GPU-side MXFP4 → BF16 dequantization INTO an existing BF16 tensor.
+/// Zero allocation — writes directly into `output`'s GPU memory.
+///
+/// `output.shape().elem_count()` must equal `rows_total * 32` where
+/// `rows_total = scales.len()`.
+#[cfg(all(feature = "cuda", feature = "bf16_u16"))]
+pub fn dequant_mxfp4_to_bf16_into(
+    blocks: &cudarc::driver::CudaSlice<u8>,
+    scales: &cudarc::driver::CudaSlice<u8>,
+    output: &Tensor,
+) -> Result<()> {
+    use cudarc::driver::DeviceSlice;
+    if output.dtype() != DType::BF16 {
+        return Err(Error::InvalidInput(format!(
+            "dequant_mxfp4_to_bf16_into: output must be BF16, got {:?}",
+            output.dtype()
+        )));
+    }
+    let numel = output.shape().elem_count();
+    if numel % 32 != 0 {
+        return Err(Error::InvalidShape(format!(
+            "dequant_mxfp4_to_bf16_into: output element count {numel} must be a multiple of 32"
+        )));
+    }
+    let rows_total = numel / 32;
+    let blocks_bytes_expected = rows_total * 16;
+    if blocks.len() < blocks_bytes_expected {
+        return Err(Error::InvalidShape(format!(
+            "dequant_mxfp4_to_bf16_into: blocks has {} bytes, expected {} (rows_total={})",
+            blocks.len(),
+            blocks_bytes_expected,
+            rows_total
+        )));
+    }
+    if scales.len() < rows_total {
+        return Err(Error::InvalidShape(format!(
+            "dequant_mxfp4_to_bf16_into: scales has {} bytes, expected {} (rows_total={})",
+            scales.len(),
+            rows_total,
+            rows_total
+        )));
+    }
+
+    let stream = device_lt::stream_ptr(output.device())?;
+
+    let ret = unsafe {
+        crate::cuda::ffi::flame_mxfp4_to_bf16(
+            *blocks.device_ptr() as *const _,
+            *scales.device_ptr() as *const _,
+            output.as_device_ptr_bf16("dequant_mxfp4_into:output")? as *mut _,
+            rows_total,
+            stream,
+        )
+    };
+    if ret != 0 {
+        return Err(Error::Cuda(format!("mxfp4_to_bf16_into CUDA error: {ret}")));
+    }
+    Ok(())
+}
+
 /// Fused RMS normalization: BF16 → BF16 with weight multiply.
 /// Replaces 6 kernel launches (cast + sq + mean + rsqrt + mul + mul_weight) with 1.
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]

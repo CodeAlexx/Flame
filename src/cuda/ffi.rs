@@ -632,6 +632,20 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// GPU-side MXFP4 → BF16 dequant.
+    /// blocks: uint8 buffer, length = rows_total * 16 (16 bytes/block, 2 FP4 nibbles/byte).
+    /// scales: uint8 buffer, length = rows_total (one E8M0 byte per 32-element block).
+    /// out: BF16 buffer, length = rows_total * 32.
+    /// Each block holds 32 FP4 values sharing one E8M0 scale (2^(scale - 127)).
+    /// Matches `transformers/integrations/mxfp4.py::convert_moe_packed_tensors`.
+    pub fn flame_mxfp4_to_bf16(
+        blocks: *const core::ffi::c_void,
+        scales: *const core::ffi::c_void,
+        out: *mut core::ffi::c_void,
+        rows_total: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// GPU-side BF16 → FP8 E4M3 quantize: out[i] = fp8(bf16(in[i]) * inv_scale)
     /// Caller provides inv_scale = 1.0 / scale where scale = absmax / 448.0.
     pub fn flame_bf16_to_fp8(
