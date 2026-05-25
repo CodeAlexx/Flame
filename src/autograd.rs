@@ -3700,6 +3700,58 @@ fn compute_gradients(
                 return Ok(SmallVec::new());
             }
 
+            // ---- Systemic F32 backward (precision fix) ----
+            // The BF16 paths below round both the incoming grad and the
+            // produced grad to BF16 at the cuBLASLt boundary; across ~2
+            // matmuls/block × 32 blocks this cumulative rounding rotates
+            // klein's composed backward (PROVEN: per-block bwd cos 0.51-0.68
+            // while fwd cos 0.99). Under FLAME_BWD_F32, compute the matmul
+            // backward entirely in F32. Handles 2D and 3D×2D (the Linear-layer
+            // cases in Klein/Flux blocks); other ranks fall through to BF16.
+            if std::env::var("FLAME_BWD_F32").as_deref() == Ok("1") {
+                let (lr, rr, ogr) =
+                    (lhs_tensor.rank(), rhs_tensor.rank(), output_grad.rank());
+                let two_d = lr == 2 && rr == 2 && ogr == 2;
+                let three_by_two = lr == 3 && rr == 2 && ogr == 3;
+                if two_d || three_by_two {
+                    let f32c = |t: &Tensor| -> Result<Tensor> {
+                        let u = t.to_dtype_no_grad(DType::F32)?;
+                        if u.is_contiguous() { Ok(u) } else { u.contiguous() }
+                    };
+                    let og_f32 = f32c(output_grad)?;
+                    let rhs_f32 = f32c(rhs_tensor)?;
+                    let lhs_f32 = f32c(lhs_tensor)?;
+                    let rd = rhs_f32.shape().dims().to_vec();
+                    let (k, n) = (rd[0], rd[1]);
+                    let (og2d, lhs2d, lhs_outshape) = if two_d {
+                        let m = og_f32.shape().dims()[0];
+                        (og_f32.clone(), lhs_f32.clone(), vec![m, k])
+                    } else {
+                        let d = lhs_f32.shape().dims().to_vec();
+                        let (bb, m) = (d[0], d[1]);
+                        (
+                            og_f32.reshape(&[bb * m, n])?,
+                            lhs_f32.reshape(&[bb * m, k])?,
+                            vec![bb, m, k],
+                        )
+                    };
+                    let mut grads: GradVec = SmallVec::new();
+                    if need_lhs_grad {
+                        // grad_lhs = og @ rhs^T
+                        let rhs_t = rhs_f32.transpose()?.contiguous()?;
+                        let gl = og2d.matmul(&rhs_t)?;
+                        let gl = if two_d { gl } else { gl.reshape(&lhs_outshape)? };
+                        grads.push((*lhs, gl));
+                    }
+                    if need_rhs_grad {
+                        // grad_rhs = lhs^T @ og
+                        let lhs_t = lhs2d.transpose()?.contiguous()?;
+                        grads.push((*rhs, lhs_t.matmul(&og2d)?));
+                    }
+                    return Ok(grads);
+                }
+            }
+
             // Fast path: BF16 2D. Use cuBLASLt with trans flags so neither
             // operand materializes a transpose. This is the dominant backward
             // for Linear layers in Klein/Flux DiT blocks — old path used
@@ -4881,7 +4933,14 @@ fn compute_gradients(
             let neg_sin = GpuOps::mul_scalar(&sin_tensor, -1.0)?;
             let grad_input = match layout {
                 RopeLayout::Interleaved => {
-                    crate::bf16_ops::rope_fused_bf16(&grad_bf16, &cos_tensor, &neg_sin)?
+                    // F32-pe forward (rope_fused_bf16_f32pe) saves F32 cos/sin; the
+                    // BF16-only kernel would reject them. Use the matching f32pe
+                    // backward when cos is F32 (also keeps F32 RoPE precision in bwd).
+                    if cos_tensor.dtype() == DType::F32 {
+                        crate::bf16_ops::rope_fused_bf16_f32pe(&grad_bf16, &cos_tensor, &neg_sin)?
+                    } else {
+                        crate::bf16_ops::rope_fused_bf16(&grad_bf16, &cos_tensor, &neg_sin)?
+                    }
                 }
                 RopeLayout::Halfsplit => {
                     crate::bf16_ops::rope_halfsplit_bf16(&grad_bf16, &cos_tensor, &neg_sin)?
@@ -5107,6 +5166,52 @@ fn compute_gradients(
                 }
                 None => None,
             };
+
+            // ---- F32 non-affine LayerNorm backward (precision fix) ----
+            // The BF16 kernel below receives the grad already cast down to
+            // BF16 (grad_bf16), then computes the cancellation
+            //   dL/dx = rstd * (g - mean(g) - xhat * mean(g*xhat))
+            // whose result is only the ~1/sigma survivor. On BF16-rounded
+            // input that cancellation amplifies rounding ~sigma x and drops
+            // the transform-branch gradient — PROVEN to rotate klein's
+            // per-block backward to cos 0.51-0.68 while the forward is cos
+            // 0.99. Recompute in F32 from the saved F32 mean/rstd. Non-affine
+            // only (modulate_pre uses weight=None); affine LN keeps the kernel.
+            if w_bf16.is_none()
+                && (std::env::var("FLAME_LN_BWD_F32").as_deref() == Ok("1")
+                    || std::env::var("FLAME_BWD_F32").as_deref() == Ok("1"))
+            {
+                let sc = entry.saved_count();
+                if let (Some((_, mean_t)), Some((_, rstd_t))) =
+                    (entry.saved_at(sc - 2), entry.saved_at(sc - 1))
+                {
+                    let dims = input_bf16.shape().dims().to_vec();
+                    let last = dims.len() - 1;
+                    let d = dims[last] as f32;
+                    let mut bshape = dims.clone();
+                    bshape[last] = 1;
+                    let x = input_bf16.to_dtype_no_grad(DType::F32)?;
+                    let g_owned;
+                    let g: &Tensor = if output_grad.dtype() == DType::F32 {
+                        output_grad
+                    } else {
+                        g_owned = output_grad.to_dtype_no_grad(DType::F32)?;
+                        &g_owned
+                    };
+                    let g = if g.is_contiguous() { g.clone() } else { g.contiguous()? };
+                    let mean = mean_t.to_dtype_no_grad(DType::F32)?.reshape(&bshape)?;
+                    let rstd = rstd_t.to_dtype_no_grad(DType::F32)?.reshape(&bshape)?;
+                    let xhat = x.sub(&mean)?.mul(&rstd)?;
+                    let g_mean = GpuOps::sum_dim_keepdim(&g, last)?.mul_scalar(1.0 / d)?;
+                    let g_xhat = GpuOps::sum_dim_keepdim(&g.mul(&xhat)?, last)?
+                        .mul_scalar(1.0 / d)?;
+                    let dx = g
+                        .sub(&g_mean)?
+                        .sub(&xhat.mul(&g_xhat)?)?
+                        .mul(&rstd)?;
+                    return Ok(smallvec![(*input, dx)]);
+                }
+            }
 
             let (grad_input, grad_weight, grad_bias) =
                 crate::cuda_ops_bf16::layer_norm_backward_bf16(

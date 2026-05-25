@@ -2996,12 +2996,23 @@ pub fn attn_split_txt_img_bf16(
     // records its own autograd op and gradient flows back through SDPA
     // to the QKV LoRA adapters. The fused kernel below severs the chain.
     if attn_out.requires_grad && crate::autograd::AutogradContext::is_recording() {
+        // The `.contiguous()` after each narrow is REQUIRED for a correct
+        // backward. Narrowing the middle (sequence) dim produces a strided,
+        // offset view; the subsequent permute->reshape backward does not invert
+        // through that view's offset (grad scatters to the wrong slice), which
+        // breaks the adjoint (proven: <f(x),G> != <x,f^T(G)>) and silently
+        // corrupts every double-block joint-attention gradient. Materializing
+        // the slice first makes the permute/reshape backward exact.
+        // (qkv_split_permute is unaffected because it narrows the LAST dim and
+        // reshapes BEFORE permuting.)
         let txt = attn_out
             .narrow(2, 0, n_txt)?
+            .contiguous()?
             .permute(&[0, 2, 1, 3])?
             .reshape(&[b, n_txt, h * d])?;
         let img = attn_out
             .narrow(2, n_txt, n_img)?
+            .contiguous()?
             .permute(&[0, 2, 1, 3])?
             .reshape(&[b, n_img, h * d])?;
         return Ok((txt, img));
