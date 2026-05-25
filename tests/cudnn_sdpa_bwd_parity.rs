@@ -244,7 +244,10 @@ fn run_bwd_parity(b: usize, h: usize, n: usize, d: usize) {
             0,
             0,
             0,
-            0,
+            0, // stats_offset_elems
+            0, // causal
+            n as i32, // real_n_q
+            n as i32, // real_n_kv
             stream,
         )
     };
@@ -295,6 +298,9 @@ fn run_bwd_parity(b: usize, h: usize, n: usize, d: usize) {
             0,
             0,
             0,
+            0, // causal
+            n as i32, // real_n_q
+            n as i32, // real_n_kv
             stream,
         )
     };
@@ -371,6 +377,7 @@ fn cudnn_sdpa_train_fwd_matches_inference_fwd() {
             0,
             0,
             0,
+            0, // causal
             stream,
         )
     };
@@ -398,7 +405,10 @@ fn cudnn_sdpa_train_fwd_matches_inference_fwd() {
             0,
             0,
             0,
-            0,
+            0, // stats_offset_elems
+            0, // causal
+            n as i32, // real_n_q
+            n as i32, // real_n_kv
             stream,
         )
     };

@@ -21,3 +21,4 @@ AUDIT_*.md
 NOTES_*.md
 kernels/_staging/
 .archive/
+tests/parity/*.json
