@@ -5511,9 +5511,15 @@ fn compute_gradients(
         }
 
         Op::Permute { input, dims } => {
-            // Gradient of permute is inverse permute
+            // Gradient of permute is inverse permute.
+            // FIX 2026-05-29: `.permute()` returns a STRIDED VIEW. Handing that
+            // strided grad to a downstream view-op backward (e.g. a mid-dim
+            // narrow's scatter) makes it misread against contiguous strides —
+            // proven by the adjoint test: `narrow(mid) -> permute` was rel 1.97
+            // (sign-flipped), while `narrow -> contiguous` is rel 3e-7. Backward
+            // grads must be dense; materialize before propagating.
             let inverse_dims = inverse_permutation(dims);
-            let grad = output_grad.permute(&inverse_dims)?;
+            let grad = output_grad.permute(&inverse_dims)?.contiguous()?;
             Ok(smallvec![(*input, ensure_bf16(grad)?)])
         }
 
