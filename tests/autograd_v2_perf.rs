@@ -310,6 +310,7 @@ fn build_klein_attn_chain(fix: &HashMap<String, Tensor>) -> (Tensor, Vec<flame_c
                         input: x_in.id(),
                         cos: pe_cos.id(),
                         sin: pe_sin.id(),
+                        layout: flame_core::autograd::RopeLayout::Interleaved,
                     },
                     vec![
                         (x_in.id(), x_in.clone()),

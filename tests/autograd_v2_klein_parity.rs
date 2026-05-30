@@ -275,6 +275,7 @@ fn scenario_apply_rope_prod() {
                         input: x.id(),
                         cos: pe_cos.id(),
                         sin: pe_sin.id(),
+                        layout: flame_core::autograd::RopeLayout::Interleaved,
                     },
                     vec![
                         (x.id(), x.clone()),
@@ -487,6 +488,7 @@ fn scenario_attn_chain_prod() {
                         input: x_in.id(),
                         cos: pe_cos.id(),
                         sin: pe_sin.id(),
+                        layout: flame_core::autograd::RopeLayout::Interleaved,
                     },
                     vec![
                         (x_in.id(), x_in.clone()),
