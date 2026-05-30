@@ -976,6 +976,8 @@ enum AttentionBwdRecomputeMode {
     F32,
 }
 
+const CUDNN_SDPA_BWD_SEQ_ALIGN: usize = 128;
+
 #[inline]
 fn attention_bwd_recompute_mode() -> AttentionBwdRecomputeMode {
     match std::env::var("FLAME_ATTENTION_BWD_RECOMPUTE").ok().as_deref() {
@@ -1138,13 +1140,12 @@ fn try_cudnn_sdpa_backward(
         sdpa_bwd_log(&format!("bail:head_dim={d}"));
         return Ok(None);
     }
-    // cuDNN flash bwd requires Nq and Nkv to be 64-element aligned.
-    // Empirically validated 2026-05-12: zimage Nq=1536 (64*24) works;
-    // klein 9B Nq=1632 (not div by 64) produces CUDA_ERROR_MISALIGNED_ADDRESS
-    // during the kernel's dQ/dK/dV stores. The forward path tolerates
-    // arbitrary Nq, but the bwd kernel makes stricter alignment
-    // assumptions. Fall back to decomposed for non-aligned shapes.
-    if n_q % 64 != 0 || n_kv % 64 != 0 {
+    // cuDNN flash bwd requires Nq and Nkv to be 128-token aligned on the
+    // train-bwd path. 64-token alignment was not sufficient: L2P at
+    // Nq=Nkv=1216 (64*19, but not 128-aligned) reports success from the
+    // frontend and then leaves CUDA in CUDA_ERROR_MISALIGNED_ADDRESS during
+    // cleanup. Fall back to decomposed for non-aligned saved shapes.
+    if n_q % CUDNN_SDPA_BWD_SEQ_ALIGN != 0 || n_kv % CUDNN_SDPA_BWD_SEQ_ALIGN != 0 {
         sdpa_bwd_log(&format!("bail:nq-nkv-align Nq={n_q} Nkv={n_kv}"));
         return Ok(None);
     }
@@ -1196,6 +1197,32 @@ fn try_cudnn_sdpa_backward(
         ));
         return Ok(None);
     }
+
+    use cudarc::driver::DevicePtr;
+    let q_base = q.as_device_ptr_bf16("cudnn_sdpa_bwd:q")? as usize;
+    let k_base = k.as_device_ptr_bf16("cudnn_sdpa_bwd:k")? as usize;
+    let v_base = v.as_device_ptr_bf16("cudnn_sdpa_bwd:v")? as usize;
+    let o_base = o.as_device_ptr_bf16("cudnn_sdpa_bwd:o")? as usize;
+    let do_base = d_o.as_device_ptr_bf16("cudnn_sdpa_bwd:do")? as usize;
+    let stats_base = match &stats.storage {
+        crate::tensor_storage::TensorStorage::F32 { data, .. } => {
+            *crate::tensor_storage::slice_ref(data).device_ptr() as usize
+        }
+        _ => return Ok(None),
+    };
+    let aligned = [
+        ("q", q_base + q.offset() * 2),
+        ("k", k_base + k.offset() * 2),
+        ("v", v_base + v.offset() * 2),
+        ("o", o_base + o.offset() * 2),
+        ("do", do_base + d_o.offset() * 2),
+        ("stats", stats_base + stats.offset() * 4),
+    ];
+    if let Some((name, addr)) = aligned.iter().find(|(_, addr)| *addr % 16 != 0) {
+        sdpa_bwd_log(&format!("bail:ptr-align {name}={addr:#x}"));
+        return Ok(None);
+    }
+
     sdpa_bwd_log(&format!(
         "fired cuDNN bf16 [B={b},H={h},Nq={n_q},Nkv={n_kv},d={d},causal={causal}]"
     ));
@@ -1216,24 +1243,18 @@ fn try_cudnn_sdpa_backward(
     let dk_strides = strides_4d(&dk)?;
     let dv_strides = strides_4d(&dv)?;
 
-    use cudarc::driver::DevicePtr;
     let stream = crate::cuda::device_lt::stream_ptr(device)?;
 
-    let q_ptr = q.as_device_ptr_bf16("cudnn_sdpa_bwd:q")? as *const core::ffi::c_void;
-    let k_ptr = k.as_device_ptr_bf16("cudnn_sdpa_bwd:k")? as *const core::ffi::c_void;
-    let v_ptr = v.as_device_ptr_bf16("cudnn_sdpa_bwd:v")? as *const core::ffi::c_void;
-    let o_ptr = o.as_device_ptr_bf16("cudnn_sdpa_bwd:o")? as *const core::ffi::c_void;
-    let do_ptr = d_o.as_device_ptr_bf16("cudnn_sdpa_bwd:do")? as *const core::ffi::c_void;
+    let q_ptr = q_base as *const core::ffi::c_void;
+    let k_ptr = k_base as *const core::ffi::c_void;
+    let v_ptr = v_base as *const core::ffi::c_void;
+    let o_ptr = o_base as *const core::ffi::c_void;
+    let do_ptr = do_base as *const core::ffi::c_void;
     let dq_ptr = dq.as_device_ptr_bf16("cudnn_sdpa_bwd:dq")? as *mut core::ffi::c_void;
     let dk_ptr = dk.as_device_ptr_bf16("cudnn_sdpa_bwd:dk")? as *mut core::ffi::c_void;
     let dv_ptr = dv.as_device_ptr_bf16("cudnn_sdpa_bwd:dv")? as *mut core::ffi::c_void;
 
-    let stats_ptr = match &stats.storage {
-        crate::tensor_storage::TensorStorage::F32 { data, .. } => {
-            *crate::tensor_storage::slice_ref(data).device_ptr() as *const core::ffi::c_void
-        }
-        _ => return Ok(None),
-    };
+    let stats_ptr = stats_base as *const core::ffi::c_void;
 
     let q_off = q.offset() as i64;
     let k_off = k.offset() as i64;

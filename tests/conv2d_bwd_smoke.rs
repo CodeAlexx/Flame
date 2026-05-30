@@ -18,6 +18,7 @@
 use anyhow::Result;
 use flame_core::{
     autograd::AutogradContext,
+    cuda_conv2d::CudaConv2d,
     conv::{Conv2d, Conv2dConfig},
     DType, Device, Shape, Tensor,
 };
@@ -116,5 +117,103 @@ fn conv2d_forward_records_on_tape() -> Result<()> {
     }
 
     println!("[conv2d_bwd_smoke] PASS — Conv2d records and backwards cleanly.");
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn conv2d_backward_matches_cpu_layout() -> Result<()> {
+    let device = match Device::cuda(0) {
+        Ok(d) => d.cuda_device_arc(),
+        Err(_) => return Ok(()),
+    };
+
+    let n = 1usize;
+    let ic = 2usize;
+    let oc = 3usize;
+    let h = 3usize;
+    let w = 4usize;
+    let kh = 2usize;
+    let kw = 2usize;
+    let oh = h - kh + 1;
+    let ow = w - kw + 1;
+
+    let input_v: Vec<f32> = (0..n * ic * h * w)
+        .map(|i| ((i as i32 % 13) as f32 - 6.0) * 0.125)
+        .collect();
+    let weight_v: Vec<f32> = (0..oc * ic * kh * kw)
+        .map(|i| ((i as i32 % 11) as f32 - 5.0) * 0.0625)
+        .collect();
+    let grad_out_v: Vec<f32> = (0..n * oc * oh * ow)
+        .map(|i| ((i as i32 % 7) as f32 - 3.0) * 0.25)
+        .collect();
+
+    let input = Tensor::from_vec(input_v.clone(), Shape::from_dims(&[n, ic, h, w]), device.clone())?;
+    let weight = Tensor::from_vec(
+        weight_v.clone(),
+        Shape::from_dims(&[oc, ic, kh, kw]),
+        device.clone(),
+    )?;
+    let grad_out = Tensor::from_vec(
+        grad_out_v.clone(),
+        Shape::from_dims(&[n, oc, oh, ow]),
+        device.clone(),
+    )?;
+
+    let (grad_in, grad_w, grad_b) =
+        CudaConv2d::conv2d_backward(&grad_out, &input, &weight, (1, 1), (0, 0))?;
+
+    let mut exp_in = vec![0.0f32; n * ic * h * w];
+    let mut exp_w = vec![0.0f32; oc * ic * kh * kw];
+    let mut exp_b = vec![0.0f32; oc];
+
+    let input_idx = |b: usize, c: usize, y: usize, x: usize| ((b * ic + c) * h + y) * w + x;
+    let weight_idx =
+        |o: usize, c: usize, ky: usize, kx: usize| ((o * ic + c) * kh + ky) * kw + kx;
+    let go_idx = |b: usize, o: usize, y: usize, x: usize| ((b * oc + o) * oh + y) * ow + x;
+
+    for b in 0..n {
+        for o in 0..oc {
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let go = grad_out_v[go_idx(b, o, oy, ox)];
+                    exp_b[o] += go;
+                    for c in 0..ic {
+                        for ky in 0..kh {
+                            for kx in 0..kw {
+                                let iy = oy + ky;
+                                let ix = ox + kx;
+                                exp_in[input_idx(b, c, iy, ix)] +=
+                                    go * weight_v[weight_idx(o, c, ky, kx)];
+                                exp_w[weight_idx(o, c, ky, kx)] +=
+                                    go * input_v[input_idx(b, c, iy, ix)];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_close(name: &str, got: &[f32], exp: &[f32]) {
+        assert_eq!(got.len(), exp.len(), "{name} len mismatch");
+        let mut max_diff = 0.0f32;
+        for (g, e) in got.iter().zip(exp.iter()) {
+            max_diff = max_diff.max((g - e).abs());
+        }
+        assert!(
+            max_diff < 1e-4,
+            "{name} max diff {max_diff:.6e} exceeds tolerance"
+        );
+    }
+
+    assert_close("grad_input", &grad_in.to_vec_f32()?, &exp_in);
+    assert_close("grad_weight", &grad_w.to_vec_f32()?, &exp_w);
+    assert_close(
+        "grad_bias",
+        &grad_b.expect("bias grad").to_vec_f32()?,
+        &exp_b,
+    );
+
     Ok(())
 }

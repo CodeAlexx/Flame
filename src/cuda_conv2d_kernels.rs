@@ -39,10 +39,12 @@ extern "C" __global__ void im2col_kernel_simple(
         int h_im = h_col - 1 + kh;
         int w_im = w_col - 1 + kw;
         
-        // Calculate position in col buffer
-        int col_index = batch * (channels * kernel_h * kernel_w * out_h * out_w) +
-                        (c_im * kernel_h * kernel_w + kh * kernel_w + kw) * (out_h * out_w) +
-                        h_col * out_w + w_col;
+        // Row-major im2col layout: [N * OH * OW, C * KH * KW].
+        // The Rust GEMM side treats each output pixel as one row, so the
+        // output-position index must be the major dimension.
+        int row = (batch * out_h + h_col) * out_w + w_col;
+        int k = (c_im * kernel_h + kh) * kernel_w + kw;
+        int col_index = row * (channels * kernel_h * kernel_w) + k;
         
         // Boundary check and copy
         if (h_im >= 0 && h_im < height && w_im >= 0 && w_im < width) {
@@ -93,10 +95,10 @@ extern "C" __global__ void im2col_kernel(
         int h_im = h_col * stride_h - pad_h + kh;
         int w_im = w_col * stride_w - pad_w + kw;
         
-        // Calculate position in col buffer
-        int col_index = batch * (channels * kernel_h * kernel_w * out_h * out_w) +
-                        (c_im * kernel_h * kernel_w + kh * kernel_w + kw) * (out_h * out_w) +
-                        h_col * out_w + w_col;
+        // Row-major im2col layout: [N * OH * OW, C * KH * KW].
+        int row = (batch * out_h + h_col) * out_w + w_col;
+        int k = (c_im * kernel_h + kh) * kernel_w + kw;
+        int col_index = row * (channels * kernel_h * kernel_w) + k;
         
         // Boundary check and copy
         if (h_im >= 0 && h_im < height && w_im >= 0 && w_im < width) {
@@ -151,10 +153,10 @@ extern "C" __global__ void im2col_kernel_v2(
         int h_im = h_col * stride_h - pad_h + kh;
         int w_im = w_col * stride_w - pad_w + kw;
         
-        // Calculate position in col buffer
-        int col_index = batch * (channels * kernel_h * kernel_w * out_h * out_w) +
-                        (c_im * kernel_h * kernel_w + kh * kernel_w + kw) * (out_h * out_w) +
-                        h_col * out_w + w_col;
+        // Row-major im2col layout: [N * OH * OW, C * KH * KW].
+        int row = (batch * out_h + h_col) * out_w + w_col;
+        int k = (c_im * kernel_h + kh) * kernel_w + kw;
+        int col_index = row * (channels * kernel_h * kernel_w) + k;
         
         // Boundary check and copy
         if (h_im >= 0 && h_im < height && w_im >= 0 && w_im < width) {
@@ -205,10 +207,11 @@ extern "C" __global__ void col2im_kernel_simple(
             if (h_col_start >= 0 && h_col_start < out_h &&
                 w_col_start >= 0 && w_col_start < out_w) {
                 
-                // Calculate position in col buffer
-                int col_index = batch * (channels * kernel_h * kernel_w * out_h * out_w) +
-                               (c * kernel_h * kernel_w + kh * kernel_w + kw) * (out_h * out_w) +
-                               h_col_start * out_w + w_col_start;
+                // Inverse of row-major im2col layout:
+                // [N * OH * OW, C * KH * KW].
+                int row = (batch * out_h + h_col_start) * out_w + w_col_start;
+                int k = (c * kernel_h + kh) * kernel_w + kw;
+                int col_index = row * (channels * kernel_h * kernel_w) + k;
                 
                 val += data_col[col_index];
             }
@@ -262,10 +265,11 @@ extern "C" __global__ void col2im_kernel(
                 h_col_start >= 0 && h_col_start < out_h &&
                 w_col_start >= 0 && w_col_start < out_w) {
                 
-                // Calculate position in col buffer
-                int col_index = batch * (channels * kernel_h * kernel_w * out_h * out_w) +
-                               (c * kernel_h * kernel_w + kh * kernel_w + kw) * (out_h * out_w) +
-                               h_col_start * out_w + w_col_start;
+                // Inverse of row-major im2col layout:
+                // [N * OH * OW, C * KH * KW].
+                int row = (batch * out_h + h_col_start) * out_w + w_col_start;
+                int k = (c * kernel_h + kh) * kernel_w + kw;
+                int col_index = row * (channels * kernel_h * kernel_w) + k;
                 
                 val += data_col[col_index];
             }
@@ -324,10 +328,11 @@ extern "C" __global__ void col2im_kernel_v2(
                     h_col_start >= 0 && h_col_start < out_h &&
                     w_col_start >= 0 && w_col_start < out_w) {
                     
-                    // Calculate position in col buffer
-                    int col_index = batch * (channels * kernel_h * kernel_w * out_h * out_w) +
-                                   (c * kernel_h * kernel_w + kh * kernel_w + kw) * (out_h * out_w) +
-                                   h_col_start * out_w + w_col_start;
+                    // Inverse of row-major im2col layout:
+                    // [N * OH * OW, C * KH * KW].
+                    int row = (batch * out_h + h_col_start) * out_w + w_col_start;
+                    int k = (c * kernel_h + kh) * kernel_w + kw;
+                    int col_index = row * (channels * kernel_h * kernel_w) + k;
                     
                     val += data_col[col_index];
                 }

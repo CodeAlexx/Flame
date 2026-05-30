@@ -15,7 +15,7 @@ use crate::{
 type SdpaResult<T> = crate::Result<T>;
 
 const NEG_INF: f32 = -1.0e9;
-const CUDNN_SDPA_BWD_SEQ_ALIGN: usize = 64;
+const CUDNN_SDPA_BWD_SEQ_ALIGN: usize = 128;
 
 fn allow_cudnn_sdpa_bwd_causal() -> bool {
     std::env::var("FLAME_CUDNN_SDPA_BWD_CAUSAL")

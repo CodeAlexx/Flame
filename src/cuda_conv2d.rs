@@ -177,7 +177,8 @@ impl CudaConv2d {
 
         let weight_matrix = weight
             .reshape(&[out_channels, in_channels * kernel_h * kernel_w])?
-            .transpose()?;
+            .transpose()?
+            .contiguous()?;
 
         let y_2d = col_tensor.matmul(&weight_matrix)?;
         let mut y = y_2d
@@ -352,7 +353,9 @@ impl CudaConv2d {
         // Gradient w.r.t. input using transposed convolution
         // First, perform im2col on grad_output
         let _col_size = batch_size * out_channels * out_height * out_width;
-        let grad_col = grad_output.reshape(&[batch_size * out_height * out_width, out_channels])?;
+        let grad_output_nhwc = grad_output.permute(&[0, 2, 3, 1])?.contiguous()?;
+        let grad_col =
+            grad_output_nhwc.reshape(&[batch_size * out_height * out_width, out_channels])?;
 
         // Weight gradient: grad_output @ input^T (after im2col)
         // First, im2col on input
@@ -438,7 +441,7 @@ impl CudaConv2d {
         };
 
         // grad_weight = grad_output^T @ input_col
-        let grad_col_t = grad_col.transpose()?;
+        let grad_col_t = grad_col.transpose()?.contiguous()?;
         let grad_weight_2d = grad_col_t.matmul(&input_col_tensor)?;
         let grad_weight =
             grad_weight_2d.reshape(&[out_channels, in_channels, kernel_h, kernel_w])?;
