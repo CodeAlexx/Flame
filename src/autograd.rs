@@ -1222,6 +1222,35 @@ fn try_cudnn_sdpa_backward(
         sdpa_bwd_log(&format!("bail:ptr-align {name}={addr:#x}"));
         return Ok(None);
     }
+    // Offset/contiguity guard (BACKLOG_qwen_cudnn_sdpa_bwd_misalign.md §6.1,
+    // L2P real-cause handoff §6.1 — the PRIME suspect, 2026-06-11): the
+    // crash class survived the 64->128 seq-align bump at 64-aligned-not-128
+    // shapes, and the suspected mechanism is OFFSET VIEWS / non-dense strides
+    // (l2p feeds chunk(3,2) views of fused qkv; zimage feeds contiguous
+    // tensors and never crashed). cuDNN flash bwd's alignment assumptions on
+    // interior rows are not satisfiable for arbitrary strides even when the
+    // base pointer is 16B-aligned. ADDITIVE guard: the cuDNN path now demands
+    // zero storage offset AND dense row-major (contiguous) layout on every
+    // operand; anything else routes to the always-correct decomposed
+    // backward. Contiguous-input models (zimage/klein) are untouched by
+    // construction; over-bail is observable via these logs. GPU verification
+    // owed: l2p/qwen repro at seq 1216/1280 + zimage cuDNN-bwd re-parity.
+    let offset_views = [
+        ("q", q.offset(), q.is_contiguous()),
+        ("k", k.offset(), k.is_contiguous()),
+        ("v", v.offset(), v.is_contiguous()),
+        ("o", o.offset(), o.is_contiguous()),
+        ("do", d_o.offset(), d_o.is_contiguous()),
+    ];
+    if let Some((name, off, contig)) = offset_views
+        .iter()
+        .find(|(_, off, contig)| *off != 0 || !*contig)
+    {
+        sdpa_bwd_log(&format!(
+            "bail:offset-or-noncontig {name} offset={off} contiguous={contig}"
+        ));
+        return Ok(None);
+    }
 
     sdpa_bwd_log(&format!(
         "fired cuDNN bf16 [B={b},H={h},Nq={n_q},Nkv={n_kv},d={d},causal={causal}]"
