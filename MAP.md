@@ -73,6 +73,7 @@ Don't add ops to v3/v4. Append `Op` variants to `autograd.rs` and a backward arm
 - NVRTC: no `<cfloat>` / `<float.h>` — use literal constants. `#pragma unroll` doesn't survive macro expansion — use `_Pragma("unroll")`.
 - `cudarc` pinned at 0.11.9. **No cuSOLVER bindings** — GPU linalg (SVD/QR) needs 8-version upgrade or hand-written FFI.
 - **No Flash Attention** here. cuDNN SDPA + WMMA reference only. Don't propose FA2/FA3.
+- **head_dim ∉ {64,96,128} (no flash) → `sdpa.rs` materialized fallback**, which **auto-Q-tiles** the score matrix when it exceeds `FLAME_SDPA_MATERIALIZE_BUDGET_MB` (default 256 MiB). This is what lets d=256 (e.g. Ideogram-4) run at 1024² without OOMing on a 1.22 GB `[L,L]` F32 scores tensor (commit `7b4e281`). Sub-budget shapes keep the bit-identical single-shot path. **Do NOT route d>128 through the chunked `sdpa_stream_bf16`/`flame_sdpa_stub.cu`** — it silently produces garbage at d>128 (should hard-error; tracked). The Q-tiled materialized path is the correct memory-efficient route for large d.
 - **No F32 fallbacks in inference paths.** Missing BF16 path → write one.
 - `FLAME_ALLOC_POOL=0` required for any dataset-prep binary (pool leaks ~1 GB/sample).
 - BF16 fused kernels must register autograd backward, or LoRA-B stays zero. Default-on `FLAME_ASSERT_GRAD_FLOW=1` when running trainers.
