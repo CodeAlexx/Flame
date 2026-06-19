@@ -208,6 +208,32 @@ fn stream_threshold_from_env() -> Option<usize> {
     })
 }
 
+/// Per-Q-tile scores budget for the materialized SDPA fallback, expressed in
+/// **F32 elements** (the dtype of the live softmax-staging buffer). The
+/// materialized path peaks at roughly 8 bytes/score-elem (one live BF16
+/// logits buffer + one live F32 upcast/softmax buffer), so a budget of N
+/// F32 elements ≈ 8*N bytes peak per tile.
+///
+/// Default is 256 MiB worth of F32 (`256*1024*1024/4 = 67_108_864` elems),
+/// which auto-tiles the head_dim-256 DiT shapes (Ideogram-4 1024²: BH=18,
+/// Q=K=4114 → ~305 M score elems → ~1.22 GB single-shot F32 → OOM on a 24 GB
+/// card once weights/latents are resident) into ~5 tiles of ~268 MB each.
+/// Overridable via `FLAME_SDPA_MATERIALIZE_BUDGET_MB` (megabytes of F32
+/// scores per tile). The default already auto-tiles — no env required.
+fn materialize_budget_elems_from_env() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        const DEFAULT_BUDGET_MB: usize = 256;
+        let mb = std::env::var("FLAME_SDPA_MATERIALIZE_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_BUDGET_MB);
+        // MiB of F32 -> F32 element count. (mb << 20) / 4 == mb << 18.
+        (mb << 20) / std::mem::size_of::<f32>()
+    })
+}
+
 #[cfg(all(feature = "cuda", feature = "bf16_u16"))]
 fn allow_sdpa_f32_fallback() -> bool {
     if crate::strict::is_enabled() {
@@ -1855,10 +1881,11 @@ fn forward_bf16_fallback(
     // **Q-TILING:** The scores tensor `[BH, Q, K]` can get large at
     // 1024² DiT shapes (Z-Image BH=30 Q=K=4096 → 500M F32 elements ≈ 2 GB
     // peak during softmax staging, OOM on 24 GB). We tile the Q dimension
-    // so peak scores memory is bounded to `SCORES_TILE_ELEMS_MAX` F32
-    // elements per tile. Tiling is correctness-preserving because softmax
-    // rows are independent — each q row only attends to all K rows,
-    // never to other q rows. Output tiles are concatenated at the end.
+    // so peak scores memory is bounded to `scores_tile_elems_max` F32
+    // elements per tile (see `materialize_budget_elems_from_env`). Tiling
+    // is correctness-preserving because softmax rows are independent —
+    // each q row only attends to all K rows, never to other q rows. Output
+    // tiles are concatenated at the end.
     //
     // Flash Attention keeps scores in FP32 SRAM; we emulate the precision
     // (upcast BF16 logits → FP32 for scale+mask+softmax → downcast back
@@ -1867,29 +1894,38 @@ fn forward_bf16_fallback(
     //
     // VRAM per tile: `BH * Q_TILE * K * 4` bytes for the F32 softmax
     // staging (peak during softmax is ~8 bytes/elem because of one live
-    // BF16 + one live F32 buffer simultaneously). Budget is set so that
-    // every DiT shape we actually run fits in a SINGLE tile and takes
-    // the fast non-tiled path; tiling only kicks in for genuinely huge
-    // sequences (8k+ video transformers):
-    //   Z-Image 1024²:     BH=30, Q=K=4096 → 503 M elems  → 1 tile ≈ 4 GB peak
-    //   FLUX 1 DiT 1024²:  BH=24, Q=K=4608 → 510 M elems  → 1 tile
-    //   Klein 9B 1024²:    BH=32, Q=K=4608 → 679 M elems  → 1 tile
-    //   SDXL level1:       BH=10, Q=K=4096 → 168 M elems  → 1 tile
+    // BF16 + one live F32 buffer simultaneously). The budget bounds the
+    // per-tile F32 scores element count and is read from
+    // `materialize_budget_elems_from_env()` — default 256 MiB of F32
+    // (67 M elems ≈ 0.5 GB peak/tile), overridable via
+    // `FLAME_SDPA_MATERIALIZE_BUDGET_MB`. The DEFAULT auto-tiles; no env
+    // is required. Representative shapes and their tile counts at the
+    // 67 M-elem default:
+    //   Ideogram-4 1024² (HD256): BH=18, Q=K=4114 → 305 M elems → ~5 tiles
+    //   Z-Image 1024²:     BH=30, Q=K=4096 → 503 M elems → ~8 tiles
+    //   FLUX 1 DiT 1024²:  BH=24, Q=K=4608 → 510 M elems → ~8 tiles
+    //   Klein 9B 1024²:    BH=32, Q=K=4608 → 679 M elems → ~11 tiles
+    //   SDXL level1:       BH=10, Q=K=4096 → 168 M elems → ~3 tiles
     //   CLIP 77:           BH=12, Q=K=77   → 0.07 M elems → 1 tile
     //   LTX-2.3:           BH=32, Q=K=768  → 19 M elems   → 1 tile
     //
-    // Budget at 768 M elements (≈ 6 GB peak) matches the pre-existing
-    // `use_materialized` threshold that this function replaced. An
-    // earlier attempt with a 128 M budget caused Z-Image to slow down
-    // from 230 ms/block (naive flash) to 410 ms/block (4 tiles of 126 M)
-    // because per-tile allocator and kernel-launch overhead dominated
-    // the memory savings — tile-at-any-size is measurably worse than
-    // tile-only-when-necessary for the cuBLASLt materialized path.
+    // History: an earlier 768 M-elem budget kept every DiT shape in a
+    // SINGLE tile, but at HD=256 (Ideogram-4) a 305 M-elem single shot
+    // materializes a 1.22 GB F32 scores tensor (+0.6 GB BF16 logits +
+    // softmax temp) and OOMs on a 24 GB card once weights/latents are
+    // resident. The 256 MiB default bounds peak scores memory regardless
+    // of head_dim while leaving the budget tunable up (e.g.
+    // `FLAME_SDPA_MATERIALIZE_BUDGET_MB=3072`) for callers that prefer the
+    // single-shot path and have the VRAM. Tiling is correctness-preserving:
+    // each Q-tile attends to ALL K with a full per-row softmax, so tiles
+    // are independent and the concatenated output is bit-identical to the
+    // single-shot result (same GEMMs, same scale, same softmax — tiling
+    // only partitions rows).
     //
     // Mask path: masked attention (CLIP causal) is always small enough
-    // to fit in one tile, so we keep the simple non-tiled path when a
-    // mask is present.
-    const SCORES_TILE_ELEMS_MAX: usize = 768_000_000;
+    // to fit in one tile, so the masked path divides the budget for the
+    // extra F32 mask-tile materialization but otherwise behaves the same.
+    let scores_tile_elems_max = materialize_budget_elems_from_env();
 
     let device = q.device().clone();
     let bh = b * h;
@@ -1916,9 +1952,9 @@ fn forward_bf16_fallback(
     // so divide by 8 to leave headroom for fragmentation on a 24 GB card
     // under tight memory.
     let tile_budget = if mask.is_some() {
-        SCORES_TILE_ELEMS_MAX / 8
+        scores_tile_elems_max / 8
     } else {
-        SCORES_TILE_ELEMS_MAX
+        scores_tile_elems_max
     };
     let do_tile = full_elems > tile_budget;
 
