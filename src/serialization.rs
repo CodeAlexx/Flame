@@ -548,23 +548,23 @@ fn decode_tensors_from_mmap(
                 tensor
             }
             "F8_E4M3" => {
-                // FP8 E4M3: 1 byte per element. Dequant with per-tensor scale.
-                // Two naming conventions in the wild:
+                // FP8 E4M3: 1 byte per element. Dequant with per-tensor OR per-row
+                // scale — per-tensor `weight_scale` is [1]; per-row (e.g. Ideogram-4)
+                // is [out_rows], one scale per output row. Reading only scale[0]
+                // mis-scales every row but the first → garbage weights.
                 //   LTX-2:         `foo.weight_scale` (suffix on the key)
                 //   Comfy-scaled:  `foo.scale_weight` (replaces `.weight` with `.scale_weight`)
-                let scale = if let Some(header) = header_for_scales {
-                    let lookup_scale = |key: &str| -> Option<f32> {
-                        let info = header.get(key)?;
-                        let off = info["data_offsets"].as_array()?;
-                        let s_start = off[0].as_u64()? as usize;
-                        // Scale is stored as a single F32 in the file's data
-                        // segment; mmap exposes it via tensor_bytes() too if
-                        // we look it up by name. Simpler: re-mmap-slice into
-                        // the data region using the same MmapFile.
+                let scales: Vec<f32> = if let Some(header) = header_for_scales {
+                    let lookup_scale = |key: &str| -> Option<Vec<f32>> {
+                        header.get(key)?;
                         let bytes = mmap.tensor_bytes(key)?;
                         if bytes.len() >= 4 {
-                            let _ = s_start; // header offset isn't needed when we have tensor_bytes
-                            Some(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                            Some(
+                                bytes
+                                    .chunks_exact(4)
+                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                    .collect(),
+                            )
                         } else {
                             None
                         }
@@ -576,10 +576,15 @@ fn decode_tensors_from_mmap(
                 } else {
                     None
                 }
-                .unwrap_or(1.0);
+                .unwrap_or_else(|| vec![1.0]);
                 let num_elems = bytes.len();
+                // per-row when the scale length matches the leading (out) dim.
+                let out_dim = shape.first().copied().unwrap_or(1);
+                let per_row = out_dim > 1 && scales.len() == out_dim && num_elems % out_dim == 0;
+                let in_dim = if per_row { num_elems / out_dim } else { 1 };
                 let mut bf16_u16 = vec![0u16; num_elems];
-                for (value, &byte) in bf16_u16.iter_mut().zip(bytes.iter()) {
+                for (i, (value, &byte)) in bf16_u16.iter_mut().zip(bytes.iter()).enumerate() {
+                    let scale = if per_row { scales[i / in_dim] } else { scales[0] };
                     let f = fp8_e4m3_to_f32(byte) * scale;
                     *value = half::bf16::from_f32(f).to_bits();
                 }
