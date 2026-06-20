@@ -393,23 +393,47 @@ fn save_tensors_safetensors<T: AsRef<Tensor>>(
     }
     let mut offset = 0u64;
 
-    // Collect tensor info
-    let mut tensor_data = Vec::new();
+    // Collect tensor info. Honor the tensor's dtype (F16/BF16 stay 2-byte; F32
+    // stays 4-byte) instead of always upcasting to F32 — so an F16/BF16 LoRA
+    // saves at reference size, not 2x. `to_vec()` upcasts to f32; we round back
+    // to the native dtype for the bytes (lossless: the tensor already held that
+    // precision).
+    let mut tensor_data: Vec<Vec<u8>> = Vec::new();
     for (name, tensor) in tensors {
         let tensor = tensor.as_ref();
-        let data = tensor.to_vec()?;
+        let f32_data = tensor.to_vec()?;
         let shape = tensor.shape().dims();
 
-        let tensor_info = json!({
-            "dtype": "F32",
-            "shape": shape,
-            "data_offsets": [offset, offset + (data.len() * 4) as u64],
-        });
+        let (dtype_str, bytes): (&str, Vec<u8>) = match tensor.dtype() {
+            DType::F16 => (
+                "F16",
+                f32_data
+                    .iter()
+                    .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                    .collect(),
+            ),
+            DType::BF16 => (
+                "BF16",
+                f32_data
+                    .iter()
+                    .flat_map(|&x| half::bf16::from_f32(x).to_le_bytes())
+                    .collect(),
+            ),
+            _ => (
+                "F32",
+                f32_data.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+            ),
+        };
 
-        let data_len = data.len();
+        let end = offset + bytes.len() as u64;
+        let tensor_info = json!({
+            "dtype": dtype_str,
+            "shape": shape,
+            "data_offsets": [offset, end],
+        });
         metadata.insert(name.clone(), tensor_info);
-        tensor_data.push(data);
-        offset += (data_len * 4) as u64;
+        tensor_data.push(bytes);
+        offset = end;
     }
 
     // Convert metadata to JSON
@@ -428,13 +452,11 @@ fn save_tensors_safetensors<T: AsRef<Tensor>>(
         .write_all(metadata_bytes)
         .map_err(|e| Error::Io(e.to_string()))?;
 
-    // Write tensor data
-    for data in tensor_data {
-        for &value in &data {
-            writer
-                .write_all(&value.to_le_bytes())
-                .map_err(|e| Error::Io(e.to_string()))?;
-        }
+    // Write tensor data (already serialized to the native-dtype byte layout).
+    for bytes in tensor_data {
+        writer
+            .write_all(&bytes)
+            .map_err(|e| Error::Io(e.to_string()))?;
     }
 
     writer.flush().map_err(|e| Error::Io(e.to_string()))?;
